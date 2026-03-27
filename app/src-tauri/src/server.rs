@@ -6,11 +6,29 @@ use grammers_client::types::Media;
 
 use std::sync::Arc;
 
+/// Holds the per-session streaming token for Actix validation
+pub struct StreamTokenData {
+    pub token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StreamQuery {
+    token: Option<String>,
+}
+
 #[get("/stream/{folder_id}/{message_id}")]
 async fn stream_media(
     path: web::Path<(String, i32)>,
+    query: web::Query<StreamQuery>,
     data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
 ) -> impl Responder {
+    // Validate session token
+    match &query.token {
+        Some(t) if t == &token_data.token => {},
+        _ => return HttpResponse::Forbidden().body("Invalid or missing stream token"),
+    }
+
     let (folder_id_str, message_id) = path.into_inner();
     
     // Parse folder ID
@@ -83,15 +101,24 @@ fn mime_type_from_media(media: &Media) -> String {
     }
 }
 
-pub async fn start_server(state: Arc<TelegramState>, port: u16) -> std::io::Result<()> {
+pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -> std::io::Result<()> {
     let state_data = web::Data::new(state);
+    let token_data = web::Data::new(StreamTokenData { token });
     
     log::info!("Starting Streaming Server on port {}", port);
     
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allowed_origin("tauri://localhost")
+            .allowed_origin("http://localhost:1420")
+            .allowed_origin("https://tauri.localhost")
+            .allow_any_method()
+            .allow_any_header();
+
         App::new()
-            .wrap(Cors::permissive())
+            .wrap(cors)
             .app_data(state_data.clone())
+            .app_data(token_data.clone())
             .service(stream_media)
     })
     .bind(("127.0.0.1", port))?

@@ -279,13 +279,15 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                         How do I get my API credentials?
                                     </button>
 
-                                    <button
-                                        type="button"
-                                        onClick={() => onLogin()}
-                                        className="w-full text-xs text-red-400/60 hover:text-red-300 transition-colors py-1"
-                                    >
-                                        Dev Mode
-                                    </button>
+                                    {import.meta.env.DEV && (
+                                        <button
+                                            type="button"
+                                            onClick={() => onLogin()}
+                                            className="w-full text-xs text-red-400/60 hover:text-red-300 transition-colors py-1"
+                                        >
+                                            Dev Mode
+                                        </button>
+                                    )}
                                 </motion.form>
                             )}
 

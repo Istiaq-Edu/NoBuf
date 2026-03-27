@@ -2,17 +2,17 @@
 
 ## [1.0.4] - 2026-02-13
 
-### Bug Fixes
+### Fixes
 
-- **Grid Card Overlap Fix** - Cards no longer overlap at any window size. Replaced CSS `aspect-[4/3]` with explicit pixel heights synchronized to the virtualizer's row budget.
+- Finally squashed the grid overlap bug for real. Cards were using CSS `aspect-[4/3]` to size themselves, but the virtualizer was computing row heights separately — at certain window widths these disagreed and rows would bleed into each other. Now both use the same explicit pixel height, so no more overlap regardless of how you resize the window.
 
-### Code Quality
+### Cleanup
 
-- Removed all `console.log/warn/error` statements (16 total, kept 1 in ErrorBoundary)
-- Replaced all `as any` type casts with proper types
-- Fixed all Rust Clippy warnings (7 → 0)
-- Removed 3 unused npm dependencies (`clsx`, `tailwind-merge`, `@tauri-apps/plugin-opener`)
-- Stripped ~40 AI-generated comments across TypeScript and Rust files
+- Went through the whole codebase and ripped out every `console.log` / `console.error` we'd left in from debugging (16 of them). The one in `ErrorBoundary` stays since that's the whole point of an error boundary.
+- Got rid of all `as any` casts on the frontend — everything's properly typed now.
+- Ran Clippy and fixed all 7 warnings, including a couple of `collapsible_match` ones in `fs.rs` that needed manual refactoring.
+- Dropped `clsx`, `tailwind-merge`, and `@tauri-apps/plugin-opener` from `package.json` — none of them were actually imported anywhere.
+- General comment cleanup throughout.
 
 ---
 

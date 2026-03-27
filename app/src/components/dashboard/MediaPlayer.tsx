@@ -1,5 +1,6 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../types';
 
 interface MediaPlayerProps {
@@ -13,8 +14,16 @@ interface MediaPlayerProps {
 }
 
 export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, totalItems, activeFolderId }: MediaPlayerProps) {
+    const [streamToken, setStreamToken] = useState<string | null>(null);
+
+    useEffect(() => {
+        invoke<string>('cmd_get_stream_token').then(setStreamToken).catch(() => {});
+    }, []);
+
     const folderIdParam = activeFolderId !== null ? activeFolderId.toString() : 'home';
-    const streamUrl = `http://localhost:14200/stream/${folderIdParam}/${file.id}`;
+    const streamUrl = streamToken
+        ? `http://localhost:14200/stream/${folderIdParam}/${file.id}?token=${streamToken}`
+        : null;
 
     const isVideo = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi'].some(ext => file.name.toLowerCase().endsWith(ext));
     const isAudio = ['mp3', 'wav', 'aac', 'flac', 'm4a', 'opus'].some(ext => file.name.toLowerCase().endsWith(ext));
@@ -77,7 +86,12 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
                 </button>
 
                 <div className="w-full aspect-video bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center">
-                    {isVideo ? (
+                    {!streamUrl ? (
+                        <div className="flex flex-col items-center gap-4 text-white">
+                            <div className="w-10 h-10 border-4 border-telegram-primary border-t-transparent rounded-full animate-spin"></div>
+                            <p>Preparing stream...</p>
+                        </div>
+                    ) : isVideo ? (
                         <video
                             src={streamUrl}
                             controls
