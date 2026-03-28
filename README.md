@@ -94,7 +94,7 @@ Licensed under the **MIT License**.
 ---
 *Disclaimer: This application is not affiliated with Telegram FZ-LLC. Use responsibly and in accordance with Telegram's Terms of Service.*
 
-If you're looking for a version of this app thats optimized for VPNs check out this repo:
+If you're looking for a version of this app that's optimized for VPNs check out this repo:
 https://github.com/caamer20/Telegram-Drive-ForVPNs
 
 <a href="https://www.paypal.me/Caamer20">
