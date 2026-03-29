@@ -100,6 +100,12 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
     const handleSetupSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
+
+        if (apiId.includes(' ') || apiHash.includes(' ')) {
+            setError("API ID and API Hash cannot contain spaces. Please remove any spaces.");
+            return;
+        }
+
         if (!apiId || !apiHash) {
             setError("Both API ID and Hash are required.");
             return;

@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `### Security Updates\n- Added authentication token to streaming server\n- Removed Dev Mode bypass from production builds\n- Hardened CORS policies and enabled Content Security Policy (CSP)\n\n### Other Changes\n- Bumped version to v1.0.5\n\nSee the assets below to download and install.`,
+              body: `### Bug Fixes\n- Added strict validation to prevent accidental trailing or leading spaces in API ID and API Hash during setup\n\n### Other Changes\n- Bumped version to v1.0.6\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });
