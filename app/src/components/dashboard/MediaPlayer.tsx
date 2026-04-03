@@ -115,7 +115,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
                     <p className="text-sm text-white/50">
                         Streaming from Telegram Drive
                         {typeof currentIndex === 'number' && typeof totalItems === 'number' && totalItems > 0 && (
-                            <span className="ml-2">• {currentIndex + 1}/{totalItems} • Arrow/J-L</span>
+                            <span className="ml-2">• {currentIndex + 1}/{totalItems}</span>
                         )}
                     </p>
                 </div>

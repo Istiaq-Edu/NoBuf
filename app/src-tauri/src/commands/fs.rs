@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{State, Emitter};
 use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
@@ -108,15 +108,25 @@ pub async fn cmd_delete_folder(
 }
 
 
+#[derive(Clone, serde::Serialize)]
+struct ProgressPayload {
+    id: String,
+    percent: u8,
+}
+
 #[tauri::command]
 pub async fn cmd_upload_file(
     path: String,
     folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
     let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
     bw_state.can_transfer(size)?;
+
+    let tid = transfer_id.unwrap_or_default();
 
     let client_opt = { state.client.lock().await.clone() };
     if client_opt.is_none() {
@@ -126,6 +136,11 @@ pub async fn cmd_upload_file(
     }
     let client = client_opt.unwrap();
     
+    // Emit start progress
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload { id: tid.clone(), percent: 0 });
+    }
+
     let path_clone = path.clone();
     let client_clone = client.clone();
     
@@ -141,6 +156,12 @@ pub async fn cmd_upload_file(
     client.send_message(&peer, message).await.map_err(map_error)?;
     
     bw_state.add_up(size);
+
+    // Emit completion
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload { id: tid, percent: 100 });
+    }
+
     Ok("File uploaded successfully".to_string())
 }
 
@@ -167,9 +188,13 @@ pub async fn cmd_download_file(
     message_id: i32,
     save_path: String,
     folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
+    let tid = transfer_id.unwrap_or_default();
+
     let client_opt = { state.client.lock().await.clone() };
     if client_opt.is_none() { 
         log::info!("[MOCK] Downloaded message {} from {:?} to {}", message_id, folder_id, save_path);
@@ -179,29 +204,60 @@ pub async fn cmd_download_file(
     let client = client_opt.unwrap();
     
     let peer = resolve_peer(&client, folder_id).await?;
-    let mut msgs = client.iter_messages(&peer);
+
+    // Use get_messages_by_id for efficient message lookup (same as server.rs)
+    let messages = client.get_messages_by_id(&peer, &[message_id]).await.map_err(|e| e.to_string())?;
     
-    let mut target_message = None;
-    while let Some(m) = msgs.next().await.map_err(|e| e.to_string())? { 
-        if m.id() == message_id { target_message = Some(m); break; } 
+    let msg = messages.into_iter()
+        .flatten()
+        .next()
+        .ok_or_else(|| "Message not found".to_string())?;
+
+    let media = msg.media()
+        .ok_or_else(|| "No media in message".to_string())?;
+
+    let total_size = match &media {
+        Media::Document(d) => d.size() as u64,
+        Media::Photo(_) => 1024 * 1024,
+        _ => 0,
+    };
+    
+    bw_state.can_transfer(total_size)?;
+
+    // Emit start
+    if !tid.is_empty() {
+        let _ = app_handle.emit("download-progress", ProgressPayload { id: tid.clone(), percent: 0 });
     }
 
-    if let Some(msg) = target_message {
-        if let Some(media) = msg.media() {
-            let size = match &media {
-                Media::Document(d) => d.size() as u64,
-                Media::Photo(_) => 1024 * 1024,
-                _ => 0,
-            };
-            
-            bw_state.can_transfer(size)?;
+    // Stream download with per-chunk progress
+    let mut download_iter = client.iter_download(&media);
+    let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut last_percent: u8 = 0;
 
-            client.download_media(&media, &save_path).await.map_err(map_error)?;
-            bw_state.add_down(size);
-            return Ok("Download successful".to_string());
+    while let Some(chunk) = download_iter.next().await.transpose() {
+        let bytes = chunk.map_err(|e| format!("Download chunk error: {}", e))?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())?;
+        downloaded += bytes.len() as u64;
+        
+        if !tid.is_empty() && total_size > 0 {
+            let percent = ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u8;
+            // Only emit when percent actually changes to avoid event spam
+            if percent != last_percent {
+                last_percent = percent;
+                let _ = app_handle.emit("download-progress", ProgressPayload { id: tid.clone(), percent });
+            }
         }
     }
-    Err("Not found".to_string())
+
+    bw_state.add_down(total_size);
+
+    // Emit completion
+    if !tid.is_empty() {
+        let _ = app_handle.emit("download-progress", ProgressPayload { id: tid, percent: 100 });
+    }
+
+    Ok("Download successful".to_string())
 }
 
 #[tauri::command]

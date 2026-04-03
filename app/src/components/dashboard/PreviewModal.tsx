@@ -261,7 +261,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                 <div className="absolute bottom-[-3rem] text-white text-sm opacity-50">
                     {file.name}
                     {typeof currentIndex === 'number' && typeof totalItems === 'number' && totalItems > 0 && (
-                        <span className="ml-3">{currentIndex + 1}/{totalItems} • Arrow/J-L</span>
+                        <span className="ml-3">{currentIndex + 1}/{totalItems}</span>
                     )}
                 </div>
             </div>

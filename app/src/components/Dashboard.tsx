@@ -92,13 +92,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
 
     const {
-        handleDelete, handleBulkDelete, handleDownload, handleBulkDownload,
+        handleDelete, handleBulkDelete, handleBulkDownload,
         handleBulkMove, handleDownloadFolder, handleGlobalSearch
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, isDragging } = useFileUpload(activeFolderId, store);
-    const { downloadQueue, clearFinished: clearDownloads } = useFileDownload(store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, cancelAll: cancelUploads, isDragging } = useFileUpload(activeFolderId, store);
+    const { downloadQueue, queueDownload, clearFinished: clearDownloads, cancelAll: cancelDownloads } = useFileDownload(store);
 
 
     const handleSelectAll = useCallback(() => {
@@ -402,7 +402,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     activeFolderId={activeFolderId}
                     onFileClick={handleFileClick}
                     onDelete={handleDelete}
-                    onDownload={handleDownload}
+                    onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                     onPreview={handlePreview}
                     onManualUpload={handleManualUpload}
                     onSelectionClear={() => setSelectedIds([])}
@@ -429,11 +429,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <UploadQueue
                 items={uploadQueue}
-                onClearFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error'))}
+                onClearFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
+                onCancelAll={cancelUploads}
             />
             <DownloadQueue
                 items={downloadQueue}
                 onClearFinished={clearDownloads}
+                onCancelAll={cancelDownloads}
             />
         </div>
     );
