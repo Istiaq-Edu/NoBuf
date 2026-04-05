@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `### New Features\n- Cancel All button for upload and download queues\n- Real-time download progress percentage with progress bar\n- "Download All Files" tooltip on folder download button\n\n### Improvements\n- Downloads now route through the queue for progress tracking\n- Download queue moved to bottom-right for better visibility\n- Removed keyboard shortcut hints from media preview overlays\n\n### Bug Fixes\n- Fixed external links opening inside the app instead of the system browser\n- Added validation to prevent accidental spaces in API credentials\n\n### Security\n- Added session token authentication to the streaming server\n- Removed Dev Mode bypass from production builds\n- Hardened CORS policies and enabled Content Security Policy\n\nSee the assets below to download and install.`,
+              body: `### Hotfix\n- Fixed folder list overflowing the sidebar when more than ~16 folders are present\n- The "Create Folder" button is now always visible in a sticky strip above the footer regardless of folder count\n- Folder list is now scrollable\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });

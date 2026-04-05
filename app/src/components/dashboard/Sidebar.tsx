@@ -43,7 +43,8 @@ export function Sidebar({
                 <span className="font-bold text-lg text-telegram-text tracking-tight">Telegram Drive</span>
             </div>
 
-            <nav className="flex-1 px-2 py-4 space-y-1">
+            {/* Scrollable folder list */}
+            <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto min-h-0">
                 <SidebarItem
                     icon={HardDrive}
                     label="Saved Messages"
@@ -64,8 +65,10 @@ export function Sidebar({
                         folderId={folder.id}
                     />
                 ))}
+            </nav>
 
-
+            {/* Sticky Create Folder section — always visible above the footer */}
+            <div className="px-2 pb-2 border-b border-telegram-border">
                 {showNewFolderInput ? (
                     <div className="px-3 py-2">
                         <input
@@ -82,13 +85,13 @@ export function Sidebar({
                 ) : (
                     <button
                         onClick={() => setShowNewFolderInput(true)}
-                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border mt-2"
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border"
                     >
                         <Plus className="w-4 h-4" />
                         Create Folder
                     </button>
                 )}
-            </nav>
+            </div>
 
             <div className="p-4 border-t border-telegram-border">
                 <div className="flex items-center gap-2 text-telegram-subtext text-xs">
