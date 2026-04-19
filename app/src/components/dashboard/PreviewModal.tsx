@@ -3,6 +3,7 @@ import { X, File, ChevronLeft, ChevronRight } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../types';
+import { isImageFile } from '../../utils';
 
 const PREVIEW_CACHE_TTL_MS = 5 * 60 * 1000;
 const PREVIEW_CACHE_MAX_ITEMS = 8;
@@ -49,11 +50,7 @@ const forgetPreview = (key: string) => {
     previewCache.delete(key);
 };
 
-const isSafeToPrefetch = (name: string) => {
-    const lower = name.toLowerCase();
-    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif']
-        .some(ext => lower.endsWith(ext));
-};
+const isSafeToPrefetch = (name: string) => isImageFile(name);
 
 interface PreviewModalProps {
     file: TelegramFile;
@@ -227,7 +224,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
 
                 {!loading && !error && src && (
                     <div className="flex flex-col items-center">
-                        {['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif'].some(ext => file.name.toLowerCase().endsWith(ext)) ? (
+                        {isImageFile(file.name) ? (
                             <img
                                 src={src}
                                 className="max-w-full max-h-[85vh] object-contain rounded-lg shadow-2xl bg-black"
@@ -245,8 +242,6 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                                     setError('Failed to render image preview');
                                 }}
                             />
-                        ) : ['mp4', 'webm', 'ogg', 'mov'].some(ext => file.name.toLowerCase().endsWith(ext)) ? (
-                            <video src={src} controls className="max-w-full max-h-[85vh] rounded-lg shadow-2xl bg-black" />
                         ) : (
                             <div className="bg-[#1c1c1c] p-8 rounded-xl text-center border border-white/10 shadow-2xl">
                                 <File className="w-16 h-16 text-telegram-primary mx-auto mb-4" />

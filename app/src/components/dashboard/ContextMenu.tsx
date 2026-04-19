@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play } from 'lucide-react';
+import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText } from 'lucide-react';
 import { TelegramFile } from '../../types';
+import { isMediaFile, isPdfFile } from '../../utils';
 
 interface ContextMenuProps {
     x: number;
@@ -63,10 +64,15 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
 
             {file.type !== 'folder' && (
                 <button onClick={onPreview} className="flex items-center gap-2 px-2 py-1.5 text-sm text-telegram-text hover:bg-telegram-hover rounded transition-colors text-left w-full">
-                    {['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi', 'mp3', 'wav', 'aac', 'flac', 'm4a', 'opus'].some(ext => file.name.toLowerCase().endsWith(ext)) ? (
+                    {isMediaFile(file.name) ? (
                         <>
                             <Play className="w-4 h-4 text-telegram-primary" />
                             Play
+                        </>
+                    ) : isPdfFile(file.name) ? (
+                        <>
+                            <FileText className="w-4 h-4 text-red-400" />
+                            View PDF
                         </>
                     ) : (
                         <>

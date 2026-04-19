@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { X, ChevronLeft, ChevronRight } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../types';
+import { isVideoFile, isAudioFile } from '../../utils';
 
 interface MediaPlayerProps {
     file: TelegramFile;
@@ -25,8 +26,8 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, currentIndex, total
         ? `http://localhost:14200/stream/${folderIdParam}/${file.id}?token=${streamToken}`
         : null;
 
-    const isVideo = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi'].some(ext => file.name.toLowerCase().endsWith(ext));
-    const isAudio = ['mp3', 'wav', 'aac', 'flac', 'm4a', 'opus'].some(ext => file.name.toLowerCase().endsWith(ext));
+    const isVideo = isVideoFile(file.name);
+    const isAudio = isAudioFile(file.name);
 
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {

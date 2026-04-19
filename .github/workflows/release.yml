@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `### Hotfix\n- Fixed folder list overflowing the sidebar when more than ~16 folders are present\n- The "Create Folder" button is now always visible in a sticky strip above the footer regardless of folder count\n- Folder list is now scrollable\n\nSee the assets below to download and install.`,
+              body: `### ✨ New Features\n- **In-App PDF Viewer** — View PDF files directly inside Telegram Drive with infinite scrolling, zoom controls (+/−/fit-width), and keyboard shortcuts\n- PDFs integrate seamlessly with the existing file navigation (arrow keys to browse between files)\n\n### 🐛 Bug Fixes\n- **Removed 100-file per-folder cap** — All files in a folder are now loaded instead of being silently truncated at ~100\n- **Faster preview/thumbnail loading** — Replaced O(n) message scanning with O(1) direct lookup for previews and thumbnails\n- **Restored Escape/folder-switch search clearing** — Pressing Escape or changing folders now properly clears the search bar again\n\n### 🔒 Security\n- Removed unnecessary 'unsafe-eval' from Content Security Policy\n\n### 🧹 Code Quality\n- Extracted shared file-type helpers (isMediaFile, isPdfFile, etc.) to eliminate 5 duplicated extension arrays\n- Removed dead code: unreachable video branch in PreviewModal, empty menu.rs, stale commands.rs.bak\n- Fixed PDF.js worker bundling for production Tauri builds\n- Fixed PDFDocumentProxy memory leak on file navigation\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });

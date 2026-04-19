@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
 import { TelegramFile, BandwidthStats } from '../types';
-import { formatBytes } from '../utils';
+import { formatBytes, isMediaFile, isPdfFile } from '../utils';
 
 // Components
 import { Sidebar } from './dashboard/Sidebar';
@@ -18,6 +18,7 @@ import { PreviewModal } from './dashboard/PreviewModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
+import { PdfViewer } from './dashboard/PdfViewer';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -51,6 +52,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         _setInternalDragFileId(id);
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
+    const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
@@ -116,6 +118,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setSearchTerm("");
         setPreviewFile(null);
         setPlayingFile(null);
+        setPdfFile(null);
     }, []);
 
     const handleFocusSearch = useCallback(() => {
@@ -145,7 +148,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         onEscape: handleEscape,
         onSearch: handleFocusSearch,
         onEnter: handleEnter,
-        enabled: !previewFile && !playingFile && !showMoveModal // Disable when modals are open
+        enabled: !previewFile && !playingFile && !pdfFile && !showMoveModal // Disable when modals are open
     });
 
 
@@ -156,6 +159,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setSearchResults([]);
         setPreviewFile(null);
         setPlayingFile(null);
+        setPdfFile(null);
         setPreviewContextFiles([]);
         setPreviewContextIndex(-1);
     }, [activeFolderId]);
@@ -196,22 +200,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setPreviewContextFiles(contextFiles);
         setPreviewContextIndex(contextIndex);
 
-        const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi', 'mp3', 'wav', 'aac', 'flac', 'm4a', 'opus']
-            .some(ext => file.name.toLowerCase().endsWith(ext));
+        const isMedia = isMediaFile(file.name);
+        const isPdf = isPdfFile(file.name);
 
         if (isMedia) {
             setPlayingFile(file);
             setPreviewFile(null);
+            setPdfFile(null);
+        } else if (isPdf) {
+            setPdfFile(file);
+            setPreviewFile(null);
+            setPlayingFile(null);
         } else {
             setPreviewFile(file);
             setPlayingFile(null);
+            setPdfFile(null);
         }
     };
 
     const navigatePreview = useCallback((step: 1 | -1) => {
         if (previewContextFiles.length === 0) return;
 
-        const currentFileId = previewFile?.id ?? playingFile?.id;
+        const currentFileId = previewFile?.id ?? playingFile?.id ?? pdfFile?.id;
         if (!currentFileId) return;
 
         const currentIndex = previewContextFiles.findIndex((f) => f.id === currentFileId);
@@ -223,17 +233,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
         setPreviewContextIndex(nextIndex);
 
-        const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi', 'mp3', 'wav', 'aac', 'flac', 'm4a', 'opus']
-            .some(ext => nextFile.name.toLowerCase().endsWith(ext));
+        const isMedia = isMediaFile(nextFile.name);
+        const isPdf = isPdfFile(nextFile.name);
 
         if (isMedia) {
             setPlayingFile(nextFile);
             setPreviewFile(null);
+            setPdfFile(null);
+        } else if (isPdf) {
+            setPdfFile(nextFile);
+            setPreviewFile(null);
+            setPlayingFile(null);
         } else {
             setPreviewFile(nextFile);
             setPlayingFile(null);
+            setPdfFile(null);
         }
-    }, [previewContextFiles, previewFile, playingFile]);
+    }, [previewContextFiles, previewFile, playingFile, pdfFile]);
 
     const handleNextPreview = useCallback(() => {
         navigatePreview(1);
@@ -248,7 +264,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             return { nextFile: null as TelegramFile | null, prevFile: null as TelegramFile | null };
         }
 
-        const currentFileId = previewFile?.id ?? playingFile?.id;
+        const currentFileId = previewFile?.id ?? playingFile?.id ?? pdfFile?.id;
         if (!currentFileId) {
             return { nextFile: null as TelegramFile | null, prevFile: null as TelegramFile | null };
         }
@@ -265,7 +281,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             nextFile: previewContextFiles[nextIdx] || null,
             prevFile: previewContextFiles[prevIdx] || null,
         };
-    }, [previewContextFiles, previewFile, playingFile]);
+    }, [previewContextFiles, previewFile, playingFile, pdfFile]);
 
     const handleDropOnFolder = async (e: React.DragEvent, targetFolderId: number | null) => {
         e.preventDefault();
@@ -353,6 +369,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         totalItems={previewContextFiles.length}
                         activeFolderId={activeFolderId}
                         key="media-player"
+                    />
+                )}
+                {pdfFile && (
+                    <PdfViewer
+                        file={pdfFile}
+                        onClose={() => setPdfFile(null)}
+                        onNext={handleNextPreview}
+                        onPrev={handlePrevPreview}
+                        currentIndex={previewContextIndex}
+                        totalItems={previewContextFiles.length}
+                        activeFolderId={activeFolderId}
+                        key="pdf-viewer"
                     />
                 )}
                 {isDragging && internalDragFileId === null && <DragDropOverlay key="drag-drop-overlay" />}
