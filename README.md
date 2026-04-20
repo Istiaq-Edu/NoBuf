@@ -18,6 +18,7 @@ Telegram Drive leverages the Telegram API to allow you to upload, organize, and 
 *   **High Performance Grid**: Virtual scrolling handles folders with thousands of files instantly.
 *   **Auto-Updates**: Seamless updates for Windows, macOS, and Linux.
 *   **Media Streaming**: Stream video and audio files directly without downloading.
+*   - **PDF Viewer:** Built-in PDF support with infinite scrolling for seamless document reading.
 *   **Drag & Drop**: Intuitive drag-and-drop upload and file management.
 *   **Thumbnail Previews**: Inline thumbnails for images and media files.
 *   **Folder Management**: Create "Folders" (private Telegram Channels) to organize content.
