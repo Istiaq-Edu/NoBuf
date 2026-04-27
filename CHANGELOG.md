@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.3] - 2026-04-27
+
+### Hotfix
+
+- **Fixed Arch Linux AppImage crash** — Resolved `EGL_BAD_ALLOC` error on Arch Linux (and other rolling-release distros) caused by bundled Mesa/EGL libraries conflicting with the host GPU driver stack. The app now automatically disables WebKitGTK's DMA-BUF renderer on Linux before the WebView initializes, with no impact to Windows or macOS builds.
+
+---
+
 ## [1.0.4] - 2026-02-13
 
 ### Fixes
