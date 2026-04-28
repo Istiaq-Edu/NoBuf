@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `### 🐛 Hotfix\n- **Fixed Arch Linux AppImage crash** — Resolved \`EGL_BAD_ALLOC\` error on Arch Linux (and other rolling-release distros) caused by bundled Mesa/EGL libraries conflicting with the host GPU driver stack. The app now automatically disables WebKitGTK's DMA-BUF renderer on Linux before the WebView initializes, with no impact to Windows or macOS builds.\n\nSee the assets below to download and install.`,
+              body: `### 🐛 Hotfix\n- **Deeper AppImage EGL fix for Arch/rolling-release Linux** — CI now strips the Ubuntu-bundled \`libEGL\`, \`libGL\`, \`libGLdispatch\`, \`libGLX\`, and \`libGLESv2\` from the AppImage and replaces \`AppRun\` with a smart wrapper that normalises locale, silences ATK warnings, auto-detects EGL platform, points GLVND at system ICDs, preloads system \`libEGL.so.1\`, and keeps host GPU drivers first in \`LD_LIBRARY_PATH\`.\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });
@@ -89,7 +89,8 @@ jobs:
             libssl-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            libfuse2
 
       - name: Install frontend dependencies
         working-directory: app
@@ -105,6 +106,145 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           projectPath: ./app
           args: ${{ matrix.args }}
+
+      - name: Patch AppImage for cross-distro EGL compatibility
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+
+          APPIMAGE_DIR="app/src-tauri/target/release/bundle/appimage"
+          APPIMAGE=$(find "$APPIMAGE_DIR" -maxdepth 1 -name "*.AppImage" -type f 2>/dev/null | head -1)
+
+          if [ -z "$APPIMAGE" ]; then
+            echo "::warning::No .AppImage found under $APPIMAGE_DIR — skipping patch step"
+            exit 0
+          fi
+
+          echo "--- Found AppImage: $APPIMAGE ---"
+          chmod +x "$APPIMAGE"
+
+          # Download appimagetool
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+            -O appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          # Extract the AppImage
+          "$APPIMAGE" --appimage-extract
+
+          # ── Strip bundled EGL / GL / GLVND libs that shadow host GPU drivers ──
+          STRIP_LIBS=(
+            libEGL.so      libEGL.so.1
+            libGL.so       libGL.so.1
+            libGLdispatch.so libGLdispatch.so.0
+            libGLX.so      libGLX.so.0
+            libGLESv2.so   libGLESv2.so.2
+          )
+          for lib in "${STRIP_LIBS[@]}"; do
+            find squashfs-root -name "$lib" -type f -delete -o -name "$lib" -type l -delete 2>/dev/null || true
+          done
+          echo "--- Stripped ${#STRIP_LIBS[@]} bundled GL/EGL library patterns ---"
+
+          # ── Detect inner binary name from existing AppRun ──
+          INNER_BIN=""
+          if [ -f squashfs-root/AppRun ]; then
+            INNER_BIN=$(grep -oP '(?<=exec\s["\x27]?\$\{?APPDIR\}?/usr/bin/)[^\s"'\'']+' squashfs-root/AppRun 2>/dev/null | head -1)
+          fi
+          if [ -z "$INNER_BIN" ]; then
+            # Fallback: first executable in usr/bin
+            INNER_BIN=$(ls squashfs-root/usr/bin/ 2>/dev/null | head -1)
+          fi
+          if [ -z "$INNER_BIN" ]; then
+            echo "::error::Could not detect inner binary name — aborting patch"
+            exit 1
+          fi
+          echo "--- Inner binary: $INNER_BIN ---"
+
+          # ── Write new AppRun ──
+          cat > squashfs-root/AppRun << 'APPRUN_EOF'
+          #!/usr/bin/env bash
+          # ── Telegram Drive — cross-distro AppRun wrapper ──
+          # Fixes EGL_BAD_ALLOC on Arch/Fedora/rolling-release distros by ensuring
+          # the host's GPU driver stack is used instead of bundled Ubuntu Mesa libs.
+          set -u
+
+          SELF="$(readlink -f "$0")"
+          APPDIR="${SELF%/*}"
+          export APPDIR
+
+          # ── 1. Locale: normalise to C.UTF-8 if current locale is not generated ──
+          if ! locale -a 2>/dev/null | grep -qi "^${LANG:-C}$"; then
+            export LANG="C.UTF-8"
+            export LC_ALL="C.UTF-8"
+          fi
+
+          # ── 2. Silence AT-SPI / atk-bridge warnings when no a11y bus is present ──
+          export NO_AT_BRIDGE=1
+
+          # ── 3. Auto-detect EGL platform ──
+          if [ -z "${EGL_PLATFORM:-}" ]; then
+            if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+              export EGL_PLATFORM=wayland
+            elif [ -n "${DISPLAY:-}" ]; then
+              export EGL_PLATFORM=x11
+            else
+              export EGL_PLATFORM=surfaceless
+            fi
+          fi
+
+          # ── 4. Point GLVND at system vendor ICDs ──
+          GLVND_DIRS=""
+          for d in /usr/share/glvnd/egl_vendor.d /etc/glvnd/egl_vendor.d; do
+            [ -d "$d" ] && GLVND_DIRS="${GLVND_DIRS:+$GLVND_DIRS:}$d"
+          done
+          if [ -n "$GLVND_DIRS" ]; then
+            export __EGL_VENDOR_LIBRARY_DIRS="$GLVND_DIRS"
+          fi
+
+          # ── 5. Preload first found system libEGL.so.1 ──
+          SYS_EGL=""
+          for p in /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
+                   /usr/lib64/libEGL.so.1 \
+                   /usr/lib/libEGL.so.1; do
+            if [ -f "$p" ]; then
+              SYS_EGL="$p"
+              break
+            fi
+          done
+          if [ -n "$SYS_EGL" ]; then
+            export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$SYS_EGL"
+          fi
+
+          # ── 6. Software rendering fallback (opt-in via LIBGL_ALWAYS_SOFTWARE=1) ──
+          if [ "${LIBGL_ALWAYS_SOFTWARE:-0}" = "1" ]; then
+            export GALLIUM_DRIVER=llvmpipe
+            export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          fi
+
+          # ── 7. LD_LIBRARY_PATH: system paths BEFORE bundled paths ──
+          SYS_LIB_PATHS="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib"
+          BUNDLED_PATHS="${APPDIR}/usr/lib:${APPDIR}/lib"
+          export LD_LIBRARY_PATH="${SYS_LIB_PATHS}:${BUNDLED_PATHS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          # ── 8. Exec the inner binary ──
+          exec "${APPDIR}/usr/bin/__INNER_BIN__" "$@"
+          APPRUN_EOF
+
+          # Un-indent the heredoc (it was indented for YAML readability)
+          sed -i 's/^          //' squashfs-root/AppRun
+
+          # Inject the detected binary name
+          sed -i "s|__INNER_BIN__|${INNER_BIN}|g" squashfs-root/AppRun
+          chmod +x squashfs-root/AppRun
+
+          echo "--- New AppRun written and configured ---"
+
+          # ── Repack with gzip compression ──
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --comp gzip squashfs-root "$APPIMAGE"
+
+          # Cleanup
+          rm -rf squashfs-root appimagetool-x86_64.AppImage
+
+          echo "::notice::AppImage patched successfully for cross-distro EGL compatibility"
 
   publish-release:
     needs: [create-release, build-tauri]
