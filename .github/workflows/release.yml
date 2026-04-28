@@ -144,14 +144,14 @@ jobs:
           done
           echo "--- Stripped ${#STRIP_LIBS[@]} bundled GL/EGL library patterns ---"
 
-          # ── Detect inner binary name from existing AppRun ──
-          INNER_BIN=""
-          if [ -f squashfs-root/AppRun ]; then
-            INNER_BIN=$(grep -oP '(?<=exec\s["\x27]?\$\{?APPDIR\}?/usr/bin/)[^\s"'\'']+' squashfs-root/AppRun 2>/dev/null | head -1)
-          fi
+          # ── Detect inner binary name ──
+          # Stage 1: parse the .desktop file's Exec= line (most reliable)
+          INNER_BIN=$(find squashfs-root -maxdepth 2 -name "*.desktop" | \
+            xargs -I{} awk -F= '/^Exec=/{print $2; exit}' {} 2>/dev/null | \
+            awk '{print $1}' | xargs basename 2>/dev/null || true)
+          # Stage 2: first executable file in usr/bin
           if [ -z "$INNER_BIN" ]; then
-            # Fallback: first executable in usr/bin
-            INNER_BIN=$(ls squashfs-root/usr/bin/ 2>/dev/null | head -1)
+            INNER_BIN=$(ls squashfs-root/usr/bin/ 2>/dev/null | head -1 || true)
           fi
           if [ -z "$INNER_BIN" ]; then
             echo "::error::Could not detect inner binary name — aborting patch"
@@ -239,7 +239,10 @@ jobs:
           echo "--- New AppRun written and configured ---"
 
           # ── Repack with gzip compression ──
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage --comp gzip squashfs-root "$APPIMAGE"
+          # APPIMAGE_EXTRACT_AND_RUN=1 avoids needing the FUSE kernel module
+          # on GitHub Actions runners (appimagetool is itself an AppImage)
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 \
+            ./appimagetool-x86_64.AppImage --comp gzip squashfs-root "$APPIMAGE"
 
           # Cleanup
           rm -rf squashfs-root appimagetool-x86_64.AppImage

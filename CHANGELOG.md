@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.5] - 2026-04-27
+
+### Hotfix
+
+- **CI fix: AppImage patch step now runs cleanly** — Replaced the fragile `grep -oP` Perl lookahead (which exited with code 2 under `set -euo pipefail`) with a safe `awk`-based `.desktop` file lookup. Added `APPIMAGE_EXTRACT_AND_RUN=1` so `appimagetool` doesn't require the FUSE kernel module on GitHub Actions runners.
+
+---
+
 ## [1.1.4] - 2026-04-27
 
 ### Hotfix
