@@ -30,15 +30,18 @@ pub async fn ensure_client_initialized(
 
     // CRITICAL: Shutdown existing runner before creating a new one
     // This prevents runner task accumulation which causes stack overflow
-    {
-        let mut shutdown_guard = state.runner_shutdown.lock().await;
-        if let Some(shutdown_tx) = shutdown_guard.take() {
+    let did_shutdown_old_runner = {
+        let mut guard = state.runner_shutdown.lock().unwrap();
+        if let Some(shutdown_tx) = guard.take() {
             log::info!("Signaling old runner to shutdown...");
             let _ = shutdown_tx.send(());
-            // Brief wait for old runner to cleanup
-            drop(shutdown_guard);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            true
+        } else {
+            false
         }
+    }; // MutexGuard dropped here — before the await
+    if did_shutdown_old_runner {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     let runner_num = state.runner_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -77,7 +80,7 @@ pub async fn ensure_client_initialized(
     
     // Create shutdown channel for this runner
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    *state.runner_shutdown.lock().await = Some(shutdown_tx);
+    *state.runner_shutdown.lock().unwrap() = Some(shutdown_tx);
     
     // Spawn the network runner with shutdown support
     let SenderPool { runner, .. } = pool;
@@ -163,7 +166,7 @@ pub async fn cmd_logout(
     
     // 1. Shutdown the network runner FIRST to prevent any operations
     {
-        let mut shutdown_guard = state.runner_shutdown.lock().await;
+        let mut shutdown_guard = state.runner_shutdown.lock().unwrap();
         if let Some(shutdown_tx) = shutdown_guard.take() {
             log::info!("Signaling runner shutdown for logout...");
             let _ = shutdown_tx.send(());

@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.6] - 2026-04-28
+
+### Fix
+
+- Fixed process not terminating on Ctrl+C (SIGINT) when launched from a terminal.
+  The Actix-web streaming server and grammers network runner were running on
+  non-daemon threads with no shutdown signal wired to process exit, causing the
+  application to hang indefinitely after the main window closed. The app now
+  registers a RunEvent::Exit handler that gracefully stops both background
+  services before the process exits.
+
+---
+
 ## [1.1.5] - 2026-04-27
 
 ### Hotfix

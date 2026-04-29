@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `### 🐛 Hotfix\n- **Deeper AppImage EGL fix for Arch/rolling-release Linux** — CI now strips the Ubuntu-bundled \`libEGL\`, \`libGL\`, \`libGLdispatch\`, \`libGLX\`, and \`libGLESv2\` from the AppImage and replaces \`AppRun\` with a smart wrapper that normalises locale, silences ATK warnings, auto-detects EGL platform, points GLVND at system ICDs, preloads system \`libEGL.so.1\`, and keeps host GPU drivers first in \`LD_LIBRARY_PATH\`.\n\nSee the assets below to download and install.`,
+              body: `Fixed: process not terminating on Ctrl+C when launched from a terminal. The Actix-web streaming server and grammers network runner were blocking exit because neither received a shutdown signal. A RunEvent::Exit handler now gracefully stops both services before the process exits.\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });

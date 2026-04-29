@@ -101,13 +101,13 @@ fn mime_type_from_media(media: &Media) -> String {
     }
 }
 
-pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -> std::io::Result<()> {
+pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -> std::io::Result<actix_web::dev::Server> {
     let state_data = web::Data::new(state);
     let token_data = web::Data::new(StreamTokenData { token });
     
     log::info!("Starting Streaming Server on port {}", port);
     
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("tauri://localhost")
             .allowed_origin("http://localhost:1420")
@@ -122,6 +122,7 @@ pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -
             .service(stream_media)
     })
     .bind(("127.0.0.1", port))?
-    .run()
-    .await
+    .run();
+
+    Ok(server)
 }
