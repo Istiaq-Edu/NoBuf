@@ -101,3 +101,11 @@ https://github.com/caamer20/Telegram-Drive-ForVPNs
 <a href="https://www.paypal.me/Caamer20">
   <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" width="200" />
 </a>
+
+My Public Address to Receive LTC: ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp
+
+Pay me via Trust Wallet: https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2
+
+My Public Address to Receive BTC: bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy
+
+Pay me via Trust Wallet: https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy
