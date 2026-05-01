@@ -104,8 +104,8 @@ https://github.com/caamer20/Telegram-Drive-ForVPNs
 
 My Public Address to Receive LTC: ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp
 
-Pay me via Trust Wallet: https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2
+Donate to me via Trust Wallet: https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2
 
 My Public Address to Receive BTC: bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy
 
-Pay me via Trust Wallet: https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy
+Donate to me via Trust Wallet: https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy
