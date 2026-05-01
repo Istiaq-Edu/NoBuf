@@ -98,12 +98,21 @@ Licensed under the **MIT License**.
 If you're looking for a version of this app that's optimized for VPNs check out this repo:
 https://github.com/caamer20/Telegram-Drive-ForVPNs
 
-<a href="https://www.paypal.me/Caamer20">
-<img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" width="200"/>
 
-[![Donate LTC](https://img.shields.io/badge/Donate-LTC-345D9D?style=for-the-badge&logo=litecoin&logoColor=white)](https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2)
+<div style="display: flex; gap: 20px; align-items: center; justify-content: center; flex-wrap: wrap;">
+  <!-- PayPal button -->
+  <a href="https://www.paypal.me/Caamer20">
+    <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" width="200">
+  </a>
 
-[![Donate BTC](https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white)](https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy)
+  <!-- Litecoin button -->
+  <a href="https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2">
+    <img src="https://img.shields.io/badge/Donate-LTC-345D9D?style=for-the-badge&logo=litecoin&logoColor=white" alt="Donate LTC">
+  </a>
 
-</a>
+  <!-- Bitcoin button -->
+  <a href="https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy">
+    <img src="https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Donate BTC">
+  </a>
+</div>
 
