@@ -29,7 +29,7 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
               name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
-              body: `Fixed: process not terminating on Ctrl+C when launched from a terminal. The Actix-web streaming server and grammers network runner were blocking exit because neither received a shutdown signal. A RunEvent::Exit handler now gracefully stops both services before the process exits.\n\nSee the assets below to download and install.`,
+              body: `Feature: Added a donation button and popup modal to the main login screen to support the project via PayPal, Litecoin, and Bitcoin.\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
             });
