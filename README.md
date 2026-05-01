@@ -102,7 +102,7 @@ https://github.com/caamer20/Telegram-Drive-ForVPNs
 <div style="display: flex; gap: 20px; align-items: center; justify-content: center; flex-wrap: wrap;">
   <!-- PayPal button -->
   <a href="https://www.paypal.me/Caamer20">
-    <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" style="height: 28px; width: auto; display: block;">
+    <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" style="height: 36px; width: auto; display: block;">
   </a>
 
   <!-- Litecoin button -->
