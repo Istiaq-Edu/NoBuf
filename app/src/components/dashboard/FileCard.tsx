@@ -18,6 +18,7 @@ interface FileCardProps {
     onDragEnd?: () => void;
     activeFolderId?: number | null;
     height?: number;
+    onToggleSelection?: () => void;
 }
 
 // Check if file is an image type that can have a thumbnail
@@ -26,7 +27,7 @@ function isImageFile(filename: string): boolean {
     return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
 }
 
-export function FileCard({ file, onDelete, onDownload, onPreview, isSelected, onClick, onContextMenu, onDrop, onDragStart, onDragEnd, activeFolderId, height }: FileCardProps) {
+export function FileCard({ file, onDelete, onDownload, onPreview, isSelected, onClick, onContextMenu, onDrop, onDragStart, onDragEnd, activeFolderId, height, onToggleSelection }: FileCardProps) {
     const isFolder = file.type === 'folder';
     const [isDragOver, setIsDragOver] = useState(false);
     const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -124,7 +125,13 @@ export function FileCard({ file, onDelete, onDownload, onPreview, isSelected, on
                 )}
 
                 {/* Selection Checkmark */}
-                <div className={`absolute top-2 left-2 w-5 h-5 rounded-full border flex items-center justify-center transition-all z-10 ${isSelected ? 'bg-telegram-primary border-telegram-primary' : 'border-white/50 bg-black/30 opacity-0 group-hover:opacity-100'}`}>
+                <div
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        if (onToggleSelection) onToggleSelection();
+                    }}
+                    className={`absolute top-2 left-2 w-5 h-5 rounded-full border flex items-center justify-center transition-all z-10 cursor-pointer ${isSelected ? 'bg-telegram-primary border-telegram-primary' : 'border-white/50 bg-black/30 opacity-0 group-hover:opacity-100'}`}
+                >
                     {isSelected && <div className="w-1.5 h-1.5 bg-black rounded-full" />}
                 </div>
 
