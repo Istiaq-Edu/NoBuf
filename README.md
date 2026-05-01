@@ -100,19 +100,19 @@ https://github.com/caamer20/Telegram-Drive-ForVPNs
 
 
 <div style="display: flex; gap: 20px; align-items: center; justify-content: center; flex-wrap: wrap;">
-  <!-- PayPal button -->
+  <!-- PayPal button (original size) -->
   <a href="https://www.paypal.me/Caamer20">
-    <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" style="height: 36px; width: auto; display: block;">
+    <img src="https://raw.githubusercontent.com/stefan-niedermann/paypal-donate-button/master/paypal-donate-button.png" alt="Donate with PayPal" width="200" style="display: block; vertical-align: middle;">
   </a>
 
-  <!-- Litecoin button -->
+  <!-- Litecoin badge -->
   <a href="https://link.trustwallet.com/send?address=ltc1q6wkr5ac4u0pxx4hx7xgwn0gsaku25ws0df73rp&asset=c2">
-    <img src="https://img.shields.io/badge/Donate-LTC-345D9D?style=for-the-badge&logo=litecoin&logoColor=white" alt="Donate LTC" style="height: 28px; width: auto; display: block;">
+    <img src="https://img.shields.io/badge/Donate-LTC-345D9D?style=for-the-badge&logo=litecoin&logoColor=white" alt="Donate LTC" style="display: block; vertical-align: middle;">
   </a>
 
-  <!-- Bitcoin button -->
+  <!-- Bitcoin badge -->
   <a href="https://link.trustwallet.com/send?asset=c0&address=bc1q5pt7m2fk6w0dzsnf6vvd5k6nw5k44785286ujy">
-    <img src="https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Donate BTC" style="height: 28px; width: auto; display: block;">
+    <img src="https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Donate BTC" style="display: block; vertical-align: middle;">
   </a>
 </div>
 
