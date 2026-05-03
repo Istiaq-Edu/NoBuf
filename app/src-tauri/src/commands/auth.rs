@@ -185,6 +185,7 @@ pub async fn cmd_logout(
     *state.login_token.lock().await = None;
     *state.password_token.lock().await = None;
     *state.api_id.lock().await = None;
+    crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
 
     // 4. Remove Session File
     let app_data_dir = app_handle.path().app_data_dir().unwrap();

@@ -2,25 +2,61 @@ use grammers_client::Client;
 use grammers_client::types::Peer;
 use tauri::State;
 use crate::bandwidth::BandwidthManager;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-pub async fn resolve_peer(client: &Client, folder_id: Option<i64>) -> Result<Peer, String> {
+/// Resolve a folder_id to a Telegram Peer, using the cache for O(1) lookups.
+///
+/// - `folder_id == None` → returns the user's own peer (Saved Messages)
+/// - Cache hit → returns immediately without any network call
+/// - Cache miss → scans all dialogs, populates the cache, and returns
+pub async fn resolve_peer(
+    client: &Client,
+    folder_id: Option<i64>,
+    peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>,
+) -> Result<Peer, String> {
     if let Some(fid) = folder_id {
-        let mut dialogs = client.iter_dialogs();
-        while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
-            // We use .raw.id() based on compiler suggestions that .id() might be missing on wrapper types in this version
-            match &dialog.peer {
-                Peer::Channel(c) => if c.raw.id == fid { return Ok(dialog.peer.clone()); },
-                Peer::User(u) => if u.raw.id() == fid { return Ok(dialog.peer.clone()); },
-                _ => {}
+        // Fast path: check cache
+        {
+            let cache = peer_cache.read().await;
+            if let Some(peer) = cache.get(&fid) {
+                return Ok(peer.clone());
             }
         }
-        Err(format!("Folder/Chat {} not found", fid))
+
+        // Slow path: scan dialogs and populate cache
+        log::debug!("Peer cache miss for folder_id={}, scanning dialogs...", fid);
+        let mut found: Option<Peer> = None;
+        let mut dialogs = client.iter_dialogs();
+        let mut cache = peer_cache.write().await;
+        while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
+            let peer_id = match &dialog.peer {
+                Peer::Channel(c) => Some(c.raw.id),
+                Peer::User(u) => Some(u.raw.id()),
+                _ => None,
+            };
+            if let Some(id) = peer_id {
+                cache.insert(id, dialog.peer.clone());
+                if id == fid {
+                    found = Some(dialog.peer.clone());
+                    // Don't break — keep scanning to warm the cache
+                }
+            }
+        }
+
+        found.ok_or_else(|| format!("Folder/Chat {} not found", fid))
     } else {
         match client.get_me().await {
             Ok(me) => Ok(Peer::User(me)),
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+/// Clear the peer cache (called on logout)
+pub async fn clear_peer_cache(peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>) {
+    peer_cache.write().await.clear();
 }
 
 #[tauri::command]

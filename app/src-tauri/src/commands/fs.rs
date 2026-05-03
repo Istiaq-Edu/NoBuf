@@ -87,7 +87,7 @@ pub async fn cmd_delete_folder(
     let client = client_opt.unwrap();
     log::info!("Deleting folder/channel: {}", folder_id);
 
-    let peer = resolve_peer(&client, Some(folder_id)).await?;
+    let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
     
     let input_channel = match peer {
         Peer::Channel(c) => {
@@ -151,7 +151,7 @@ pub async fn cmd_upload_file(
         
     let message = InputMessage::new().text("").file(uploaded_file);
 
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
     
     client.send_message(&peer, message).await.map_err(map_error)?;
     
@@ -178,7 +178,7 @@ pub async fn cmd_delete_file(
     }
     let client = client_opt.unwrap();
 
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
     client.delete_messages(&peer, &[message_id]).await.map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -203,7 +203,7 @@ pub async fn cmd_download_file(
     }
     let client = client_opt.unwrap();
     
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
     // Use get_messages_by_id for efficient message lookup (same as server.rs)
     let messages = client.get_messages_by_id(&peer, &[message_id]).await.map_err(|e| e.to_string())?;
@@ -275,8 +275,8 @@ pub async fn cmd_move_files(
     }
     let client = client_opt.unwrap();
 
-    let source_peer = resolve_peer(&client, source_folder_id).await?;
-    let target_peer = resolve_peer(&client, target_folder_id).await?;
+    let source_peer = resolve_peer(&client, source_folder_id, &state.peer_cache).await?;
+    let target_peer = resolve_peer(&client, target_folder_id, &state.peer_cache).await?;
 
     match client.forward_messages(&target_peer, &message_ids, &source_peer).await {
         Ok(_) => {},
@@ -304,7 +304,7 @@ pub async fn cmd_get_files(
     let client = client_opt.unwrap();
     let mut files = Vec::new();
     
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
     let mut msgs = client.iter_messages(&peer);
     while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
@@ -430,10 +430,16 @@ pub async fn cmd_scan_folders(
     
     log::info!("Starting Folder Scan...");
 
+    // Acquire write lock once for the entire scan to populate the peer cache
+    let mut peer_cache = state.peer_cache.write().await;
+
     while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
+        // Populate peer cache for every dialog we encounter (free priming)
         match &dialog.peer {
             Peer::Channel(c) => {
                 let id = c.raw.id;
+                peer_cache.insert(id, dialog.peer.clone());
+
                 let name = c.raw.title.clone();
                 let access_hash = c.raw.access_hash.unwrap_or(0);
                 
@@ -467,12 +473,16 @@ pub async fn cmd_scan_folders(
                     Err(e) => log::warn!(" -> Failed to get full info: {}", e),
                 }
             },
+            Peer::User(u) => {
+                peer_cache.insert(u.raw.id(), dialog.peer.clone());
+                log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
+            },
             peer => {
                 log::debug!("[SCAN] Skipped Peer: {:?}", peer);
             }
         }
     }
     
-    log::info!("Scan complete. Found {} folders.", folders.len());
+    log::info!("Scan complete. Found {} folders. Peer cache size: {}.", folders.len(), peer_cache.len());
     Ok(folders)
 }

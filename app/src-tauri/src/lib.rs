@@ -6,11 +6,17 @@ pub mod bandwidth;
 use tauri::Manager;
 use tokio::sync::Mutex;
 use std::sync::Arc;
+use std::collections::HashMap;
 use commands::TelegramState;
-use commands::streaming::StreamToken;
+use commands::streaming::StreamConfig;
 use rand::Rng;
 
 pub mod server;
+
+/// Single source of truth for the Actix streaming server port.
+/// Referenced in lib.rs (server startup) and exposed to the frontend
+/// via cmd_get_stream_info so no component ever hardcodes the port.
+pub const STREAM_PORT: u16 = 14201;
 
 /// Generate a random 32-character hex token for streaming server auth
 fn generate_stream_token() -> String {
@@ -51,9 +57,10 @@ pub fn run() {
                 api_id: Arc::new(Mutex::new(None)),
                 runner_shutdown: Arc::new(std::sync::Mutex::new(None)),
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
-            app.manage(StreamToken(stream_token.clone()));
+            app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             
             // Start Streaming Server on dedicated thread (Actix needs its own runtime)
@@ -63,7 +70,7 @@ pub fn run() {
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_server(state, 14201, token_for_server).await {
+                    match server::start_server(state, STREAM_PORT, token_for_server).await {
                         Ok(server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap() = Some(server.handle());
@@ -99,7 +106,7 @@ pub fn run() {
             commands::cmd_is_network_available,
             commands::cmd_clean_cache,
             commands::cmd_get_thumbnail,
-            commands::cmd_get_stream_token,
+            commands::cmd_get_stream_info,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

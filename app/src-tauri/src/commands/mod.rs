@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 use grammers_client::{Client};
-use grammers_client::types::{LoginToken, PasswordToken};
+use grammers_client::types::{LoginToken, PasswordToken, Peer};
 
 /// Tracks the lifecycle of the Telegram connection
 /// 
@@ -20,6 +21,10 @@ pub struct TelegramState {
     pub runner_shutdown: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Counter for debugging runner lifecycle
     pub runner_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Cache of folder_id → Peer to avoid O(N) dialog scanning on every operation.
+    /// Populated lazily on first resolve_peer call, eagerly during cmd_scan_folders.
+    /// Cleared on logout.
+    pub peer_cache: Arc<tokio::sync::RwLock<HashMap<i64, Peer>>>,
 }
 
 pub mod auth;

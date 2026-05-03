@@ -59,7 +59,7 @@ async fn stream_media(
 
     if let Some(client) = client_opt {
         log::debug!("Stream request: Client acquired, resolving peer for msg {}...", message_id);
-        match resolve_peer(&client, folder_id).await {
+        match resolve_peer(&client, folder_id, &data.peer_cache).await {
             Ok(peer) => {
                 log::debug!("Stream request: Peer resolved, fetching message {}...", message_id);
                 // Try to fetch message efficiently

@@ -1,10 +1,25 @@
 use tauri::State;
 
-/// Holds the per-session streaming token
-pub struct StreamToken(pub String);
+/// Holds the per-session streaming config (token + port)
+pub struct StreamConfig {
+    pub token: String,
+    pub port: u16,
+}
 
-/// Returns the streaming server's session token to the frontend
+/// Returned to the frontend so it can construct stream URLs dynamically
+#[derive(serde::Serialize)]
+pub struct StreamInfo {
+    pub token: String,
+    pub base_url: String,
+}
+
+/// Returns the streaming server's session token and base URL to the frontend.
+/// The frontend must use the returned base_url to construct stream URLs,
+/// never hardcoding the port.
 #[tauri::command]
-pub fn cmd_get_stream_token(token_state: State<'_, StreamToken>) -> String {
-    token_state.0.clone()
+pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
+    StreamInfo {
+        token: config.token.clone(),
+        base_url: format!("http://localhost:{}", config.port),
+    }
 }

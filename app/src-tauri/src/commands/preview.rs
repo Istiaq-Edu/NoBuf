@@ -63,7 +63,7 @@ pub async fn cmd_get_preview(
     }
     let client = client_opt.unwrap();
 
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
     let messages = client.get_messages_by_id(&peer, &[message_id])
         .await.map_err(|e| e.to_string())?;
     let target_message = messages.into_iter().flatten().next();
@@ -222,7 +222,7 @@ pub async fn cmd_get_thumbnail(
     }
     let client = client_opt.unwrap();
 
-    let peer = resolve_peer(&client, folder_id).await?;
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
     let messages = client.get_messages_by_id(&peer, &[message_id])
         .await.map_err(|e| e.to_string())?;
     if let Some(m) = messages.into_iter().flatten().next() {
