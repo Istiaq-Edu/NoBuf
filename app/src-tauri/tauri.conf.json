@@ -9,7 +9,7 @@
     }
   },
   "productName": "Telegram Drive",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "identifier": "com.cameronamer.telegramdrive",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -29,7 +29,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://localhost:14200; media-src 'self' http://localhost:14200; img-src 'self' data: blob: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:;",
+      "csp": "default-src 'self'; connect-src 'self' http://localhost:14201; media-src 'self' http://localhost:14201; img-src 'self' data: blob: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:;",
       "capabilities": [
         "default"
       ]
