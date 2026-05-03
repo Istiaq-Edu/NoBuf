@@ -59,6 +59,7 @@ Telegram Drive leverages the Telegram API to allow you to upload, organize, and 
 ### Prerequisites
 *   Node.js (v18+)
 *   Rust (latest stable)
+*   OS-Specific Build Tools for Tauri (e.g., `build-essential`, `libwebkit2gtk-4.1-dev` on Ubuntu, Visual Studio C++ Build Tools on Windows, Xcode on macOS). See [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/) for full details.
 *   A Telegram Account
 *   API ID and Hash from [my.telegram.org](https://my.telegram.org)
 
