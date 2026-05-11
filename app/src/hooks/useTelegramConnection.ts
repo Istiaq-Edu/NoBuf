@@ -21,6 +21,10 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const networkIsOnline = useNetworkStatus();
 
 
+    // Load persisted store and restore saved folders.
+    // NOTE: The Telegram connection is already established by App.tsx before
+    // Dashboard mounts, so we do NOT call cmd_connect here. This prevents
+    // duplicate network runners and race conditions in the Rust backend.
     useEffect(() => {
         const initStore = async () => {
             try {
@@ -34,57 +38,18 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 const savedFolders = await _store.get<TelegramFolder[]>('folders');
                 if (savedFolders) setFolders(savedFolders);
 
-
                 const savedActiveFolderId = await _store.get<number | null>('activeFolderId');
                 if (savedActiveFolderId !== undefined) setActiveFolderId(savedActiveFolderId);
 
-                const apiIdStr = await _store.get<string>('api_id');
-                if (apiIdStr) {
-                    try {
-                        const apiId = parseInt(apiIdStr as string);
-                        await invoke('cmd_connect', { apiId });
-                        setIsConnected(true);
-                        queryClient.invalidateQueries({ queryKey: ['files'] });
-                    } catch {
-                        // Retry loop: keep asking until the user succeeds or cancels
-                        let connected = false;
-                        while (!connected) {
-                            const shouldRetry = await confirm({
-                                title: "Connection Failed",
-                                message: "Failed to connect to Telegram. Would you like to retry?",
-                                confirmText: "Retry",
-                                variant: 'danger'
-                            });
-                            if (!shouldRetry) {
-                                // User chose cancel — clear credentials and log out
-                                if (_store) {
-                                    await _store.delete('api_id');
-                                    await _store.save();
-                                }
-                                onLogoutParent();
-                                return;
-                            }
-                            try {
-                                const apiId = parseInt(apiIdStr as string);
-                                await invoke('cmd_connect', { apiId });
-                                setIsConnected(true);
-                                queryClient.invalidateQueries({ queryKey: ['files'] });
-                                connected = true;
-                            } catch {
-                                // Loop will show the confirm dialog again
-                            }
-                        }
-                    }
-                } else {
-                    onLogoutParent();
-                }
-
+                // Connection is already live — just mark connected and refresh files
+                setIsConnected(true);
+                queryClient.invalidateQueries({ queryKey: ['files'] });
             } catch {
                 // store not available
             }
         };
         initStore();
-    }, [queryClient, onLogoutParent, confirm]);
+    }, [queryClient]);
 
 
     useEffect(() => {
