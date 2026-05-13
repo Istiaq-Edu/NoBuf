@@ -1,0 +1,294 @@
+use actix_web::{get, web, HttpRequest, HttpResponse, Responder};
+use crate::commands::TelegramState;
+use crate::commands::utils::resolve_peer;
+use grammers_client::types::Media;
+use serde::Serialize;
+use std::sync::Arc;
+
+/// Shared state for the API server — holds the key hash for auth checks
+pub struct ApiState {
+    pub key_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: ErrorDetail,
+}
+
+#[derive(Serialize)]
+struct ErrorDetail {
+    code: String,
+    message: String,
+}
+
+fn json_error(code: &str, message: &str, status: u16) -> HttpResponse {
+    let body = ErrorBody {
+        error: ErrorDetail {
+            code: code.to_string(),
+            message: message.to_string(),
+        },
+    };
+    HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
+        .json(body)
+}
+
+/// Validate X-API-Key header against stored hash
+fn check_auth(req: &HttpRequest, api_state: &web::Data<ApiState>) -> Result<(), HttpResponse> {
+    let key_hash = match &api_state.key_hash {
+        Some(h) => h,
+        None => return Err(json_error("NO_KEY_CONFIGURED", "No API key has been configured. Generate one in Settings.", 401)),
+    };
+
+    let provided = req
+        .headers()
+        .get("X-API-Key")
+        .and_then(|v| v.to_str().ok());
+
+    match provided {
+        Some(key) if crate::commands::api_settings::verify_key(key, key_hash) => Ok(()),
+        Some(_) => Err(json_error("UNAUTHORIZED", "Invalid API key", 401)),
+        None => Err(json_error("UNAUTHORIZED", "Missing X-API-Key header", 401)),
+    }
+}
+
+// ──────────────────────────────── Endpoints ────────────────────────────────
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
+}
+
+#[get("/api/v1/health")]
+async fn api_health() -> impl Responder {
+    HttpResponse::Ok().json(HealthResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct FilesQuery {
+    folder_id: Option<i64>,
+    page: Option<u32>,
+    limit: Option<u32>,
+    search: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FilesResponse {
+    files: Vec<ApiFile>,
+    page: u32,
+    limit: u32,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct ApiFile {
+    id: i64,
+    folder_id: Option<i64>,
+    name: String,
+    size: u64,
+    mime_type: Option<String>,
+    created_at: String,
+}
+
+#[get("/api/v1/files")]
+async fn api_list_files(
+    req: HttpRequest,
+    query: web::Query<FilesQuery>,
+    tg_state: web::Data<Arc<TelegramState>>,
+    api_state: web::Data<ApiState>,
+) -> impl Responder {
+    if let Err(e) = check_auth(&req, &api_state) {
+        return e;
+    }
+
+    let client_opt = { tg_state.client.lock().await.clone() };
+    let client = match client_opt {
+        Some(c) => c,
+        None => return json_error("NOT_CONNECTED", "Telegram client is not connected", 503),
+    };
+
+    let peer = match resolve_peer(&client, query.folder_id, &tg_state.peer_cache).await {
+        Ok(p) => p,
+        Err(e) => return json_error("PEER_ERROR", &e, 400),
+    };
+
+    let mut all_files: Vec<ApiFile> = Vec::new();
+    let mut msgs = client.iter_messages(&peer);
+
+    while let Some(msg) = msgs.next().await.ok().flatten() {
+        if let Some(doc) = msg.media() {
+            let (name, size, mime) = match doc {
+                Media::Document(d) => {
+                    (d.name().to_string(), d.size(), d.mime_type().map(|s| s.to_string()))
+                }
+                Media::Photo(_) => ("Photo.jpg".to_string(), 0, Some("image/jpeg".into())),
+                _ => ("Unknown".to_string(), 0, None),
+            };
+
+            // Apply search filter if provided
+            if let Some(ref search) = query.search {
+                if !name.to_lowercase().contains(&search.to_lowercase()) {
+                    continue;
+                }
+            }
+
+            all_files.push(ApiFile {
+                id: msg.id() as i64,
+                folder_id: query.folder_id,
+                name,
+                size: size as u64,
+                mime_type: mime,
+                created_at: msg.date().to_string(),
+            });
+        }
+    }
+
+    let total = all_files.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).min(200).max(1);
+    let start = ((page - 1) * limit) as usize;
+    let paginated: Vec<ApiFile> = all_files.into_iter().skip(start).take(limit as usize).collect();
+
+    HttpResponse::Ok().json(FilesResponse {
+        files: paginated,
+        page,
+        limit,
+        total,
+    })
+}
+
+#[get("/api/v1/files/{message_id}")]
+async fn api_get_file(
+    req: HttpRequest,
+    path: web::Path<i64>,
+    query: web::Query<FolderQuery>,
+    tg_state: web::Data<Arc<TelegramState>>,
+    api_state: web::Data<ApiState>,
+) -> impl Responder {
+    if let Err(e) = check_auth(&req, &api_state) {
+        return e;
+    }
+
+    let message_id = path.into_inner() as i32;
+    let client_opt = { tg_state.client.lock().await.clone() };
+    let client = match client_opt {
+        Some(c) => c,
+        None => return json_error("NOT_CONNECTED", "Telegram client is not connected", 503),
+    };
+
+    let peer = match resolve_peer(&client, query.folder_id, &tg_state.peer_cache).await {
+        Ok(p) => p,
+        Err(e) => return json_error("PEER_ERROR", &e, 400),
+    };
+
+    match client.get_messages_by_id(peer, &[message_id]).await {
+        Ok(messages) => {
+            if let Some(Some(msg)) = messages.first() {
+                if let Some(doc) = msg.media() {
+                    let (name, size, mime) = match doc {
+                        Media::Document(d) => {
+                            (d.name().to_string(), d.size(), d.mime_type().map(|s| s.to_string()))
+                        }
+                        Media::Photo(_) => ("Photo.jpg".to_string(), 0, Some("image/jpeg".into())),
+                        _ => ("Unknown".to_string(), 0, None),
+                    };
+                    return HttpResponse::Ok().json(ApiFile {
+                        id: msg.id() as i64,
+                        folder_id: query.folder_id,
+                        name,
+                        size: size as u64,
+                        mime_type: mime,
+                        created_at: msg.date().to_string(),
+                    });
+                }
+            }
+            json_error("NOT_FOUND", "File not found", 404)
+        }
+        Err(e) => json_error("FETCH_ERROR", &format!("Failed to fetch file: {}", e), 500),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FolderQuery {
+    folder_id: Option<i64>,
+}
+
+#[get("/api/v1/files/{message_id}/download")]
+async fn api_download_file(
+    req: HttpRequest,
+    path: web::Path<i64>,
+    query: web::Query<FolderQuery>,
+    tg_state: web::Data<Arc<TelegramState>>,
+    api_state: web::Data<ApiState>,
+) -> impl Responder {
+    if let Err(e) = check_auth(&req, &api_state) {
+        return e;
+    }
+
+    let message_id = path.into_inner() as i32;
+    let client_opt = { tg_state.client.lock().await.clone() };
+    let client = match client_opt {
+        Some(c) => c,
+        None => return json_error("NOT_CONNECTED", "Telegram client is not connected", 503),
+    };
+
+    let peer = match resolve_peer(&client, query.folder_id, &tg_state.peer_cache).await {
+        Ok(p) => p,
+        Err(e) => return json_error("PEER_ERROR", &e, 400),
+    };
+
+    match client.get_messages_by_id(peer, &[message_id]).await {
+        Ok(messages) => {
+            if let Some(Some(msg)) = messages.first() {
+                if let Some(media) = msg.media() {
+                    let size = match &media {
+                        Media::Document(d) => d.size(),
+                        _ => 0,
+                    };
+                    let mime = match &media {
+                        Media::Document(d) => d.mime_type().unwrap_or("application/octet-stream").to_string(),
+                        _ => "application/octet-stream".to_string(),
+                    };
+                    let filename = match &media {
+                        Media::Document(d) => d.name().to_string(),
+                        Media::Photo(_) => "Photo.jpg".to_string(),
+                        _ => "download".to_string(),
+                    };
+
+                    let mut download_iter = client.iter_download(&media);
+                    let stream = async_stream::stream! {
+                        while let Some(chunk) = download_iter.next().await.transpose() {
+                            match chunk {
+                                Ok(bytes) => yield Ok::<_, actix_web::Error>(web::Bytes::from(bytes)),
+                                Err(e) => {
+                                    log::error!("API download stream error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    };
+
+                    return HttpResponse::Ok()
+                        .insert_header(("Content-Type", mime))
+                        .insert_header(("Content-Length", size.to_string()))
+                        .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+                        .insert_header(("Accept-Ranges", "bytes"))
+                        .streaming(stream);
+                }
+            }
+            json_error("NOT_FOUND", "File not found", 404)
+        }
+        Err(e) => json_error("FETCH_ERROR", &format!("Failed to fetch file: {}", e), 500),
+    }
+}
+
+/// Register all API routes on the Actix App
+pub fn configure_api(cfg: &mut web::ServiceConfig) {
+    cfg.service(api_health)
+       .service(api_list_files)
+       .service(api_get_file)
+       .service(api_download_file);
+}

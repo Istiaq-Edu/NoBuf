@@ -137,13 +137,25 @@ fn mime_type_from_media(media: &Media) -> String {
     }
 }
 
-pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -> std::io::Result<actix_web::dev::Server> {
-    let state_data = web::Data::new(state);
+/// Configuration for the optional REST API
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub key_hash: Option<String>,
+}
+
+pub async fn start_server(
+    state: Arc<TelegramState>,
+    port: u16,
+    token: String,
+    api_config: Option<ApiConfig>,
+    api_port: u16,
+) -> std::io::Result<(actix_web::dev::Server, Option<actix_web::dev::Server>)> {
+    let state_data = web::Data::new(state.clone());
     let token_data = web::Data::new(StreamTokenData { token });
     
     log::info!("Starting Streaming Server on port {}", port);
     
-    let server = HttpServer::new(move || {
+    let streaming_server = HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin("tauri://localhost")
             .allowed_origin("http://localhost:1420")
@@ -162,5 +174,40 @@ pub async fn start_server(state: Arc<TelegramState>, port: u16, token: String) -
 
     log::info!("Streaming Server started successfully on http://127.0.0.1:{}", port);
 
-    Ok(server)
+    // Conditionally start the API server on a separate port
+    let api_server = if let Some(config) = api_config {
+        if config.enabled {
+            let api_state_data = web::Data::new(state);
+            let api_state = web::Data::new(crate::api_routes::ApiState {
+                key_hash: config.key_hash,
+            });
+
+            log::info!("Starting REST API server on port {}", api_port);
+
+            let server = HttpServer::new(move || {
+                let cors = Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header();
+
+                App::new()
+                    .wrap(cors)
+                    .app_data(api_state_data.clone())
+                    .app_data(api_state.clone())
+                    .configure(crate::api_routes::configure_api)
+            })
+            .bind(("127.0.0.1", api_port))?
+            .run();
+
+            log::info!("REST API server started on http://127.0.0.1:{}", api_port);
+            Some(server)
+        } else {
+            log::info!("REST API is disabled");
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok((streaming_server, api_server))
 }

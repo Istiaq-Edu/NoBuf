@@ -1,4 +1,4 @@
-import { HardDrive, LayoutGrid, Sun, Moon } from 'lucide-react';
+import { HardDrive, LayoutGrid, Sun, Moon, Settings } from 'lucide-react';
 import { useTheme } from '../../context/ThemeContext';
 
 interface TopBarProps {
@@ -12,11 +12,12 @@ interface TopBarProps {
     setViewMode: (mode: 'grid' | 'list') => void;
     searchTerm: string;
     onSearchChange: (term: string) => void;
+    onSettingsClick: () => void;
 }
 
 export function TopBar({
     currentFolderName, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
-    onDownloadFolder, viewMode, setViewMode, searchTerm, onSearchChange
+    onDownloadFolder, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick
 }: TopBarProps) {
     const { theme, toggleTheme } = useTheme();
 
@@ -69,6 +70,17 @@ export function TopBar({
                 </button>
 
                 <div className="w-px h-6 bg-telegram-border mx-1"></div>
+
+                <button
+                    onClick={onSettingsClick}
+                    className="p-2 hover:bg-telegram-hover rounded-md text-telegram-subtext hover:text-telegram-text transition relative group"
+                    title="Settings"
+                >
+                    <Settings className="w-5 h-5" />
+                    <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-telegram-surface border border-telegram-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
+                        Settings
+                    </span>
+                </button>
 
                 <button
                     onClick={toggleTheme}

@@ -12,6 +12,7 @@ use commands::streaming::StreamConfig;
 use rand::Rng;
 
 pub mod server;
+pub mod api_routes;
 
 /// Single source of truth for the Actix streaming server port.
 /// Referenced in lib.rs (server startup) and exposed to the frontend
@@ -29,13 +30,86 @@ fn generate_stream_token() -> String {
 /// from the RunEvent::Exit handler for graceful Ctrl+C termination.
 pub struct ActixServerHandle(pub Arc<std::sync::Mutex<Option<actix_web::dev::ServerHandle>>>);
 
+/// Tracks whether the API server is currently running (for the frontend status dot)
+pub struct ApiServerRunning(pub Arc<std::sync::atomic::AtomicBool>);
+
+/// Holds the API server stop handle separately so we can restart it independently
+pub struct ApiServerHandle(pub Arc<std::sync::Mutex<Option<actix_web::dev::ServerHandle>>>);
+
+/// Restart (or stop) the API server based on current settings.
+/// Called from Tauri commands when the user changes API settings.
+pub fn restart_api_server(app: &tauri::AppHandle) {
+    // Stop existing API server if running
+    let api_handle_arc = app.state::<ApiServerHandle>().0.clone();
+    let old_handle = api_handle_arc.lock().ok().and_then(|mut g| g.take());
+    if let Some(handle) = old_handle {
+        log::info!("Stopping existing API server...");
+        drop(handle.stop(true));
+        // Give it a moment to release the port
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let settings = commands::api_settings::load_settings(app);
+    let running_flag = app.state::<ApiServerRunning>().0.clone();
+
+    if !settings.enabled {
+        running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        log::info!("API server disabled");
+        return;
+    }
+
+    // Need TelegramState to share with the API server
+    let tg_state = Arc::new(app.state::<TelegramState>().inner().clone());
+    let api_port = settings.port;
+    let key_hash = settings.key_hash.clone();
+    let handle_for_thread = api_handle_arc.clone();
+
+    std::thread::spawn(move || {
+        let sys = actix_rt::System::new();
+        sys.block_on(async move {
+            let api_state_data = actix_web::web::Data::new(tg_state);
+            let api_state = actix_web::web::Data::new(api_routes::ApiState {
+                key_hash,
+            });
+
+            log::info!("Starting REST API server on port {}", api_port);
+
+            match actix_web::HttpServer::new(move || {
+                let cors = actix_cors::Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header();
+
+                actix_web::App::new()
+                    .wrap(cors)
+                    .app_data(api_state_data.clone())
+                    .app_data(api_state.clone())
+                    .configure(api_routes::configure_api)
+            })
+            .bind(("127.0.0.1", api_port)) {
+                Ok(bound) => {
+                    let server = bound.run();
+                    *handle_for_thread.lock().unwrap() = Some(server.handle());
+                    running_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::info!("REST API server started on http://127.0.0.1:{}", api_port);
+                    server.await.ok();
+                }
+                Err(e) => {
+                    running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    log::error!("Failed to start API server on port {}: {}", api_port, e);
+                }
+            }
+        });
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
 
     let stream_token = generate_stream_token();
 
-    // Shared handle for stopping the Actix server during shutdown
+    // Shared handle for stopping the Actix streaming server during shutdown
     let server_handle: Arc<std::sync::Mutex<Option<actix_web::dev::ServerHandle>>> =
         Arc::new(std::sync::Mutex::new(None));
     let server_handle_for_setup = server_handle.clone();
@@ -63,6 +137,8 @@ pub fn run() {
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
+            app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
+            app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
             
             // Start Streaming Server on dedicated thread (Actix needs its own runtime)
             let state = Arc::new(app.state::<TelegramState>().inner().clone());
@@ -71,17 +147,20 @@ pub fn run() {
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_server(state, STREAM_PORT, token_for_server).await {
-                        Ok(server) => {
+                    match server::start_server(state, STREAM_PORT, token_for_server, None, 0).await {
+                        Ok((streaming_server, _)) => {
                             // Store the handle so RunEvent::Exit can stop it
-                            *handle_for_thread.lock().unwrap() = Some(server.handle());
+                            *handle_for_thread.lock().unwrap() = Some(streaming_server.handle());
                             // Now await the server — blocks until stopped
-                            server.await.ok();
+                            streaming_server.await.ok();
                         }
                         Err(e) => log::error!("Streaming server failed: {}", e),
                     }
                 });
             });
+
+            // Start API server if enabled in settings
+            restart_api_server(app.handle());
             
             Ok(())
         })
@@ -111,6 +190,9 @@ pub fn run() {
             commands::cmd_cancel_transfer,
             commands::cmd_auth_qr_login,
             commands::cmd_auth_qr_poll,
+            commands::cmd_get_api_settings,
+            commands::cmd_update_api_settings,
+            commands::cmd_regenerate_api_key,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -132,8 +214,14 @@ pub fn run() {
             let server_handle = server_arc.lock().ok().and_then(|mut g| g.take());
             if let Some(handle) = server_handle {
                 log::info!("Stopping Actix streaming server...");
-                // stop() sends the signal synchronously; the returned future
-                // tracks drain completion — we don't need to await it on exit.
+                drop(handle.stop(true));
+            }
+
+            // 3. Stop the API server (graceful)
+            let api_arc = app_handle.state::<ApiServerHandle>().0.clone();
+            let api_handle = api_arc.lock().ok().and_then(|mut g| g.take());
+            if let Some(handle) = api_handle {
+                log::info!("Stopping API server...");
                 drop(handle.stop(true));
             }
         }

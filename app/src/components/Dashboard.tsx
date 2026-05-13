@@ -19,6 +19,7 @@ import { MediaPlayer } from './dashboard/MediaPlayer';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
 import { PdfViewer } from './dashboard/PdfViewer';
+import { SettingsModal } from './dashboard/SettingsModal';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -26,6 +27,7 @@ import { useFileOperations } from '../hooks/useFileOperations';
 import { useFileUpload } from '../hooks/useFileUpload';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
+import { useSettings } from '../context/SettingsContext';
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const queryClient = useQueryClient();
@@ -37,10 +39,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useTelegramConnection(onLogout);
 
 
+    const { settings, updateSetting } = useSettings();
+    const viewMode = settings.viewMode;
+    const setViewMode = (mode: 'grid' | 'list') => updateSetting('viewMode', mode);
+
     const [previewFile, setPreviewFile] = useState<TelegramFile | null>(null);
-    const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
     const [selectedIds, setSelectedIds] = useState<number[]>([]);
     const [showMoveModal, setShowMoveModal] = useState(false);
+    const [showSettings, setShowSettings] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -55,21 +61,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
-
-    useEffect(() => {
-        if (store) {
-            store.get<'grid' | 'list'>('viewMode').then((saved) => {
-                if (saved) setViewMode(saved);
-            });
-        }
-    }, [store]);
-
-    useEffect(() => {
-        if (store) {
-            store.set('viewMode', viewMode).then(() => store.save());
-        }
-    }, [store, viewMode]);
-
 
     const { data: allFiles = [], isLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
@@ -416,6 +407,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     setViewMode={setViewMode}
                     searchTerm={searchTerm}
                     onSearchChange={setSearchTerm}
+                    onSettingsClick={() => setShowSettings(true)}
                 />
                 {searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">
@@ -473,6 +465,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onCancelAll={cancelDownloads}
                 onCancelItem={cancelDownloadItem}
                 onRetryItem={retryDownloadItem}
+            />
+
+            <SettingsModal
+                isOpen={showSettings}
+                onClose={() => setShowSettings(false)}
             />
         </div>
     );
