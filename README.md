@@ -25,6 +25,7 @@ Telegram Drive leverages the Telegram API to allow you to upload, organize, and 
 *   **Drag & Drop**: Intuitive drag-and-drop upload and file management.
 *   **Thumbnail Previews**: Inline thumbnails for images and media files.
 *   **Folder Management**: Create "Folders" (private Telegram Channels) to organize content.
+*   **REST API for AI Integration**: Secure local API (off by default) with configurable port and API key auth. OpenAPI spec for seamless LLM and tool integration.
 *   **Privacy Focused**: API keys and data stay local. No third-party servers.
 *   **Cross-Platform**: Native apps for macOS (Intel/ARM), Windows, and Linux.
 
