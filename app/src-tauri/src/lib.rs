@@ -13,6 +13,7 @@ use rand::Rng;
 
 pub mod server;
 pub mod api_routes;
+pub mod hls;
 
 /// Single source of truth for the Actix streaming server port.
 /// Referenced in lib.rs (server startup) and exposed to the frontend
@@ -148,7 +149,7 @@ pub fn run() {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
                     match server::start_server(state, STREAM_PORT, token_for_server, None, 0).await {
-                        Ok((streaming_server, _)) => {
+                        Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap() = Some(streaming_server.handle());
                             // Now await the server — blocks until stopped
