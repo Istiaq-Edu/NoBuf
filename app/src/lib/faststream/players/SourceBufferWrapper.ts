@@ -14,7 +14,7 @@ export class SourceBufferWrapper {
       this.processQueue();
     });
     this.sourceBuffer.addEventListener('error', (e) => {
-      console.error('SourceBuffer error:', e);
+      console.error('[SourceBuffer] error:', e);
       this.processing = false;
       this.processQueue();
     });
@@ -66,6 +66,35 @@ export class SourceBufferWrapper {
     }
     this.queue = [];
     this.processing = false;
+  }
+
+  setTimestampOffset(offset: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      // Clear pending operations
+      this.queue = [];
+      this.processing = false;
+
+      const apply = () => {
+        try {
+          this.sourceBuffer.timestampOffset = offset;
+        } catch (e) {
+          console.error('[SourceBuffer] Failed to set timestampOffset:', e);
+        }
+        resolve();
+      };
+
+      if (this.sourceBuffer.updating) {
+        // Wait for current operation to finish before setting offset
+        this.sourceBuffer.addEventListener('updateend', apply, { once: true });
+        try {
+          this.sourceBuffer.abort();
+        } catch (_) {
+          // abort may also trigger updateend, but we handle it with once: true
+        }
+      } else {
+        apply();
+      }
+    });
   }
 
   destroy(): void {

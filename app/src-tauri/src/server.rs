@@ -302,6 +302,7 @@ pub async fn start_streaming_server(
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges"])
             .max_age(3600);
 
         App::new()
