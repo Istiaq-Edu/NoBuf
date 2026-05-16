@@ -97,6 +97,43 @@ export class SourceBufferWrapper {
     });
   }
 
+  /** Remove all buffered data — for seeking to unbuffered positions.
+   *  Does NOT set timestampOffset because mp4box produces absolute timestamps. */
+  resetForSeek(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      // Clear pending operations
+      this.queue = [];
+      this.processing = false;
+
+      if (this.sourceBuffer.updating) {
+        this.sourceBuffer.addEventListener('updateend', () => this._removeAllAndFinish(resolve), { once: true });
+        try { this.sourceBuffer.abort(); } catch (_) {}
+      } else {
+        this._removeAllAndFinish(resolve);
+      }
+    });
+  }
+
+  private _removeAllAndFinish(callback: () => void): void {
+    const buffered = this.sourceBuffer.buffered;
+    if (buffered.length === 0) {
+      callback();
+      return;
+    }
+
+    const onDone = () => {
+      this.sourceBuffer.removeEventListener('updateend', onDone);
+      callback();
+    };
+    this.sourceBuffer.addEventListener('updateend', onDone, { once: true });
+    try {
+      this.sourceBuffer.remove(buffered.start(0), buffered.end(buffered.length - 1));
+    } catch (_) {
+      this.sourceBuffer.removeEventListener('updateend', onDone);
+      callback();
+    }
+  }
+
   destroy(): void {
     this.abort();
   }
