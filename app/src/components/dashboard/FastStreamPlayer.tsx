@@ -1,0 +1,367 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { TelegramFile } from '../../types';
+import { useVideoPrefetch, formatSpeed } from '../../hooks/useVideoPrefetch';
+
+interface FastStreamPlayerProps {
+  file: TelegramFile;
+  streamUrl: string;
+  onClose: () => void;
+  onNext?: () => void;
+  onPrev?: () => void;
+}
+
+const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
+
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: FastStreamPlayerProps) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const vidRef = useRef<HTMLVideoElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+
+  const [playing, setPlaying] = useState(false);
+  const [time, setTime] = useState(0);
+  const [dur, setDur] = useState(0);
+  const [vol, setVol] = useState(1);
+  const [muted, setMuted] = useState(false);
+  const [rate, setRate] = useState(1);
+  const [buf, setBuf] = useState(0);
+  const [load, setLoad] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [vis, setVis] = useState(true);
+  const [fs, setFs] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
+
+  // FastStream-style background prefetch
+  const {
+    prefetchedBytes,
+    totalBytes,
+    isPrefetching,
+    isPaused: prefetchPaused,
+    isComplete: prefetchComplete,
+    speed,
+    pausePrefetch,
+    resumePrefetch,
+  } = useVideoPrefetch(streamUrl);
+
+  const fmt = (s: number) => {
+    if (!isFinite(s)) return '0:00';
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sc = Math.floor(s % 60);
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sc).padStart(2, '0')}` : `${m}:${String(sc).padStart(2, '0')}`;
+  };
+
+  const formatBytes = (b: number) => {
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  // Init video
+  useEffect(() => {
+    const v = vidRef.current;
+    if (!v || !streamUrl) return;
+
+    v.src = streamUrl;
+    v.autoplay = true;
+
+    const onMeta = () => {
+      setDur(v.duration);
+      setVol(v.volume);
+      setMuted(v.muted);
+      setLoad(false);
+    };
+    const onErr = () => {
+      setErr('Failed to load video');
+      setLoad(false);
+    };
+    const onTime = () => {
+      setTime(v.currentTime);
+      // Get the furthest buffered position
+      if (v.buffered.length > 0) {
+        let maxBuf = 0;
+        for (let i = 0; i < v.buffered.length; i++) {
+          maxBuf = Math.max(maxBuf, v.buffered.end(i));
+        }
+        setBuf(maxBuf);
+      }
+    };
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    const onWait = () => setLoad(true);
+    const onPlay2 = () => setLoad(false);
+    const onProgress = () => {
+      // Update buffer on progress events too
+      if (v.buffered.length > 0) {
+        let maxBuf = 0;
+        for (let i = 0; i < v.buffered.length; i++) {
+          maxBuf = Math.max(maxBuf, v.buffered.end(i));
+        }
+        setBuf(maxBuf);
+      }
+    };
+
+    v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('error', onErr);
+    v.addEventListener('timeupdate', onTime);
+    v.addEventListener('play', onPlay);
+    v.addEventListener('pause', onPause);
+    v.addEventListener('waiting', onWait);
+    v.addEventListener('playing', onPlay2);
+    v.addEventListener('progress', onProgress);
+    return () => {
+      v.removeEventListener('loadedmetadata', onMeta);
+      v.removeEventListener('error', onErr);
+      v.removeEventListener('timeupdate', onTime);
+      v.removeEventListener('play', onPlay);
+      v.removeEventListener('pause', onPause);
+      v.removeEventListener('waiting', onWait);
+      v.removeEventListener('playing', onPlay2);
+      v.removeEventListener('progress', onProgress);
+    };
+  }, [streamUrl]);
+
+  // Update buffer state regularly
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const v = vidRef.current;
+      if (v && v.buffered.length > 0) {
+        let maxBuf = 0;
+        for (let i = 0; i < v.buffered.length; i++) {
+          maxBuf = Math.max(maxBuf, v.buffered.end(i));
+        }
+        setBuf(maxBuf);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Auto-hide controls
+  useEffect(() => {
+    let t: number;
+    const mv = () => { setVis(true); clearTimeout(t); t = window.setTimeout(() => playing && setVis(false), 3000); };
+    document.addEventListener('mousemove', mv);
+    return () => { document.removeEventListener('mousemove', mv); clearTimeout(t); };
+  }, [playing]);
+
+  // Fullscreen
+  useEffect(() => {
+    const ch = () => setFs(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', ch);
+    return () => document.removeEventListener('fullscreenchange', ch);
+  }, []);
+
+  const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; v.paused ? v.play().catch(() => {}) : v.pause(); }, []);
+  const seek = useCallback((s: number) => { const v = vidRef.current; if (v) v.currentTime = Math.max(0, Math.min(v.currentTime + s, dur)); }, [dur]);
+  const setVol2 = useCallback((n: number) => { const v = vidRef.current; if (!v) return; v.volume = Math.max(0, Math.min(1, n)); setVol(v.volume); if (n > 0) { v.muted = false; setMuted(false); } }, []);
+  const mute = useCallback(() => { const v = vidRef.current; if (!v) return; v.muted = !v.muted; setMuted(v.muted); }, []);
+  const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
+  const rate2 = useCallback((r: number) => { const v = vidRef.current; if (v) { v.playbackRate = r; setRate(r); } setMenu(false); }, []);
+
+  const onBarClick = useCallback((e: React.MouseEvent) => {
+    if (!barRef.current || !vidRef.current) return;
+    const r = barRef.current.getBoundingClientRect();
+    vidRef.current.currentTime = ((e.clientX - r.left) / r.width) * dur;
+  }, [dur]);
+
+  const onBarMove = useCallback((e: React.MouseEvent) => {
+    if (!barRef.current) return;
+    const r = barRef.current.getBoundingClientRect();
+    setTip({ t: ((e.clientX - r.left) / r.width) * dur, x: e.clientX - r.left, show: true });
+  }, [dur]);
+
+  // Keyboard
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
+      switch (e.key.toLowerCase()) {
+        case ' ': case 'k': e.preventDefault(); toggle(); break;
+        case 'arrowleft': e.preventDefault(); e.shiftKey ? onPrev?.() : seek(-5); break;
+        case 'arrowright': e.preventDefault(); e.shiftKey ? onNext?.() : seek(5); break;
+        case 'arrowup': e.preventDefault(); setVol2(vol + 0.1); break;
+        case 'arrowdown': e.preventDefault(); setVol2(vol - 0.1); break;
+        case 'm': e.preventDefault(); mute(); break;
+        case 'f': e.preventDefault(); fs2(); break;
+        case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : onClose(); break;
+        case 'j': e.preventDefault(); seek(-10); break;
+        case 'l': e.preventDefault(); seek(10); break;
+        case ',': e.preventDefault(); rate2(Math.max(0.25, rate - 0.25)); break;
+        case '.': e.preventDefault(); rate2(Math.min(16, rate + 0.25)); break;
+        case '<': e.preventDefault(); rate2(Math.max(0.25, rate / 2)); break;
+        case '>': e.preventDefault(); rate2(Math.min(16, rate * 2)); break;
+      }
+    };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [toggle, seek, setVol2, mute, fs2, onClose, onNext, onPrev, vol, rate, rate2, dur]);
+
+  const pct = dur > 0 ? (time / dur) * 100 : 0;
+  const bufPct = dur > 0 ? (buf / dur) * 100 : 0;
+  // Show prefetch progress on the progress bar
+  // If we know totalBytes, use it directly. Otherwise estimate from video duration.
+  // Typical 720p video: ~250KB/s, so bytes ≈ duration * 250000
+  const estimatedTotalBytes = totalBytes > 0 ? totalBytes : (dur > 0 ? dur * 250000 : 0);
+  const prefetchPct = estimatedTotalBytes > 0 ? Math.min(100, (prefetchedBytes / estimatedTotalBytes) * 100) : 0;
+  // Use the larger of native buffer or prefetch
+  const bufferPct = Math.max(bufPct, prefetchPct);
+
+  return (
+    <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex flex-col select-none">
+      {/* Video - FastStream's DirectVideoPlayer approach */}
+      <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
+        {err ? (
+          <div className="text-center px-8">
+            <div className="text-red-400 text-lg mb-2">{err}</div>
+            <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
+            <button onClick={onClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
+          </div>
+        ) : (
+          <video ref={vidRef} className="max-w-full max-h-full" playsInline />
+        )}
+        {load && !err && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+          </div>
+        )}
+      </div>
+
+      {/* Controls - FastStream-style */}
+      <div className={`absolute bottom-0 left-0 right-0 transition-opacity duration-300 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+        {/* Progress bar with buffer indicator */}
+        <div
+          ref={barRef}
+          className="relative h-1 bg-white/20 rounded-full cursor-pointer group mb-3 hover:h-1.5 transition-all mx-1"
+          onClick={onBarClick}
+          onMouseMove={onBarMove}
+          onMouseLeave={() => setTip(p => ({ ...p, show: false }))}
+        >
+          {/* Buffer indicator (like FastStream) */}
+          <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufferPct}%` }} />
+          {/* Playback position */}
+          <div className="absolute h-full bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+          {/* Knob */}
+          <div className="absolute w-3 h-3 bg-red-500 rounded-full -top-1 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translateX(-50%)' }} />
+          {/* Tooltip */}
+          {tip.show && (
+            <div className="absolute -top-8 px-2 py-0.5 bg-black/80 text-white text-xs rounded whitespace-nowrap pointer-events-none" style={{ left: tip.x, transform: 'translateX(-50%)' }}>
+              {fmt(tip.t)}
+            </div>
+          )}
+        </div>
+
+        {/* Buttons row */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            {/* Play/Pause */}
+            <button onClick={toggle} className="p-1.5 hover:bg-white/10 rounded text-white" title="Play/Pause (Space)">
+              <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                {playing ? <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /> : <path d="M8 5v14l11-7z" />}
+              </svg>
+            </button>
+            {/* Prev */}
+            {onPrev && (
+              <button onClick={onPrev} className="p-1.5 hover:bg-white/10 rounded text-white" title="Previous">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
+              </button>
+            )}
+            {/* Next */}
+            {onNext && (
+              <button onClick={onNext} className="p-1.5 hover:bg-white/10 rounded text-white" title="Next">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" /></svg>
+              </button>
+            )}
+            {/* Volume */}
+            <div className="flex items-center group">
+              <button onClick={mute} className="p-1.5 hover:bg-white/10 rounded text-white" title="Mute (M)">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                  {muted || vol === 0
+                    ? <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" />
+                    : vol < 0.5
+                      ? <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z" />
+                      : <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />}
+                </svg>
+              </button>
+              <input type="range" min="0" max="1" step="0.01" value={muted ? 0 : vol} onChange={e => setVol2(parseFloat(e.target.value))} className="w-0 group-hover:w-20 transition-all opacity-0 group-hover:opacity-100 accent-white" />
+            </div>
+            {/* Time */}
+            <span className="text-white text-xs font-mono ml-1">{fmt(time)} / {fmt(dur)}</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {/* FastStream Buffer control button */}
+            {(isPrefetching || prefetchPaused || prefetchComplete || prefetchedBytes > 0) && (
+              <button
+                onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
+                className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1"
+                title={prefetchPaused ? 'Resume buffering' : prefetchComplete ? 'Buffering complete' : 'Pause buffering'}
+              >
+                {prefetchPaused ? (
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                ) : prefetchComplete ? (
+                  <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                )}
+                <span className="text-xs">
+                  {prefetchComplete ? 'Done' : `${formatBytes(prefetchedBytes)}${speed > 0 ? ` (${formatSpeed(speed)})` : ''}`}
+                </span>
+              </button>
+            )}
+            {/* Rate */}
+            <div className="relative">
+              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback rate">
+                {rate}x
+              </button>
+              {menu && (
+                <div className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-lg overflow-hidden min-w-[60px] z-50">
+                  {RATES.map(r => (
+                    <button key={r} onClick={() => rate2(r)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${rate === r ? 'text-red-400 bg-white/5' : 'text-white'}`}>
+                      {r}x
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {/* Close */}
+            <button onClick={onClose} className="p-1.5 hover:bg-white/10 rounded text-white" title="Close (Esc)">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+            </button>
+            {/* Fullscreen */}
+            <button onClick={fs2} className="p-1.5 hover:bg-white/10 rounded text-white" title="Fullscreen (F)">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                {fs
+                  ? <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" />
+                  : <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" />}
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Buffer status text */}
+        {(isPrefetching || prefetchPaused) && !prefetchComplete && prefetchedBytes > 0 && (
+          <div className="flex items-center justify-between mt-1 px-1">
+            <span className="text-white/40 text-[10px]">
+              {prefetchPaused ? 'Buffering paused' : `Buffering${speed > 0 ? ` • ${formatSpeed(speed)}` : ''}`}
+            </span>
+            <span className="text-white/40 text-[10px]">
+              {totalBytes > 0 ? `${formatBytes(prefetchedBytes)} / ${formatBytes(totalBytes)}` : `${formatBytes(prefetchedBytes)} downloaded`}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* File name */}
+      <div className={`absolute top-3 left-3 right-3 text-white text-sm truncate transition-opacity duration-300 ${vis ? 'opacity-100' : 'opacity-0'}`} style={{ textShadow: '0 1px 3px rgba(0,0,0,0.5)' }}>
+        {file.name}
+      </div>
+
+      {/* Big play */}
+      {!playing && !load && !err && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="w-16 h-16 bg-black/50 rounded-full flex items-center justify-center">
+            <svg className="w-8 h-8 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
