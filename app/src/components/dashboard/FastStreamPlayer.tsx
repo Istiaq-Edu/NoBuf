@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { TelegramFile } from '../../types';
-import { useVideoPrefetch, formatSpeed } from '../../hooks/useVideoPrefetch';
+import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -31,8 +31,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   const [menu, setMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
-  // FastStream-style background prefetch
+  // MSE player with native fallback
   const {
+    mseUrl,
+    error: mseError,
+    useNative,
     prefetchedBytes,
     totalBytes,
     isPrefetching,
@@ -41,7 +44,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     speed,
     pausePrefetch,
     resumePrefetch,
-  } = useVideoPrefetch(streamUrl);
+    seekTo,
+    setVideoRef,
+  } = useMSEPlayer(streamUrl, time);
 
   const fmt = (s: number) => {
     if (!isFinite(s)) return '0:00';
@@ -56,22 +61,39 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   };
 
-  // Init video
+  // Init video - use MSE URL or fall back to native
   useEffect(() => {
     const v = vidRef.current;
-    if (!v || !streamUrl) return;
+    if (!v) return;
 
-    v.src = streamUrl;
+    // Pass video element to MSE hook for seek currentTime setting
+    setVideoRef(v);
+
+    // Use MSE URL if available, otherwise use streamUrl directly
+    const videoUrl = useNative ? streamUrl : (mseUrl || streamUrl);
+    if (!videoUrl) return;
+
+    console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
+    v.src = videoUrl;
     v.autoplay = true;
 
     const onMeta = () => {
+      console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
       setDur(v.duration);
       setVol(v.volume);
       setMuted(v.muted);
       setLoad(false);
+      // Ensure playback starts (autoplay may be blocked by browser)
+      v.play().catch((e) => console.warn('[Player] play() failed:', e));
+    };
+    const onCanPlay = () => {
+      console.log('[Player] canplay, readyState:', v.readyState);
+      v.play().catch(() => {});
     };
     const onErr = () => {
-      setErr('Failed to load video');
+      const err = v.error;
+      console.error('[Player] video error:', err?.code, err?.message);
+      setErr(mseError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
     const onTime = () => {
@@ -101,6 +123,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     };
 
     v.addEventListener('loadedmetadata', onMeta);
+    v.addEventListener('canplay', onCanPlay);
     v.addEventListener('error', onErr);
     v.addEventListener('timeupdate', onTime);
     v.addEventListener('play', onPlay);
@@ -109,7 +132,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
     return () => {
+      setVideoRef(null);
       v.removeEventListener('loadedmetadata', onMeta);
+      v.removeEventListener('canplay', onCanPlay);
       v.removeEventListener('error', onErr);
       v.removeEventListener('timeupdate', onTime);
       v.removeEventListener('play', onPlay);
@@ -118,7 +143,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
     };
-  }, [streamUrl]);
+  }, [streamUrl, mseUrl, useNative, setVideoRef]);
+
 
   // Update buffer state regularly
   useEffect(() => {
@@ -151,17 +177,31 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   }, []);
 
   const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; v.paused ? v.play().catch(() => {}) : v.pause(); }, []);
-  const seek = useCallback((s: number) => { const v = vidRef.current; if (v) v.currentTime = Math.max(0, Math.min(v.currentTime + s, dur)); }, [dur]);
+  const seek = useCallback((s: number) => {
+    const v = vidRef.current;
+    if (!v) return;
+    const target = Math.max(0, Math.min(v.currentTime + s, dur));
+    if (useNative) {
+      v.currentTime = target;
+    } else {
+      seekTo(target);
+    }
+  }, [dur, useNative, seekTo]);
   const setVol2 = useCallback((n: number) => { const v = vidRef.current; if (!v) return; v.volume = Math.max(0, Math.min(1, n)); setVol(v.volume); if (n > 0) { v.muted = false; setMuted(false); } }, []);
   const mute = useCallback(() => { const v = vidRef.current; if (!v) return; v.muted = !v.muted; setMuted(v.muted); }, []);
   const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
   const rate2 = useCallback((r: number) => { const v = vidRef.current; if (v) { v.playbackRate = r; setRate(r); } setMenu(false); }, []);
 
   const onBarClick = useCallback((e: React.MouseEvent) => {
-    if (!barRef.current || !vidRef.current) return;
+    if (!barRef.current || !vidRef.current || !isFinite(dur) || dur <= 0) return;
     const r = barRef.current.getBoundingClientRect();
-    vidRef.current.currentTime = ((e.clientX - r.left) / r.width) * dur;
-  }, [dur]);
+    const targetTime = ((e.clientX - r.left) / r.width) * dur;
+    if (useNative) {
+      vidRef.current.currentTime = targetTime;
+    } else {
+      seekTo(targetTime);
+    }
+  }, [dur, useNative, seekTo]);
 
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
@@ -197,13 +237,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
   const bufPct = dur > 0 ? (buf / dur) * 100 : 0;
-  // Show prefetch progress on the progress bar
-  // If we know totalBytes, use it directly. Otherwise estimate from video duration.
-  // Typical 720p video: ~250KB/s, so bytes ≈ duration * 250000
-  const estimatedTotalBytes = totalBytes > 0 ? totalBytes : (dur > 0 ? dur * 250000 : 0);
-  const prefetchPct = estimatedTotalBytes > 0 ? Math.min(100, (prefetchedBytes / estimatedTotalBytes) * 100) : 0;
-  // Use the larger of native buffer or prefetch
-  const bufferPct = Math.max(bufPct, prefetchPct);
 
   return (
     <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex flex-col select-none">
@@ -227,7 +260,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
 
       {/* Controls - FastStream-style */}
       <div className={`absolute bottom-0 left-0 right-0 transition-opacity duration-300 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-        {/* Progress bar with buffer indicator */}
+        {/* Progress bar with MSE buffer indicator */}
         <div
           ref={barRef}
           className="relative h-1 bg-white/20 rounded-full cursor-pointer group mb-3 hover:h-1.5 transition-all mx-1"
@@ -235,8 +268,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           onMouseMove={onBarMove}
           onMouseLeave={() => setTip(p => ({ ...p, show: false }))}
         >
-          {/* Buffer indicator (like FastStream) */}
-          <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufferPct}%` }} />
+          {/* MSE buffer (video.buffered reflects SourceBuffer) */}
+          <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
           {/* Playback position */}
           <div className="absolute h-full bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
           {/* Knob */}
