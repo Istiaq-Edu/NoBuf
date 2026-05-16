@@ -46,7 +46,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     resumePrefetch,
     seekTo,
     setVideoRef,
-  } = useMSEPlayer(streamUrl, time);
+  } = useMSEPlayer(streamUrl);
 
   const fmt = (s: number) => {
     if (!isFinite(s)) return '0:00';
@@ -87,7 +87,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
     };
     const onCanPlay = () => {
-      console.log('[Player] canplay, readyState:', v.readyState);
+      const bufLen = v.buffered.length;
+      const bufRange = bufLen > 0 ? `${v.buffered.start(0).toFixed(1)}-${v.buffered.end(bufLen - 1).toFixed(1)}s` : 'none';
+      console.log(`[Player] canplay readyState=${v.readyState} currentTime=${v.currentTime.toFixed(1)}s buffered=${bufRange} paused=${v.paused}`);
       v.play().catch(() => {});
     };
     const onErr = () => {
@@ -109,8 +111,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     };
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
-    const onWait = () => setLoad(true);
-    const onPlay2 = () => setLoad(false);
+    const onWait = () => {
+      console.log(`[Player] waiting: currentTime=${v.currentTime.toFixed(1)}s readyState=${v.readyState}`);
+      setLoad(true);
+    };
+    const onPlay2 = () => {
+      console.log(`[Player] playing: currentTime=${v.currentTime.toFixed(1)}s readyState=${v.readyState}`);
+      setLoad(false);
+    };
     const onProgress = () => {
       // Update buffer on progress events too
       if (v.buffered.length > 0) {
