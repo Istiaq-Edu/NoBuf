@@ -1,4 +1,22 @@
 declare module 'mp4box' {
+  interface MP4BoxSample {
+    dts: number;
+    cts: number;
+    duration: number;
+    size: number;
+    offset: number;
+    is_sync: boolean;
+    description?: any;
+  }
+
+  interface MP4BoxTrak {
+    samples: MP4BoxSample[];
+  }
+
+  interface MP4BoxMoov {
+    traks: MP4BoxTrak[];
+  }
+
   interface MP4BoxFile {
     appendBuffer(buffer: ArrayBuffer & { fileStart: number }): void;
     onReady: (info: MP4Info) => void;
@@ -6,6 +24,7 @@ declare module 'mp4box' {
     start(): void;
     stop(): void;
     flush(): void;
+    moov?: MP4BoxMoov;
   }
 
   interface MP4Info {
