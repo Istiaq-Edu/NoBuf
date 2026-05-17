@@ -37,6 +37,7 @@ pub mod utils;
 pub mod network;
 pub mod streaming;
 pub mod api_settings;
+pub mod sprite;
 
 pub use auth::*;
 pub use fs::*;
@@ -45,3 +46,4 @@ pub use utils::*;
 pub use network::*;
 pub use streaming::*;
 pub use api_settings::*;
+pub use sprite::*;

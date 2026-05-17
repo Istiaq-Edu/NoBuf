@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { TelegramFile } from '../../types';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
+import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -47,6 +48,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     seekTo,
     setVideoRef,
   } = useMSEPlayer(streamUrl);
+
+  // Thumbnail extractor — uses video element directly (no WebCodecs, no separate mp4box)
+  const { ready: thumbReady, getThumbnail } = useThumbnailExtractor(vidRef, streamUrl);
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const [thumbLoading, setThumbLoading] = useState(false);
+  const lastThumbTimeRef = useRef<number>(-1);
+  const thumbAbortRef = useRef<AbortController | null>(null);
 
   const fmt = (s: number) => {
     if (!isFinite(s)) return '0:00';
@@ -160,12 +168,38 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     return () => clearInterval(interval);
   }, []);
 
-  // Auto-hide controls
+  // Auto-hide controls — stay visible when cursor is over controls area
+  const overControlsRef = useRef(false);
   useEffect(() => {
     let t: number;
-    const mv = () => { setVis(true); clearTimeout(t); t = window.setTimeout(() => playing && setVis(false), 3000); };
+    const scheduleHide = () => {
+      clearTimeout(t);
+      t = window.setTimeout(() => {
+        if (playing && !overControlsRef.current) setVis(false);
+      }, 3000);
+    };
+    const mv = (e: MouseEvent) => {
+      setVis(true);
+      // Track if cursor is in bottom controls area (bottom 120px)
+      const h = window.innerHeight;
+      overControlsRef.current = (h - e.clientY) < 120;
+      scheduleHide();
+    };
+    // Reset hover ref when mouse stops moving (fallback for edge case)
+    const resetHover = () => { overControlsRef.current = false; };
+    let idleTimer: number;
+    const mv2 = () => {
+      clearTimeout(idleTimer);
+      idleTimer = window.setTimeout(resetHover, 4000);
+    };
     document.addEventListener('mousemove', mv);
-    return () => { document.removeEventListener('mousemove', mv); clearTimeout(t); };
+    document.addEventListener('mousemove', mv2);
+    return () => {
+      document.removeEventListener('mousemove', mv);
+      document.removeEventListener('mousemove', mv2);
+      clearTimeout(t);
+      clearTimeout(idleTimer);
+    };
   }, [playing]);
 
   // Fullscreen
@@ -205,8 +239,38 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
     const r = barRef.current.getBoundingClientRect();
-    setTip({ t: ((e.clientX - r.left) / r.width) * dur, x: e.clientX - r.left, show: true });
-  }, [dur]);
+    const hoverTime = ((e.clientX - r.left) / r.width) * dur;
+    setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
+
+    // Fetch thumbnail for this time (WebCodecs approach)
+    if (thumbReady && getThumbnail) {
+      const roundedTime = Math.floor(hoverTime / 2) * 2; // Round to 2s for cache
+      if (roundedTime !== lastThumbTimeRef.current) {
+        lastThumbTimeRef.current = roundedTime;
+
+        // Abort previous in-flight thumbnail request
+        thumbAbortRef.current?.abort();
+        const controller = new AbortController();
+        thumbAbortRef.current = controller;
+
+        // Clear old thumbnail immediately — show spinner for uncached positions
+        setThumbUrl(null);
+        setThumbLoading(true);
+
+        getThumbnail(hoverTime).then((result) => {
+          if (!controller.signal.aborted) {
+            setThumbUrl(result?.dataUrl ?? null);
+            setThumbLoading(false);
+          }
+        }).catch(() => {
+          if (!controller.signal.aborted) {
+            setThumbUrl(null);
+            setThumbLoading(false);
+          }
+        });
+      }
+    }
+  }, [dur, thumbReady, getThumbnail]);
 
   // Keyboard
   useEffect(() => {
@@ -257,6 +321,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
         )}
       </div>
 
+      {/* Hover zone — invisible, always captures mouse events over controls area */}
+      <div
+        className="absolute bottom-0 left-0 right-0 h-28"
+        onMouseEnter={() => { overControlsRef.current = true; }}
+        onMouseLeave={() => { overControlsRef.current = false; }}
+      />
+
       {/* Controls - FastStream-style */}
       <div className={`absolute bottom-0 left-0 right-0 transition-opacity duration-300 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
         {/* Progress bar with MSE buffer indicator */}
@@ -265,7 +336,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           className="relative h-1 bg-white/20 rounded-full cursor-pointer group mb-3 hover:h-1.5 transition-all mx-1"
           onClick={onBarClick}
           onMouseMove={onBarMove}
-          onMouseLeave={() => setTip(p => ({ ...p, show: false }))}
+          onMouseLeave={() => {
+            setTip(p => ({ ...p, show: false }));
+            thumbAbortRef.current?.abort();
+          }}
         >
           {/* MSE buffer (video.buffered reflects SourceBuffer) */}
           <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
@@ -273,12 +347,31 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           <div className="absolute h-full bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
           {/* Knob */}
           <div className="absolute w-3 h-3 bg-red-500 rounded-full -top-1 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translateX(-50%)' }} />
-          {/* Tooltip */}
-          {tip.show && (
-            <div className="absolute -top-8 px-2 py-0.5 bg-black/80 text-white text-xs rounded whitespace-nowrap pointer-events-none" style={{ left: tip.x, transform: 'translateX(-50%)' }}>
-              {fmt(tip.t)}
-            </div>
-          )}
+          {/* Tooltip with WebCodecs thumbnail */}
+          {tip.show && (() => {
+            const barWidth = barRef.current?.getBoundingClientRect().width ?? 0;
+            const tooltipHalf = 60;
+            const clampedX = Math.max(tooltipHalf, Math.min(tip.x, barWidth - tooltipHalf));
+            return (
+              <div className="absolute pointer-events-none flex flex-col items-center" style={{ left: clampedX, bottom: '100%', marginBottom: '8px', transform: 'translateX(-50%)' }}>
+                {thumbUrl ? (
+                  <img
+                    src={thumbUrl}
+                    className="rounded overflow-hidden border border-white/20 mb-1 shadow-lg"
+                    style={{ width: 114, height: 64, objectFit: 'cover' }}
+                    alt=""
+                  />
+                ) : thumbLoading && thumbReady ? (
+                  <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
+                    <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                  </div>
+                ) : null}
+                <div className="px-2 py-0.5 bg-black/80 text-white text-xs rounded whitespace-nowrap font-mono">
+                  {fmt(tip.t)}
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Buttons row */}

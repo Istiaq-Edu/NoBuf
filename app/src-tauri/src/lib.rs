@@ -194,6 +194,7 @@ pub fn run() {
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
+            commands::cmd_generate_sprite_sheet,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

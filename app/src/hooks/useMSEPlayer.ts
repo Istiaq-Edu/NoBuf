@@ -684,6 +684,8 @@ export function useMSEPlayer(streamUrl: string | null) {
     resumePrefetch,
     seekTo,
     setVideoRef,
+    getMp4Box: () => state.current.mp4box,
+    getFileLength: () => state.current.fileLength,
   };
 }
 
