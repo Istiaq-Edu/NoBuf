@@ -49,12 +49,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     setVideoRef,
   } = useMSEPlayer(streamUrl);
 
-  // Thumbnail extractor — uses video element directly (no WebCodecs, no separate mp4box)
-  const { ready: thumbReady, getThumbnail } = useThumbnailExtractor(vidRef, streamUrl);
+  // Thumbnail extractor — uses hidden video element, LRU cache (max 3)
+  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
   const thumbAbortRef = useRef<AbortController | null>(null);
+
 
   const fmt = (s: number) => {
     if (!isFinite(s)) return '0:00';
@@ -345,6 +346,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
           {/* Playback position */}
           <div className="absolute h-full bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+          {/* Cached thumbnail dots */}
+          {Array.from(cachedTimes).map(t => (
+            <div
+              key={t}
+              className="absolute w-1 h-1 bg-yellow-400/70 rounded-full -top-0.5"
+              style={{ left: `${(t / dur) * 100}%`, transform: 'translateX(-50%)' }}
+              title={`Preview at ${fmt(t)}`}
+            />
+          ))}
           {/* Knob */}
           <div className="absolute w-3 h-3 bg-red-500 rounded-full -top-1 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translateX(-50%)' }} />
           {/* Tooltip with WebCodecs thumbnail */}
