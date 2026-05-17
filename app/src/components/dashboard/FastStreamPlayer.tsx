@@ -54,7 +54,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
-  const thumbAbortRef = useRef<AbortController | null>(null);
 
 
   const fmt = (s: number) => {
@@ -243,31 +242,21 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     const hoverTime = ((e.clientX - r.left) / r.width) * dur;
     setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
 
-    // Fetch thumbnail for this time (WebCodecs approach)
     if (thumbReady && getThumbnail) {
-      const roundedTime = Math.floor(hoverTime / 2) * 2; // Round to 2s for cache
+      const roundedTime = Math.floor(hoverTime / 2) * 2;
       if (roundedTime !== lastThumbTimeRef.current) {
         lastThumbTimeRef.current = roundedTime;
 
-        // Abort previous in-flight thumbnail request
-        thumbAbortRef.current?.abort();
-        const controller = new AbortController();
-        thumbAbortRef.current = controller;
-
-        // Clear old thumbnail immediately — show spinner for uncached positions
+        // Hook handles serialization internally — just fire and update
         setThumbUrl(null);
         setThumbLoading(true);
 
         getThumbnail(hoverTime).then((result) => {
-          if (!controller.signal.aborted) {
-            setThumbUrl(result?.dataUrl ?? null);
-            setThumbLoading(false);
-          }
+          setThumbUrl(result?.dataUrl ?? null);
+          setThumbLoading(false);
         }).catch(() => {
-          if (!controller.signal.aborted) {
-            setThumbUrl(null);
-            setThumbLoading(false);
-          }
+          setThumbUrl(null);
+          setThumbLoading(false);
         });
       }
     }
@@ -339,7 +328,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           onMouseMove={onBarMove}
           onMouseLeave={() => {
             setTip(p => ({ ...p, show: false }));
-            thumbAbortRef.current?.abort();
           }}
         >
           {/* MSE buffer (video.buffered reflects SourceBuffer) */}
