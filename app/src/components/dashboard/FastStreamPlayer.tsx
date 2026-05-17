@@ -49,8 +49,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     setVideoRef,
   } = useMSEPlayer(streamUrl);
 
-  // Thumbnail extractor — uses hidden video element, LRU cache (max 3)
-  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl);
+  // MSE is ready once loadedmetadata fires (duration is set)
+  const mseReady = dur > 0;
+
+  // Thumbnail extractor — uses hidden video element with buffer-aware background generation
+  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
@@ -153,20 +156,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   }, [streamUrl, mseUrl, useNative, setVideoRef]);
 
 
-  // Update buffer state regularly
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const v = vidRef.current;
-      if (v && v.buffered.length > 0) {
-        let maxBuf = 0;
-        for (let i = 0; i < v.buffered.length; i++) {
-          maxBuf = Math.max(maxBuf, v.buffered.end(i));
-        }
-        setBuf(maxBuf);
-      }
-    }, 500);
-    return () => clearInterval(interval);
-  }, []);
+  // Buffer state is already updated by timeupdate and progress events above
 
   // Auto-hide controls — stay visible when cursor is over controls area
   const overControlsRef = useRef(false);
@@ -236,27 +226,38 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     }
   }, [dur, useNative, seekTo]);
 
+  const tipRafRef = useRef(0);
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
     const r = barRef.current.getBoundingClientRect();
     const hoverTime = ((e.clientX - r.left) / r.width) * dur;
-    setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
+
+    // Throttle tooltip position updates to rAF
+    cancelAnimationFrame(tipRafRef.current);
+    tipRafRef.current = requestAnimationFrame(() => {
+      setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
+    });
 
     if (thumbReady && getThumbnail) {
       const roundedTime = Math.floor(hoverTime / 2) * 2;
       if (roundedTime !== lastThumbTimeRef.current) {
         lastThumbTimeRef.current = roundedTime;
 
-        // Hook handles serialization internally — just fire and update
         setThumbUrl(null);
         setThumbLoading(true);
 
+        const requestedTime = roundedTime;
         getThumbnail(hoverTime).then((result) => {
-          setThumbUrl(result?.dataUrl ?? null);
-          setThumbLoading(false);
+          // Only apply if this is still the latest request
+          if (requestedTime === lastThumbTimeRef.current) {
+            setThumbUrl(result?.dataUrl ?? null);
+            setThumbLoading(false);
+          }
         }).catch(() => {
-          setThumbUrl(null);
-          setThumbLoading(false);
+          if (requestedTime === lastThumbTimeRef.current) {
+            setThumbUrl(null);
+            setThumbLoading(false);
+          }
         });
       }
     }
@@ -336,15 +337,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
             <div className="absolute inset-y-0 left-0 bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
             {/* Playback position */}
             <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
-            {/* Cached thumbnail indicators — small dots on the bar */}
-            {Array.from(cachedTimes).map(t => (
-              <div
-                key={t}
-                className="absolute top-1/2 w-1 h-1 bg-yellow-400/80 rounded-full -translate-y-1/2"
-                style={{ left: `${(t / dur) * 100}%` }}
-                title={`Preview at ${fmt(t)}`}
-              />
-            ))}
+            {/* Cached thumbnail indicators */}
+            {(() => {
+              const times = Array.from(cachedTimes);
+              // Show dots for most recent 100 cached positions only
+              const recent = times.length > 100 ? times.slice(-100) : times;
+              return recent.map(t => (
+                <div
+                  key={t}
+                  className="absolute top-1/2 w-1 h-1 bg-yellow-400/60 rounded-full -translate-y-1/2"
+                  style={{ left: `${(t / dur) * 100}%` }}
+                />
+              ));
+            })()}
             {/* Knob */}
             <div className="absolute w-3 h-3 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
           </div>
