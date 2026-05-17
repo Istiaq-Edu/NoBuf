@@ -320,31 +320,34 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
 
       {/* Controls - FastStream-style */}
       <div className={`absolute bottom-0 left-0 right-0 transition-opacity duration-300 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-        {/* Progress bar with MSE buffer indicator */}
+        {/* Progress bar — unified with buffer, position, and preview indicators */}
         <div
           ref={barRef}
-          className="relative h-1 bg-white/20 rounded-full cursor-pointer group mb-3 hover:h-1.5 transition-all mx-1"
+          className="relative cursor-pointer group mb-3 mx-1 py-3"
           onClick={onBarClick}
           onMouseMove={onBarMove}
           onMouseLeave={() => {
             setTip(p => ({ ...p, show: false }));
           }}
         >
-          {/* MSE buffer (video.buffered reflects SourceBuffer) */}
-          <div className="absolute h-full bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
-          {/* Playback position */}
-          <div className="absolute h-full bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
-          {/* Cached thumbnail dots */}
-          {Array.from(cachedTimes).map(t => (
-            <div
-              key={t}
-              className="absolute w-1 h-1 bg-yellow-400/70 rounded-full -top-0.5"
-              style={{ left: `${(t / dur) * 100}%`, transform: 'translateX(-50%)' }}
-              title={`Preview at ${fmt(t)}`}
-            />
-          ))}
-          {/* Knob */}
-          <div className="absolute w-3 h-3 bg-red-500 rounded-full -top-1 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translateX(-50%)' }} />
+          {/* Visual bar track */}
+          <div className="relative h-1 bg-white/20 rounded-full group-hover:h-1.5 transition-all">
+            {/* MSE buffer indicator */}
+            <div className="absolute inset-y-0 left-0 bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
+            {/* Playback position */}
+            <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+            {/* Cached thumbnail indicators — small dots on the bar */}
+            {Array.from(cachedTimes).map(t => (
+              <div
+                key={t}
+                className="absolute top-1/2 w-1 h-1 bg-yellow-400/80 rounded-full -translate-y-1/2"
+                style={{ left: `${(t / dur) * 100}%` }}
+                title={`Preview at ${fmt(t)}`}
+              />
+            ))}
+            {/* Knob */}
+            <div className="absolute w-3 h-3 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
+          </div>
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {
             const barWidth = barRef.current?.getBoundingClientRect().width ?? 0;
