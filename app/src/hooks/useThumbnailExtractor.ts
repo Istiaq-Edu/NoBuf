@@ -57,12 +57,10 @@ export function useThumbnailExtractor(
     video.src = streamUrl;
 
     video.addEventListener('loadeddata', () => {
-      console.log('[ThumbnailExtractor] Hidden video ready, duration:', video.duration);
+      console.log('[ThumbnailExtractor] Hidden video loaded, duration:', video.duration);
       durationRef.current = video.duration;
       setReady(true);
-      video.playbackRate = 16;
-      video.currentTime = 0;
-      video.play().catch(() => {});
+      // Don't auto-play — let the background loop start it after MSE player is ready
     });
 
     video.addEventListener('error', () => {
@@ -201,12 +199,22 @@ export function useThumbnailExtractor(
     let animId: number;
     let captureCount = 0;
     let checkCounter = 0;
+    let started = false;
 
     const loop = () => {
       const video = hiddenVideoRef.current;
       if (!video) {
         animId = requestAnimationFrame(loop);
         return;
+      }
+
+      // Start playback on first iteration
+      if (!started && video.readyState >= 1) {
+        started = true;
+        video.playbackRate = 16;
+        video.currentTime = 0;
+        video.play().catch(() => {});
+        console.log('[ThumbnailExtractor-BG] Started hidden video playback');
       }
 
       // Skip if hover is active
@@ -310,6 +318,13 @@ export function useThumbnailExtractor(
         const cached = frameBufferRef.current.get(bucket);
         if (cached) {
           hoverResultRef.current = { dataUrl: cached, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket };
+          continue;
+        }
+
+        // Ensure video is loaded before seeking
+        if (video.readyState < 1) {
+          console.log('[ThumbnailExtractor-HOVER] Video not ready, skipping');
+          hoverResultRef.current = null;
           continue;
         }
 
