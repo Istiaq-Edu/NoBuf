@@ -457,7 +457,7 @@ export function useMSEPlayer(streamUrl: string | null) {
       console.log('[MSE] Initialization complete!');
 
       // Set up mp4box callback for segments
-      mp4box.onSegment = (trackId: number, _user: any, buffer: ArrayBuffer, _sampleNum: number, isLast: boolean) => {
+      mp4box.onSegment = (trackId: number, _user: any, buffer: ArrayBuffer, _sampleNum: number, _isLast: boolean) => {
         if (cancelledRef.current) return;
 
         const isVideo = trackId === videoTrackId;
@@ -465,31 +465,16 @@ export function useMSEPlayer(streamUrl: string | null) {
 
         if (isVideo && state.current.videoSourceBuffer) {
           state.current.videoSourceBuffer.appendBuffer(buffer);
-          console.log(`[MSE-SEG] Video segment: ${formatBytes(buffer.byteLength)}`);
         }
         if (isAudio && state.current.audioSourceBuffer) {
           state.current.audioSourceBuffer.appendBuffer(buffer);
-          console.log(`[MSE-SEG] Audio segment: ${formatBytes(buffer.byteLength)}`);
-        }
-
-        // Log video readyState after segment append
-        if (videoRef.current && (isVideo || isAudio)) {
-          const v = videoRef.current;
-          const bufLen = v.buffered.length;
-          const bufRange = bufLen > 0 ? `${v.buffered.start(bufLen - 1).toFixed(1)}-${v.buffered.end(bufLen - 1).toFixed(1)}s` : 'none';
-          console.log(`[MSE-SEG] readyState=${v.readyState} paused=${v.paused} buffered=${bufRange}`);
         }
 
         // Evict old buffer to prevent memory growth
         evictOldBuffer();
-
-        if (isLast) {
-          console.log('[MSE] All segments flushed');
-        }
       };
 
       // Start mp4box segment generation
-      console.log('[MSE] Starting mp4box segment generation...');
       mp4box.start();
 
       // Start downloading and appending
@@ -549,7 +534,6 @@ export function useMSEPlayer(streamUrl: string | null) {
       abortRef.current = controller;
 
       try {
-        const fetchStart = Date.now();
         let response: Response | null = null;
         let retries = 3;
         while (retries > 0) {
@@ -575,22 +559,14 @@ export function useMSEPlayer(streamUrl: string | null) {
           break;
         }
 
-        const fetchMs = Date.now() - fetchStart;
         const data = await response.arrayBuffer();
         if (cancelledRef.current) break;
 
-        console.log(`[MSE-SEEK] Chunk ${chunksAfterSeek.current - 1}: ${formatBytes(data.byteLength)} fetched in ${fetchMs}ms (offset ${formatBytes(offset)})`);
-
         // Feed to mp4box for segmentation
-        const mp4boxStart = Date.now();
         const buffer = data as any;
         buffer.fileStart = offset;
         state.current.mp4box!.appendBuffer(buffer);
         state.current.mp4box!.flush();
-        const mp4boxMs = Date.now() - mp4boxStart;
-        if (mp4boxMs > 50) {
-          console.log(`[MSE-SEEK] mp4box processing took ${mp4boxMs}ms`);
-        }
 
         // Update tracking
         state.current.currentOffset = offset + data.byteLength;
