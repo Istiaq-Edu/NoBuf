@@ -59,6 +59,22 @@ function getChunkSize(chunksAfterSeek: number): number {
   return FRAGMENT_SIZES[idx];
 }
 
+/** Merge overlapping or adjacent [start,end] byte ranges into a minimal set */
+function mergeByteRanges(ranges: [number, number][]): [number, number][] {
+  if (ranges.length === 0) return [];
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const last = merged[merged.length - 1];
+    if (sorted[i][0] <= last[1] + 1) {
+      last[1] = Math.max(last[1], sorted[i][1]);
+    } else {
+      merged.push(sorted[i]);
+    }
+  }
+  return merged;
+}
+
 interface MSEState {
   mediaSource: MediaSource | null;
   videoSourceBuffer: SourceBufferWrapper | null;
@@ -87,6 +103,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const [isPaused, setIsPaused] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
   const [speed, setSpeed] = useState(0);
+  // Downloaded byte-range → time-range for green buffer bar
+  const [downloadedTimeRanges, setDownloadedTimeRanges] = useState<[number, number][]>([]);
 
   const downloadLoopRef = useRef<((url: string) => void) | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -95,6 +113,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const chunksAfterSeek = useRef(0); // For progressive chunk sizing
   const pendingRangesRef = useRef<[number, number][]>([]); // Accumulated ranges to report
   const rangeReportTimer = useRef<number | null>(null); // Debounce timer for range reporting
+  // Downloaded byte ranges — merged and converted to time for green buffer bar
+  const downloadedRangesRef = useRef<[number, number][]>([]);
   // Cached init segments (codec config) — re-appended after each SourceBuffer clear
   const initSegmentsRef = useRef<Array<{ id: number; buffer: ArrayBuffer }>>([]);
   const state = useRef<MSEState>({
@@ -172,6 +192,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
   }, [file, activeFolderId]);
 
+  // Track downloaded byte ranges for the green buffer bar.
+  // Converts byte ranges to time ranges using the duration/fileLength ratio.
+  const trackDownloadedRange = useCallback((byteStart: number, byteEnd: number) => {
+    if (state.current.fileLength <= 0 || state.current.duration <= 0) return;
+    downloadedRangesRef.current.push([byteStart, byteEnd]);
+    const merged = mergeByteRanges(downloadedRangesRef.current);
+    downloadedRangesRef.current = merged;
+    // Convert byte ranges → time ranges for progress bar rendering
+    const timeRanges: [number, number][] = merged.map(([bs, be]) => {
+      const ts = (bs / state.current.fileLength) * state.current.duration;
+      const te = (be / state.current.fileLength) * state.current.duration;
+      return [ts, te];
+    });
+    setDownloadedTimeRanges(timeRanges);
+  }, []);
+
+  // Clear downloaded ranges (on seek / cleanup)
+  const clearDownloadedRanges = useCallback(() => {
+    downloadedRangesRef.current = [];
+    setDownloadedTimeRanges([]);
+  }, []);
+
   // Initialize MSE when streamUrl changes
   useEffect(() => {
     if (!streamUrl) return;
@@ -204,6 +246,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     };
     speedHistory.current = [];
     initSegmentsRef.current = [];
+    clearDownloadedRanges();
     setPrefetchedBytes(0);
     setTotalBytes(0);
     setIsPrefetching(false);
@@ -263,6 +306,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     state.current.audioSourceBuffer = null;
     state.current.mp4box = null;
     state.current.initialized = false;
+    clearDownloadedRanges();
   };
 
   /** Remove buffered data older than (currentTime - BUFFER_KEEP_BEHIND) when buffer is too large */
@@ -421,6 +465,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         state.current.currentOffset = offset + data.byteLength;
         setPrefetchedBytes(state.current.currentOffset);
         reportRangesToBackend(offset, offset + data.byteLength - 1);
+        trackDownloadedRange(offset, offset + data.byteLength - 1);
       } catch (e) {
         console.error('[MSE] fetchMoreData error:', e);
         break;
@@ -667,6 +712,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
         // Report this range to cache backend
         reportRangesToBackend(offset, offset + data.byteLength - 1);
+        // Track for green buffer bar
+        trackDownloadedRange(offset, offset + data.byteLength - 1);
 
         // Throttle React state updates to every 250ms
         const now = Date.now();
@@ -794,6 +841,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     resumePrefetch,
     seekTo,
     setVideoRef,
+    downloadedTimeRanges,
     getMp4Box: () => state.current.mp4box,
     getFileLength: () => state.current.fileLength,
   };

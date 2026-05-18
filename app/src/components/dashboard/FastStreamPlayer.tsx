@@ -62,6 +62,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     resumePrefetch,
     seekTo,
     setVideoRef,
+    downloadedTimeRanges,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
 
   // MSE is ready once loadedmetadata fires (duration is set)
@@ -446,7 +447,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           }}
         >
           {/* Visual bar track */}
-          <div className="relative h-2 bg-white/20 rounded-full group-hover:h-2.5 transition-all">
+          <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
+            {/* Downloaded (green) buffer coverage — merged byte ranges mapped to time */}
+            {downloadedTimeRanges.length > 0 && dur > 0 && downloadedTimeRanges.map(([ts, te], i) => {
+              const leftPct = (ts / dur) * 100;
+              const widthPct = ((te - ts) / dur) * 100;
+              return (
+                <div
+                  key={`buf-${i}`}
+                  className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
+                  style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
+                />
+              );
+            })}
             {/* Preview thumbnail coverage — segments at each cached position */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
