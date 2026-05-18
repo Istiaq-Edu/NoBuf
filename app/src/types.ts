@@ -42,5 +42,6 @@ export interface DownloadItem {
     uploadedBytes?: number;
     totalBytes?: number;
     speedBytesPerSec?: number;
+    cacheInfo?: string; // "From cache ✓" or "Using cache (67%)"
 }
 

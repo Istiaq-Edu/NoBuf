@@ -41,6 +41,65 @@ pub async fn cmd_get_cache_status(
     Ok(cache_state.get_status(message_id))
 }
 
+/// Report byte ranges that the MSE player has fetched — updates cache metadata
+/// so that subsequent downloads can use cached data. The MSE player fetches
+/// bytes through the Actix server which writes them to .dat, but we need to
+/// ensure the meta sidecar accurately tracks which ranges are present.
+#[tauri::command]
+pub async fn cmd_report_cached_ranges(
+    message_id: i32,
+    folder_id: i64,
+    total_size: u64,
+    filename: String,
+    mime_type: String,
+    ranges: Vec<(u64, u64)>,
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<bool, String> {
+    // Verify the .dat file actually has data at the reported ranges
+    let data_path = cache_state.data_path(message_id);
+    if !data_path.exists() {
+        // No cache file yet — ranges can't be present
+        log::warn!("cmd_report_cached_ranges: no .dat file for msg {}", message_id);
+        return Ok(false);
+    }
+
+    let file_size = std::fs::metadata(&data_path)
+        .map(|m| m.len())
+        .map_err(|e| format!("Failed to read .dat metadata: {}", e))?;
+
+    // Filter ranges: only include those where the .dat file actually covers the bytes
+    let verified_ranges: Vec<(u64, u64)> = ranges
+        .into_iter()
+        .filter(|(_start, end)| *end < file_size)
+        .collect();
+
+    if verified_ranges.is_empty() {
+        return Ok(false);
+    }
+
+    // Load existing meta or create new one
+    let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+        message_id,
+        folder_id,
+        total_size,
+        filename,
+        cached_ranges: Vec::new(),
+        mime_type,
+    });
+
+    // Add verified ranges and merge
+    meta.cached_ranges.extend(verified_ranges);
+    merge_ranges(&mut meta.cached_ranges);
+
+    cache_state.save_meta(&meta)
+        .map_err(|e| format!("Failed to save meta: {}", e))?;
+
+    log::info!("cmd_report_cached_ranges: msg {} now has {} cached ranges ({:.1}% complete)",
+        message_id, meta.cached_ranges.len(), meta.cached_percentage());
+
+    Ok(true)
+}
+
 /// Delete cache for a specific message
 #[tauri::command]
 pub async fn cmd_delete_cache(
@@ -199,7 +258,7 @@ async fn background_cache_download(
         let mut offset = gap_start;
         let mut first_chunk = true;
 
-        while let Some(chunk_result) = iter.next().await {
+        while let Ok(Some(chunk_result)) = iter.next().await {
             // Check cancellation
             if state
                 .cancelled_transfers
@@ -211,7 +270,7 @@ async fn background_cache_download(
                 return Ok(());
             }
 
-            let chunk = chunk_result.map_err(|e| format!("Download error: {}", e))?;
+            let chunk = chunk_result;
 
             // On first chunk of this gap, discard leading bytes to align with gap_start
             let chunk_slice: &[u8] = if first_chunk && skip_bytes > 0 {

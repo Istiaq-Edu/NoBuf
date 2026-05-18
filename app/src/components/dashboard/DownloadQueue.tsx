@@ -60,6 +60,9 @@ export function DownloadQueue({ items, onClearFinished, onCancelAll, onCancelIte
                             <div className="flex-1 truncate text-telegram-subtext" title={item.filename}>
                                 {item.filename}
                             </div>
+                            {item.cacheInfo && (
+                                <span className="text-xs text-blue-400 flex-shrink-0">{item.cacheInfo}</span>
+                            )}
                             {item.status === 'downloading' && (
                                 <button onClick={() => onCancelItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Cancel">
                                     <X className="w-3.5 h-3.5" />

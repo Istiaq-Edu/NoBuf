@@ -387,7 +387,6 @@ async fn api_download_file(
 
                                     if data.len() as u64 > remaining {
                                         yield Ok::<_, actix_web::Error>(web::Bytes::from(data[..remaining as usize].to_vec()));
-                                        bytes_sent += remaining;
                                         break;
                                     }
                                     bytes_sent += data.len() as u64;

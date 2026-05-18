@@ -110,13 +110,29 @@ export function useFileDownload(store: Store | null) {
         }
     };
 
-    const queueDownload = (messageId: number, filename: string, folderId: number | null) => {
+    const queueDownload = async (messageId: number, filename: string, folderId: number | null) => {
+        // Check cache status
+        let cacheInfo: string | undefined;
+        try {
+            const cacheStatus = await invoke<any>('cmd_get_cache_status', { messageId });
+            if (cacheStatus) {
+                if (cacheStatus.is_complete) {
+                    cacheInfo = 'From cache ✓';
+                } else if (cacheStatus.percentage > 0) {
+                    cacheInfo = `Using cache (${cacheStatus.percentage}%)`;
+                }
+            }
+        } catch {
+            // No cache, proceed normally
+        }
+
         const newItem: DownloadItem = {
             id: Math.random().toString(36).substr(2, 9),
             messageId,
             filename,
             folderId,
-            status: 'pending'
+            status: 'pending',
+            cacheInfo,
         };
         setDownloadQueue(prev => [...prev, newItem]);
     };
