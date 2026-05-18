@@ -1,6 +1,7 @@
 pub mod models;
 
 pub mod commands;
+pub mod stream_cache;
 pub mod bandwidth;
 
 use tauri::Manager;
