@@ -332,26 +332,43 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           }}
         >
           {/* Visual bar track */}
-          <div className="relative h-1 bg-white/20 rounded-full group-hover:h-1.5 transition-all">
+          <div className="relative h-2 bg-white/20 rounded-full group-hover:h-2.5 transition-all">
+            {/* Preview thumbnail coverage — segments at each cached position */}
+            {cachedTimes.size > 0 && dur > 0 && (() => {
+              // Group consecutive cached times into segments
+              const sorted = Array.from(cachedTimes).sort((a, b) => a - b);
+              const segments: { start: number; end: number }[] = [];
+              let segStart = sorted[0];
+              let segEnd = sorted[0];
+              for (let i = 1; i < sorted.length; i++) {
+                if (sorted[i] - sorted[i - 1] <= 4) {
+                  segEnd = sorted[i];
+                } else {
+                  segments.push({ start: segStart, end: segEnd });
+                  segStart = sorted[i];
+                  segEnd = sorted[i];
+                }
+              }
+              segments.push({ start: segStart, end: segEnd });
+
+              return segments.map((seg, i) => {
+                const leftPct = (seg.start / dur) * 100;
+                const widthPct = ((seg.end - seg.start + 2) / dur) * 100;
+                return (
+                  <div
+                    key={i}
+                    className="absolute top-0 h-[3px] bg-yellow-400/70 rounded-full z-10"
+                    style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
+                  />
+                );
+              });
+            })()}
             {/* MSE buffer indicator */}
             <div className="absolute inset-y-0 left-0 bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
             {/* Playback position */}
             <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
-            {/* Cached thumbnail indicators */}
-            {(() => {
-              const times = Array.from(cachedTimes);
-              // Show dots for most recent 100 cached positions only
-              const recent = times.length > 100 ? times.slice(-100) : times;
-              return recent.map(t => (
-                <div
-                  key={t}
-                  className="absolute top-1/2 w-1 h-1 bg-yellow-400/60 rounded-full -translate-y-1/2"
-                  style={{ left: `${(t / dur) * 100}%` }}
-                />
-              ));
-            })()}
             {/* Knob */}
-            <div className="absolute w-3 h-3 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
+            <div className="absolute w-4 h-4 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
           </div>
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {

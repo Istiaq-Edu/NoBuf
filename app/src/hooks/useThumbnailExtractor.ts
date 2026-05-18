@@ -51,8 +51,6 @@ export function useThumbnailExtractor(
 
   // Hover request protocol
   const hoverQueueRef = useRef<PendingRequest[]>([]);
-  const hoverMutexRef = useRef(false);
-  const lastHoverTimeRef = useRef(0);
 
   // Throttle for cachedTimes updates
   const lastCachedUpdateRef = useRef(0);
@@ -64,7 +62,7 @@ export function useThumbnailExtractor(
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
-    video.preload = 'metadata'; // Minimal bandwidth — only load metadata
+    video.preload = 'auto'; // Allow downloading on demand for seeking
     video.crossOrigin = 'anonymous';
     video.style.position = 'absolute';
     video.style.left = '-9999px';
@@ -138,7 +136,7 @@ export function useThumbnailExtractor(
   // Throttled cachedTimes update
   const updateCachedTimes = useCallback(() => {
     const now = Date.now();
-    if (now - lastCachedUpdateRef.current > 1000) {
+    if (now - lastCachedUpdateRef.current > 500) {
       lastCachedUpdateRef.current = now;
       setCachedTimes(new Set(frameBufferRef.current.keys()));
     }
@@ -203,7 +201,8 @@ export function useThumbnailExtractor(
 
     const timer = setTimeout(() => {
       started = true;
-      console.log('[ThumbnailExtractor] Starting main video frame capture');
+      console.log(`[MAIN-CAP] Starting main video frame capture after ${CAPTURE_DELAY_MS}ms delay`);
+      let mainCaptureCount = 0;
 
       const onFrame = () => {
         if (!active || !started) return;
@@ -213,7 +212,11 @@ export function useThumbnailExtractor(
 
         if (bucket !== lastCaptureBucket && !frameBufferRef.current.has(bucket) && video.readyState >= 2) {
           lastCaptureBucket = bucket;
-          captureFrame(video, bucket);
+          const captured = captureFrame(video, bucket);
+          mainCaptureCount++;
+          if (mainCaptureCount <= 5 || mainCaptureCount % 20 === 0) {
+            console.log(`[MAIN-CAP] #${mainCaptureCount}: ${time.toFixed(1)}s (bucket ${bucket}), success=${captured}, cacheSize=${frameBufferRef.current.size}`);
+          }
         }
 
         (video as any).requestVideoFrameCallback(onFrame);
@@ -227,79 +230,6 @@ export function useThumbnailExtractor(
       clearTimeout(timer);
     };
   }, [mainVideoRef, mseReady, captureFrame]);
-
-  // Background loop: use hidden video to fill buffered range gaps
-  // The main video downloads data → browser HTTP cache → hidden video reads from cache (no extra bandwidth)
-  // This keeps thumbnails in sync with the buffer even when playback is behind
-  useEffect(() => {
-    if (!ready || !mseReady) return;
-    let animId: number;
-    let started = false;
-
-    const loop = () => {
-      const video = hiddenVideoRef.current;
-      const mainVideo = mainVideoRef.current;
-      if (!video || !mainVideo) {
-        animId = requestAnimationFrame(loop);
-        return;
-      }
-
-      // Start hidden video after delay
-      if (!started && video.readyState >= 1) {
-        started = true;
-        video.playbackRate = 16;
-        video.currentTime = 0;
-        video.play().catch(() => {});
-        console.log('[ThumbnailExtractor-BG] Started hidden video for buffered range sync');
-      }
-
-      if (!started || hoverMutexRef.current) {
-        animId = requestAnimationFrame(loop);
-        return;
-      }
-
-      const time = video.currentTime;
-      const bucket = Math.floor(time / BUCKET_SIZE) * BUCKET_SIZE;
-
-      // Only capture if this position is within the main video's buffered range
-      let isBuffered = false;
-      for (let i = 0; i < mainVideo.buffered.length; i++) {
-        if (time >= mainVideo.buffered.start(i) && time <= mainVideo.buffered.end(i)) {
-          isBuffered = true;
-          break;
-        }
-      }
-
-      if (isBuffered && !frameBufferRef.current.has(bucket) && video.readyState >= 2) {
-        captureFrame(video, bucket);
-      }
-
-      // If we've gone past the buffer, pause and wait
-      if (!isBuffered && time > 0) {
-        // Find the end of the current buffer
-        let bufferEnd = 0;
-        for (let i = 0; i < mainVideo.buffered.length; i++) {
-          bufferEnd = Math.max(bufferEnd, mainVideo.buffered.end(i));
-        }
-        // If we're past the buffer, jump back to buffer end to wait for more data
-        if (time > bufferEnd + 5) {
-          video.pause();
-          // Check again in 2 seconds
-          setTimeout(() => {
-            if (hiddenVideoRef.current && !hoverMutexRef.current) {
-              video.playbackRate = 16;
-              video.play().catch(() => {});
-            }
-          }, 2000);
-        }
-      }
-
-      animId = requestAnimationFrame(loop);
-    };
-
-    animId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animId);
-  }, [ready, mseReady, captureFrame]);
 
   // Seek helper for hidden video
   const seekTo = useCallback((video: HTMLVideoElement, time: number): Promise<boolean> => {
@@ -323,16 +253,22 @@ export function useThumbnailExtractor(
           video.removeEventListener('seeked', onSeeked);
           resolve(false);
         }
-      }, 3000);
+      }, 5000);
     });
   }, []);
+
+  // No background hidden video loop — main video capture via requestVideoFrameCallback handles buffered content.
+  // Hidden video is used ONLY for on-demand hover requests (see hover processor below).
 
   // Hover request processor — processes one request at a time
   useEffect(() => {
     if (!ready) return;
     let active = true;
 
+    let hoverCount = 0;
+
     const processLoop = async () => {
+      console.log(`[HOVER] Process loop started, ready=${ready}`);
       while (active) {
         const request = await new Promise<PendingRequest | null>((resolve) => {
           const checkQueue = () => {
@@ -346,6 +282,7 @@ export function useThumbnailExtractor(
 
         if (!active || !request) continue;
 
+        hoverCount++;
         const video = hiddenVideoRef.current;
         if (!video) {
           request.resolve(null);
@@ -354,7 +291,7 @@ export function useThumbnailExtractor(
 
         const bucket = Math.floor(request.time / BUCKET_SIZE) * BUCKET_SIZE;
 
-        // Check cache first (instant — captured during playback)
+        // Check cache first
         const cached = frameBufferRef.current.get(bucket);
         if (cached) {
           request.resolve({ dataUrl: cached, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket });
@@ -367,27 +304,23 @@ export function useThumbnailExtractor(
           continue;
         }
 
+        // Seek hidden video to requested position
         video.pause();
-        hoverMutexRef.current = true;
-
+        const seekStart = performance.now();
         const ok = await seekTo(video, request.time);
+        const seekMs = performance.now() - seekStart;
+
+        console.log(`[HOVER] #${hoverCount}: time=${request.time.toFixed(1)}s, seek=${seekMs.toFixed(0)}ms, ok=${ok}`);
 
         if (ok) {
           captureFrame(video, bucket);
         }
 
-        hoverMutexRef.current = false;
-        lastHoverTimeRef.current = Date.now();
-
-        // Resume hidden video in preload mode (minimal bandwidth)
-        video.preload = 'metadata';
+        // Stop hidden video after capture — no background loop to resume
+        video.pause();
 
         const result = frameBufferRef.current.get(bucket);
-        if (result) {
-          request.resolve({ dataUrl: result, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket });
-        } else {
-          request.resolve(null);
-        }
+        request.resolve(result ? { dataUrl: result, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket } : null);
       }
     };
 
@@ -402,10 +335,15 @@ export function useThumbnailExtractor(
     // Check cache first (instant — captured during playback)
     const cached = frameBufferRef.current.get(bucket);
     if (cached) {
+      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, bucket=${bucket} → CACHE_HIT`);
       return { dataUrl: cached, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket };
     }
 
     // Cancel all previous pending requests
+    const cancelled = hoverQueueRef.current.length;
+    if (cancelled > 0) {
+      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, cancelling ${cancelled} pending requests`);
+    }
     for (const req of hoverQueueRef.current) {
       req.resolve(null);
     }
@@ -415,10 +353,12 @@ export function useThumbnailExtractor(
     return new Promise<ThumbnailResult | null>((resolve) => {
       const request: PendingRequest = { time: timeSeconds, resolve };
       hoverQueueRef.current.push(request);
+      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, bucket=${bucket} → QUEUED (queue=${hoverQueueRef.current.length})`);
 
       setTimeout(() => {
         const idx = hoverQueueRef.current.indexOf(request);
         if (idx >= 0) {
+          console.warn(`[GET] time=${timeSeconds.toFixed(1)}s → TIMEOUT (5s)`);
           hoverQueueRef.current.splice(idx, 1);
           resolve(null);
         }
