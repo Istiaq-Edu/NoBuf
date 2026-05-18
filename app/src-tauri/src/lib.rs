@@ -144,15 +144,17 @@ pub fn run() {
 
             // Initialize stream cache manager
             let cache_dir = std::env::temp_dir().join("telegram-drive-cache");
-            match stream_cache::StreamCacheManager::new(cache_dir) {
+            let cache_mgr = match stream_cache::StreamCacheManager::new(cache_dir) {
                 Ok(cache_mgr) => {
                     app.manage(cache_mgr.clone());
                     log::info!("Stream cache initialized at {:?}", cache_mgr.cache_dir());
+                    Some(cache_mgr)
                 }
                 Err(e) => {
                     log::error!("Failed to initialize stream cache: {}", e);
+                    None
                 }
-            }
+            };
 
             // Start Streaming Server on dedicated thread
             let state = Arc::new(app.state::<TelegramState>().inner().clone());
@@ -161,7 +163,7 @@ pub fn run() {
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_server(state, STREAM_PORT, token_for_server, None, 0).await {
+                    match server::start_server(state, STREAM_PORT, token_for_server, cache_mgr, 0).await {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap() = Some(streaming_server.handle());

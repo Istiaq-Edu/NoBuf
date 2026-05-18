@@ -7,6 +7,8 @@ use grammers_client::types::Media;
 use grammers_tl_types as tl;
 
 use std::sync::Arc;
+use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges};
+use std::io::{Write, Seek, SeekFrom};
 
 /// Holds the per-session streaming token for Actix validation
 pub(crate) struct StreamTokenData {
@@ -137,7 +139,7 @@ async fn resolve_media_from_path(
     Ok((media, size))
 }
 
-fn mime_type_from_media(media: &Media) -> String {
+pub fn mime_type_from_media(media: &Media) -> String {
     match media {
         Media::Document(d) => {
             d.mime_type().unwrap_or("application/octet-stream").to_string()
@@ -181,6 +183,7 @@ async fn stream_media(
     query: web::Query<StreamQuery>,
     data: web::Data<Arc<TelegramState>>,
     token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
 ) -> impl Responder {
     let (folder_id_str, message_id) = path.into_inner();
     log::debug!("Stream request: Received request for message {} in folder '{}'", message_id, folder_id_str);
@@ -192,6 +195,35 @@ async fn stream_media(
 
     let mime = mime_type_from_media(&media);
     log::debug!("Stream request: Starting download for msg {} (mime: {}, size: {})", message_id, mime, size);
+
+    // Set up cache file if cache manager is available
+    let mut cache_setup: Option<(std::fs::File, StreamCacheManager, i32, i64, String, String)> =
+        if let Some(ref cache_mgr) = **cache {
+            let data_path = cache_mgr.data_path(message_id);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&data_path)
+            {
+                Ok(f) => Some((
+                    f,
+                    cache_mgr.clone(),
+                    message_id,
+                    folder_id_str.parse::<i64>().unwrap_or(0),
+                    match &media {
+                        Media::Document(d) => d.name().to_string(),
+                        _ => format!("{}.mp4", message_id),
+                    },
+                    mime.clone(),
+                )),
+                Err(e) => {
+                    log::warn!("Failed to open cache file for {}: {}", message_id, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Parse Range header if present
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
@@ -235,6 +267,7 @@ async fn stream_media(
         let mut bytes_sent: u64 = 0;
         let mut first_chunk = true;
         let mut iter = download_iter;
+        let mut current_offset = start_byte;
 
         while let Some(chunk) = iter.next().await.transpose() {
             match chunk {
@@ -253,15 +286,40 @@ async fn stream_media(
                         first_chunk = false;
                     }
 
-                    if data.len() as u64 > remaining {
-                        // Only send the remaining bytes
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(data[..remaining as usize].to_vec()));
-                        bytes_sent += remaining;
-                        break;
+                    let is_last = data.len() as u64 > remaining;
+                    let final_data = if is_last {
+                        data[..remaining as usize].to_vec()
+                    } else {
+                        data
+                    };
+
+                    let bytes_in_chunk = final_data.len() as u64;
+
+                    // Write to disk cache if available
+                    if let Some((ref mut cache_file, ref cache_mgr, mid, fid, ref fname, ref mime)) = cache_setup {
+                        let _ = cache_file.seek(SeekFrom::Start(current_offset));
+                        let _ = cache_file.write_all(&final_data);
+
+                        let mut meta = cache_mgr.load_meta(mid).unwrap_or_else(|| CacheMeta {
+                            message_id: mid,
+                            folder_id: fid,
+                            total_size: size,
+                            filename: fname.clone(),
+                            cached_ranges: Vec::new(),
+                            mime_type: mime.clone(),
+                        });
+                        meta.cached_ranges.push((current_offset, current_offset + bytes_in_chunk - 1));
+                        merge_ranges(&mut meta.cached_ranges);
+                        let _ = cache_mgr.save_meta(&meta);
                     }
 
-                    bytes_sent += data.len() as u64;
-                    yield Ok::<_, actix_web::Error>(web::Bytes::from(data));
+                    current_offset += bytes_in_chunk;
+                    bytes_sent += bytes_in_chunk;
+                    yield Ok::<_, actix_web::Error>(web::Bytes::from(final_data));
+
+                    if is_last {
+                        break;
+                    }
                 }
                 Err(e) => {
                     log::error!("Stream error for msg {}: {}", message_id, e);
@@ -293,9 +351,11 @@ pub async fn start_streaming_server(
     port: u16,
     tg_state: Arc<TelegramState>,
     token: String,
+    cache_mgr: Option<StreamCacheManager>,
 ) -> std::io::Result<actix_web::dev::Server> {
     let token_data = web::Data::new(StreamTokenData { token });
     let tg_data = web::Data::new(tg_state);
+    let cache_data = web::Data::new(cache_mgr);
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
@@ -309,6 +369,7 @@ pub async fn start_streaming_server(
             .wrap(cors)
             .app_data(token_data.clone())
             .app_data(tg_data.clone())
+            .app_data(cache_data.clone())
             .service(stream_media)
             .service(stream_media_head)
             .configure(hls::configure_hls)
@@ -325,8 +386,8 @@ pub async fn start_server(
     tg_state: Arc<TelegramState>,
     port: u16,
     token: String,
-    _api_key: Option<String>,
+    cache_mgr: Option<StreamCacheManager>,
     _api_port: u16,
 ) -> std::io::Result<actix_web::dev::Server> {
-    start_streaming_server(port, tg_state, token).await
+    start_streaming_server(port, tg_state, token, cache_mgr).await
 }
