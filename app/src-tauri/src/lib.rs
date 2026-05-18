@@ -210,6 +210,10 @@ pub fn run() {
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
             commands::cmd_generate_sprite_sheet,
+            commands::cmd_get_cache_status,
+            commands::cmd_delete_cache,
+            commands::cmd_start_background_cache,
+            commands::cmd_stop_background_cache,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
