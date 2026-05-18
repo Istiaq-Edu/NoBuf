@@ -141,8 +141,20 @@ pub fn run() {
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
-            
-            // Start Streaming Server on dedicated thread (Actix needs its own runtime)
+
+            // Initialize stream cache manager
+            let cache_dir = std::env::temp_dir().join("telegram-drive-cache");
+            match stream_cache::StreamCacheManager::new(cache_dir) {
+                Ok(cache_mgr) => {
+                    app.manage(cache_mgr.clone());
+                    log::info!("Stream cache initialized at {:?}", cache_mgr.cache_dir());
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize stream cache: {}", e);
+                }
+            }
+
+            // Start Streaming Server on dedicated thread
             let state = Arc::new(app.state::<TelegramState>().inner().clone());
             let token_for_server = stream_token.clone();
             let handle_for_thread = server_handle_for_setup.clone();
@@ -226,6 +238,14 @@ pub fn run() {
             if let Some(handle) = api_handle {
                 log::info!("Stopping API server...");
                 drop(handle.stop(true));
+            }
+
+            // 4. Clear stream cache
+            if let Some(cache_mgr) = app_handle.try_state::<stream_cache::StreamCacheManager>() {
+                log::info!("Clearing stream cache...");
+                if let Err(e) = cache_mgr.clear_all() {
+                    log::error!("Failed to clear stream cache: {}", e);
+                }
             }
         }
     });
