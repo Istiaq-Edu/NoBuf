@@ -6,6 +6,11 @@ use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
+use crate::stream_cache::{self, StreamCacheManager};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Chunk size for downloads (512 KB) — matches server.rs
+const DOWNLOAD_CHUNK_SIZE: i32 = 512 * 1024;
 
 #[tauri::command]
 pub async fn cmd_create_folder(
@@ -321,6 +326,7 @@ pub async fn cmd_download_file(
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
+    cache_state: State<'_, StreamCacheManager>,
 ) -> Result<String, String> {
     let tid = transfer_id.unwrap_or_default();
 
@@ -360,6 +366,140 @@ pub async fn cmd_download_file(
         });
     }
 
+    // === CACHE-AWARE DOWNLOAD ===
+    let cache_meta = cache_state.load_meta(message_id);
+    let cache_path = cache_state.data_path(message_id);
+
+    if let Some(ref meta) = cache_meta {
+        if meta.is_complete() {
+            // FULL CACHE HIT: Copy cache file to save path
+            log::info!("Download {} fully cached, copying to save path", message_id);
+            std::fs::copy(&cache_path, &save_path)
+                .map_err(|e| format!("Failed to copy cached file: {}", e))?;
+
+            bw_state.add_down(total_size);
+
+            if !tid.is_empty() {
+                let _ = app_handle.emit("download-progress", ProgressPayload {
+                    id: tid.clone(), percent: 100, uploaded_bytes: total_size, total_bytes: total_size, speed_bytes_per_sec: 0,
+                });
+            }
+
+            return Ok("Downloaded from cache".to_string());
+        }
+
+        // PARTIAL CACHE HIT
+        log::info!("Download {} partially cached ({}%), using cache + Telegram",
+                   message_id, meta.cached_percentage());
+
+        let mut output_file = std::fs::File::create(&save_path)
+            .map_err(|e| format!("Failed to create output file: {}", e))?;
+
+        // Write cached ranges to output file
+        for &(range_start, range_end) in &meta.cached_ranges {
+            let range_len = range_end - range_start + 1;
+            let mut cache_file = std::fs::File::open(&cache_path)
+                .map_err(|e| format!("Failed to open cache file: {}", e))?;
+
+            cache_file.seek(SeekFrom::Start(range_start))
+                .map_err(|e| format!("Cache seek error: {}", e))?;
+            output_file.seek(SeekFrom::Start(range_start))
+                .map_err(|e| format!("Output seek error: {}", e))?;
+
+            let mut remaining = range_len;
+            let mut buf = vec![0u8; 512 * 1024]; // 512KB buffer
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len() as u64) as usize;
+                let n = cache_file.read(&mut buf[..to_read])
+                    .map_err(|e| format!("Cache read error: {}", e))?;
+                if n == 0 { break; }
+                output_file.write_all(&buf[..n])
+                    .map_err(|e| format!("Write error: {}", e))?;
+                remaining -= n as u64;
+            }
+        }
+
+        // Download gaps from Telegram
+        let gaps = stream_cache::find_gaps(&meta.cached_ranges, total_size);
+        let mut bytes_written: u64 = meta.cached_bytes();
+        let mut last_emit_time = std::time::Instant::now();
+        let mut last_emit_bytes: u64 = 0;
+
+        for (gap_start, gap_end) in gaps {
+            // Check cancellation
+            if state.cancelled_transfers.read().await.contains(&tid) {
+                state.cancelled_transfers.write().await.remove(&tid);
+                drop(output_file);
+                cleanup_partial_file(&save_path);
+                return Err("Transfer cancelled".to_string());
+            }
+
+            let skip_chunks = gap_start / DOWNLOAD_CHUNK_SIZE as u64;
+            let skip_bytes = gap_start % DOWNLOAD_CHUNK_SIZE as u64;
+
+            let mut iter = client.iter_download(&media)
+                .chunk_size(DOWNLOAD_CHUNK_SIZE)
+                .skip_chunks(skip_chunks as i32);
+
+            output_file.seek(SeekFrom::Start(gap_start))
+                .map_err(|e| format!("Seek error: {}", e))?;
+            let mut offset = gap_start;
+
+            while let Some(chunk) = iter.next().await.transpose() {
+                // Check cancellation
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    state.cancelled_transfers.write().await.remove(&tid);
+                    drop(output_file);
+                    cleanup_partial_file(&save_path);
+                    return Err("Transfer cancelled".to_string());
+                }
+
+                let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+                let chunk_slice = if offset == gap_start && skip_bytes > 0 {
+                    &chunk[skip_bytes as usize..]
+                } else {
+                    &chunk
+                };
+
+                let to_write = chunk_slice.len().min((gap_end + 1 - offset) as usize);
+                output_file.write_all(&chunk_slice[..to_write])
+                    .map_err(|e| format!("Write error: {}", e))?;
+
+                offset += to_write as u64;
+                bytes_written = offset.max(bytes_written);
+
+                // Time-based progress emission
+                if !tid.is_empty() {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(last_emit_time).as_secs_f64();
+                    if dt >= 0.25 || offset > gap_end {
+                        let speed = if dt > 0.0 { ((bytes_written - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
+                        let percent = if total_size > 0 { ((bytes_written as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
+                        let _ = app_handle.emit("download-progress", ProgressPayload {
+                            id: tid.clone(), percent, uploaded_bytes: bytes_written, total_bytes: total_size, speed_bytes_per_sec: speed,
+                        });
+                        last_emit_time = now;
+                        last_emit_bytes = bytes_written;
+                    }
+                }
+
+                if offset > gap_end { break; }
+            }
+        }
+
+        bw_state.add_down(total_size);
+
+        // Emit completion
+        if !tid.is_empty() {
+            let _ = app_handle.emit("download-progress", ProgressPayload {
+                id: tid.clone(), percent: 100, uploaded_bytes: total_size, total_bytes: total_size, speed_bytes_per_sec: 0,
+            });
+        }
+
+        return Ok("Downloaded with cache assist".to_string());
+    }
+
+    // No cache available — fall through to standard download
     // Stream download with per-chunk progress
     let mut download_iter = client.iter_download(&media);
     let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
