@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { TelegramFile } from '../types';
 import { SourceBufferWrapper } from '../lib/faststream/players/SourceBufferWrapper';
 
 /**
@@ -67,13 +69,15 @@ interface MSEState {
   bitrate: number;
   videoTracks: MP4BoxTrack[];
   audioTracks: MP4BoxTrack[];
+  videoTrackId: number;
+  audioTrackId: number;
   initialized: boolean;
   downloading: boolean;
   currentOffset: number;
   pendingSeek: number;
 }
 
-export function useMSEPlayer(streamUrl: string | null) {
+export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null, activeFolderId: number | null) {
   const [mseUrl, setMseUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [useNative, setUseNative] = useState(false); // Fallback flag
@@ -89,6 +93,10 @@ export function useMSEPlayer(streamUrl: string | null) {
   const abortRef = useRef<AbortController | null>(null);
   const loopGeneration = useRef(0); // Prevents stale loops from running after seek
   const chunksAfterSeek = useRef(0); // For progressive chunk sizing
+  const pendingRangesRef = useRef<[number, number][]>([]); // Accumulated ranges to report
+  const rangeReportTimer = useRef<number | null>(null); // Debounce timer for range reporting
+  // Cached init segments (codec config) — re-appended after each SourceBuffer clear
+  const initSegmentsRef = useRef<Array<{ id: number; buffer: ArrayBuffer }>>([]);
   const state = useRef<MSEState>({
     mediaSource: null,
     videoSourceBuffer: null,
@@ -99,6 +107,8 @@ export function useMSEPlayer(streamUrl: string | null) {
     bitrate: 1000000,
     videoTracks: [],
     audioTracks: [],
+    videoTrackId: -1,
+    audioTrackId: -1,
     initialized: false,
     downloading: false,
     currentOffset: 0,
@@ -109,6 +119,58 @@ export function useMSEPlayer(streamUrl: string | null) {
   const lastThrottleRef = useRef(0); // For throttling state updates
   const prevUrlRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
+
+  // Debounced range reporter — accumulates fetched byte ranges and
+  // reports them to the Rust backend every 2 seconds (or on completion)
+  const reportRangesToBackend = useCallback((start: number, end: number) => {
+    if (!file || activeFolderId === null) return;
+    pendingRangesRef.current.push([start, end]);
+
+    // Debounce: send accumulated ranges every 2s
+    if (rangeReportTimer.current === null) {
+      rangeReportTimer.current = window.setTimeout(() => {
+        const ranges = [...pendingRangesRef.current];
+        pendingRangesRef.current = [];
+        rangeReportTimer.current = null;
+
+        if (ranges.length > 0 && state.current.fileLength > 0) {
+          invoke('cmd_report_cached_ranges', {
+            messageId: file.id,
+            folderId: activeFolderId,
+            totalSize: state.current.fileLength,
+            filename: file.name,
+            mimeType: 'video/mp4',
+            ranges,
+          }).catch((e) => {
+            console.warn('[MSE] Failed to report cached ranges:', e);
+          });
+        }
+      }, 2000);
+    }
+  }, [file, activeFolderId]);
+
+  // Flush remaining ranges on unmount or completion
+  const flushRangeReport = useCallback(() => {
+    if (rangeReportTimer.current !== null) {
+      window.clearTimeout(rangeReportTimer.current);
+      rangeReportTimer.current = null;
+    }
+    const ranges = [...pendingRangesRef.current];
+    pendingRangesRef.current = [];
+
+    if (ranges.length > 0 && file && activeFolderId !== null && state.current.fileLength > 0) {
+      invoke('cmd_report_cached_ranges', {
+        messageId: file.id,
+        folderId: activeFolderId,
+        totalSize: state.current.fileLength,
+        filename: file.name,
+        mimeType: 'video/mp4',
+        ranges,
+      }).catch((e) => {
+        console.warn('[MSE] Failed to flush cached ranges:', e);
+      });
+    }
+  }, [file, activeFolderId]);
 
   // Initialize MSE when streamUrl changes
   useEffect(() => {
@@ -133,12 +195,15 @@ export function useMSEPlayer(streamUrl: string | null) {
       bitrate: 1000000,
       videoTracks: [],
       audioTracks: [],
+      videoTrackId: -1,
+      audioTrackId: -1,
       initialized: false,
       downloading: false,
       currentOffset: 0,
       pendingSeek: -1,
     };
     speedHistory.current = [];
+    initSegmentsRef.current = [];
     setPrefetchedBytes(0);
     setTotalBytes(0);
     setIsPrefetching(false);
@@ -181,12 +246,14 @@ export function useMSEPlayer(streamUrl: string | null) {
 
     return () => {
       cancelledRef.current = true;
+      // Flush remaining range reports before cleanup
+      flushRangeReport();
       // Revoke blob URL on cleanup
       if (blobUrl) {
         URL.revokeObjectURL(blobUrl);
       }
     };
-  }, [streamUrl]);
+  }, [streamUrl, flushRangeReport]);
 
   const cleanup = () => {
     abortRef.current?.abort();
@@ -310,6 +377,9 @@ export function useMSEPlayer(streamUrl: string | null) {
       state.current.currentOffset = firstChunkSize;
       setPrefetchedBytes(firstChunkSize);
 
+      // Report initial chunk range to cache backend
+      reportRangesToBackend(0, firstChunkSize - 1);
+
       // If onReady hasn't fired yet, keep fetching more data (moov may be beyond 1MB)
       if (!state.current.initialized && state.current.fileLength > 0) {
         await fetchMoreData(url, mp4box);
@@ -350,6 +420,7 @@ export function useMSEPlayer(streamUrl: string | null) {
 
         state.current.currentOffset = offset + data.byteLength;
         setPrefetchedBytes(state.current.currentOffset);
+        reportRangesToBackend(offset, offset + data.byteLength - 1);
       } catch (e) {
         console.error('[MSE] fetchMoreData error:', e);
         break;
@@ -428,6 +499,8 @@ export function useMSEPlayer(streamUrl: string | null) {
       // Track IDs for mapping segments
       const videoTrackId = state.current.videoTracks.length > 0 ? state.current.videoTracks[0].id : -1;
       const audioTrackId = state.current.audioTracks.length > 0 ? state.current.audioTracks[0].id : -1;
+      state.current.videoTrackId = videoTrackId;
+      state.current.audioTrackId = audioTrackId;
 
       // Set up mp4box segmentation — pass user objects so onSegment/initSegs can identify tracks
       if (videoTrackId >= 0) {
@@ -440,6 +513,11 @@ export function useMSEPlayer(streamUrl: string | null) {
       // Get and append init segment
       const initSegs = mp4box.initializeSegmentation();
       if (initSegs && initSegs.length > 0) {
+        // Cache for re-append after seek clears buffers
+        initSegmentsRef.current = initSegs.map(s => ({
+          id: s.id,
+          buffer: s.buffer.slice(0), // Clone since buffer may be transferred
+        }));
         for (const seg of initSegs) {
           const isVideo = seg.id === videoTrackId;
           const isAudio = seg.id === audioTrackId;
@@ -495,33 +573,44 @@ export function useMSEPlayer(streamUrl: string | null) {
 
     while (!cancelledRef.current && state.current.downloading && gen === loopGeneration.current &&
            state.current.currentOffset < state.current.fileLength) {
-      // Check for pending seek
+      // Check for pending seek (set by seekTo when user clicks progress bar
+      // on an unbuffered position)
       if (state.current.pendingSeek >= 0) {
         const seekByte = state.current.pendingSeek;
-        const seekTime = state.current.bitrate > 0 ? seekByte / state.current.bitrate : 0;
+        const seekTime = (seekByte / state.current.fileLength) * state.current.duration;
         state.current.pendingSeek = -1;
 
-        // Use mp4box.seek() to find the actual sync sample position
-        state.current.mp4box!.flush();
-        const seekInfo = state.current.mp4box!.seek(seekTime, true);
+        console.log(`[MSE-SEEK] Processing seek to ${seekTime.toFixed(1)}s, clearing buffers...`);
 
-        // The seek returns the byte offset of the sync sample
-        const syncOffset = seekInfo && typeof seekInfo === 'object' && 'offset' in seekInfo
-          ? (seekInfo as any).offset
-          : seekByte;
-
-        // Jump to the sync sample's byte position
-        state.current.currentOffset = syncOffset;
-
-        // Adjust video currentTime to match
-        const syncTime = seekInfo && typeof seekInfo === 'object' && 'sync_sample_time' in seekInfo
-          ? (seekInfo as any).sync_sample_time
-          : seekTime;
-        if (videoRef.current) {
-          videoRef.current.currentTime = syncTime;
+        // 1. Clear old buffered data from SourceBuffers (fire-and-forget —
+        //    SourceBufferWrapper queues operations, so subsequent appends
+        //    will be serialized after the clear completes).
+        if (state.current.videoSourceBuffer) {
+          state.current.videoSourceBuffer.resetForSeek();
+        }
+        if (state.current.audioSourceBuffer) {
+          state.current.audioSourceBuffer.resetForSeek();
         }
 
-        console.log(`[MSE-SEEK] Seek to ${seekTime.toFixed(1)}s → sync at byte ${formatBytes(syncOffset)} (${syncTime.toFixed(1)}s)`);
+        // 2. Seek mp4box BEFORE flushing (sample table is intact).
+        //    This returns the exact byte offset of the sync sample nearest
+        //    to the target time — much more accurate than the ratio guess.
+        const seekInfo = state.current.mp4box!.seek(seekTime, true) as any;
+        state.current.mp4box!.flush();
+
+        // Use mp4box's exact sync-sample offset, falling back to ratio
+        const syncOffset = (seekInfo && typeof seekInfo.offset === 'number')
+          ? seekInfo.offset
+          : seekByte;
+        state.current.currentOffset = syncOffset;
+        chunksAfterSeek.current = 1; // Skip 512KB, start at 1MB
+
+        // Update video currentTime so the progress bar reflects the seek
+        if (videoRef.current) {
+          videoRef.current.currentTime = seekTime;
+        }
+
+        console.log(`[MSE-SEEK] Done — downloading from byte ${formatBytes(syncOffset)} (seek target: ${seekTime.toFixed(1)}s)`);
       }
 
       const offset = state.current.currentOffset;
@@ -571,6 +660,14 @@ export function useMSEPlayer(streamUrl: string | null) {
         // Update tracking
         state.current.currentOffset = offset + data.byteLength;
 
+        // Log first 3 chunks after each seek to confirm download is flowing
+        if (chunksAfterSeek.current <= 3) {
+          console.log(`[MSE-LOOP] Chunk #${chunksAfterSeek.current}: ${formatBytes(offset)}-${formatBytes(offset + data.byteLength - 1)} (${formatBytes(data.byteLength)}) → total ${formatBytes(state.current.currentOffset)}`);
+        }
+
+        // Report this range to cache backend
+        reportRangesToBackend(offset, offset + data.byteLength - 1);
+
         // Throttle React state updates to every 250ms
         const now = Date.now();
         if (now - lastThrottleRef.current > 250) {
@@ -594,7 +691,16 @@ export function useMSEPlayer(streamUrl: string | null) {
         }
       } catch (e: any) {
         if (cancelledRef.current) break;
-        if (e.name === 'AbortError') break; // Seek cancelled this fetch
+        if (e.name === 'AbortError') {
+          // Abort was triggered by seekTo() — check if there's a pending seek
+          // to jump to, and if so keep the loop running to process it
+          if (state.current.pendingSeek >= 0) {
+            console.log(`[MSE-LOOP] AbortError with pending seek → continuing loop to process`);
+            continue; // Loop will process pendingSeek on next iteration
+          }
+          console.log(`[MSE-LOOP] AbortError without pending seek → stopping`);
+          break; // Abort without pending seek = intentional stop
+        }
         console.error('[MSE] Download error:', e);
         await new Promise(r => setTimeout(r, 1000));
       }
@@ -605,6 +711,8 @@ export function useMSEPlayer(streamUrl: string | null) {
     // Only set isComplete if we reached the end (not interrupted by seek)
     const reachedEnd = state.current.currentOffset >= state.current.fileLength;
     if (!cancelledRef.current) {
+      // Flush any remaining range reports
+      flushRangeReport();
       if (reachedEnd) {
         setIsComplete(true);
       }
@@ -614,39 +722,41 @@ export function useMSEPlayer(streamUrl: string | null) {
   };
   downloadLoopRef.current = downloadLoop;
 
-  // Direct seek function — bypasses currentTime observer for MSE unbuffered seeking
+  // Direct seek function — avoids hard-restarting the download loop.
+  // For already-buffered positions: just set currentTime, no download restart.
+  // For unbuffered positions: jump byte offset and let the running loop continue naturally.
   const seekTo = useCallback((timeSeconds: number) => {
     if (!state.current.initialized || !streamUrl || useNative) return;
-    if (state.current.fileLength <= 0 || state.current.bitrate <= 0) return;
-    if (!isFinite(timeSeconds) || timeSeconds < 0) return;
+    if (state.current.fileLength <= 0 || !isFinite(timeSeconds) || timeSeconds < 0) return;
 
-    const seekByte = Math.floor((timeSeconds / state.current.duration) * state.current.fileLength);
-    const seekStart = Date.now();
-    console.log(`[MSE-SEEK] seekTo(${timeSeconds.toFixed(1)}s) → byte ${formatBytes(seekByte)} [gen=${loopGeneration.current + 1}]`);
-    state.current.pendingSeek = seekByte;
-    state.current.downloading = false;
-    loopGeneration.current++; // Invalidate any running download loop
-    chunksAfterSeek.current = 0; // Reset progressive chunk sizing
-
-    // Set currentTime immediately — progress bar jumps to new position right away
-    if (videoRef.current) {
-      videoRef.current.currentTime = timeSeconds;
-      console.log(`[MSE-SEEK] currentTime set to ${timeSeconds.toFixed(1)}s, readyState=${videoRef.current.readyState}`);
+    // 1. Check if the target position is already buffered in the SourceBuffer
+    if (videoRef.current && videoRef.current.buffered.length > 0) {
+      for (let i = 0; i < videoRef.current.buffered.length; i++) {
+        if (timeSeconds >= videoRef.current.buffered.start(i) &&
+            timeSeconds <= videoRef.current.buffered.end(i)) {
+          // Already buffered — just set currentTime, browser seeks within buffer
+          videoRef.current.currentTime = timeSeconds;
+          return;
+        }
+      }
     }
 
-    // Cancel any in-flight fetch so the loop exits immediately
-    abortRef.current?.abort();
-    abortRef.current = null;
+    // 2. Position is NOT buffered — jump the download to the new byte offset
+    const seekByte = Math.floor((timeSeconds / state.current.duration) * state.current.fileLength);
+    state.current.pendingSeek = seekByte;
+    chunksAfterSeek.current = 0;
     setIsComplete(false);
-    setIsPrefetching(true);
 
-    // Restart download loop immediately — fetch was aborted above
-    setTimeout(() => {
-      if (!cancelledRef.current && downloadLoopRef.current && streamUrl) {
-        console.log(`[MSE-SEEK] Restarting download loop after ${Date.now() - seekStart}ms`);
-        downloadLoopRef.current(streamUrl);
-      }
-    }, 50);
+    // Abort the in-flight fetch so the download loop processes the pending seek
+    abortRef.current?.abort();
+
+    // If the download loop isn't running (e.g., it was paused or completed),
+    // restart it. Otherwise the running loop will pick up the pendingSeek.
+    if (!state.current.downloading && downloadLoopRef.current) {
+      state.current.downloading = true;
+      setIsPrefetching(true);
+      downloadLoopRef.current(streamUrl);
+    }
   }, [streamUrl, useNative]);
 
   const pausePrefetch = () => {

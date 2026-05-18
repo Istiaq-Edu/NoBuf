@@ -188,6 +188,24 @@ pub fn find_gaps(cached_ranges: &[(u64, u64)], total_size: u64) -> Vec<(u64, u64
     gaps
 }
 
+/// Check if a byte range is fully covered by the union of cached_ranges.
+/// Works by checking that every byte in [range_start, range_end] is covered
+/// by at least one cached range. Since ranges are sorted and merged, we can
+/// walk through them to verify coverage.
+pub fn is_range_cached(cached_ranges: &[(u64, u64)], range_start: u64, range_end: u64) -> bool {
+    let mut covered_start = range_start;
+    for &(start, end) in cached_ranges {
+        if start > covered_start {
+            return false; // Gap found
+        }
+        covered_start = end.max(covered_start) + 1;
+        if covered_start > range_end {
+            return true; // Fully covered
+        }
+    }
+    covered_start > range_end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +288,49 @@ mod tests {
         };
         assert_eq!(meta.cached_percentage(), 100);
         assert!(meta.is_complete());
+    }
+
+    #[test]
+    fn test_is_range_cached_fully_covered() {
+        // Single range covers a subrange
+        let ranges = vec![(0, 499)];
+        assert!(is_range_cached(&ranges, 100, 200));
+        assert!(is_range_cached(&ranges, 0, 499));
+
+        // Adjacent ranges merged into one — covers full span
+        let merged = vec![(0, 999)];
+        assert!(is_range_cached(&merged, 0, 999));
+
+        // Multiple ranges covering full span
+        let multi = vec![(0, 100), (101, 499)];
+        assert!(is_range_cached(&multi, 0, 499));
+        assert!(is_range_cached(&multi, 50, 300));
+    }
+
+    #[test]
+    fn test_is_range_cached_not_covered() {
+        let ranges = vec![(0, 499)];
+        assert!(!is_range_cached(&ranges, 500, 999));
+    }
+
+    #[test]
+    fn test_is_range_cached_partially_covered() {
+        let ranges = vec![(0, 499)];
+        // Range spans cached and uncached — not fully covered
+        assert!(!is_range_cached(&ranges, 400, 600));
+    }
+
+    #[test]
+    fn test_is_range_cached_multi_range_gap() {
+        // Two ranges with a gap in between — request across gap fails
+        let ranges = vec![(0, 100), (200, 499)];
+        assert!(!is_range_cached(&ranges, 0, 499)); // gap at 101-199
+        assert!(is_range_cached(&ranges, 0, 100)); // fully in first range
+        assert!(is_range_cached(&ranges, 200, 499)); // fully in second range
+    }
+
+    #[test]
+    fn test_is_range_cached_empty() {
+        assert!(!is_range_cached(&[], 0, 999));
     }
 }

@@ -43,6 +43,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId }: M
             onClose={onClose}
             onNext={onNext}
             onPrev={onPrev}
+            activeFolderId={activeFolderId}
         />
     );
 }

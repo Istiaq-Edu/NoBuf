@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
+import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
+import { useConfirm } from '../../context/ConfirmContext';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -9,14 +14,16 @@ interface FastStreamPlayerProps {
   onClose: () => void;
   onNext?: () => void;
   onPrev?: () => void;
+  activeFolderId: number | null;
 }
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
+  const { confirm } = useConfirm();
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -31,6 +38,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
+
+  // Cache status for download button indicator
+  const [cachePercent, setCachePercent] = useState(0);
+  const [cacheComplete, setCacheComplete] = useState(false);
+
+  // Download overlay state
+  const [dlOverlay, setDlOverlay] = useState<{ active: boolean; percent: number; fromCache: boolean; speed: number } | null>(null);
+  const dlTransferIdRef = useRef<string>('');
 
   // MSE player with native fallback
   const {
@@ -47,7 +62,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     resumePrefetch,
     seekTo,
     setVideoRef,
-  } = useMSEPlayer(streamUrl);
+  } = useMSEPlayer(streamUrl, file, activeFolderId);
 
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
@@ -57,6 +72,105 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
+
+  // Close handler — check cache status and offer to continue in background
+  const handleClose = useCallback(async () => {
+    try {
+      const cacheStatus = await invoke<any>('cmd_get_cache_status', {
+        messageId: file.id,
+      });
+
+      if (cacheStatus && cacheStatus.percentage > 0 && !cacheStatus.is_complete) {
+        const choice = await confirm({
+          title: 'Video partially cached',
+          message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
+          confirmText: 'Continue in Background',
+          cancelText: 'Close & Discard Cache',
+        });
+
+        if (choice) {
+          await invoke('cmd_start_background_cache', {
+            messageId: file.id,
+            folderId: activeFolderId ?? 0,
+          });
+          toast.success('Video caching in background');
+        } else {
+          // Discard cache for this video
+          await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
+        }
+      }
+    } catch {
+      // No cache or error — just close
+    }
+    onClose();
+  }, [file.id, activeFolderId, confirm, onClose]);
+
+  // Poll cache status every 5 seconds while playing
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      while (active) {
+        try {
+          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+          if (status) {
+            setCachePercent(status.percentage);
+            setCacheComplete(status.is_complete);
+          }
+        } catch { /* ignore */ }
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    };
+    poll();
+    return () => { active = false; };
+  }, [file.id]);
+
+  // Listen for download-progress events for our transferId
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    listen<any>('download-progress', (event) => {
+      if (event.payload.id === dlTransferIdRef.current) {
+        setDlOverlay({
+          active: true,
+          percent: event.payload.percent,
+          fromCache: cacheComplete,
+          speed: event.payload.speed_bytes_per_sec,
+        });
+        if (event.payload.percent >= 100) {
+          setTimeout(() => setDlOverlay(null), 3000);
+          dlTransferIdRef.current = '';
+        }
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [cacheComplete]);
+
+  // Download handler
+  const handleDownload = useCallback(async () => {
+    try {
+      const savePath = await save({ defaultPath: file.name });
+      if (!savePath) return;
+
+      const transferId = `dl-${file.id}-${Date.now()}`;
+      dlTransferIdRef.current = transferId;
+      setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
+
+      await invoke('cmd_download_file', {
+        messageId: file.id,
+        savePath,
+        folderId: activeFolderId,
+        transferId,
+      });
+
+      toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
+    } catch (e: any) {
+      const errMsg = String(e);
+      if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
+        toast.error(`Download failed: ${errMsg}`);
+      }
+      setDlOverlay(null);
+      dlTransferIdRef.current = '';
+    }
+  }, [file, activeFolderId, cacheComplete]);
 
 
   const fmt = (s: number) => {
@@ -276,7 +390,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
         case 'arrowdown': e.preventDefault(); setVol2(vol - 0.1); break;
         case 'm': e.preventDefault(); mute(); break;
         case 'f': e.preventDefault(); fs2(); break;
-        case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : onClose(); break;
+        case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : handleClose(); break;
         case 'j': e.preventDefault(); seek(-10); break;
         case 'l': e.preventDefault(); seek(10); break;
         case ',': e.preventDefault(); rate2(Math.max(0.25, rate - 0.25)); break;
@@ -287,7 +401,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
     };
     document.addEventListener('keydown', h);
     return () => document.removeEventListener('keydown', h);
-  }, [toggle, seek, setVol2, mute, fs2, onClose, onNext, onPrev, vol, rate, rate2, dur]);
+  }, [toggle, seek, setVol2, mute, fs2, handleClose, onNext, onPrev, vol, rate, rate2, dur]);
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
   const bufPct = dur > 0 ? (buf / dur) * 100 : 0;
@@ -300,7 +414,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
           <div className="text-center px-8">
             <div className="text-red-400 text-lg mb-2">{err}</div>
             <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
-            <button onClick={onClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
+            <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
           </div>
         ) : (
           <video ref={vidRef} className="max-w-full max-h-full" playsInline />
@@ -469,8 +583,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
                 </div>
               )}
             </div>
+            {/* Download */}
+            <button onClick={handleDownload} className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1" title="Download">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
+              {cachePercent > 0 && (
+                <span className="text-xs font-mono">
+                  {cacheComplete ? <span className="text-green-400">✓</span> : `${cachePercent}%`}
+                </span>
+              )}
+            </button>
             {/* Close */}
-            <button onClick={onClose} className="p-1.5 hover:bg-white/10 rounded text-white" title="Close (Esc)">
+            <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-white" title="Close (Esc)">
               <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
             {/* Fullscreen */}
@@ -501,6 +624,22 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev }: F
       <div className={`absolute top-3 left-3 right-3 text-white text-sm truncate transition-opacity duration-300 ${vis ? 'opacity-100' : 'opacity-0'}`} style={{ textShadow: '0 1px 3px rgba(0,0,0,0.5)' }}>
         {file.name}
       </div>
+
+      {/* Download overlay */}
+      {dlOverlay && dlOverlay.active && (
+        <div className="absolute bottom-16 left-4 right-4 flex items-center gap-2 pointer-events-none">
+          <div className="flex-1 bg-white/10 rounded-full h-2 overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-300 ${dlOverlay.fromCache ? 'bg-green-400' : 'bg-telegram-secondary'}`}
+              style={{ width: `${dlOverlay.percent}%` }}
+            />
+          </div>
+          <span className="text-white/80 text-xs font-mono whitespace-nowrap">
+            {dlOverlay.fromCache ? 'Cache' : dlOverlay.speed > 0 ? `${formatBytes(dlOverlay.speed)}/s` : ''}
+            {dlOverlay.percent}%
+          </span>
+        </div>
+      )}
 
       {/* Big play */}
       {!playing && !load && !err && (

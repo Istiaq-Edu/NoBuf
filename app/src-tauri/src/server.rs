@@ -7,7 +7,7 @@ use grammers_client::types::Media;
 use grammers_tl_types as tl;
 
 use std::sync::Arc;
-use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges};
+use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom};
 
 /// Holds the per-session streaming token for Actix validation
@@ -196,7 +196,8 @@ async fn stream_media(
     let mime = mime_type_from_media(&media);
     log::debug!("Stream request: Starting download for msg {} (mime: {}, size: {})", message_id, mime, size);
 
-    // Set up cache file if cache manager is available
+    // Set up cache file if cache manager is available — every range request
+    // caches its bytes independently (no write-lock needed, seek+write is atomic).
     let mut cache_setup: Option<(std::fs::File, StreamCacheManager, i32, i64, String, String)> =
         if let Some(ref cache_mgr) = **cache {
             let data_path = cache_mgr.data_path(message_id);
@@ -246,6 +247,49 @@ async fn stream_media(
     };
 
     let content_length = end_byte - start_byte + 1;
+
+    // FAST PATH: If the requested range is fully cached, serve from disk immediately
+    if let Some(ref cache_mgr) = **cache {
+        if let Some(meta) = cache_mgr.load_meta(message_id) {
+            if is_range_cached(&meta.cached_ranges, start_byte, end_byte) {
+                let cache_path = cache_mgr.data_path(message_id);
+                match (|| -> std::io::Result<Vec<u8>> {
+                    let mut file = std::fs::File::open(&cache_path)?;
+                    use std::io::Read;
+                    file.seek(SeekFrom::Start(start_byte))?;
+                    let mut buf = vec![0u8; (end_byte - start_byte + 1) as usize];
+                    file.read_exact(&mut buf)?;
+                    Ok(buf)
+                })() {
+                    Ok(slice) => {
+                        log::info!("Cache HIT for msg {} range {}-{} ({} bytes served from disk)",
+                            message_id, start_byte, end_byte, slice.len());
+
+                        let response = if is_partial {
+                            HttpResponse::PartialContent()
+                                .insert_header(("Content-Type", mime))
+                                .insert_header(("Content-Length", slice.len().to_string()))
+                                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
+                                .insert_header(("Accept-Ranges", "bytes"))
+                                .insert_header(("X-Cache", "HIT"))
+                                .body(slice)
+                        } else {
+                            HttpResponse::Ok()
+                                .insert_header(("Content-Type", mime))
+                                .insert_header(("Content-Length", slice.len().to_string()))
+                                .insert_header(("Accept-Ranges", "bytes"))
+                                .insert_header(("X-Cache", "HIT"))
+                                .body(slice)
+                        };
+                        return response;
+                    }
+                    Err(e) => {
+                        log::warn!("Cache read failed for msg {}, falling back to Telegram: {}", message_id, e);
+                    }
+                }
+            }
+        }
+    }
 
     let client_guard = { data.client.lock().await.clone() };
     let client = match client_guard {
