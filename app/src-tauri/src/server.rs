@@ -313,7 +313,12 @@ async fn stream_media(
         let mut iter = download_iter;
         let mut current_offset = start_byte;
 
-        while let Some(chunk) = iter.next().await.transpose() {
+        while let Some(chunk) = {
+            // Acquire the global semaphore before hitting Telegram's API —
+            // serializes with cmd_download_file to prevent FLOOD_WAIT
+            let _permit = data.download_semaphore.acquire().await.unwrap();
+            iter.next().await.transpose()
+        } {
             match chunk {
                 Ok(bytes) => {
                     let remaining = content_length - bytes_sent;

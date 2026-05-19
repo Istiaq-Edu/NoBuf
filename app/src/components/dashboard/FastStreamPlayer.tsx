@@ -178,7 +178,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
           setSuppressBackendReports(false);
-          resumePrefetch();
           setTimeout(() => setDlOverlay(null), 3000);
           dlTransferIdRef.current = '';
         }
@@ -187,12 +186,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => { unlisten?.(); };
   }, [cacheComplete, dur, totalBytes, file.id]);
 
-  // Download handler — pauses player prebuffer during download to avoid
-  // Telegram FLOOD_WAIT (the stream server and download command both hit
-  // Telegram's API, and interleaving at the Rust level requires major refactoring).
-  // Player can still play from its SourceBuffer; green bar shows both the player's
-  // static buffered region (downloadedTimeRanges) and the download's growing cache
-  // (cachedTimeRanges via cmd_get_cache_status polling).
+  // Download handler — player prebuffer and file download run simultaneously,
+  // interleaved at the Rust level via a Semaphore(1) that serializes all Telegram
+  // iter_download calls. Only one chunk request hits Telegram at a time → no FLOOD_WAIT.
+  // Green bar merges player's in-memory ranges (downloadedTimeRanges) and download's
+  // cache ranges (cachedTimeRanges from cmd_get_cache_status polling).
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
@@ -203,9 +201,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
 
-      // Pause player prebuffer and suppress cache reports — the download fills
-      // gaps linearly and updates cache meta per-chunk (protected by Mutex).
-      pausePrefetch();
+      // Suppress player's cache meta reports during download — download updates
+      // CacheMeta per-chunk instead (both protected by per-message Mutex in Rust).
       setSuppressBackendReports(true);
 
       await invoke('cmd_download_file', {
@@ -216,12 +213,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       });
 
       setSuppressBackendReports(false);
-      resumePrefetch();
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
       setSuppressBackendReports(false);
-      resumePrefetch();
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
@@ -230,17 +225,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     }
   }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
 
-  // Cancel download — resume player prebuffer
+  // Cancel download
   const handleCancelDownload = useCallback(async () => {
     if (!dlTransferIdRef.current) return;
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
     setSuppressBackendReports(false);
-    resumePrefetch();
     setDlOverlay(null);
     dlTransferIdRef.current = '';
-  }, [setSuppressBackendReports, resumePrefetch]);
+  }, [setSuppressBackendReports]);
 
 
   const fmt = (s: number) => {
