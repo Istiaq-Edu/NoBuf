@@ -242,8 +242,14 @@ async fn stream_media(
     let content_length = end_byte - start_byte + 1;
 
     // FAST PATH: if the requested range is fully cached, serve from disk immediately
+    // Acquire lock_meta before load_meta to prevent concurrent save_meta from
+    // truncating the file mid-read (which caused meta corruption in test round 4).
     if let Some(ref cache_mgr) = **cache {
-        if let Some(meta) = cache_mgr.load_meta(message_id) {
+        let _fast_lock = cache_mgr.lock_meta(message_id).await;
+        let fast_meta = cache_mgr.load_meta(message_id);
+        drop(_fast_lock); // Release immediately — meta data is in memory now
+
+        if let Some(meta) = fast_meta {
             if is_range_cached(&meta.cached_ranges, start_byte, end_byte) {
                 let cache_path = cache_mgr.data_path(message_id);
                 match (|| -> std::io::Result<Vec<u8>> {
