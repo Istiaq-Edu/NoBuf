@@ -456,7 +456,10 @@ pub async fn cmd_download_file(
             let mut offset = gap_start;
             let mut first_chunk = true;
 
-            while let Some(chunk_result) = iter.next().await.transpose() {
+            while let Some(chunk_result) = {
+                let _permit = state.download_semaphore.acquire().await.unwrap();
+                iter.next().await.transpose()
+            } {
                 if state.cancelled_transfers.read().await.contains(&tid) {
                     state.cancelled_transfers.write().await.remove(&tid);
                     drop(output_file);
@@ -565,7 +568,10 @@ pub async fn cmd_download_file(
     let mut last_emit_time = std::time::Instant::now();
     let mut last_emit_bytes: u64 = 0;
 
-    while let Some(chunk) = download_iter.next().await.transpose() {
+    while let Some(chunk) = {
+        let _permit = state.download_semaphore.acquire().await.unwrap();
+        download_iter.next().await.transpose()
+    } {
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&tid) {
             state.cancelled_transfers.write().await.remove(&tid);

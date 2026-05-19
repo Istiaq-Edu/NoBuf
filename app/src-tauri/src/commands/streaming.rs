@@ -259,7 +259,10 @@ async fn background_cache_download(
         let mut offset = gap_start;
         let mut first_chunk = true;
 
-        while let Ok(Some(chunk_result)) = iter.next().await {
+        while let Ok(Some(chunk_result)) = {
+            let _permit = state.download_semaphore.acquire().await.unwrap();
+            iter.next().await
+        } {
             // Check cancellation
             if state
                 .cancelled_transfers
