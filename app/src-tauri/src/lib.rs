@@ -107,7 +107,7 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let stream_token = generate_stream_token();
 
@@ -135,6 +135,7 @@ pub fn run() {
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+                partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
@@ -253,6 +254,20 @@ pub fn run() {
                     log::error!("Failed to clear stream cache: {}", e);
                 }
             }
+            // 5. Clean up partial download files
+            let state = app_handle.state::<TelegramState>();
+            let partials = state.partial_downloads.clone();
+            if let Ok(mut paths) = partials.try_lock() {
+                for path in paths.drain(..) {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            log::warn!("Failed to clean up partial download {}: {}", path, e);
+                        }
+                    } else {
+                        log::info!("Cleaned up partial download: {}", path);
+                    }
+                }
+            };
         }
     });
 }

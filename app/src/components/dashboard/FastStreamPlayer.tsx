@@ -39,9 +39,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [menu, setMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
-  // Cache status for download button indicator
   const [cachePercent, setCachePercent] = useState(0);
   const [cacheComplete, setCacheComplete] = useState(false);
+  // Time ranges from backend cache (includes both playback buffer + download)
+  const [cachedTimeRanges, setCachedTimeRanges] = useState<[number, number][]>([]);
 
   // Download overlay state
   const [dlOverlay, setDlOverlay] = useState<{ active: boolean; percent: number; fromCache: boolean; speed: number } | null>(null);
@@ -64,6 +65,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     setVideoRef,
     downloadedTimeRanges,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
+  // Debug: log player-tracked ranges changes
+  useEffect(() => {
+    if (downloadedTimeRanges.length > 0) {
+      console.log(`[GREEN-BAR] Player ranges updated: ${JSON.stringify(downloadedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
+    }
+  }, [downloadedTimeRanges, dur]);
+
+  // Debug: log cache ranges changes
+  useEffect(() => {
+    if (cachedTimeRanges.length > 0) {
+      console.log(`[GREEN-BAR] Cache ranges updated: ${JSON.stringify(cachedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
+    }
+  }, [cachedTimeRanges, dur]);
 
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
@@ -116,6 +130,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
+            if (status.cached_ranges && dur > 0 && status.total_bytes > 0) {
+              const ranges: [number, number][] = status.cached_ranges.map(
+                ([s, e]: [number, number]) => [
+                  (s / status.total_bytes) * dur,
+                  ((e + 1) / status.total_bytes) * dur,
+                ]
+              );
+              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
+              setCachedTimeRanges(ranges);
+            } else {
+              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${dur}, total=${status.total_bytes})`);
+            }
           }
         } catch { /* ignore */ }
         await new Promise(r => setTimeout(r, 5000));
@@ -128,7 +154,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // Listen for download-progress events for our transferId
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
-    listen<any>('download-progress', (event) => {
+    listen<any>('download-progress', async (event) => {
       if (event.payload.id === dlTransferIdRef.current) {
         setDlOverlay({
           active: true,
@@ -136,6 +162,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           fromCache: cacheComplete,
           speed: event.payload.speed_bytes_per_sec,
         });
+        try {
+          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+          if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
+            const ranges: [number, number][] = status.cached_ranges.map(
+              ([s, e]: [number, number]) => [
+                (s / status.total_bytes) * dur,
+                ((e + 1) / status.total_bytes) * dur,
+              ]
+            );
+            console.log(`[GREEN-BAR] DL-progress ${event.payload.percent}%: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))}`);
+            setCachedTimeRanges(ranges);
+          }
+        } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
           setTimeout(() => setDlOverlay(null), 3000);
           dlTransferIdRef.current = '';
@@ -143,7 +182,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       }
     }).then(fn => { unlisten = fn; });
     return () => { unlisten?.(); };
-  }, [cacheComplete]);
+  }, [cacheComplete, dur, totalBytes, file.id]);
 
   // Download handler
   const handleDownload = useCallback(async () => {
@@ -152,6 +191,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (!savePath) return;
 
       const transferId = `dl-${file.id}-${Date.now()}`;
+      console.log(`[GREEN-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
 
@@ -172,6 +212,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       dlTransferIdRef.current = '';
     }
   }, [file, activeFolderId, cacheComplete]);
+
+  // Cancel download
+  const handleCancelDownload = useCallback(async () => {
+    if (!dlTransferIdRef.current) return;
+    try {
+      await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
+    } catch { /* ignore */ }
+    setDlOverlay(null);
+    dlTransferIdRef.current = '';
+  }, []);
 
 
   const fmt = (s: number) => {
@@ -448,18 +498,33 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Downloaded (green) buffer coverage — merged byte ranges mapped to time */}
-            {downloadedTimeRanges.length > 0 && dur > 0 && downloadedTimeRanges.map(([ts, te], i) => {
-              const leftPct = (ts / dur) * 100;
-              const widthPct = ((te - ts) / dur) * 100;
-              return (
-                <div
-                  key={`buf-${i}`}
-                  className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
-                  style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
-                />
-              );
-            })}
+            {/* Downloaded (green) buffer coverage — merged from player + backend cache */}
+            {(() => {
+              // Merge player-tracked ranges (instant) with cache ranges (includes downloads)
+              const merged = [...downloadedTimeRanges, ...cachedTimeRanges];
+              if (merged.length === 0 || dur <= 0) return null;
+              // Sort and deduplicate overlapping ranges
+              const sorted = merged.sort((a, b) => a[0] - b[0]);
+              const deduped: [number, number][] = [];
+              for (const r of sorted) {
+                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1]) {
+                  deduped.push(r);
+                } else {
+                  deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
+                }
+              }
+              return deduped.map(([ts, te], i) => {
+                const leftPct = (ts / dur) * 100;
+                const widthPct = ((te - ts) / dur) * 100;
+                return (
+                  <div
+                    key={`buf-${i}`}
+                    className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
+                    style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
+                  />
+                );
+              });
+            })()}
             {/* Preview thumbnail coverage — segments at each cached position */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
@@ -640,7 +705,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
       {/* Download overlay */}
       {dlOverlay && dlOverlay.active && (
-        <div className="absolute bottom-16 left-4 right-4 flex items-center gap-2 pointer-events-none">
+        <div className="absolute bottom-16 left-4 right-4 flex items-center gap-2">
           <div className="flex-1 bg-white/10 rounded-full h-2 overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-300 ${dlOverlay.fromCache ? 'bg-green-400' : 'bg-telegram-secondary'}`}
@@ -651,6 +716,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             {dlOverlay.fromCache ? 'Cache' : dlOverlay.speed > 0 ? `${formatBytes(dlOverlay.speed)}/s` : ''}
             {dlOverlay.percent}%
           </span>
+          <button
+            onClick={(e) => { e.stopPropagation(); handleCancelDownload(); }}
+            className="p-1 hover:bg-white/10 rounded text-white/60 hover:text-red-400 transition-colors flex-shrink-0"
+            title="Cancel download"
+          >
+            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+          </button>
         </div>
       )}
 
