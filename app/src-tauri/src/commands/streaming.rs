@@ -59,7 +59,7 @@ pub async fn cmd_report_cached_ranges(
     let data_path = cache_state.data_path(message_id);
     if !data_path.exists() {
         // No cache file yet — ranges can't be present
-        log::warn!("cmd_report_cached_ranges: no .dat file for msg {}", message_id);
+        log::warn!("[PREBUFFER] REPORT: no .dat file for msg {}", message_id);
         return Ok(false);
     }
 
@@ -89,14 +89,14 @@ pub async fn cmd_report_cached_ranges(
     });
 
     // Add verified ranges and merge
-    meta.cached_ranges.extend(verified_ranges);
+    meta.cached_ranges.extend(verified_ranges.clone());
     merge_ranges(&mut meta.cached_ranges);
 
     cache_state.save_meta(&meta)
         .map_err(|e| format!("Failed to save meta: {}", e))?;
 
-    log::info!("cmd_report_cached_ranges: msg {} now has {} cached ranges ({:.1}% complete)",
-        message_id, meta.cached_ranges.len(), meta.cached_percentage());
+    log::info!("[PREBUFFER] REPORT: msg {} adding verified_ranges {:?}, meta now has {} ranges ({:.1}% complete)",
+        message_id, verified_ranges, meta.cached_ranges.len(), meta.cached_percentage());
 
     Ok(true)
 }
@@ -298,7 +298,8 @@ async fn background_cache_download(
 
             offset += to_write as u64;
 
-            // Update meta
+            // Update meta (serialized via per-message lock)
+            let _lock = cache_mgr.lock_meta(message_id).await;
             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                 message_id,
                 folder_id,

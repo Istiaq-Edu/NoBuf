@@ -28,6 +28,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
+  const durRef = useRef(0);
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
   const [rate, setRate] = useState(1);
@@ -131,17 +132,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
-            if (status.cached_ranges && dur > 0 && status.total_bytes > 0) {
+            if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
               const ranges: [number, number][] = status.cached_ranges.map(
                 ([s, e]: [number, number]) => [
-                  (s / status.total_bytes) * dur,
-                  ((e + 1) / status.total_bytes) * dur,
+                  (s / status.total_bytes) * durRef.current,
+                  ((e + 1) / status.total_bytes) * durRef.current,
                 ]
               );
-              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
+              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${durRef.current.toFixed(1)}s`);
               setCachedTimeRanges(ranges);
             } else {
-              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${dur}, total=${status.total_bytes})`);
+              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${durRef.current}, total=${status.total_bytes})`);
             }
           }
         } catch { /* ignore */ }
@@ -202,7 +203,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
 
       // Suppress player's cache meta reports during download — download updates
-      // CacheMeta per-chunk instead (both protected by per-message Mutex in Rust).
+      // CacheMeta per-chunk instead (protected by per-message Mutex in Rust).
+      // Player prebuffer continues running — both interleave through Semaphore(1)
+      // at the Rust level (one Telegram iter_download call at a time → no FLOOD_WAIT).
       setSuppressBackendReports(true);
 
       await invoke('cmd_download_file', {
@@ -269,6 +272,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
       setDur(v.duration);
+      durRef.current = v.duration;
       setVol(v.volume);
       setMuted(v.muted);
       setLoad(false);
@@ -532,7 +536,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={`buf-${i}`}
-                    className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
+                    className="absolute bottom-0 h-[3px] bg-green-400 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );

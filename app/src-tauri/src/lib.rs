@@ -238,6 +238,10 @@ pub fn run() {
             if let Some(handle) = server_handle {
                 log::info!("Stopping Actix streaming server...");
                 drop(handle.stop(true));
+                // Give the server time to finish in-flight streaming requests
+                // before we clear the cache — prevents concurrent writes during
+                // cache deletion which can cause meta corruption on Windows.
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
 
             // 3. Stop the API server (graceful)

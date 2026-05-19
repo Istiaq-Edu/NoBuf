@@ -164,9 +164,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             filename: file.name,
             mimeType: 'video/mp4',
             ranges,
-          }).catch((e) => {
-            console.warn('[MSE] Failed to report cached ranges:', e);
-          });
+          }).catch(() => {});
         }
       }, 2000);
     }
@@ -189,9 +187,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         filename: file.name,
         mimeType: 'video/mp4',
         ranges,
-      }).catch((e) => {
-        console.warn('[MSE] Failed to flush cached ranges:', e);
-      });
+      }).catch(() => {});
     }
   }, [file, activeFolderId]);
 
@@ -259,7 +255,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     setMseUrl(null);
 
     // Try MSE first
-    console.log('[MSE] Initializing for URL:', streamUrl);
     let blobUrl: string | null = null;
     try {
       const mediaSource = new MediaSource();
@@ -269,7 +264,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       state.current.mediaSource = mediaSource;
 
       const onSourceOpen = () => {
-        console.log('[MSE] sourceopen event fired');
         if (cancelledRef.current) return;
         initMP4Box(streamUrl, mediaSource, blobUrl!);
       };
@@ -279,13 +273,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Timeout for MSE initialization (20s to allow fetching moov atom)
       setTimeout(() => {
         if (!state.current.initialized && !cancelledRef.current) {
-          console.warn('[MSE] MSE initialization timeout, falling back to native');
           setError('MSE initialization timeout');
           setUseNative(true);
         }
       }, 20000);
     } catch (e) {
-      console.warn('[MSE] MediaSource not supported, using native:', e);
       setError('MediaSource not supported');
       setUseNative(true);
     }
@@ -357,7 +349,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       state.current.mp4box = mp4box;
 
       mp4box.onReady = (info: any) => {
-        console.log('[MSE] mp4box onReady!', info);
         if (cancelledRef.current) return;
         onMP4BoxReady(info, url, mediaSource, mp4box, blobUrl);
       };
@@ -411,7 +402,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const boxType = String.fromCharCode(view.getUint8(4), view.getUint8(5), view.getUint8(6), view.getUint8(7));
 
       if (boxType !== 'ftyp' && boxType !== 'jP  ') {
-        console.warn('[MSE] Not a valid MP4 file (box:', boxType, '), falling back to native');
         setUseNative(true);
         return;
       }
@@ -470,28 +460,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         reportRangesToBackend(offset, offset + data.byteLength - 1);
         trackDownloadedRange(offset, offset + data.byteLength - 1);
       } catch (e) {
-        console.error('[MSE] fetchMoreData error:', e);
         break;
       }
     }
 
     if (!state.current.initialized && !cancelledRef.current) {
-      console.warn('[MSE] mp4box onReady still not fired after fetching', state.current.currentOffset, 'bytes');
       setUseNative(true);
     }
   };
 
   const onMP4BoxReady = (info: MP4BoxInfo, url: string, mediaSource: MediaSource, mp4box: MP4BoxFile, _blobUrl: string) => {
-    console.log('[MSE] onMP4BoxReady called with info:', info);
     if (!mediaSource || cancelledRef.current) return;
 
     state.current.duration = info.duration / info.timescale;
-    console.log('[MSE] Duration:', state.current.duration, 'seconds');
 
-    // Set MediaSource duration so the video element knows the total length
     if (mediaSource.readyState === 'open') {
       mediaSource.duration = state.current.duration;
-      console.log('[MSE] MediaSource duration set to', state.current.duration);
     }
 
     // Extract tracks
@@ -529,7 +513,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const sb = mediaSource.addSourceBuffer(mimeType);
           state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
         } else {
-          console.warn('[MSE] Video codec not supported:', mimeType);
           setUseNative(true);
           return;
         }
@@ -580,7 +563,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       state.current.initialized = true;
       setIsPrefetching(true);
-      console.log('[MSE] Initialization complete!');
 
       // Set up mp4box callback for segments
       mp4box.onSegment = (trackId: number, _user: any, buffer: ArrayBuffer, _sampleNum: number, _isLast: boolean) => {
@@ -606,7 +588,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Start downloading and appending
       downloadLoop(url);
     } catch (e: any) {
-      console.error('[MSE] Failed to create SourceBuffers:', e);
       if (!cancelledRef.current) {
         setUseNative(true);
       }
@@ -628,11 +609,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const seekTime = (seekByte / state.current.fileLength) * state.current.duration;
         state.current.pendingSeek = -1;
 
-        console.log(`[MSE-SEEK] Processing seek to ${seekTime.toFixed(1)}s, clearing buffers...`);
+        console.log(`[PREBUFFER] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)})`);
 
-        // 1. Clear old buffered data from SourceBuffers (fire-and-forget —
-        //    SourceBufferWrapper queues operations, so subsequent appends
-        //    will be serialized after the clear completes).
+        // 1. Clear old buffered data from SourceBuffers
         if (state.current.videoSourceBuffer) {
           state.current.videoSourceBuffer.resetForSeek();
         }
@@ -641,8 +620,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
 
         // 2. Seek mp4box BEFORE flushing (sample table is intact).
-        //    This returns the exact byte offset of the sync sample nearest
-        //    to the target time — much more accurate than the ratio guess.
         const seekInfo = state.current.mp4box!.seek(seekTime, true) as any;
         state.current.mp4box!.flush();
 
@@ -651,14 +628,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           ? seekInfo.offset
           : seekByte;
         state.current.currentOffset = syncOffset;
-        chunksAfterSeek.current = 1; // Skip 512KB, start at 1MB
+        chunksAfterSeek.current = 1;
 
-        // Update video currentTime so the progress bar reflects the seek
         if (videoRef.current) {
           videoRef.current.currentTime = seekTime;
         }
 
-        console.log(`[MSE-SEEK] Done — downloading from byte ${formatBytes(syncOffset)} (seek target: ${seekTime.toFixed(1)}s)`);
+        
       }
 
       const offset = state.current.currentOffset;
@@ -684,7 +660,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             if (fetchErr.name === 'AbortError') throw fetchErr;
             retries--;
             if (retries === 0) throw fetchErr;
-            console.warn(`[MSE] Fetch retry ${4 - retries}/3, waiting ${(4 - retries)}s`);
             await new Promise(r => setTimeout(r, (4 - retries) * 1000)); // 1s, 2s backoff
           }
         }
@@ -692,8 +667,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         if (cancelledRef.current || !response) break;
 
         if (!response.ok && response.status !== 206) {
-          console.error(`[MSE] Download failed: HTTP ${response.status} for bytes=${offset}-${end}`);
           break;
+        }
+
+        const xCache = response.headers.get('X-Cache');
+        if (xCache) {
+          console.log(`[PREBUFFER] RESPONSE: bytes=${offset}-${end}, cache=${xCache}`);
+        } else {
+          console.log(`[PREBUFFER] RESPONSE: bytes=${offset}-${end}, cache=DOWNLOAD (from Telegram)`);
         }
 
         const data = await response.arrayBuffer();
@@ -742,7 +723,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
           break;
         }
-        console.error('[MSE] Download error:', e);
         await new Promise(r => setTimeout(r, 1000));
       }
     }

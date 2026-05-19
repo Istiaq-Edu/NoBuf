@@ -359,7 +359,8 @@ pub async fn cmd_download_file(
     
     bw_state.can_transfer(total_size)?;
 
-    // Emit start
+    // Emit 0% start — percentage will rapidly jump to cached% once prebuffered
+    // data is processed, then climb gradually as gaps are filled from Telegram
     if !tid.is_empty() {
         let _ = app_handle.emit("download-progress", ProgressPayload {
             id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
@@ -426,13 +427,23 @@ pub async fn cmd_download_file(
         let mut last_emit_time = std::time::Instant::now();
         let mut last_emit_bytes: u64 = base_bytes;
 
+        // Emit initial progress reflecting cached bytes already written to output
+        if !tid.is_empty() {
+            let percent = if total_size > 0 {
+                ((base_bytes as f64 / total_size as f64) * 100.0).min(100.0) as u8
+            } else { 0 };
+            let _ = app_handle.emit("download-progress", ProgressPayload {
+                id: tid.clone(), percent, uploaded_bytes: base_bytes, total_bytes: total_size, speed_bytes_per_sec: 0,
+            });
+        }
+
         let mut cache_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&cache_path)
             .ok();
 
-        log::info!("[DL-DEBUG] Per-gap download: base_bytes={}, gaps={:?}, total={}", base_bytes, gaps, total_size);
+        log::info!("Download {} filling {} gap(s)", message_id, gaps.len());
 
         for (gap_idx, &(gap_start, gap_end)) in gaps.iter().enumerate() {
             if state.cancelled_transfers.read().await.contains(&tid) {
@@ -496,7 +507,7 @@ pub async fn cmd_download_file(
                     let _lock = cache_state.lock_meta(message_id).await;
                     if let Some(mut m) = cache_state.load_meta(message_id) {
                         let chunk_end = offset + to_write as u64;
-                        m.cached_ranges.push((gap_start, chunk_end - 1));
+                        m.cached_ranges.push((offset, chunk_end - 1));
                         stream_cache::merge_ranges(&mut m.cached_ranges);
                         let _ = cache_state.save_meta(&m);
                     }
@@ -520,16 +531,15 @@ pub async fn cmd_download_file(
                     }
                 }
 
-                // Throttle to avoid FLOOD_PREMIUM_WAIT — yields time for player prebuffer
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
                 if offset > gap_end {
-                    log::info!("[DL-DEBUG] Gap {} filled: {}-{}", gap_idx, gap_start, gap_end);
+                    log::info!("Gap {} filled: {}-{}", gap_idx, gap_start, gap_end);
                     break;
                 }
+
+                // Yield briefly so player prebuffer gets a fair share of the semaphore;
+                // tokio::sync::Semaphore uses FIFO waiters so this is cooperative yielding.
+                tokio::task::yield_now().await;
             }
-            // Brief pause between gaps to avoid rate limiting
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         bw_state.add_down(total_size);
@@ -567,6 +577,13 @@ pub async fn cmd_download_file(
     let mut downloaded: u64 = 0;
     let mut last_emit_time = std::time::Instant::now();
     let mut last_emit_bytes: u64 = 0;
+
+    // Emit initial progress for fresh (non-cached) download
+    if !tid.is_empty() {
+        let _ = app_handle.emit("download-progress", ProgressPayload {
+            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
+        });
+    }
 
     while let Some(chunk) = {
         let _permit = state.download_semaphore.acquire().await.unwrap();
@@ -619,6 +636,9 @@ pub async fn cmd_download_file(
                 last_emit_bytes = downloaded;
             }
         }
+
+        // Yield so player prebuffer gets a fair share of the semaphore
+        tokio::task::yield_now().await;
     }
 
     bw_state.add_down(total_size);

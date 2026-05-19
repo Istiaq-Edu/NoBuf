@@ -62,7 +62,7 @@ export function useThumbnailExtractor(
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
-    video.preload = 'auto'; // Allow downloading on demand for seeking
+    video.preload = 'none'; // Don't auto-download — only load on-demand for hover thumbnails
     video.crossOrigin = 'anonymous';
     video.style.position = 'absolute';
     video.style.left = '-9999px';
