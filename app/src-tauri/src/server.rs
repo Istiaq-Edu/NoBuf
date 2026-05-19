@@ -134,8 +134,6 @@ async fn resolve_media_from_path(
         _ => 0,
     };
 
-    log::info!("Document size for msg {}: {} bytes", message_id, size);
-
     Ok((media, size))
 }
 
@@ -162,7 +160,6 @@ async fn stream_media_head(
     match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
         Ok((media, size)) => {
             let mime = mime_type_from_media(&media);
-            log::info!("HEAD response for msg {}: size={}, mime={}", message_id, size, mime);
             HttpResponse::Ok()
                 .insert_header(("Content-Type", mime))
                 .insert_header(("Content-Length", size.to_string()))
@@ -170,7 +167,6 @@ async fn stream_media_head(
                 .finish()
         }
         Err(resp) => {
-            log::error!("HEAD request failed for msg {}", message_id);
             resp
         },
     }
@@ -186,19 +182,18 @@ async fn stream_media(
     cache: web::Data<Option<StreamCacheManager>>,
 ) -> impl Responder {
     let (folder_id_str, message_id) = path.into_inner();
-    log::debug!("Stream request: Received request for message {} in folder '{}'", message_id, folder_id_str);
-
     let (media, size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
         Ok(result) => result,
         Err(resp) => return resp,
     };
 
     let mime = mime_type_from_media(&media);
-    log::debug!("Stream request: Starting download for msg {} (mime: {}, size: {})", message_id, mime, size);
+    let mime_stream = mime.clone(); // Clone for use inside the async stream
 
-    // Set up cache file if cache manager is available — every range request
-    // caches its bytes independently (no write-lock needed, seek+write is atomic).
-    let mut cache_setup: Option<(std::fs::File, StreamCacheManager, i32, i64, String, String)> =
+    // Extract cache-related variables BEFORE the stream to avoid
+    // partial-borrow issues inside async_stream::stream! and to
+    // use the per-message lock for serialized meta updates.
+    let cache_file_opt: Option<std::fs::File> =
         if let Some(ref cache_mgr) = **cache {
             let data_path = cache_mgr.data_path(message_id);
             match std::fs::OpenOptions::new()
@@ -206,19 +201,9 @@ async fn stream_media(
                 .write(true)
                 .open(&data_path)
             {
-                Ok(f) => Some((
-                    f,
-                    cache_mgr.clone(),
-                    message_id,
-                    folder_id_str.parse::<i64>().unwrap_or(0),
-                    match &media {
-                        Media::Document(d) => d.name().to_string(),
-                        _ => format!("{}.mp4", message_id),
-                    },
-                    mime.clone(),
-                )),
+                Ok(f) => Some(f),
                 Err(e) => {
-                    log::warn!("Failed to open cache file for {}: {}", message_id, e);
+                    log::warn!("[PREBUFFER] Failed to open cache file for {}: {}", message_id, e);
                     None
                 }
             }
@@ -226,17 +211,25 @@ async fn stream_media(
             None
         };
 
+    let cache_mgr_opt: Option<StreamCacheManager> =
+        (**cache).as_ref().map(|cm| cm.clone());
+
+    let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
+    let cache_filename = match &media {
+        Media::Document(d) => d.name().to_string(),
+        _ => format!("{}.mp4", message_id),
+    };
+
     // Parse Range header if present
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
 
     let (start_byte, end_byte, is_partial) = if let Some(range_str) = range_header {
         match parse_range_header(range_str, size) {
             Some((start, end)) => {
-                log::debug!("Stream request: Range request bytes={}-{} for msg {}", start, end, message_id);
                 (start, end, true)
             }
             None => {
-                log::warn!("Stream request: Invalid Range header '{}' for msg {}", range_str, message_id);
+                log::warn!("[PREBUFFER] Invalid Range header '{}' for msg {}", range_str, message_id);
                 return HttpResponse::build(actix_web::http::StatusCode::RANGE_NOT_SATISFIABLE)
                     .insert_header(("Content-Range", format!("bytes */{}", size)))
                     .body("Invalid Range header");
@@ -248,7 +241,7 @@ async fn stream_media(
 
     let content_length = end_byte - start_byte + 1;
 
-    // FAST PATH: If the requested range is fully cached, serve from disk immediately
+    // FAST PATH: if the requested range is fully cached, serve from disk immediately
     if let Some(ref cache_mgr) = **cache {
         if let Some(meta) = cache_mgr.load_meta(message_id) {
             if is_range_cached(&meta.cached_ranges, start_byte, end_byte) {
@@ -262,8 +255,8 @@ async fn stream_media(
                     Ok(buf)
                 })() {
                     Ok(slice) => {
-                        log::info!("Cache HIT for msg {} range {}-{} ({} bytes served from disk)",
-                            message_id, start_byte, end_byte, slice.len());
+                        log::info!("[PREBUFFER] HIT: msg {} range {}-{} served from disk cache",
+                            message_id, start_byte, end_byte);
 
                         let response = if is_partial {
                             HttpResponse::PartialContent()
@@ -284,10 +277,15 @@ async fn stream_media(
                         return response;
                     }
                     Err(e) => {
-                        log::warn!("Cache read failed for msg {}, falling back to Telegram: {}", message_id, e);
+                        log::warn!("[PREBUFFER] Cache read failed for msg {}, falling back to Telegram: {}", message_id, e);
                     }
                 }
+            } else {
+                log::info!("[PREBUFFER] MISS: msg {} range {}-{} not cached",
+                    message_id, start_byte, end_byte);
             }
+        } else {
+            log::info!("[PREBUFFER] MISS: msg {} no meta found", message_id);
         }
     }
 
@@ -312,6 +310,7 @@ async fn stream_media(
         let mut first_chunk = true;
         let mut iter = download_iter;
         let mut current_offset = start_byte;
+        let mut cache_file_mut = cache_file_opt;
 
         while let Some(chunk) = {
             // Acquire the global semaphore before hitting Telegram's API —
@@ -343,23 +342,52 @@ async fn stream_media(
                     };
 
                     let bytes_in_chunk = final_data.len() as u64;
+                    let chunk_range_end = current_offset + bytes_in_chunk - 1;
 
-                    // Write to disk cache if available
-                    if let Some((ref mut cache_file, ref cache_mgr, mid, fid, ref fname, ref mime)) = cache_setup {
+                    // 1) Write data to cache file (seek+write is atomic, no lock needed)
+                    if let Some(ref mut cache_file) = cache_file_mut {
                         let _ = cache_file.seek(SeekFrom::Start(current_offset));
                         let _ = cache_file.write_all(&final_data);
+                    }
 
-                        let mut meta = cache_mgr.load_meta(mid).unwrap_or_else(|| CacheMeta {
-                            message_id: mid,
-                            folder_id: fid,
-                            total_size: size,
-                            filename: fname.clone(),
-                            cached_ranges: Vec::new(),
-                            mime_type: mime.clone(),
-                        });
-                        meta.cached_ranges.push((current_offset, current_offset + bytes_in_chunk - 1));
+                    // 2) Update meta with per-message lock (serialized with
+                    //    cmd_report_cached_ranges and other streaming requests)
+                    if let Some(ref cache_mgr) = cache_mgr_opt {
+                        let _lock = cache_mgr.lock_meta(message_id).await;
+                        let mut meta = match cache_mgr.load_meta(message_id) {
+                            Some(m) => m,
+                            None => {
+                                // On Windows, save_meta's truncate+write may briefly
+                                // leave the file empty. Retry once before creating a
+                                // fresh meta (which would lose all existing ranges).
+                                log::warn!("[PREBUFFER] Meta load returned None for msg {}, retrying after brief pause", message_id);
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                match cache_mgr.load_meta(message_id) {
+                                    Some(m) => m,
+                                    None => {
+                                        if cache_mgr.data_path(message_id).exists() {
+                                            log::warn!("[PREBUFFER] Meta missing for msg {} but data file exists — creating recovery meta", message_id);
+                                        }
+                                        CacheMeta {
+                                            message_id,
+                                            folder_id: cache_folder_id,
+                                            total_size: size,
+                                            filename: cache_filename.clone(),
+                                            cached_ranges: Vec::new(),
+                                            mime_type: mime_stream.clone(),
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        meta.cached_ranges.push((current_offset, chunk_range_end));
                         merge_ranges(&mut meta.cached_ranges);
-                        let _ = cache_mgr.save_meta(&meta);
+                        if let Err(e) = cache_mgr.save_meta(&meta) {
+                            log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
+                        } else {
+                            log::info!("[PREBUFFER] ADD: msg {} range {}-{} written to cache, meta ranges: {:?}",
+                                message_id, current_offset, chunk_range_end, meta.cached_ranges);
+                        }
                     }
 
                     current_offset += bytes_in_chunk;
@@ -371,12 +399,11 @@ async fn stream_media(
                     }
                 }
                 Err(e) => {
-                    log::error!("Stream error for msg {}: {}", message_id, e);
+                    log::error!("[PREBUFFER] Stream error for msg {}: {}", message_id, e);
                     break;
                 }
             }
         }
-        log::debug!("Stream complete for msg {}: sent {} bytes", message_id, bytes_sent);
     };
 
     if is_partial {
@@ -411,7 +438,7 @@ pub async fn start_streaming_server(
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
             .max_age(3600);
 
         App::new()
