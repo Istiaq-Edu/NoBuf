@@ -49,6 +49,8 @@ pub struct CacheStatus {
     pub percentage: u8,
     pub is_complete: bool,
     pub filename: String,
+    /// Byte ranges that are cached on disk (for green buffer bar)
+    pub cached_ranges: Vec<(u64, u64)>,
 }
 
 /// Manages the disk cache for streamed media
@@ -105,7 +107,8 @@ impl StreamCacheManager {
             total_bytes: meta.total_size,
             percentage: meta.cached_percentage(),
             is_complete: meta.is_complete(),
-            filename: meta.filename,
+            filename: meta.filename.clone(),
+            cached_ranges: meta.cached_ranges.clone(),
         })
     }
 

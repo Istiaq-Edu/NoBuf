@@ -28,6 +28,8 @@ pub struct TelegramState {
     /// Set of transfer IDs that have been cancelled. Checked cooperatively
     /// in upload/download chunk loops. Cleared on logout.
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Paths of partial download files — cleaned up on app close.
+    pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 pub mod auth;

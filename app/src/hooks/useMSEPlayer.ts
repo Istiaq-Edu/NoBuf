@@ -705,11 +705,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Update tracking
         state.current.currentOffset = offset + data.byteLength;
 
-        // Log first 3 chunks after each seek to confirm download is flowing
-        if (chunksAfterSeek.current <= 3) {
-          console.log(`[MSE-LOOP] Chunk #${chunksAfterSeek.current}: ${formatBytes(offset)}-${formatBytes(offset + data.byteLength - 1)} (${formatBytes(data.byteLength)}) → total ${formatBytes(state.current.currentOffset)}`);
-        }
-
         // Report this range to cache backend
         reportRangesToBackend(offset, offset + data.byteLength - 1);
         // Track for green buffer bar
@@ -739,14 +734,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       } catch (e: any) {
         if (cancelledRef.current) break;
         if (e.name === 'AbortError') {
-          // Abort was triggered by seekTo() — check if there's a pending seek
-          // to jump to, and if so keep the loop running to process it
           if (state.current.pendingSeek >= 0) {
-            console.log(`[MSE-LOOP] AbortError with pending seek → continuing loop to process`);
-            continue; // Loop will process pendingSeek on next iteration
+            continue;
           }
-          console.log(`[MSE-LOOP] AbortError without pending seek → stopping`);
-          break; // Abort without pending seek = intentional stop
+          break;
         }
         console.error('[MSE] Download error:', e);
         await new Promise(r => setTimeout(r, 1000));

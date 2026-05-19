@@ -419,20 +419,30 @@ pub async fn cmd_download_file(
             }
         }
 
-        // Download gaps from Telegram
+        // Download gaps from Telegram, writing to both output file and disk cache
         let gaps = stream_cache::find_gaps(&meta.cached_ranges, total_size);
-        let mut bytes_written: u64 = meta.cached_bytes();
+        let base_bytes: u64 = meta.cached_bytes(); // already in output file
+        let mut gap_bytes: u64 = 0; // new bytes written this session
         let mut last_emit_time = std::time::Instant::now();
-        let mut last_emit_bytes: u64 = 0;
+        let mut last_emit_bytes: u64 = base_bytes;
 
-        for (gap_start, gap_end) in gaps {
-            // Check cancellation
+        let mut cache_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&cache_path)
+            .ok();
+
+        log::info!("[DL-DEBUG] Per-gap download: base_bytes={}, gaps={:?}, total={}", base_bytes, gaps, total_size);
+
+        for (gap_idx, &(gap_start, gap_end)) in gaps.iter().enumerate() {
             if state.cancelled_transfers.read().await.contains(&tid) {
                 state.cancelled_transfers.write().await.remove(&tid);
                 drop(output_file);
                 cleanup_partial_file(&save_path);
                 return Err("Transfer cancelled".to_string());
             }
+
+
 
             let skip_chunks = gap_start / DOWNLOAD_CHUNK_SIZE as u64;
             let skip_bytes = gap_start % DOWNLOAD_CHUNK_SIZE as u64;
@@ -444,9 +454,9 @@ pub async fn cmd_download_file(
             output_file.seek(SeekFrom::Start(gap_start))
                 .map_err(|e| format!("Seek error: {}", e))?;
             let mut offset = gap_start;
+            let mut first_chunk = true;
 
-            while let Some(chunk) = iter.next().await.transpose() {
-                // Check cancellation
+            while let Some(chunk_result) = iter.next().await.transpose() {
                 if state.cancelled_transfers.read().await.contains(&tid) {
                     state.cancelled_transfers.write().await.remove(&tid);
                     drop(output_file);
@@ -454,48 +464,73 @@ pub async fn cmd_download_file(
                     return Err("Transfer cancelled".to_string());
                 }
 
-                let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-                let chunk_slice = if offset == gap_start && skip_bytes > 0 {
-                    &chunk[skip_bytes as usize..]
+                let chunk = chunk_result.map_err(|e| format!("Download error: {}", e))?;
+
+                let chunk_slice: &[u8] = if first_chunk && skip_bytes > 0 {
+                    let discard = (skip_bytes as usize).min(chunk.len());
+                    first_chunk = false;
+                    &chunk[discard..]
                 } else {
+                    first_chunk = false;
                     &chunk
                 };
 
-                let to_write = chunk_slice.len().min((gap_end + 1 - offset) as usize);
-                output_file.write_all(&chunk_slice[..to_write])
+                let remaining_in_gap = (gap_end + 1 - offset) as usize;
+                let to_write = chunk_slice.len().min(remaining_in_gap);
+                let slice = &chunk_slice[..to_write];
+
+                output_file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| format!("Seek error: {}", e))?;
+                output_file.write_all(slice)
                     .map_err(|e| format!("Write error: {}", e))?;
 
-                offset += to_write as u64;
-                bytes_written = offset.max(bytes_written);
+                if let Some(ref mut cf) = cache_file {
+                    let _ = cf.seek(SeekFrom::Start(offset));
+                    let _ = cf.write_all(slice);
+                }
 
-                // Time-based progress emission
+                offset += to_write as u64;
+                gap_bytes += to_write as u64;
+
                 if !tid.is_empty() {
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(last_emit_time).as_secs_f64();
-                    if dt >= 0.25 || offset > gap_end {
-                        let speed = if dt > 0.0 { ((bytes_written - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
-                        let percent = if total_size > 0 { ((bytes_written as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
+                    if dt >= 0.25 {
+                        let total_progress = base_bytes + gap_bytes;
+                        let speed = if dt > 0.0 { ((total_progress - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
+                        let percent = if total_size > 0 { ((total_progress as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
                         let _ = app_handle.emit("download-progress", ProgressPayload {
-                            id: tid.clone(), percent, uploaded_bytes: bytes_written, total_bytes: total_size, speed_bytes_per_sec: speed,
+                            id: tid.clone(), percent, uploaded_bytes: total_progress, total_bytes: total_size, speed_bytes_per_sec: speed,
                         });
                         last_emit_time = now;
-                        last_emit_bytes = bytes_written;
+                        last_emit_bytes = total_progress;
                     }
                 }
 
-                if offset > gap_end { break; }
+                // Throttle to avoid FLOOD_PREMIUM_WAIT from concurrent player requests
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+                if offset > gap_end {
+                    log::info!("[DL-DEBUG] Gap {} filled: {}-{}", gap_idx, gap_start, gap_end);
+                    if let Some(mut m) = cache_state.load_meta(message_id) {
+                        m.cached_ranges.push((gap_start, gap_end));
+                        stream_cache::merge_ranges(&mut m.cached_ranges);
+                        let _ = cache_state.save_meta(&m);
+                    }
+                    break;
+                }
             }
+            // Brief pause between gaps to avoid rate limiting
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         bw_state.add_down(total_size);
 
-        // Emit completion
         if !tid.is_empty() {
             let _ = app_handle.emit("download-progress", ProgressPayload {
                 id: tid.clone(), percent: 100, uploaded_bytes: total_size, total_bytes: total_size, speed_bytes_per_sec: 0,
             });
         }
-
         return Ok("Downloaded with cache assist".to_string());
     }
 
