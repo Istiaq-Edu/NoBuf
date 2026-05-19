@@ -97,10 +97,14 @@ impl StreamCacheManager {
 
     /// Save metadata to disk atomically.
     /// On POSIX: write to temp file, then rename (atomically replaces target).
-    /// On Windows: rename fails if target exists, so we overwrite in place
-    /// (truncate + write) — the file never disappears, preventing load_meta
-    /// from returning None during the write gap. The per-message lock ensures
-    /// no concurrent reads observe the truncated state.
+    /// On Windows: rename fails if target exists, so we overwrite in-place
+    /// WITHOUT truncating first. We open the file for write-only (no truncate),
+    /// write the new content (which overwrites the old byte-by-byte), then
+    /// truncate to the new length if shorter, then sync_all. This ensures
+    /// the file NEVER has zero-byte content — it always contains either the
+    /// old valid JSON or the new valid JSON, never an empty/truncated state
+    /// that would cause load_meta to return None and lose all cached ranges.
+    /// The per-message lock serializes all access during the overwrite window.
     pub fn save_meta(&self, meta: &CacheMeta) -> std::io::Result<()> {
         let path = self.meta_path(meta.message_id);
         let json = serde_json::to_string_pretty(meta)
@@ -111,14 +115,18 @@ impl StreamCacheManager {
             Ok(()) => Ok(()),
             Err(_) => {
                 // On Windows, rename fails if target exists.
-                // Overwrite in place: truncate + write. The file always exists
-                // (never removed), so load_meta never sees a missing file.
-                // The per-message lock serializes access during the overwrite.
-                let mut file = std::fs::File::create(&path)?;
-                use std::io::Write;
+                // Overwrite in-place WITHOUT truncating first:
+                // open for write (not truncate), write new content over old,
+                // then truncate to new length, then sync. This avoids the
+                // zero-byte window that File::create (truncate+write) causes.
+                use std::io::{Write, Seek, SeekFrom};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)?;
+                file.seek(SeekFrom::Start(0))?;
                 file.write_all(json.as_bytes())?;
+                file.set_len(json.len() as u64)?; // Truncate if new content shorter
                 file.sync_all()?;
-                // Close the file handle before removing temp (drop happens at end of scope)
                 std::fs::remove_file(&tmp_path).ok();
                 Ok(())
             }
