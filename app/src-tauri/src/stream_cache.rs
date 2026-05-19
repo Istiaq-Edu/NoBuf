@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -59,6 +60,9 @@ pub struct StreamCacheManager {
     cache_dir: PathBuf,
     /// Active background cache tasks: message_id
     active_tasks: Arc<Mutex<Vec<i32>>>,
+    /// Per-message locks to serialize meta read-modify-write operations
+    /// between player reports and download updates (prevents race conditions)
+    meta_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl StreamCacheManager {
@@ -67,6 +71,7 @@ impl StreamCacheManager {
         Ok(Self {
             cache_dir,
             active_tasks: Arc::new(Mutex::new(Vec::new())),
+            meta_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -110,6 +115,19 @@ impl StreamCacheManager {
             filename: meta.filename.clone(),
             cached_ranges: meta.cached_ranges.clone(),
         })
+    }
+
+    /// Acquire a per-message lock for serializing read-modify-write
+    /// operations on CacheMeta. Prevents race conditions between
+    /// player's cmd_report_cached_ranges and download's per-chunk updates.
+    pub async fn lock_meta(&self, message_id: i32) -> tokio::sync::OwnedMutexGuard<()> {
+        let mut locks = self.meta_locks.lock().await;
+        let entry = locks
+            .entry(message_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        let lock = Arc::clone(entry);
+        drop(locks);
+        lock.lock_owned().await
     }
 
     /// Delete cache for a specific message

@@ -77,7 +77,8 @@ pub async fn cmd_report_cached_ranges(
         return Ok(false);
     }
 
-    // Load existing meta or create new one
+    // Load existing meta or create new one (serialized via per-message lock)
+    let _lock = cache_state.lock_meta(message_id).await;
     let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
         message_id,
         folder_id,

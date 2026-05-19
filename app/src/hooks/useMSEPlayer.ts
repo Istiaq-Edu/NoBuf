@@ -139,11 +139,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const lastThrottleRef = useRef(0); // For throttling state updates
   const prevUrlRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
+  // When true, suppress reports to backend cache (used during active download)
+  const suppressBackendReportsRef = useRef(false);
 
   // Debounced range reporter — accumulates fetched byte ranges and
   // reports them to the Rust backend every 2 seconds (or on completion)
   const reportRangesToBackend = useCallback((start: number, end: number) => {
     if (!file || activeFolderId === null) return;
+    if (suppressBackendReportsRef.current) return; // Suppress during active download
     pendingRangesRef.current.push([start, end]);
 
     // Debounce: send accumulated ranges every 2s
@@ -818,6 +821,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     videoRef.current = el;
   }, []);
 
+  const setSuppressBackendReports = useCallback((suppress: boolean) => {
+    suppressBackendReportsRef.current = suppress;
+  }, []);
+
   return {
     mseUrl: useNative ? null : mseUrl,
     error: useNative ? null : error,
@@ -833,6 +840,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     seekTo,
     setVideoRef,
     downloadedTimeRanges,
+    setSuppressBackendReports,
     getMp4Box: () => state.current.mp4box,
     getFileLength: () => state.current.fileLength,
   };

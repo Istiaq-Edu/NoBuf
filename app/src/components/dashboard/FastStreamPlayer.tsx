@@ -64,6 +64,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     seekTo,
     setVideoRef,
     downloadedTimeRanges,
+    setSuppressBackendReports,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
   // Debug: log player-tracked ranges changes
   useEffect(() => {
@@ -176,6 +177,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
+          setSuppressBackendReports(false);
+          resumePrefetch();
           setTimeout(() => setDlOverlay(null), 3000);
           dlTransferIdRef.current = '';
         }
@@ -184,7 +187,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => { unlisten?.(); };
   }, [cacheComplete, dur, totalBytes, file.id]);
 
-  // Download handler
+  // Download handler — pauses player prebuffer during download to avoid
+  // Telegram FLOOD_WAIT (the stream server and download command both hit
+  // Telegram's API, and interleaving at the Rust level requires major refactoring).
+  // Player can still play from its SourceBuffer; green bar shows both the player's
+  // static buffered region (downloadedTimeRanges) and the download's growing cache
+  // (cachedTimeRanges via cmd_get_cache_status polling).
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
@@ -195,6 +203,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
 
+      // Pause player prebuffer and suppress cache reports — the download fills
+      // gaps linearly and updates cache meta per-chunk (protected by Mutex).
+      pausePrefetch();
+      setSuppressBackendReports(true);
+
       await invoke('cmd_download_file', {
         messageId: file.id,
         savePath,
@@ -202,26 +215,32 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         transferId,
       });
 
+      setSuppressBackendReports(false);
+      resumePrefetch();
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
+      setSuppressBackendReports(false);
+      resumePrefetch();
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
       setDlOverlay(null);
       dlTransferIdRef.current = '';
     }
-  }, [file, activeFolderId, cacheComplete]);
+  }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
 
-  // Cancel download
+  // Cancel download — resume player prebuffer
   const handleCancelDownload = useCallback(async () => {
     if (!dlTransferIdRef.current) return;
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
+    setSuppressBackendReports(false);
+    resumePrefetch();
     setDlOverlay(null);
     dlTransferIdRef.current = '';
-  }, []);
+  }, [setSuppressBackendReports, resumePrefetch]);
 
 
   const fmt = (s: number) => {
@@ -507,7 +526,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               const sorted = merged.sort((a, b) => a[0] - b[0]);
               const deduped: [number, number][] = [];
               for (const r of sorted) {
-                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1]) {
+                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1] + 0.01) {
                   deduped.push(r);
                 } else {
                   deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
