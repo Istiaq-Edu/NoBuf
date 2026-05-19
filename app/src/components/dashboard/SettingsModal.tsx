@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw } from 'lucide-react';
+import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, LayoutGrid } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useSettings } from '../../context/SettingsContext';
@@ -224,6 +224,38 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                         >
                                             +
                                         </button>
+                                    </div>
+                                </div>
+                            </section>
+
+                            {/* Grid Section */}
+                            <section className="space-y-3">
+                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                    <LayoutGrid className="w-3.5 h-3.5" />
+                                    Grid Density
+                                </h3>
+
+                                <div className="p-3 rounded-lg bg-telegram-hover/50">
+                                    <p className="text-sm text-telegram-text font-medium mb-1">Card Size</p>
+                                    <p className="text-xs text-telegram-subtext mb-3">Adjust how many files appear per row</p>
+                                    <div className="flex gap-1 p-1 bg-telegram-bg rounded-lg">
+                                        {([
+                                            { value: 'compact' as const, label: 'Compact' },
+                                            { value: 'default' as const, label: 'Default' },
+                                            { value: 'spacious' as const, label: 'Spacious' },
+                                        ]).map(option => (
+                                            <button
+                                                key={option.value}
+                                                onClick={() => updateSetting('gridDensity', option.value)}
+                                                className={`flex-1 px-2 py-2 rounded-md text-xs font-medium transition-all ${
+                                                    settings.gridDensity === option.value
+                                                        ? 'bg-telegram-primary text-white shadow-sm'
+                                                        : 'text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover'
+                                                }`}
+                                            >
+                                                {option.label}
+                                            </button>
+                                        ))}
                                     </div>
                                 </div>
                             </section>

@@ -50,6 +50,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
     const [isSearching, setIsSearching] = useState(false);
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+        try { return localStorage.getItem('sidebar-collapsed') === 'true'; }
+        catch { return false; }
+    });
+    const toggleSidebar = useCallback(() => {
+        setSidebarCollapsed(prev => {
+            const next = !prev;
+            try { localStorage.setItem('sidebar-collapsed', String(next)); }
+            catch { /* ignore */ }
+            return next;
+        });
+    }, []);
     const [internalDragFileId, _setInternalDragFileId] = useState<number | null>(null);
     const internalDragRef = useRef<number | null>(null);
 
@@ -86,7 +98,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const {
         handleDelete, handleBulkDelete, handleBulkDownload,
-        handleBulkMove, handleDownloadFolder, handleGlobalSearch
+        handleBulkMove, handleGlobalSearch
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
@@ -142,6 +154,20 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         enabled: !previewFile && !playingFile && !pdfFile && !showMoveModal // Disable when modals are open
     });
 
+    // [ key toggles sidebar
+    useEffect(() => {
+        const handler = (e: KeyboardEvent) => {
+            const target = e.target as HTMLElement;
+            if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+            if (e.key === '[') {
+                e.preventDefault();
+                toggleSidebar();
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [toggleSidebar]);
+
 
     useEffect(() => {
         setSelectedIds([]);
@@ -178,9 +204,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const handleFileClick = (e: React.MouseEvent, id: number) => {
         e.stopPropagation();
         if (e.metaKey || e.ctrlKey) {
+            // Ctrl/Cmd+click: toggle multi-select
             setSelectedIds(ids => ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id]);
         } else {
-            setSelectedIds([id]);
+            const file = displayedFiles.find(f => f.id === id);
+            if (file) {
+                setSelectedIds([id]);
+                if (file.type === 'folder') {
+                    setActiveFolderId(file.id);
+                } else {
+                    handlePreview(file, displayedFiles);
+                }
+            }
         }
     }
 
@@ -393,6 +428,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onSync={handleSyncFolders}
                 onLogout={handleLogout}
                 bandwidth={bandwidth || null}
+                collapsed={sidebarCollapsed}
+                onToggleCollapse={toggleSidebar}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
@@ -402,7 +439,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onShowMoveModal={() => setShowMoveModal(true)}
                     onBulkDownload={handleBulkDownload}
                     onBulkDelete={handleBulkDelete}
-                    onDownloadFolder={handleDownloadFolder}
+                    onSelectAll={handleSelectAll}
                     viewMode={viewMode}
                     setViewMode={setViewMode}
                     searchTerm={searchTerm}

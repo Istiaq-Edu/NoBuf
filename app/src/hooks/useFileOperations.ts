@@ -100,38 +100,12 @@ export function useFileOperations(
         }
     };
 
-    const handleDownloadFolder = async () => {
-        if (displayedFiles.length === 0) {
-            toast.info("Folder is empty.");
-            return;
-        }
-        try {
-            const dirPath = await import('@tauri-apps/plugin-dialog').then(d => d.open({
-                directory: true, multiple: false, title: "Download Folder To..."
-            }));
-            if (!dirPath) return;
-            let successCount = 0;
-            toast.info(`Downloading folder contents (${displayedFiles.length} files)...`);
-            for (const file of displayedFiles) {
-                const filePath = `${dirPath}/${file.name}`;
-                try {
-                    await invoke('cmd_download_file', { messageId: file.id, savePath: filePath, folderId: activeFolderId });
-                    successCount++;
-                } catch (e) { }
-            }
-            toast.success(`Folder Download Complete: ${successCount} files.`);
-        } catch (e) {
-            toast.error("Error: " + e);
-        }
-    }
-
     return {
         handleDelete,
         handleBulkDelete,
         handleDownload,
         handleBulkDownload,
         handleBulkMove,
-        handleDownloadFolder,
         handleGlobalSearch: async (query: string) => {
             try {
                 return await invoke<TelegramFile[]>('cmd_search_global', { query });
