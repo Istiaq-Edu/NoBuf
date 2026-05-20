@@ -519,9 +519,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Green buffer bar — always visible, fills track height */}
+            {/* Green buffer bar — all locally available data (SourceBuffer + disk cache) */}
             {(() => {
-              // Read actual buffered time ranges from MSE video element (exact, no VBR issue)
               const vid = vidRef.current;
               const bufferedRanges: [number, number][] = [];
               if (vid && vid.buffered && vid.buffered.length > 0) {
@@ -531,7 +530,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               }
               const merged = [...bufferedRanges, ...cachedTimeRanges];
               if (merged.length === 0 || dur <= 0) return null;
-              // Sort and deduplicate overlapping ranges
               const sorted = merged.sort((a, b) => a[0] - b[0]);
               const deduped: [number, number][] = [];
               for (const r of sorted) {
