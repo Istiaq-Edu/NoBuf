@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
 import { Plus, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileCard } from './FileCard';
@@ -6,9 +6,7 @@ import { EmptyState } from './EmptyState';
 import { TelegramFile } from '../../types';
 import { ContextMenu } from './ContextMenu';
 import { FileListItem } from './FileListItem';
-
-type SortField = 'name' | 'size' | 'date';
-type SortDirection = 'asc' | 'desc';
+import { useSettings, GridDensity, SortField } from '../../context/SettingsContext';
 
 interface FileExplorerProps {
     files: TelegramFile[];
@@ -30,47 +28,127 @@ interface FileExplorerProps {
 }
 
 
-function useGridColumns(containerRef: React.RefObject<HTMLDivElement | null>) {
+const MIN_CARD_WIDTH: Record<GridDensity, number> = {
+    compact: 140,
+    default: 200,
+    spacious: 280,
+};
+/** Max columns per density — compact gets more columns in fullscreen */
+const MAX_COLS: Record<GridDensity, number> = {
+    compact: 12,
+    default: 8,
+    spacious: 6,
+};
+const GAP = 6;
+
+/** Pure calculation — exported for testing */
+export function calculateColumns(containerWidth: number, gap: number, minWidth: number, maxCols: number): number {
+    if (containerWidth <= 0 || minWidth <= 0) return 1;
+    return Math.min(maxCols, Math.max(1, Math.floor((containerWidth + gap) / (minWidth + gap))));
+}
+
+/**
+ * Grid layout hook — callback ref for immediate mount, ResizeObserver with
+ * direct gating (no debounce — ResizeObserver already batches per-frame).
+ *
+ * Industry pattern (Google Photos, Apple Photos, Notion):
+ *   - ResizeObserver fires → gate on actual column change → React skips
+ *     re-render if value is identical (React 18 Object.is)
+ *   - animateShift flag controls CSS transition window for smooth column shifts
+ *   - rAF used only to break potential observer→layout→observer loops
+ */
+function useGridColumns(density: GridDensity) {
+    const elRef = useRef<HTMLDivElement | null>(null);
+    const roRef = useRef<ResizeObserver | null>(null);
     const [columns, setColumns] = useState(4);
-    const [containerWidth, setContainerWidth] = useState(800);
+    const densityRef = useRef(density);
+    densityRef.current = density;
+    const animTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const [animateShift, setAnimateShift] = useState(false);
+    const mountedRef = useRef(false);
 
+    // Animate whenever columns actually change (skip first render)
     useEffect(() => {
-        if (!containerRef.current) return;
+        if (!mountedRef.current) { mountedRef.current = true; return; }
+        setAnimateShift(true);
+        clearTimeout(animTimerRef.current);
+        animTimerRef.current = setTimeout(() => setAnimateShift(false), 280);
+        return () => clearTimeout(animTimerRef.current);
+    }, [columns]);
 
-        const updateColumns = () => {
-            const width = containerRef.current?.clientWidth || 800;
-            setContainerWidth(width);
-            if (width < 640) setColumns(2);
-            else if (width < 768) setColumns(3);
-            else if (width < 1024) setColumns(4);
-            else if (width < 1280) setColumns(5);
-            else setColumns(6);
-        };
+    // Direct gating — ResizeObserver already batches per-frame, no debounce needed.
+    // React 18 skips re-render when setColumns receives the same value (Object.is).
+    const updateColumns = useCallback(() => {
+        const el = elRef.current;
+        if (!el) return;
+        const d = densityRef.current;
+        const nextCols = calculateColumns(el.clientWidth, GAP, MIN_CARD_WIDTH[d], MAX_COLS[d]);
+        setColumns(prev => prev === nextCols ? prev : nextCols);
+    }, []);
 
-        updateColumns();
-        const observer = new ResizeObserver(updateColumns);
-        observer.observe(containerRef.current);
-        return () => observer.disconnect();
-    }, [containerRef]);
+    // Callback ref — fires synchronously when the element mounts/unmounts
+    const containerRef: RefCallback<HTMLDivElement> = useCallback((el) => {
+        roRef.current?.disconnect();
+        elRef.current = el;
+        if (el) {
+            updateColumns(); // first paint — synchronous
+            const ro = new ResizeObserver(() => {
+                // rAF breaks potential observer→layout→observer loops
+                requestAnimationFrame(() => updateColumns());
+            });
+            ro.observe(el);
+            roRef.current = ro;
+        }
+    }, [updateColumns]);
 
-    return { columns, containerWidth };
+    // Recalculate when density changes (immediate)
+    useEffect(() => { updateColumns(); }, [density, updateColumns]);
+
+    // Cleanup on unmount
+    useEffect(() => () => { clearTimeout(animTimerRef.current); }, []);
+
+    return { columns, containerRef, scrollRef: elRef, animateShift };
 }
 
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
     onFileClick, onDelete, onDownload, onPreview, onManualUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd
 }: FileExplorerProps) {
-    const [sortField, setSortField] = useState<SortField>('name');
-    const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
+    const { settings, updateSetting } = useSettings();
+    const { columns, containerRef, scrollRef, animateShift } = useGridColumns(settings.gridDensity);
 
-    const parentRef = useRef<HTMLDivElement>(null);
-    const { columns, containerWidth } = useGridColumns(parentRef);
+    const sortField = settings.sortField;
+    const sortDirection = settings.sortDirection;
 
-    const GAP = 6;
-    const cardWidth = (containerWidth - (GAP * (columns - 1))) / columns;
-    const cardHeight = cardWidth * 0.75; // aspect-[4/3]
-    const rowHeight = Math.max(cardHeight + GAP, 150);
+    // Measure actual row height from the DOM for the virtualizer.
+    // Uses rAF batching (industry standard) to break observer→layout→observer loops.
+    // Ref updates immediately; state update is batched to next frame.
+    const rowHeightRef = useRef(200);
+    const [rowHeight, setRowHeight] = useState(200);
+    const rowRafRef = useRef<number>(0);
+
+    const handleRowMount = useCallback((el: HTMLDivElement | null) => {
+        if (!el) return;
+        const ro = new ResizeObserver(([entry]) => {
+            const h = entry.contentRect.height;
+            if (h > 0 && Math.abs(h - rowHeightRef.current) > 1) {
+                rowHeightRef.current = h; // ref is always accurate
+                cancelAnimationFrame(rowRafRef.current);
+                rowRafRef.current = requestAnimationFrame(() => {
+                    setRowHeight(h + GAP); // state update batched to next frame
+                });
+            }
+        });
+        ro.observe(el);
+        return () => {
+            ro.disconnect();
+            cancelAnimationFrame(rowRafRef.current);
+        };
+    }, []);
+
+    // Cleanup rAF on unmount
+    useEffect(() => () => { cancelAnimationFrame(rowRafRef.current); }, []);
 
     const handleContextMenu = useCallback((e: React.MouseEvent, file: TelegramFile) => {
         e.preventDefault();
@@ -102,10 +180,9 @@ export function FileExplorer({
 
 
     const gridRows = useMemo(() => {
-        const rows: (TelegramFile | 'upload')[][] = [];
-        const itemsWithUpload: (TelegramFile | 'upload')[] = [...sortedFiles, 'upload'];
-        for (let i = 0; i < itemsWithUpload.length; i += columns) {
-            rows.push(itemsWithUpload.slice(i, i + columns));
+        const rows: TelegramFile[][] = [];
+        for (let i = 0; i < sortedFiles.length; i += columns) {
+            rows.push(sortedFiles.slice(i, i + columns));
         }
         return rows;
     }, [sortedFiles, columns]);
@@ -118,7 +195,7 @@ export function FileExplorer({
 
     const gridVirtualizer = useVirtualizer({
         count: gridRows.length,
-        getScrollElement: () => parentRef.current,
+        getScrollElement: () => scrollRef.current,
         estimateSize: useCallback(() => rowHeight, [rowHeight]),
         overscan: 2,
         gap: GAP,
@@ -127,21 +204,21 @@ export function FileExplorer({
 
     useEffect(() => {
         gridVirtualizer.measure();
-    }, [rowHeight, gridVirtualizer]);
+    }, [rowHeight, columns, gridVirtualizer]);
 
     const listVirtualizer = useVirtualizer({
         count: listItems.length,
-        getScrollElement: () => parentRef.current,
+        getScrollElement: () => scrollRef.current,
         estimateSize: () => 48,
         overscan: 5,
     });
 
     const handleSort = (field: SortField) => {
         if (sortField === field) {
-            setSortDirection(d => d === 'asc' ? 'desc' : 'asc');
+            updateSetting('sortDirection', sortDirection === 'asc' ? 'desc' : 'asc');
         } else {
-            setSortField(field);
-            setSortDirection('asc');
+            updateSetting('sortField', field);
+            updateSetting('sortDirection', 'asc');
         }
     };
 
@@ -175,8 +252,9 @@ export function FileExplorer({
 
     return (
         <div
-            ref={parentRef}
-            className="flex-1 p-6 overflow-auto custom-scrollbar"
+            ref={containerRef}
+            className="flex-1 px-6 pb-6 overflow-auto custom-scrollbar"
+            style={{ willChange: 'scroll-position' }}
             onClick={(e) => {
                 if (e.target === e.currentTarget) onSelectionClear();
             }}
@@ -184,25 +262,34 @@ export function FileExplorer({
             {viewMode === 'grid' ? (
                 <>
 
-                    <div className="flex items-center gap-2 mb-4 text-xs text-telegram-subtext">
-                        <span>Sort by:</span>
+                    <div className="sticky top-0 z-10 bg-telegram-bg flex items-center justify-between px-4 pt-3 pb-2 text-xs text-telegram-subtext border-b border-telegram-border select-none">
+                        <div className="flex items-center gap-2">
+                            <span className="font-semibold">Sort by:</span>
+                            <button
+                                onClick={() => handleSort('name')}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'name' ? 'text-telegram-primary' : ''}`}
+                            >
+                                Name <SortIcon field="name" />
+                            </button>
+                            <button
+                                onClick={() => handleSort('size')}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'size' ? 'text-telegram-primary' : ''}`}
+                            >
+                                Size <SortIcon field="size" />
+                            </button>
+                            <button
+                                onClick={() => handleSort('date')}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'date' ? 'text-telegram-primary' : ''}`}
+                            >
+                                Date <SortIcon field="date" />
+                            </button>
+                        </div>
                         <button
-                            onClick={() => handleSort('name')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'name' ? 'text-telegram-primary' : ''}`}
+                            onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
+                            className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-telegram-primary text-black hover:brightness-110 active:scale-95 transition-all"
                         >
-                            Name <SortIcon field="name" />
-                        </button>
-                        <button
-                            onClick={() => handleSort('size')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'size' ? 'text-telegram-primary' : ''}`}
-                        >
-                            Size <SortIcon field="size" />
-                        </button>
-                        <button
-                            onClick={() => handleSort('date')}
-                            className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'date' ? 'text-telegram-primary' : ''}`}
-                        >
-                            Date <SortIcon field="date" />
+                            <Plus className="w-3.5 h-3.5" />
+                            Upload
                         </button>
                     </div>
 
@@ -211,36 +298,26 @@ export function FileExplorer({
                         className="relative w-full"
                         style={{ height: `${gridVirtualizer.getTotalSize()}px` }}
                     >
-                        {gridVirtualizer.getVirtualItems().map((virtualRow) => {
+                        {gridVirtualizer.getVirtualItems().map((virtualRow, vIdx) => {
                             const row = gridRows[virtualRow.index];
                             return (
                                 <div
                                     key={virtualRow.key}
+                                    ref={vIdx === 0 ? handleRowMount : undefined}
                                     className="absolute top-0 left-0 w-full grid"
                                     style={{
-                                        height: `${cardHeight}px`,
                                         transform: `translateY(${virtualRow.start}px)`,
                                         gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
                                         gap: `${GAP}px`,
+                                        contain: 'layout style paint',
+                                        ...(animateShift ? {
+                                            transition: 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)',
+                                        } : {}),
                                     }}
                                 >
-                                    {row.map((item) => {
-                                        if (item === 'upload') {
-                                            return (
-                                                <button
-                                                    key="upload"
-                                                    onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                                    className="border-2 border-dashed border-telegram-border rounded-xl flex flex-col items-center justify-center text-telegram-subtext hover:border-telegram-primary hover:text-telegram-primary transition-all group"
-                                                    style={{ height: `${cardHeight}px` }}
-                                                >
-                                                    <Plus className="w-8 h-8 mb-2 group-hover:scale-110 transition-transform" />
-                                                    <span className="text-sm font-medium">Upload File</span>
-                                                </button>
-                                            );
-                                        }
-                                        const file = item;
+                                    {row.map((file) => {
                                         return (
-                                            <FileCard
+                                                <FileCard
                                                 key={file.id}
                                                 file={file}
                                                 isSelected={selectedIds.includes(file.id)}
@@ -248,12 +325,10 @@ export function FileExplorer({
                                                 onContextMenu={(e) => handleContextMenu(e, file)}
                                                 onDelete={() => onDelete(file.id)}
                                                 onDownload={() => onDownload(file.id, file.name)}
-                                                onPreview={() => handlePreviewRequest(file)}
                                                 onDrop={onDrop}
                                                 onDragStart={onDragStart}
                                                 onDragEnd={onDragEnd}
                                                 activeFolderId={activeFolderId}
-                                                height={cardHeight}
                                                 onToggleSelection={() => onToggleSelection(file.id)}
                                             />
                                         );
@@ -265,12 +340,21 @@ export function FileExplorer({
                 </>
             ) : (
                 <div className="flex flex-col w-full">
-                    {/* List Header */}
-                    <div className="grid grid-cols-[2rem_2fr_6rem_8rem] gap-4 px-4 py-2 text-xs font-semibold text-telegram-subtext border-b border-telegram-border mb-2 select-none items-center">
+                    {/* List Header — pinned */}
+                    <div className="sticky top-0 z-10 bg-telegram-bg grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 px-4 pt-3 pb-2 text-xs font-semibold text-telegram-subtext border-b border-telegram-border select-none items-center">
                         <div className="text-center">#</div>
-                        <button onClick={() => handleSort('name')} className="flex items-center gap-1 hover:text-telegram-text transition-colors">
-                            Name <SortIcon field="name" />
-                        </button>
+                        <div className="flex items-center justify-between">
+                            <button onClick={() => handleSort('name')} className="flex items-center gap-1 hover:text-telegram-text transition-colors">
+                                Name <SortIcon field="name" />
+                            </button>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
+                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-telegram-primary text-black hover:brightness-110 active:scale-95 transition-all"
+                            >
+                                <Plus className="w-3.5 h-3.5" />
+                                Upload
+                            </button>
+                        </div>
                         <button onClick={() => handleSort('size')} className="flex items-center gap-1 justify-end hover:text-telegram-text transition-colors">
                             Size <SortIcon field="size" />
                         </button>
@@ -318,7 +402,7 @@ export function FileExplorer({
                                         onDragStart={onDragStart}
                                         onDragEnd={onDragEnd}
                                         onDrop={onDrop}
-                                        onPreview={handlePreviewRequest}
+                                        onToggleSelection={onToggleSelection}
                                         onDownload={onDownload}
                                         onDelete={onDelete}
                                     />
