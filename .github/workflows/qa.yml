@@ -1,0 +1,192 @@
+name: QA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            xvfb
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm install
+
+      - name: Build the app
+        working-directory: app
+        run: npm run tauri build
+        env:
+          CI: true
+
+      - name: Start app with xvfb and enable REST API
+        run: |
+          set -euo pipefail
+
+          QA_API_KEY="qa-test-key-$(date +%s)"
+          echo "QA_API_KEY=$QA_API_KEY" >> $GITHUB_ENV
+
+          # Compute SHA-256 hash of the API key
+          API_KEY_HASH=$(echo -n "$QA_API_KEY" | sha256sum | cut -d' ' -f1)
+
+          # Pre-configure REST API settings
+          API_SETTINGS_DIR="$HOME/.local/share/com.cameronamer.telegramdrive"
+          mkdir -p "$API_SETTINGS_DIR"
+          cat > "$API_SETTINGS_DIR/api_settings.json" << JSONEOF
+          {
+            "enabled": true,
+            "port": 8550,
+            "key_hash": "${API_KEY_HASH}"
+          }
+          JSONEOF
+          echo "REST API settings written to $API_SETTINGS_DIR/api_settings.json"
+
+          # Start the app with virtual display
+          BINARY="app/src-tauri/target/release/app"
+          if [ ! -f "$BINARY" ]; then
+            echo "::error::Binary not found at $BINARY"
+            exit 1
+          fi
+
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
+            "$BINARY" &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+          echo "App started with PID $APP_PID"
+
+          # Wait for REST API health check
+          echo "Waiting for REST API on port 8550..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8550/api/v1/health > /dev/null 2>&1; then
+              echo "REST API is ready (attempt $i)"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "::warning::REST API did not become ready within 60 seconds"
+            fi
+            sleep 2
+          done
+
+      - name: Install droid CLI
+        run: curl -fsSL https://app.factory.ai/cli | sh
+
+      - name: Run QA
+        id: qa
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          CI: true
+          QA_API_KEY: ${{ env.QA_API_KEY }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          cat > /tmp/qa-prompt.txt << 'PROMPTEOF'
+          You are running in a non-interactive CI environment. There is NO human available.
+          Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input.
+
+          Run the qa skill for Telegram-Drive. This is a Tauri desktop app.
+          Only REST API tests can run in CI (marked ci: true in qa-app/SKILL.md).
+          Skip all GUI-only flows (marked ci: false).
+
+          The REST API is running at http://localhost:8550.
+          The API key is available in the QA_API_KEY environment variable.
+
+          Important notes:
+          - The Telegram client may not be connected (no saved session in CI).
+            The 'No Connection State' flow (503 error) is expected behavior.
+          - The health check should always return 200 regardless of connection state.
+          - Test auth-required flows: missing key returns 401, invalid key returns 401.
+          - Test health, auth errors, and the API structure.
+
+          Write the final report to qa-results/report.md
+          PROMPTEOF
+
+          droid exec --auto high "$(cat /tmp/qa-prompt.txt)"
+
+      - name: Stop the app
+        if: always()
+        run: |
+          if [ -n "${APP_PID:-}" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+          # Also kill any remaining xvfb
+          pkill -f xvfb-run 2>/dev/null || true
+
+      - name: Upload QA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results
+          path: qa-results/
+          retention-days: 14
+
+      - name: Post QA report as PR comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPORT_FILE="qa-results/report.md"
+          ARTIFACT_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ -f "$REPORT_FILE" ]; then
+            REPORT_CONTENT=$(cat "$REPORT_FILE")
+          else
+            REPORT_CONTENT="## QA Report
+
+          :warning: **QA did not produce a report.** Check the workflow logs for details."
+          fi
+
+          COMMENT_BODY="<!-- qa-report -->
+          ${REPORT_CONTENT}
+
+          ---
+          :package: [Download QA artifacts](${ARTIFACT_URL}) | :gear: [Workflow run](${ARTIFACT_URL})"
+
+          echo "$COMMENT_BODY" > /tmp/qa-comment.md
+
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- qa-report -->")) | .id' | head -1)
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            echo "Updating existing QA comment #$EXISTING_COMMENT_ID"
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_COMMENT_ID" \
+              -X PATCH -F body="$(cat /tmp/qa-comment.md)" > /dev/null
+          else
+            echo "Creating new QA comment"
+            gh pr comment ${{ github.event.pull_request.number }} --body "$(cat /tmp/qa-comment.md)"
+          fi
