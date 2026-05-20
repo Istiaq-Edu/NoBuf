@@ -141,6 +141,33 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const cancelledRef = useRef(false);
   // When true, suppress reports to backend cache (used during active download)
   const suppressBackendReportsRef = useRef(false);
+  // When true, log the first trackDownloadedRange call after a seek reset
+  const justSeekedRef = useRef(false);
+
+  // Byte-to-time lookup table for accurate VBR conversion.
+  // Built from mp4box.seek() calibration points during initialization.
+  // Each entry is [byteOffset, timeSeconds], sorted by byteOffset.
+  const byteToTimeTableRef = useRef<[number, number][]>([]);
+
+  /** Convert a byte position to a time position using the VBR lookup table.
+   *  Falls back to linear formula if table is empty. */
+  const byteToTime = useCallback((bytePos: number): number => {
+    const table = byteToTimeTableRef.current;
+    if (table.length === 0 || state.current.fileLength <= 0) {
+      return (bytePos / state.current.fileLength) * state.current.duration;
+    }
+    // Binary search for the two nearest calibration points
+    let lo = 0, hi = table.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (table[mid][0] <= bytePos) lo = mid;
+      else hi = mid;
+    }
+    const [byteLo, timeLo] = table[lo];
+    const [byteHi, timeHi] = table[hi];
+    if (byteHi === byteLo) return timeLo;
+    return timeLo + (timeHi - timeLo) * (bytePos - byteLo) / (byteHi - byteLo);
+  }, []);
 
   // Debounced range reporter — accumulates fetched byte ranges and
   // reports them to the Rust backend every 2 seconds (or on completion)
@@ -200,11 +227,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     downloadedRangesRef.current = merged;
     // Convert byte ranges → time ranges for progress bar rendering
     const timeRanges: [number, number][] = merged.map(([bs, be]) => {
-      const ts = (bs / state.current.fileLength) * state.current.duration;
-      const te = (be / state.current.fileLength) * state.current.duration;
+      const ts = byteToTime(bs);
+ const te = byteToTime(be);
       return [ts, te];
     });
     setDownloadedTimeRanges(timeRanges);
+    // Log first range after a seek reset for debugging
+    if (justSeekedRef.current) {
+      justSeekedRef.current = false;
+      const [ts, te] = timeRanges[timeRanges.length - 1];
+      console.log(`[BUFFER-BAR] First range after seek: bytes ${byteStart}-${byteEnd} → time ${ts.toFixed(1)}-${te.toFixed(1)}s`);
+    }
   }, []);
 
   // Clear downloaded ranges (on seek / cleanup)
@@ -504,6 +537,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       state.current.bitrate = state.current.fileLength / state.current.duration;
     }
 
+    // Build byte-to-time VBR lookup table (200 calibration points)
+    // mp4box.seek(time, true) → { offset: bytePos } gives exact byte for each time.
+    // We store [bytePos, time] pairs and interpolate for any byte position.
+    if (state.current.fileLength > 0 && state.current.duration > 0) {
+      const CALIBRATION_POINTS = 200;
+      const table: [number, number][] = [];
+      for (let i = 0; i <= CALIBRATION_POINTS; i++) {
+        const t = (i / CALIBRATION_POINTS) * state.current.duration;
+        const seekResult = mp4box.seek(t, true) as any;
+        const byteOffset = (seekResult && typeof seekResult.offset === 'number')
+          ? seekResult.offset
+          : (t / state.current.duration) * state.current.fileLength;
+        table.push([byteOffset, t]);
+      }
+      byteToTimeTableRef.current = table;
+      console.log(`[BUFFER-BAR] VBR lookup table built: ${table.length} points, video duration=${state.current.duration.toFixed(1)}s`);
+    }
+
     // Create SourceBuffers
     try {
       if (state.current.videoTracks.length > 0) {
@@ -609,7 +660,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const seekTime = (seekByte / state.current.fileLength) * state.current.duration;
         state.current.pendingSeek = -1;
 
-        console.log(`[PREBUFFER] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)})`);
+        const oldRangeCount = downloadedRangesRef.current.length;
+        console.log(`[BUFFER-BAR] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)}), clearing ${oldRangeCount} stale downloaded ranges`);
 
         // 1. Clear old buffered data from SourceBuffers
         if (state.current.videoSourceBuffer) {
@@ -619,7 +671,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           state.current.audioSourceBuffer.resetForSeek();
         }
 
-        // 2. Seek mp4box BEFORE flushing (sample table is intact).
+        // 2. Clear stale downloaded ranges so green bar resets with grey bar
+        clearDownloadedRanges();
+        justSeekedRef.current = true;
+
+        // 3. Seek mp4box BEFORE flushing (sample table is intact).
         const seekInfo = state.current.mp4box!.seek(seekTime, true) as any;
         state.current.mp4box!.flush();
 
@@ -668,13 +724,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
         if (!response.ok && response.status !== 206) {
           break;
-        }
-
-        const xCache = response.headers.get('X-Cache');
-        if (xCache) {
-          console.log(`[PREBUFFER] RESPONSE: bytes=${offset}-${end}, cache=${xCache}`);
-        } else {
-          console.log(`[PREBUFFER] RESPONSE: bytes=${offset}-${end}, cache=DOWNLOAD (from Telegram)`);
         }
 
         const data = await response.arrayBuffer();
@@ -820,6 +869,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     seekTo,
     setVideoRef,
     downloadedTimeRanges,
+    byteToTime,
     setSuppressBackendReports,
     getMp4Box: () => state.current.mp4box,
     getFileLength: () => state.current.fileLength,
