@@ -175,6 +175,16 @@ body,
   animation: progress-indeterminate 1.5s infinite linear;
 }
 
+/* Subtle pulse for download indicator */
+@keyframes subtlePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.animate-subtle-pulse {
+  animation: subtlePulse 2s ease-in-out infinite;
+}
+
 /* Light mode specific overrides for common patterns */
 :root.light .bg-telegram-bg {
   background-color: var(--color-telegram-bg);
