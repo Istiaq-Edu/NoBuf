@@ -10,6 +10,22 @@ use std::sync::Arc;
 use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom};
 
+/// Drop-guard that untracks streaming when the Actix response ends
+/// (including client disconnect). Prevents cmd_delete_cache from
+/// deleting files while the stream is still active.
+struct StreamingGuard {
+    cache_mgr: Option<StreamCacheManager>,
+    message_id: i32,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        if let Some(ref cm) = self.cache_mgr {
+            cm.untrack_streaming(self.message_id);
+        }
+    }
+}
+
 /// Holds the per-session streaming token for Actix validation
 pub(crate) struct StreamTokenData {
     pub(crate) token: String,
@@ -195,12 +211,7 @@ async fn stream_media(
     // use the per-message lock for serialized meta updates.
     let cache_file_opt: Option<std::fs::File> =
         if let Some(ref cache_mgr) = **cache {
-            let data_path = cache_mgr.data_path(message_id);
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&data_path)
-            {
+            match cache_mgr.open_data_file_write(message_id) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     log::warn!("[PREBUFFER] Failed to open cache file for {}: {}", message_id, e);
@@ -213,6 +224,20 @@ async fn stream_media(
 
     let cache_mgr_opt: Option<StreamCacheManager> =
         (**cache).as_ref().map(|cm| cm.clone());
+
+    // Track streaming activity so cmd_delete_cache refuses to delete
+    // files while this Actix response is active (prevents catastrophic
+    // range loss on Windows where FILE_SHARE_DELETE allows deletion
+    // of files with open handles).
+    let _stream_guard = if let Some(ref cache_mgr) = **cache {
+        cache_mgr.track_streaming(message_id);
+        StreamingGuard {
+            cache_mgr: Some(cache_mgr.clone()),
+            message_id,
+        }
+    } else {
+        StreamingGuard { cache_mgr: None, message_id }
+    };
 
     let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
     let cache_filename = match &media {
@@ -363,23 +388,58 @@ async fn stream_media(
                         let mut meta = match cache_mgr.load_meta(message_id) {
                             Some(m) => m,
                             None => {
-                                // On Windows, save_meta's truncate+write may briefly
-                                // leave the file empty. Retry once before creating a
-                                // fresh meta (which would lose all existing ranges).
-                                log::warn!("[PREBUFFER] Meta load returned None for msg {}, retrying after brief pause", message_id);
-                                std::thread::sleep(std::time::Duration::from_millis(20));
-                                match cache_mgr.load_meta(message_id) {
+                                // Meta file temporarily unreadable (filesystem cache,
+                                // antivirus scan, save_meta race). Retry 3 times
+                                // with increasing delays before creating recovery meta.
+                                // NEVER lose all existing ranges by creating empty
+                                // cached_ranges — always try to recover from data file.
+                                log::warn!("[PREBUFFER] Meta load returned None for msg {}, retrying", message_id);
+                                let mut recovered = None;
+                                for (attempt, delay_ms) in [(1, 20), (2, 50), (3, 100)] {
+                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                    if let Some(m) = cache_mgr.load_meta(message_id) {
+                                        log::info!("[PREBUFFER] Meta recovered for msg {} on attempt {}", message_id, attempt);
+                                        recovered = Some(m);
+                                        break;
+                                    }
+                                }
+                                match recovered {
                                     Some(m) => m,
                                     None => {
-                                        if cache_mgr.data_path(message_id).exists() {
-                                            log::warn!("[PREBUFFER] Meta missing for msg {} but data file exists — creating recovery meta", message_id);
-                                        }
+                                        // All retries failed. Create recovery meta that
+                                        // preserves as much info as possible. On Windows,
+                                        // files can enter "pending delete" state where
+                                        // the directory entry is gone but open handles
+                                        // remain valid — use the open cache file handle
+                                        // as a fallback for file size detection.
+                                        let data_path = cache_mgr.data_path(message_id);
+                                        let data_exists = data_path.exists();
+                                        let fs_data_size = if data_exists {
+                                            std::fs::metadata(&data_path)
+                                                .map(|m| m.len()).unwrap_or(0)
+                                        } else { 0 };
+                                        // Fallback: open handle metadata (handles
+                                        // Windows "pending delete" where directory
+                                        // entry is gone but handle is still valid)
+                                        let handle_data_size = cache_file_mut
+                                            .as_ref()
+                                            .and_then(|f| f.metadata().ok())
+                                            .map(|m| m.len())
+                                            .unwrap_or(0);
+                                        let data_size = fs_data_size.max(handle_data_size);
+                                        log::warn!("[PREBUFFER] Meta recovery for msg {}: data_file_exists={}, fs_data_size={}, handle_data_size={}, total_size={}", 
+                                            message_id, data_exists, fs_data_size, handle_data_size, size);
+                                        let recovery_ranges = if data_size > 0 && data_size <= size {
+                                            vec![(0u64, data_size - 1)]
+                                        } else {
+                                            Vec::new()
+                                        };
                                         CacheMeta {
                                             message_id,
                                             folder_id: cache_folder_id,
                                             total_size: size,
                                             filename: cache_filename.clone(),
-                                            cached_ranges: Vec::new(),
+                                            cached_ranges: recovery_ranges,
                                             mime_type: mime_stream.clone(),
                                         }
                                     }

@@ -437,11 +437,7 @@ pub async fn cmd_download_file(
             });
         }
 
-        let mut cache_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&cache_path)
-            .ok();
+        let mut cache_file = cache_state.open_data_file_write(message_id).ok();
 
         log::info!("Download {} filling {} gap(s)", message_id, gaps.len());
 
@@ -556,12 +552,7 @@ pub async fn cmd_download_file(
     // Stream download with per-chunk progress -- also cache to disk so download
     // chunks serve as buffers. The green bar polls cmd_get_cache_status to track
     // download progress in real-time, and future downloads benefit from cached data.
-    let cache_path = cache_state.data_path(message_id);
-    let mut cache_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&cache_path)
-        .ok();
+    let mut cache_file = cache_state.open_data_file_write(message_id).ok();
     let dl_filename = match &media {
         Media::Document(d) => d.name().to_string(),
         _ => format!("{}.mp4", message_id),

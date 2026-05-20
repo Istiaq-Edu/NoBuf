@@ -145,7 +145,14 @@ pub fn run() {
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
 
             // Initialize stream cache manager
-            let cache_dir = std::env::temp_dir().join("telegram-drive-cache");
+            // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
+            // subject to automatic cleanup by Storage Sense, Disk Cleanup,
+            // and antivirus — which can delete .dat and .meta files mid-stream
+            // causing catastrophic cached-range loss.
+            let cache_dir = app.path().app_data_dir()
+                .map_err(|e| format!("app_data_dir: {}", e))
+                .unwrap_or_else(|_| std::env::temp_dir().join("telegram-drive-cache"))
+                .join("stream-cache");
             let cache_mgr = match stream_cache::StreamCacheManager::new(cache_dir) {
                 Ok(cache_mgr) => {
                     app.manage(cache_mgr.clone());

@@ -237,11 +237,7 @@ async fn background_cache_download(
     let mime_type = crate::server::mime_type_from_media(&media);
 
     // Download gaps to cache file
-    let cache_path = cache_mgr.data_path(message_id);
-    let mut cache_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&cache_path)
+    let mut cache_file = cache_mgr.open_data_file_write(message_id)
         .map_err(|e| format!("Failed to open cache file: {}", e))?;
 
     let chunk_size: i32 = 512 * 1024;
