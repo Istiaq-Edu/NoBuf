@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { HardDrive, Folder, Plus, RefreshCw, LogOut } from 'lucide-react';
+import { HardDrive, Folder, Plus, RefreshCw, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
 import { TelegramFolder, BandwidthStats } from '../../types';
@@ -16,11 +16,13 @@ interface SidebarProps {
     onSync: () => void;
     onLogout: () => void;
     bandwidth: BandwidthStats | null;
+    collapsed: boolean;
+    onToggleCollapse: () => void;
 }
 
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onCreate,
-    isSyncing, isConnected, onSync, onLogout, bandwidth
+    isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
@@ -37,14 +39,24 @@ export function Sidebar({
     }
 
     return (
-        <aside className="w-64 bg-telegram-surface border-r border-telegram-border flex flex-col" onClick={e => e.stopPropagation()}>
-            <div className="p-4 flex items-center gap-2">
-                <img src="/logo.svg" className="w-8 h-8 drop-shadow-lg" alt="Logo" />
-                <span className="font-bold text-lg text-telegram-text tracking-tight">Telegram Drive</span>
+        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-telegram-surface border-r border-telegram-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0`} onClick={e => e.stopPropagation()}>
+
+            {/* Toggle button — always in the same spot */}
+            <div className="p-3 flex items-center">
+                <button
+                    onClick={onToggleCollapse}
+                    className="w-8 h-8 rounded-lg flex items-center justify-center text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover transition-colors"
+                    title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                >
+                    {collapsed
+                        ? <PanelLeftOpen className="w-4 h-4" />
+                        : <PanelLeftClose className="w-4 h-4" />
+                    }
+                </button>
             </div>
 
             {/* Scrollable folder list */}
-            <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto min-h-0">
+            <nav className="flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0">
                 <SidebarItem
                     icon={HardDrive}
                     label="Saved Messages"
@@ -52,6 +64,7 @@ export function Sidebar({
                     onClick={() => setActiveFolderId(null)}
                     onDrop={(e: React.DragEvent) => onDrop(e, null)}
                     folderId={null}
+                    collapsed={collapsed}
                 />
                 {folders.map(folder => (
                     <SidebarItem
@@ -63,11 +76,12 @@ export function Sidebar({
                         onDrop={(e: React.DragEvent) => onDrop(e, folder.id)}
                         onDelete={() => onDelete(folder.id, folder.name)}
                         folderId={folder.id}
+                        collapsed={collapsed}
                     />
                 ))}
             </nav>
 
-            {/* Sticky Create Folder section — always visible above the footer */}
+            {/* Create Folder */}
             <div className="px-2 pb-2 border-b border-telegram-border">
                 {showNewFolderInput ? (
                     <div className="px-3 py-2">
@@ -79,47 +93,59 @@ export function Sidebar({
                             value={newFolderName}
                             onChange={e => setNewFolderName(e.target.value)}
                             onKeyDown={e => e.key === 'Enter' && submitCreate()}
-                            onBlur={() => !newFolderName && setShowNewFolderInput(false)}
+                            onBlur={() => { if (!newFolderName) { setShowNewFolderInput(false); if (collapsed) onToggleCollapse(); } }}
                         />
                     </div>
                 ) : (
                     <button
-                        onClick={() => setShowNewFolderInput(true)}
-                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border"
+                        onClick={() => {
+                            if (collapsed) { onToggleCollapse(); }
+                            setShowNewFolderInput(true);
+                        }}
+                        className={`w-full flex items-center px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border overflow-hidden ${collapsed ? 'justify-center' : 'gap-3'}`}
+                        title="Create Folder"
                     >
-                        <Plus className="w-4 h-4" />
-                        Create Folder
+                        <Plus className="w-4 h-4 shrink-0" />
+                        <span className={`whitespace-nowrap transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>Create Folder</span>
                     </button>
                 )}
             </div>
 
-            <div className="p-4 border-t border-telegram-border">
-                <div className="flex items-center gap-2 text-telegram-subtext text-xs">
-                    <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-                    <span>{isConnected ? 'Connected to Telegram' : 'Disconnected from Telegram'}</span>
+            {/* Footer — single structure, text fades out */}
+            <div className="p-3 border-t border-telegram-border">
+                <div className={`flex items-center text-telegram-subtext text-xs mb-3 ${collapsed ? 'justify-center' : 'gap-2'}`}>
+                    <div className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+                    <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'max-w-0 opacity-0' : 'max-w-[200px] opacity-100'}`}>
+                        {isConnected ? 'Connected' : 'Disconnected'}
+                    </span>
                 </div>
 
-                <div className="flex gap-2 mt-4">
+                <div className={`flex ${collapsed ? 'flex-col items-center gap-2' : 'gap-2'}`}>
                     <button
                         onClick={onSync}
                         disabled={isSyncing}
-                        className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded-lg transition-colors ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                        title="Scan for existing folders"
+                        className={`flex items-center justify-center text-xs font-medium text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'} ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        title={isSyncing ? 'Syncing...' : 'Sync'}
                     >
-                        <RefreshCw className={`w-3 h-3 ${isSyncing ? 'animate-spin' : ''}`} />
-                        {isSyncing ? 'Syncing...' : 'Sync'}
+                        <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isSyncing ? 'animate-spin' : ''}`} />
+                        <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>
+                            {isSyncing ? 'Syncing...' : 'Sync'}
+                        </span>
                     </button>
                     <button
                         onClick={onLogout}
-                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-red-500 hover:text-red-600 bg-red-500/10 hover:bg-red-500/20 rounded-lg transition-colors"
+                        className={`flex items-center justify-center text-xs font-medium text-red-500 hover:text-red-600 bg-red-500/10 hover:bg-red-500/20 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'}`}
                         title="Sign Out"
                     >
-                        <LogOut className="w-3 h-3" />
-                        Logout
+                        <LogOut className="w-3.5 h-3.5 shrink-0" />
+                        <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>Logout</span>
                     </button>
                 </div>
 
-                {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
+                {/* Bandwidth — fades out when collapsed */}
+                <div className={`transition-all duration-200 overflow-hidden ${collapsed ? 'max-h-0 opacity-0 mt-0' : 'max-h-40 opacity-100 mt-3'}`}>
+                    {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
+                </div>
             </div>
 
         </aside>

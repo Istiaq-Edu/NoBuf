@@ -1,11 +1,18 @@
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { load } from '@tauri-apps/plugin-store';
 
+export type GridDensity = 'compact' | 'default' | 'spacious';
+export type SortField = 'name' | 'size' | 'date';
+export type SortDirection = 'asc' | 'desc';
+
 export interface Settings {
     viewMode: 'grid' | 'list';
     autoUpdate: boolean;
     maxConcurrentUploads: number;
     maxConcurrentDownloads: number;
+    gridDensity: GridDensity;
+    sortField: SortField;
+    sortDirection: SortDirection;
 }
 
 const defaultSettings: Settings = {
@@ -13,6 +20,9 @@ const defaultSettings: Settings = {
     autoUpdate: true,
     maxConcurrentUploads: 6,
     maxConcurrentDownloads: 6,
+    gridDensity: 'default',
+    sortField: 'name',
+    sortDirection: 'asc',
 };
 
 interface SettingsContextType {
@@ -35,8 +45,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
                 const store = await load('settings.json');
                 const saved = await store.get<Settings>('settings');
                 if (saved) {
-                    // Merge with defaults so new keys are always present
-                    setSettings({ ...defaultSettings, ...saved });
+                    // Filter out undefined values so defaults aren't overridden
+                    const cleaned = Object.fromEntries(
+                        Object.entries(saved).filter(([_, v]) => v !== undefined)
+                    ) as Partial<Settings>;
+                    setSettings({ ...defaultSettings, ...cleaned });
                 }
             } catch {
                 // Store not available or first run — use defaults
