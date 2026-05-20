@@ -4,6 +4,89 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Windows FILE_SHARE_DELETE protection
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// On Windows, Rust's std::fs::OpenOptions opens files with
+// FILE_SHARE_DELETE, allowing ANY process to mark the file for
+// deletion while our handle is open. This causes the file to enter
+// a "pending delete" state where the directory entry is removed
+// (file appears not to exist) but open handles can still read/write.
+// When all handles close, the file is permanently deleted, losing
+// ALL cached data.
+//
+// Most likely cause: antivirus scanning the .dat file (containing
+// video data) and marking it for deletion.
+//
+// Fix: open cache .dat files with FILE_SHARE_READ | FILE_SHARE_WRITE
+// (no FILE_SHARE_DELETE). This prevents external processes from
+// deleting the file. DeleteFile/RemoveFile will fail with
+// ERROR_ACCESS_DENIED while our handle is open. Reputable antivirus
+// respects this flag and skips files in active use.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    // NOTE: FILE_SHARE_DELETE (0x00000004) is intentionally EXCLUDED
+    // to prevent external processes (antivirus, system cleanup) from
+    // marking cache files for deletion while streaming is active.
+    const OPEN_ALWAYS: u32 = 4;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const GENERIC_READ: u32 = 0x80000000;
+    const GENERIC_WRITE: u32 = 0x40000000;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> isize;
+
+        fn GetLastError() -> u32;
+    }
+
+    /// Open a file for read+write with FILE_SHARE_READ | FILE_SHARE_WRITE
+    /// but WITHOUT FILE_SHARE_DELETE. Equivalent to
+    /// OpenOptions::new().create(true).write(true).open() but protected
+    /// from external deletion on Windows.
+    pub fn open_file_no_delete_share(path: &Path) -> std::io::Result<std::fs::File> {
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            let err_code = unsafe { GetLastError() };
+            return Err(std::io::Error::from_raw_os_error(err_code as i32));
+        }
+
+        // SAFETY: CreateFileW returned a valid, non-INVALID_HANDLE_VALUE handle.
+        // We take ownership via from_raw_handle — the File's Drop impl will
+        // call CloseHandle when it goes out of scope.
+        Ok(unsafe { FromRawHandle::from_raw_handle(handle as *mut std::ffi::c_void) })
+    }
+}
+
 /// Metadata sidecar for a cached file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
@@ -63,6 +146,8 @@ pub struct StreamCacheManager {
     /// Per-message locks to serialize meta read-modify-write operations
     /// between player reports and download updates (prevents race conditions)
     meta_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Tracks messages currently being streamed (synchronous, for Drop guards)
+    streaming_active: Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl StreamCacheManager {
@@ -72,12 +157,33 @@ impl StreamCacheManager {
             cache_dir,
             active_tasks: Arc::new(Mutex::new(Vec::new())),
             meta_locks: Arc::new(Mutex::new(HashMap::new())),
+            streaming_active: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
     /// Path to the data file for a message
     pub fn data_path(&self, message_id: i32) -> PathBuf {
         self.cache_dir.join(format!("{}.dat", message_id))
+    }
+
+    /// Open the data file for writing, protected from external deletion.
+    /// On Windows, this opens with FILE_SHARE_READ | FILE_SHARE_WRITE
+    /// (no FILE_SHARE_DELETE) to prevent antivirus/cleanup from marking
+    /// the file for deletion while our handle is open. Equivalent to
+    /// OpenOptions::new().create(true).write(true).open() on non-Windows.
+    pub fn open_data_file_write(&self, message_id: i32) -> std::io::Result<std::fs::File> {
+        let path = self.data_path(message_id);
+        #[cfg(target_os = "windows")]
+        {
+            win32::open_file_no_delete_share(&path)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+        }
     }
 
     /// Path to the meta sidecar for a message
@@ -89,37 +195,67 @@ impl StreamCacheManager {
     pub fn load_meta(&self, message_id: i32) -> Option<CacheMeta> {
         let path = self.meta_path(message_id);
         if !path.exists() {
+            log::debug!("[META] load_meta: {} file does not exist", path.display());
             return None;
         }
-        let data = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&data).ok()
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if file_size == 0 {
+            log::warn!("[META] load_meta: {} exists but is 0 bytes (zero-byte window)", path.display());
+            return None;
+        }
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("[META] load_meta: {} read_to_string failed: {} (size={})", path.display(), e, file_size);
+                return None;
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log::warn!("[META] load_meta: {} JSON parse failed: {} (size={}, content_len={}, first_80={:?})", 
+                    path.display(), e, file_size, data.len(), &data[..data.len().min(80)]);
+                None
+            }
+        }
     }
 
     /// Save metadata to disk atomically.
-    /// On POSIX: write to temp file, then rename (atomically replaces target).
-    /// On Windows: rename fails if target exists, so we overwrite in-place
-    /// WITHOUT truncating first. We open the file for write-only (no truncate),
-    /// write the new content (which overwrites the old byte-by-byte), then
-    /// truncate to the new length if shorter, then sync_all. This ensures
-    /// the file NEVER has zero-byte content — it always contains either the
-    /// old valid JSON or the new valid JSON, never an empty/truncated state
-    /// that would cause load_meta to return None and lose all cached ranges.
-    /// The per-message lock serializes all access during the overwrite window.
+    /// Strategy: write to a temp file, sync it to disk, then atomically
+    /// rename it over the target. On modern Rust/Windows, rename replaces
+    /// the destination (MOVEFILE_REPLACE_EXISTING). On older Rust where
+    /// rename fails if destination exists, we fall back to in-place
+    /// overwrite (open-for-write without truncate, write, truncate, sync).
+    ///
+    /// Critical: we sync_all the .tmp file BEFORE renaming. This ensures
+    /// the data is committed to disk before the atomic replace, preventing
+    /// scenarios where rename succeeds but the file content hasn't reached
+    /// stable storage — which could cause load_meta to read incomplete data
+    /// on a busy Windows filesystem.
     pub fn save_meta(&self, meta: &CacheMeta) -> std::io::Result<()> {
         let path = self.meta_path(meta.message_id);
         let json = serde_json::to_string_pretty(meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &json)?;
+
+        // Write .tmp with explicit sync to ensure data hits disk before rename
+        use std::io::Write;
+        {
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            tmp_file.write_all(json.as_bytes())?;
+            tmp_file.sync_all()?; // CRITICAL: commit to disk before rename
+        }
+
         match std::fs::rename(&tmp_path, &path) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // On Windows, rename fails if target exists.
-                // Overwrite in-place WITHOUT truncating first:
-                // open for write (not truncate), write new content over old,
-                // then truncate to new length, then sync. This avoids the
-                // zero-byte window that File::create (truncate+write) causes.
-                use std::io::{Write, Seek, SeekFrom};
+            Ok(()) => {
+                log::debug!("[META] save_meta: renamed {} -> {} ({}B)", tmp_path.display(), path.display(), json.len());
+                Ok(())
+            }
+            Err(rename_err) => {
+                // Rename failed — log the reason and fall back to in-place overwrite
+                log::warn!("[META] save_meta: rename {} -> {} failed: {}, falling back to in-place overwrite ({}B)", 
+                    tmp_path.display(), path.display(), rename_err, json.len());
+                use std::io::{Seek, SeekFrom};
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&path)?;
@@ -160,8 +296,15 @@ impl StreamCacheManager {
         lock.lock_owned().await
     }
 
-    /// Delete cache for a specific message
+    /// Delete cache for a specific message.
+    /// Refuses to delete if the message is currently being streamed
+    /// (frontend cmd_delete_cache during streaming caused catastrophic
+    /// range loss because files enter "pending-delete" state on Windows).
     pub fn delete_cache(&self, message_id: i32) -> std::io::Result<()> {
+        if self.is_streaming(message_id) {
+            log::warn!("[CACHE] delete_cache: msg {} has active streaming — skipping deletion, cache will be cleaned on exit", message_id);
+            return Ok(());
+        }
         let data = self.data_path(message_id);
         let meta = self.meta_path(message_id);
         if data.exists() { std::fs::remove_file(&data)?; }
@@ -196,6 +339,29 @@ impl StreamCacheManager {
     /// Check if a message has an active background task
     pub async fn has_active_task(&self, message_id: i32) -> bool {
         self.active_tasks.lock().await.contains(&message_id)
+    }
+
+    /// Track that a message is currently being streamed (Actix response active).
+    /// Synchronous so it can be used in Drop guards.
+    pub fn track_streaming(&self, message_id: i32) {
+        self.streaming_active.lock().unwrap().push(message_id);
+    }
+
+    /// Untrack a streaming message (called when stream ends or client disconnects).
+    /// Removes only ONE entry — concurrent streams for the same message_id
+    /// (e.g. player seeks spawning a new range request) each track/untrack
+    /// independently.
+    pub fn untrack_streaming(&self, message_id: i32) {
+        if let Ok(mut v) = self.streaming_active.lock() {
+            if let Some(pos) = v.iter().position(|&id| id == message_id) {
+                v.remove(pos);
+            }
+        }
+    }
+
+    /// Check if a message is currently being streamed by Actix.
+    pub fn is_streaming(&self, message_id: i32) -> bool {
+        self.streaming_active.lock().map(|v| v.contains(&message_id)).unwrap_or(false)
     }
 }
 
