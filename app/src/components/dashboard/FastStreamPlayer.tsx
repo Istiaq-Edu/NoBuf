@@ -519,7 +519,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Green buffer bar — SourceBuffer (video.buffered, VBR-accurate) + disk cache */}
+            {/* Green buffer bar — always visible, fills track height */}
             {(() => {
               // Read actual buffered time ranges from MSE video element (exact, no VBR issue)
               const vid = vidRef.current;
@@ -547,13 +547,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={`buf-${i}`}
-                    className="absolute bottom-0 h-[3px] bg-green-400 rounded-full z-20"
+                    className="absolute bottom-0 h-[3px] bg-green-400/70 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* Preview thumbnail coverage — segments at each cached position */}
+            {/* Preview thumbnail coverage — yellow bar, hover-only */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
               const sorted = Array.from(cachedTimes).sort((a, b) => a - b);
