@@ -185,6 +185,16 @@ body,
   animation: subtlePulse 2s ease-in-out infinite;
 }
 
+/* Skip feedback — pop-in bounce then smooth fade-out */
+@keyframes skipPop {
+  0% { opacity: 0; transform: scale(0.6); }
+  12% { opacity: 1; transform: scale(1.08); }
+  24% { transform: scale(0.96); }
+  36% { transform: scale(1); }
+  72% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.92); }
+}
+
 /* Light mode specific overrides for common patterns */
 :root.light .bg-telegram-bg {
   background-color: var(--color-telegram-bg);
