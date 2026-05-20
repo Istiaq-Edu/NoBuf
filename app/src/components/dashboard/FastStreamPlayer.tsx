@@ -71,11 +71,25 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
 
-  // Thumbnail extractor — uses hidden video element with buffer-aware background generation
-  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
+  // Thumbnail extractor — ref-based hover processor + synchronous cache check
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
+
+  // When cachedTimes updates (from on-demand capture), check if the current
+  // hover position is now cached and update the display. This is the key
+  // mechanism that makes on-demand thumbnails appear — the hover processor
+  // caches them, cachedTimes state updates, and this effect resolves the spinner.
+  useEffect(() => {
+    if (lastThumbTimeRef.current >= 0 && thumbLoading) {
+      const cachedUrl = getCachedThumbnailSync(lastThumbTimeRef.current);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+      }
+    }
+  }, [cachedTimes, getCachedThumbnailSync, thumbLoading]);
 
   // Close handler — check cache status and offer to continue in background
   const handleClose = useCallback(async () => {
@@ -392,6 +406,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [dur, useNative, seekTo]);
 
   const tipRafRef = useRef(0);
+  const hoverDebounceRef = useRef(0);
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
     const r = barRef.current.getBoundingClientRect();
@@ -403,30 +418,34 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
     });
 
-    if (thumbReady && getThumbnail) {
-      const roundedTime = Math.floor(hoverTime / 2) * 2;
-      if (roundedTime !== lastThumbTimeRef.current) {
-        lastThumbTimeRef.current = roundedTime;
+    const roundedTime = Math.floor(hoverTime / 2) * 2;
+    if (roundedTime !== lastThumbTimeRef.current) {
+      lastThumbTimeRef.current = roundedTime;
 
+      // Synchronous cache check — instant display for already-cached thumbnails
+      const cachedUrl = getCachedThumbnailSync(hoverTime);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+        // Cancel any pending on-demand request (we have the thumbnail)
+        clearTimeout(hoverDebounceRef.current);
+        clearDesiredHover();
+      } else {
+        // Not cached: show spinner immediately, but delay the on-demand seek
+        // by 1 second. This prevents accidental/sweep hovers from triggering
+        // expensive network seeks. If the user stays at this position for 1s,
+        // the hover processor starts generating the thumbnail.
         setThumbUrl(null);
         setThumbLoading(true);
 
-        const requestedTime = roundedTime;
-        getThumbnail(hoverTime).then((result) => {
-          // Only apply if this is still the latest request
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(result?.dataUrl ?? null);
-            setThumbLoading(false);
-          }
-        }).catch(() => {
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(null);
-            setThumbLoading(false);
-          }
-        });
+        // Cancel previous debounce timer
+        clearTimeout(hoverDebounceRef.current);
+        hoverDebounceRef.current = window.setTimeout(() => {
+          setDesiredHoverTime(hoverTime);
+        }, 1000);
       }
     }
-  }, [dur, thumbReady, getThumbnail]);
+  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
 
   // Keyboard
   useEffect(() => {
@@ -494,6 +513,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           onMouseMove={onBarMove}
           onMouseLeave={() => {
             setTip(p => ({ ...p, show: false }));
+            clearTimeout(hoverDebounceRef.current);
+            clearDesiredHover();
           }}
         >
           {/* Visual bar track */}
@@ -583,7 +604,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                     style={{ width: 114, height: 64, objectFit: 'cover' }}
                     alt=""
                   />
-                ) : thumbLoading && thumbReady ? (
+                ) : thumbLoading ? (
                   <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
                   </div>
