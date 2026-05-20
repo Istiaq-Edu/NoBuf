@@ -101,6 +101,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const [totalBytes, setTotalBytes] = useState(0);
   const [isPrefetching, setIsPrefetching] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const isPausedRef = useRef(false); // Ref so seekTo can check without React state delay
   const [isComplete, setIsComplete] = useState(false);
   const [speed, setSpeed] = useState(0);
   // Downloaded byte-range → time-range for green buffer bar
@@ -820,9 +821,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // Abort the in-flight fetch so the download loop processes the pending seek
     abortRef.current?.abort();
 
-    // If the download loop isn't running (e.g., it was paused or completed),
-    // restart it. Otherwise the running loop will pick up the pendingSeek.
-    if (!state.current.downloading && downloadLoopRef.current) {
+    // If the download loop isn't running AND we're not paused, restart it.
+    // When paused, we store the pendingSeek but don't resume — the user must
+    // explicitly click "resume buffering" to continue downloading.
+    if (!state.current.downloading && !isPausedRef.current && downloadLoopRef.current) {
       state.current.downloading = true;
       setIsPrefetching(true);
       downloadLoopRef.current(streamUrl);
@@ -831,6 +833,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   const pausePrefetch = () => {
     state.current.downloading = false;
+    isPausedRef.current = true;
     loopGeneration.current++;
     abortRef.current?.abort();
     setIsPaused(true);
@@ -840,6 +843,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   const resumePrefetch = () => {
     if (!state.current.downloading && streamUrl && downloadLoopRef.current) {
+      isPausedRef.current = false;
       setIsPaused(false);
       setIsPrefetching(true);
       downloadLoopRef.current(streamUrl);
