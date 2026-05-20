@@ -7,6 +7,7 @@ import { TelegramFile } from '../../types';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useConfirm } from '../../context/ConfirmContext';
+import { useSettings, SkipDuration, VideoFit, AutoHideDelay } from '../../context/SettingsContext';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -25,6 +26,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const barRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
   const { confirm } = useConfirm();
+  const { settings, updateSetting } = useSettings();
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -32,7 +34,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const durRef = useRef(0);
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [rate, setRate] = useState(1);
+  const [rate, setRate] = useState(settings.playerSpeed);
   const [buf, setBuf] = useState(0);
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -40,6 +42,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
+
+  // Settings panel state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [loop, setLoop] = useState(false);
+  const [rotation, setRotation] = useState(0);
+  const [brightness, setBrightness] = useState(1);
+  const [pip, setPip] = useState(false);
+  const [bgCache, setBgCache] = useState(false);
+  const [videoResolution, setVideoResolution] = useState<{ w: number; h: number } | null>(null);
+  const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
+  const skipFeedbackTimer = useRef<number>(0);
+  const skipFeedbackKey = useRef(0);
 
   const [cachePercent, setCachePercent] = useState(0);
   const [cacheComplete, setCacheComplete] = useState(false);
@@ -96,7 +110,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     }
   }, [cachedTimes, getCachedThumbnailSync, thumbLoading]);
 
-  // Close handler — check cache status and offer to continue in background
+  // Close handler — background cache controls behavior
   const handleClose = useCallback(async () => {
     try {
       const cacheStatus = await invoke<any>('cmd_get_cache_status', {
@@ -104,29 +118,38 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       });
 
       if (cacheStatus && cacheStatus.percentage > 0 && !cacheStatus.is_complete) {
-        const choice = await confirm({
-          title: 'Video partially cached',
-          message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
-          confirmText: 'Continue in Background',
-          cancelText: 'Close & Discard Cache',
-        });
-
-        if (choice) {
+        if (bgCache) {
+          // Auto-start background caching (no dialog)
           await invoke('cmd_start_background_cache', {
             messageId: file.id,
             folderId: activeFolderId ?? 0,
           });
           toast.success('Video caching in background');
         } else {
-          // Discard cache for this video
-          await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
+          // Show dialog — let user decide
+          const choice = await confirm({
+            title: 'Video partially cached',
+            message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
+            confirmText: 'Continue in Background',
+            cancelText: 'Close & Discard Cache',
+          });
+
+          if (choice) {
+            await invoke('cmd_start_background_cache', {
+              messageId: file.id,
+              folderId: activeFolderId ?? 0,
+            });
+            toast.success('Video caching in background');
+          } else {
+            await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
+          }
         }
       }
     } catch {
       // No cache or error — just close
     }
     onClose();
-  }, [file.id, activeFolderId, confirm, onClose]);
+  }, [file.id, activeFolderId, confirm, onClose, bgCache]);
 
   // Poll cache status every 5 seconds while playing
   useEffect(() => {
@@ -294,6 +317,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       durRef.current = v.duration;
       setVol(v.volume);
       setMuted(v.muted);
+      setVideoResolution({ w: v.videoWidth, h: v.videoHeight });
+      v.playbackRate = settings.playerSpeed;
+      v.loop = loop;
       setLoad(false);
       // Ensure playback starts (autoplay may be blocked by browser)
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
@@ -361,9 +387,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // Auto-hide controls — show on mouse activity, hide after idle during playback
   const lastMousePos = useRef({ x: 0, y: 0 });
+  const hideDelayMs = settings.playerAutoHideDelay === 0 ? 0 : settings.playerAutoHideDelay * 1000;
   useEffect(() => {
-    // Always show controls when paused (no auto-hide)
-    if (!playing) {
+    // Always show controls when paused or settings panel is open
+    if (!playing || settingsOpen) {
+      setVis(true);
+      return;
+    }
+    // Never auto-hide if delay is 0
+    if (hideDelayMs === 0) {
       setVis(true);
       return;
     }
@@ -374,10 +406,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
         // CSS :hover works with stationary mouse — unlike JS event tracking
-        if (playing && !controlsRef.current?.matches(':hover')) {
+        if (playing && !settingsOpen && !controlsRef.current?.matches(':hover')) {
           setVis(false);
         }
-      }, 3000);
+      }, hideDelayMs);
     };
 
     // Schedule initial hide — handles case where mouse is already outside window
@@ -398,7 +430,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onMouseLeave = () => {
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
-        if (playing) setVis(false);
+        if (playing && !settingsOpen) setVis(false);
       }, 1500);
     };
 
@@ -409,7 +441,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       document.removeEventListener('mouseleave', onMouseLeave);
       clearTimeout(hideTimer);
     };
-  }, [playing]);
+  }, [playing, settingsOpen, hideDelayMs]);
 
   // Mini progress bar — appears after controls have fully hidden (300ms delay)
   useEffect(() => {
@@ -426,6 +458,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     document.addEventListener('fullscreenchange', ch);
     return () => document.removeEventListener('fullscreenchange', ch);
   }, []);
+
+  // Sync player settings to video element
+  useEffect(() => {
+    const v = vidRef.current;
+    if (v) v.loop = loop;
+  }, [loop]);
+
+  useEffect(() => {
+    const v = vidRef.current;
+    if (v) v.playbackRate = rate;
+    updateSetting('playerSpeed', rate);
+  }, [rate, updateSetting]);
+
+  useEffect(() => {
+    if (pip && vidRef.current) {
+      vidRef.current.requestPictureInPicture?.().catch(() => { toast.error('PiP not supported'); setPip(false); });
+    } else if (!pip && document.pictureInPictureElement) {
+      document.exitPictureInPicture?.().catch(() => {});
+    }
+  }, [pip]);
 
   // Track controls overlay height for download overlay positioning
   useEffect(() => {
@@ -451,6 +503,22 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       seekTo(target);
     }
   }, [dur, useNative, seekTo]);
+  const seekFwd = useCallback(() => {
+    seek(settings.playerSkipForward);
+    setVis(true);
+    clearTimeout(skipFeedbackTimer.current);
+    skipFeedbackKey.current += 1;
+    setSkipFeedback({ direction: 'forward', amount: settings.playerSkipForward });
+    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
+  }, [seek, settings.playerSkipForward]);
+  const seekBwd = useCallback(() => {
+    seek(-settings.playerSkipBackward);
+    setVis(true);
+    clearTimeout(skipFeedbackTimer.current);
+    skipFeedbackKey.current += 1;
+    setSkipFeedback({ direction: 'backward', amount: settings.playerSkipBackward });
+    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
+  }, [seek, settings.playerSkipBackward]);
   const setVol2 = useCallback((n: number) => { const v = vidRef.current; if (!v) return; v.volume = Math.max(0, Math.min(1, n)); setVol(v.volume); if (n > 0) { v.muted = false; setMuted(false); } }, []);
   const mute = useCallback(() => { const v = vidRef.current; if (!v) return; v.muted = !v.muted; setMuted(v.muted); }, []);
   const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
@@ -516,15 +584,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
       switch (e.key.toLowerCase()) {
         case ' ': case 'k': e.preventDefault(); toggle(); break;
-        case 'arrowleft': e.preventDefault(); e.shiftKey ? onPrev?.() : seek(-5); break;
-        case 'arrowright': e.preventDefault(); e.shiftKey ? onNext?.() : seek(5); break;
+        case 'arrowleft': e.preventDefault(); e.shiftKey ? onPrev?.() : seekBwd(); break;
+        case 'arrowright': e.preventDefault(); e.shiftKey ? onNext?.() : seekFwd(); break;
         case 'arrowup': e.preventDefault(); setVol2(vol + 0.1); break;
         case 'arrowdown': e.preventDefault(); setVol2(vol - 0.1); break;
         case 'm': e.preventDefault(); mute(); break;
         case 'f': e.preventDefault(); fs2(); break;
         case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : handleClose(); break;
-        case 'j': e.preventDefault(); seek(-10); break;
-        case 'l': e.preventDefault(); seek(10); break;
+        case 'j': e.preventDefault(); seekBwd(); break;
+        case 'l': e.preventDefault(); seekFwd(); break;
         case ',': e.preventDefault(); rate2(Math.max(0.25, rate - 0.25)); break;
         case '.': e.preventDefault(); rate2(Math.min(16, rate + 0.25)); break;
         case '<': e.preventDefault(); rate2(Math.max(0.25, rate / 2)); break;
@@ -549,7 +617,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
           </div>
         ) : (
-          <video ref={vidRef} className="max-w-full max-h-full" playsInline />
+          <video
+            ref={vidRef}
+            className="w-full h-full"
+            playsInline
+            style={{
+              objectFit: settings.playerVideoFit === 'original' ? 'none' : settings.playerVideoFit,
+              filter: `brightness(${brightness})`,
+              transform: rotation ? `rotate(${rotation}deg)` : undefined,
+            }}
+          />
         )}
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -742,9 +819,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </span>
               </button>
             )}
-            {/* Rate */}
+            {/* Speed */}
             <div className="relative">
-              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback rate">
+              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback speed">
                 {rate}x
               </button>
               {menu && (
@@ -757,6 +834,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </div>
               )}
             </div>
+            {/* Settings */}
+            <button onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }} className="p-1.5 hover:bg-white/10 rounded text-white" title="Settings">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z" /></svg>
+            </button>
             {/* Download */}
             <button onClick={handleDownload} className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1" title="Download">
               <svg className={`w-5 h-5 ${dlOverlayVisible && !dlOverlay?.completed ? 'animate-subtle-pulse' : ''}`} fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
@@ -783,6 +864,207 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
         
       </div>
+
+      {/* Settings overlay panel */}
+      {settingsOpen && (
+        <div
+          className="absolute right-0 top-0 bottom-0 w-[40%] max-w-[320px] z-30 bg-black/70 backdrop-blur-xl border-l border-white/10 overflow-y-auto"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+            <span className="text-white text-sm font-semibold">Settings</span>
+            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded text-white/60 hover:text-white transition-colors" title="Close settings">
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+            </button>
+          </div>
+
+          {/* Playback */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Playback</h3>
+            {/* Loop */}
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-white/70 text-xs">Loop</span>
+              <button
+                onClick={() => setLoop(!loop)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${loop ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${loop ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+            {/* Skip forward */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Skip forward</label>
+              <div className="flex gap-1 items-center">
+                {[5, 10, 15, 30].map(s => (
+                  <button
+                    key={s}
+                    onClick={() => updateSetting('playerSkipForward', s as SkipDuration)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipForward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+                <input
+                  type="number" min="1" max="60"
+                  value={settings.playerSkipForward}
+                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipForward', v as SkipDuration); }}
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  title="Custom seconds (1-60)"
+                />
+              </div>
+            </div>
+            {/* Skip backward */}
+            <div className="mb-0">
+              <label className="text-white/70 text-xs mb-1.5 block">Skip backward</label>
+              <div className="flex gap-1 items-center">
+                {[5, 10, 15, 30].map(s => (
+                  <button
+                    key={s}
+                    onClick={() => updateSetting('playerSkipBackward', s as SkipDuration)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipBackward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+                <input
+                  type="number" min="1" max="60"
+                  value={settings.playerSkipBackward}
+                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipBackward', v as SkipDuration); }}
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  title="Custom seconds (1-60)"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Display */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Display</h3>
+            {/* Video fit */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Video fit</label>
+              <div className="flex gap-1">
+                {([
+                  ['original', 'Original'],
+                  ['contain', 'Fit'],
+                  ['fill', 'Fill'],
+                ] as [VideoFit, string][]).map(([val, label]) => (
+                  <button
+                    key={val}
+                    onClick={() => updateSetting('playerVideoFit', val)}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerVideoFit === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Rotation */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Rotation</label>
+              <div className="flex gap-1">
+                {[0, 90, 180, 270].map(r => (
+                  <button
+                    key={r}
+                    onClick={() => setRotation(r)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${rotation === r ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {r}°
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Brightness */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-white/70 text-xs">Brightness</label>
+                <span className="text-white/50 text-xs font-mono">{brightness.toFixed(1)}</span>
+              </div>
+              <input
+                type="range" min="0.5" max="2" step="0.1"
+                value={brightness}
+                onChange={e => setBrightness(parseFloat(e.target.value))}
+                className="w-full accent-telegram-secondary h-1"
+              />
+            </div>
+            {/* PiP */}
+            <div className="flex items-center justify-between">
+              <span className="text-white/70 text-xs">Picture-in-Picture</span>
+              <button
+                onClick={() => setPip(!pip)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${pip ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${pip ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Behavior */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Behavior</h3>
+            {/* Auto-hide delay */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Auto-hide controls</label>
+              <div className="flex gap-1">
+                {([
+                  [3, '3s'],
+                  [5, '5s'],
+                  [10, '10s'],
+                  [0, 'Never'],
+                ] as [AutoHideDelay, string][]).map(([val, label]) => (
+                  <button
+                    key={val}
+                    onClick={() => updateSetting('playerAutoHideDelay', val)}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Background cache */}
+            <div className="flex items-center justify-between">
+              <span className="text-white/70 text-xs">Background cache</span>
+              <button
+                onClick={() => setBgCache(!bgCache)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${bgCache ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${bgCache ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Info */}
+          <div className="px-4 py-3">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Video info</h3>
+            <div className="space-y-1">
+              {videoResolution && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">Resolution</span>
+                  <span className="text-white/80 font-mono">{videoResolution.w}×{videoResolution.h}</span>
+                </div>
+              )}
+              {dur > 0 && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">Duration</span>
+                  <span className="text-white/80 font-mono">{fmt(dur)}</span>
+                </div>
+              )}
+              {totalBytes > 0 && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">File size</span>
+                  <span className="text-white/80 font-mono">{formatBytes(totalBytes)}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-xs">
+                <span className="text-white/50">Cache</span>
+                <span className="text-white/80 font-mono">{cacheComplete ? 'Complete ✓' : cachePercent > 0 ? `${cachePercent}%` : 'None'}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* File name */}
       <div className={`absolute top-3 left-3 right-3 text-white text-sm truncate transition-opacity duration-300 ${vis ? 'opacity-100' : 'opacity-0'}`} style={{ textShadow: '0 1px 3px rgba(0,0,0,0.5)' }}>
@@ -822,6 +1104,45 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           </div>
         )}
       </div>
+
+      {/* Skip feedback overlay */}
+      {skipFeedback && (() => {
+        const fromTime = time;
+        const toTime = skipFeedback.direction === 'forward'
+          ? Math.min(fromTime + skipFeedback.amount, dur)
+          : Math.max(fromTime - skipFeedback.amount, 0);
+        const isForward = skipFeedback.direction === 'forward';
+        return (
+          <div
+            key={skipFeedbackKey.current}
+            className="absolute inset-0 flex items-center justify-center pointer-events-none z-20 animate-[skipPop_1.5s_ease-out_forwards]"
+          >
+            <div className="flex flex-col items-center gap-2 bg-black/30 backdrop-blur-xl rounded-2xl px-10 py-6">
+              {/* Icon + delta */}
+              <div className="flex items-center gap-2">
+                {isForward ? (
+                  <svg className="w-7 h-7 text-telegram-primary" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M5.59 7.41L10.18 12l-4.59 4.59L7 18l6-6-6-6zM16 18l6-6-6-6-1.41 1.41L20.18 12l-5.59 4.59L16 18z" />
+                  </svg>
+                ) : (
+                  <svg className="w-7 h-7 text-white" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M18.41 16.59L13.82 12l4.59-4.59L17 6l-6 6 6 6zM8 6l-6 6 6 6 1.41-1.41L3.82 12l5.59-4.59L8 6z" />
+                  </svg>
+                )}
+                <span className={`text-xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>
+                  {isForward ? '+' : '-'}{skipFeedback.amount}s
+                </span>
+              </div>
+              {/* FROM → TO — big, bold, dominant */}
+              <div className="flex items-center gap-4">
+                <span className="text-2xl font-bold text-white font-mono">{fmt(fromTime)}</span>
+                <svg className={`w-6 h-6 ${isForward ? 'text-telegram-primary' : 'text-white/60'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" /></svg>
+                <span className={`text-2xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>{fmt(toTime)}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Big play */}
       {!playing && !load && !err && (

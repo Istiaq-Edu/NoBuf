@@ -5,6 +5,10 @@ export type GridDensity = 'compact' | 'default' | 'spacious';
 export type SortField = 'name' | 'size' | 'date';
 export type SortDirection = 'asc' | 'desc';
 
+export type VideoFit = 'original' | 'contain' | 'fill';
+export type AutoHideDelay = 3 | 5 | 10 | 0;
+export type SkipDuration = 5 | 10 | 15 | 30;
+
 export interface Settings {
     viewMode: 'grid' | 'list';
     autoUpdate: boolean;
@@ -13,6 +17,11 @@ export interface Settings {
     gridDensity: GridDensity;
     sortField: SortField;
     sortDirection: SortDirection;
+    playerSpeed: number;
+    playerSkipForward: SkipDuration;
+    playerSkipBackward: SkipDuration;
+    playerVideoFit: VideoFit;
+    playerAutoHideDelay: AutoHideDelay;
 }
 
 const defaultSettings: Settings = {
@@ -23,6 +32,11 @@ const defaultSettings: Settings = {
     gridDensity: 'default',
     sortField: 'name',
     sortDirection: 'asc',
+    playerSpeed: 1,
+    playerSkipForward: 5,
+    playerSkipBackward: 5,
+    playerVideoFit: 'contain',
+    playerAutoHideDelay: 3,
 };
 
 interface SettingsContextType {
