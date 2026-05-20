@@ -64,23 +64,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     resumePrefetch,
     seekTo,
     setVideoRef,
-    downloadedTimeRanges,
+    downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
+    byteToTime,
     setSuppressBackendReports,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
-  // Debug: log player-tracked ranges changes
-  useEffect(() => {
-    if (downloadedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Player ranges updated: ${JSON.stringify(downloadedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [downloadedTimeRanges, dur]);
-
-  // Debug: log cache ranges changes
-  useEffect(() => {
-    if (cachedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Cache ranges updated: ${JSON.stringify(cachedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [cachedTimeRanges, dur]);
-
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
 
@@ -135,14 +122,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
               const ranges: [number, number][] = status.cached_ranges.map(
                 ([s, e]: [number, number]) => [
-                  (s / status.total_bytes) * durRef.current,
-                  ((e + 1) / status.total_bytes) * durRef.current,
+                  byteToTime(s),
+                  byteToTime(e + 1),
                 ]
               );
-              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${durRef.current.toFixed(1)}s`);
               setCachedTimeRanges(ranges);
-            } else {
-              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${durRef.current}, total=${status.total_bytes})`);
             }
           }
         } catch { /* ignore */ }
@@ -169,11 +153,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
             const ranges: [number, number][] = status.cached_ranges.map(
               ([s, e]: [number, number]) => [
-                (s / status.total_bytes) * dur,
-                ((e + 1) / status.total_bytes) * dur,
+                byteToTime(s),
+                byteToTime(e + 1),
               ]
             );
-            console.log(`[GREEN-BAR] DL-progress ${event.payload.percent}%: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))}`);
             setCachedTimeRanges(ranges);
           }
         } catch { /* ignore */ }
@@ -198,7 +181,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (!savePath) return;
 
       const transferId = `dl-${file.id}-${Date.now()}`;
-      console.log(`[GREEN-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
+      console.log(`[BUFFER-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
 
@@ -515,10 +498,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Downloaded (green) buffer coverage — merged from player + backend cache */}
+            {/* Green buffer bar — SourceBuffer (video.buffered, VBR-accurate) + disk cache */}
             {(() => {
-              // Merge player-tracked ranges (instant) with cache ranges (includes downloads)
-              const merged = [...downloadedTimeRanges, ...cachedTimeRanges];
+              // Read actual buffered time ranges from MSE video element (exact, no VBR issue)
+              const vid = vidRef.current;
+              const bufferedRanges: [number, number][] = [];
+              if (vid && vid.buffered && vid.buffered.length > 0) {
+                for (let i = 0; i < vid.buffered.length; i++) {
+                  bufferedRanges.push([vid.buffered.start(i), vid.buffered.end(i)]);
+                }
+              }
+              const merged = [...bufferedRanges, ...cachedTimeRanges];
               if (merged.length === 0 || dur <= 0) return null;
               // Sort and deduplicate overlapping ranges
               const sorted = merged.sort((a, b) => a[0] - b[0]);
