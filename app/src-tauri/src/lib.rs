@@ -136,6 +136,7 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                download_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
@@ -144,7 +145,14 @@ pub fn run() {
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
 
             // Initialize stream cache manager
-            let cache_dir = std::env::temp_dir().join("telegram-drive-cache");
+            // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
+            // subject to automatic cleanup by Storage Sense, Disk Cleanup,
+            // and antivirus — which can delete .dat and .meta files mid-stream
+            // causing catastrophic cached-range loss.
+            let cache_dir = app.path().app_data_dir()
+                .map_err(|e| format!("app_data_dir: {}", e))
+                .unwrap_or_else(|_| std::env::temp_dir().join("telegram-drive-cache"))
+                .join("stream-cache");
             let cache_mgr = match stream_cache::StreamCacheManager::new(cache_dir) {
                 Ok(cache_mgr) => {
                     app.manage(cache_mgr.clone());
@@ -237,6 +245,10 @@ pub fn run() {
             if let Some(handle) = server_handle {
                 log::info!("Stopping Actix streaming server...");
                 drop(handle.stop(true));
+                // Give the server time to finish in-flight streaming requests
+                // before we clear the cache — prevents concurrent writes during
+                // cache deletion which can cause meta corruption on Windows.
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
 
             // 3. Stop the API server (graceful)

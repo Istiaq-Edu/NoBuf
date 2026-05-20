@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
 
@@ -30,6 +30,9 @@ pub struct TelegramState {
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Paths of partial download files — cleaned up on app close.
     pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Serializes all Telegram iter_download calls across player prebuffer and
+    /// file download — only one chunk request at a time, preventing FLOOD_WAIT.
+    pub download_semaphore: Arc<Semaphore>,
 }
 
 pub mod auth;

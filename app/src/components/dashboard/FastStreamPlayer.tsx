@@ -28,6 +28,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
+  const durRef = useRef(0);
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
   const [rate, setRate] = useState(1);
@@ -63,30 +64,32 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     resumePrefetch,
     seekTo,
     setVideoRef,
-    downloadedTimeRanges,
+    downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
+    byteToTime,
+    setSuppressBackendReports,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
-  // Debug: log player-tracked ranges changes
-  useEffect(() => {
-    if (downloadedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Player ranges updated: ${JSON.stringify(downloadedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [downloadedTimeRanges, dur]);
-
-  // Debug: log cache ranges changes
-  useEffect(() => {
-    if (cachedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Cache ranges updated: ${JSON.stringify(cachedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [cachedTimeRanges, dur]);
-
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
 
-  // Thumbnail extractor — uses hidden video element with buffer-aware background generation
-  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
+  // Thumbnail extractor — ref-based hover processor + synchronous cache check
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
+
+  // When cachedTimes updates (from on-demand capture), check if the current
+  // hover position is now cached and update the display. This is the key
+  // mechanism that makes on-demand thumbnails appear — the hover processor
+  // caches them, cachedTimes state updates, and this effect resolves the spinner.
+  useEffect(() => {
+    if (lastThumbTimeRef.current >= 0 && thumbLoading) {
+      const cachedUrl = getCachedThumbnailSync(lastThumbTimeRef.current);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+      }
+    }
+  }, [cachedTimes, getCachedThumbnailSync, thumbLoading]);
 
   // Close handler — check cache status and offer to continue in background
   const handleClose = useCallback(async () => {
@@ -130,17 +133,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
-            if (status.cached_ranges && dur > 0 && status.total_bytes > 0) {
+            if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
               const ranges: [number, number][] = status.cached_ranges.map(
                 ([s, e]: [number, number]) => [
-                  (s / status.total_bytes) * dur,
-                  ((e + 1) / status.total_bytes) * dur,
+                  byteToTime(s),
+                  byteToTime(e + 1),
                 ]
               );
-              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
               setCachedTimeRanges(ranges);
-            } else {
-              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${dur}, total=${status.total_bytes})`);
             }
           }
         } catch { /* ignore */ }
@@ -167,15 +167,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
             const ranges: [number, number][] = status.cached_ranges.map(
               ([s, e]: [number, number]) => [
-                (s / status.total_bytes) * dur,
-                ((e + 1) / status.total_bytes) * dur,
+                byteToTime(s),
+                byteToTime(e + 1),
               ]
             );
-            console.log(`[GREEN-BAR] DL-progress ${event.payload.percent}%: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))}`);
             setCachedTimeRanges(ranges);
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
+          setSuppressBackendReports(false);
           setTimeout(() => setDlOverlay(null), 3000);
           dlTransferIdRef.current = '';
         }
@@ -184,16 +184,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => { unlisten?.(); };
   }, [cacheComplete, dur, totalBytes, file.id]);
 
-  // Download handler
+  // Download handler — player prebuffer and file download run simultaneously,
+  // interleaved at the Rust level via a Semaphore(1) that serializes all Telegram
+  // iter_download calls. Only one chunk request hits Telegram at a time → no FLOOD_WAIT.
+  // Green bar merges player's in-memory ranges (downloadedTimeRanges) and download's
+  // cache ranges (cachedTimeRanges from cmd_get_cache_status polling).
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
       if (!savePath) return;
 
       const transferId = `dl-${file.id}-${Date.now()}`;
-      console.log(`[GREEN-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
+      console.log(`[BUFFER-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
+
+      // Suppress player's cache meta reports during download — download updates
+      // CacheMeta per-chunk instead (protected by per-message Mutex in Rust).
+      // Player prebuffer continues running — both interleave through Semaphore(1)
+      // at the Rust level (one Telegram iter_download call at a time → no FLOOD_WAIT).
+      setSuppressBackendReports(true);
 
       await invoke('cmd_download_file', {
         messageId: file.id,
@@ -202,16 +212,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         transferId,
       });
 
+      setSuppressBackendReports(false);
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
+      setSuppressBackendReports(false);
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
       setDlOverlay(null);
       dlTransferIdRef.current = '';
     }
-  }, [file, activeFolderId, cacheComplete]);
+  }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
 
   // Cancel download
   const handleCancelDownload = useCallback(async () => {
@@ -219,9 +231,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
+    setSuppressBackendReports(false);
     setDlOverlay(null);
     dlTransferIdRef.current = '';
-  }, []);
+  }, [setSuppressBackendReports]);
 
 
   const fmt = (s: number) => {
@@ -256,6 +269,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
       setDur(v.duration);
+      durRef.current = v.duration;
       setVol(v.volume);
       setMuted(v.muted);
       setLoad(false);
@@ -392,6 +406,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [dur, useNative, seekTo]);
 
   const tipRafRef = useRef(0);
+  const hoverDebounceRef = useRef(0);
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
     const r = barRef.current.getBoundingClientRect();
@@ -403,30 +418,34 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
     });
 
-    if (thumbReady && getThumbnail) {
-      const roundedTime = Math.floor(hoverTime / 2) * 2;
-      if (roundedTime !== lastThumbTimeRef.current) {
-        lastThumbTimeRef.current = roundedTime;
+    const roundedTime = Math.floor(hoverTime / 2) * 2;
+    if (roundedTime !== lastThumbTimeRef.current) {
+      lastThumbTimeRef.current = roundedTime;
 
+      // Synchronous cache check — instant display for already-cached thumbnails
+      const cachedUrl = getCachedThumbnailSync(hoverTime);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+        // Cancel any pending on-demand request (we have the thumbnail)
+        clearTimeout(hoverDebounceRef.current);
+        clearDesiredHover();
+      } else {
+        // Not cached: show spinner immediately, but delay the on-demand seek
+        // by 1 second. This prevents accidental/sweep hovers from triggering
+        // expensive network seeks. If the user stays at this position for 1s,
+        // the hover processor starts generating the thumbnail.
         setThumbUrl(null);
         setThumbLoading(true);
 
-        const requestedTime = roundedTime;
-        getThumbnail(hoverTime).then((result) => {
-          // Only apply if this is still the latest request
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(result?.dataUrl ?? null);
-            setThumbLoading(false);
-          }
-        }).catch(() => {
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(null);
-            setThumbLoading(false);
-          }
-        });
+        // Cancel previous debounce timer
+        clearTimeout(hoverDebounceRef.current);
+        hoverDebounceRef.current = window.setTimeout(() => {
+          setDesiredHoverTime(hoverTime);
+        }, 1000);
       }
     }
-  }, [dur, thumbReady, getThumbnail]);
+  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
 
   // Keyboard
   useEffect(() => {
@@ -494,20 +513,27 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           onMouseMove={onBarMove}
           onMouseLeave={() => {
             setTip(p => ({ ...p, show: false }));
+            clearTimeout(hoverDebounceRef.current);
+            clearDesiredHover();
           }}
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Downloaded (green) buffer coverage — merged from player + backend cache */}
+            {/* Green buffer bar — all locally available data (SourceBuffer + disk cache) */}
             {(() => {
-              // Merge player-tracked ranges (instant) with cache ranges (includes downloads)
-              const merged = [...downloadedTimeRanges, ...cachedTimeRanges];
+              const vid = vidRef.current;
+              const bufferedRanges: [number, number][] = [];
+              if (vid && vid.buffered && vid.buffered.length > 0) {
+                for (let i = 0; i < vid.buffered.length; i++) {
+                  bufferedRanges.push([vid.buffered.start(i), vid.buffered.end(i)]);
+                }
+              }
+              const merged = [...bufferedRanges, ...cachedTimeRanges];
               if (merged.length === 0 || dur <= 0) return null;
-              // Sort and deduplicate overlapping ranges
               const sorted = merged.sort((a, b) => a[0] - b[0]);
               const deduped: [number, number][] = [];
               for (const r of sorted) {
-                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1]) {
+                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1] + 0.01) {
                   deduped.push(r);
                 } else {
                   deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
@@ -519,13 +545,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={`buf-${i}`}
-                    className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
+                    className="absolute bottom-0 h-[3px] bg-green-400/70 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* Preview thumbnail coverage — segments at each cached position */}
+            {/* Preview thumbnail coverage — yellow bar, hover-only */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
               const sorted = Array.from(cachedTimes).sort((a, b) => a - b);
@@ -576,7 +602,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                     style={{ width: 114, height: 64, objectFit: 'cover' }}
                     alt=""
                   />
-                ) : thumbLoading && thumbReady ? (
+                ) : thumbLoading ? (
                   <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
                   </div>
