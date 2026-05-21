@@ -27,9 +27,11 @@ import { useFileUpload } from '../hooks/useFileUpload';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
+import { useCacheSession } from '../context/CacheSessionContext';
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const queryClient = useQueryClient();
+    const cacheSession = useCacheSession();
 
 
     const {
@@ -117,6 +119,25 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const { uploadQueue, setUploadQueue, handleManualUpload, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
+
+    // Sync active download progress to cacheSession badge so the percentage stays accurate
+    useEffect(() => {
+        for (const item of downloadQueue) {
+            if ((item.status === 'downloading' || item.status === 'pending') && item.progress !== undefined) {
+                const cached = cacheSession.getCacheInfo(item.messageId);
+                if (cached && item.progress > cached.percentage) {
+                    cacheSession.updateCachePercent(item.messageId, item.progress);
+                }
+            }
+            // Remove cache badge when download finishes or is cancelled — no meaningful cache to show
+            if (item.status === 'success' || item.status === 'cancelled' || item.status === 'error') {
+                const cached = cacheSession.getCacheInfo(item.messageId);
+                if (cached) {
+                    cacheSession.removeCache(item.messageId);
+                }
+            }
+        }
+    }, [downloadQueue, cacheSession]);
 
     // Handle "Continue Download" from VideoCacheDialog — queues download in panel with cache percentage
     const handleContinueToDownload = useCallback(async (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => {
@@ -435,6 +456,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         totalItems={previewContextFiles.length}
                         activeFolderId={activeFolderId}
                         onContinueToDownload={handleContinueToDownload}
+                        isAlreadyDownloading={playingFile ? downloadQueue.some(i => i.messageId === playingFile.id && (i.status === 'pending' || i.status === 'downloading')) : false}
                         key="media-player"
                     />
                 )}

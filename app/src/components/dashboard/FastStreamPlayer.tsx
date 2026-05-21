@@ -19,11 +19,12 @@ interface FastStreamPlayerProps {
   onPrev?: () => void;
   activeFolderId: number | null;
   onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
+  isAlreadyDownloading?: boolean;
 }
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -205,6 +206,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // console.log(`[CACHE-DIALOG] Cancelled — returning to video player for msg=${file.id}`);
     setShowCacheDialog(false);
   }, [file.id]);
+
+  const handleAlreadyDownloadingClose = useCallback(() => {
+    setShowCacheDialog(false);
+    toast.info(`${file.name} is already downloading — check the transfer panel`);
+    onClose();
+  }, [file.id, file.name, onClose]);
 
   // Ref to cacheSession so the poll effect doesn't re-trigger on every updateCachePercent
   // (which would create an infinite loop: poll → update → state change → effect re-run → new poll → ...)
@@ -1227,9 +1234,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           percentage={pendingCachePercent}
           filename={file.name}
           messageId={file.id}
+          isAlreadyDownloading={isAlreadyDownloading ?? false}
           onDiscard={handleCacheDiscard}
           onKeepBuffers={handleCacheKeepBuffers}
           onContinueDownload={handleCacheContinueDownload}
+          onAlreadyDownloadingClose={handleAlreadyDownloadingClose}
           onCancel={handleCacheDialogCancel}
         />
       )}
