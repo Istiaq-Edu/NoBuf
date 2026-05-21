@@ -129,8 +129,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     cacheSession.updateCachePercent(item.messageId, item.progress);
                 }
             }
-            // Remove cache badge when download finishes or is cancelled — no meaningful cache to show
-            if (item.status === 'success' || item.status === 'cancelled' || item.status === 'error') {
+            // Remove cache badge only on cancel/error — cache data is deleted in these cases.
+            // On success (100%), keep the badge — the disk cache data is still there.
+            if (item.status === 'cancelled' || item.status === 'error') {
                 const cached = cacheSession.getCacheInfo(item.messageId);
                 if (cached) {
                     cacheSession.removeCache(item.messageId);

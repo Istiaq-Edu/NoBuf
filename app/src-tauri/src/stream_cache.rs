@@ -314,10 +314,10 @@ impl StreamCacheManager {
     ///    cleaned on app exit via clear_all().
     /// The .meta.json deletion alone makes get_status() return None, effectively
     /// discarding the cache from the frontend's perspective.
-    pub fn delete_cache(&self, message_id: i32) -> std::io::Result<()> {
+    pub fn delete_cache(&self, message_id: i32) -> std::io::Result<bool> {
         if self.is_streaming(message_id) {
-            log::warn!("[CACHE] delete_cache: msg {} has active streaming — skipping deletion, cache will be cleaned on exit", message_id);
-            return Ok(());
+            log::warn!("[CACHE] delete_cache: msg {} has active streaming — skipping deletion, returning false for frontend retry", message_id);
+            return Ok(false);
         }
 
         // Always delete the meta sidecar first — it uses standard share modes
@@ -352,7 +352,7 @@ impl StreamCacheManager {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Delete all cache files (called on app exit)

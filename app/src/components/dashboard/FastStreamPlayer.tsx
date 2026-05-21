@@ -163,26 +163,20 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // VideoCacheDialog action handlers
   const handleCacheDiscard = useCallback(() => {
-    // console.log(`[CACHE-DIALOG] Discard selected — closing player first, then deleting cache for msg=${file.id}`);
     setShowCacheDialog(false);
     cacheSession.removeCache(file.id);
     onClose();
     // Schedule cache deletion after player closes — the Actix stream needs time
-    // to drop its file handle before the OS can delete the .dat file.
-    // The Rust delete_cache now handles locked .dat files gracefully by:
-    // 1. Deleting the .meta.json sidecar (always succeeds)
-    // 2. Attempting to delete .dat; falling back to truncate if locked
-    // 3. Leaving .dat for clear_all at app exit if truncation also fails
+    // to drop its StreamingGuard and file handle. cmd_delete_cache now returns
+    // an error when streaming is still active, so retries properly handle this.
     const tryDelete = (attempt: number) => {
-      // console.log(`[CACHE-DIALOG] Deleting cache for msg=${file.id} (attempt ${attempt})`);
       invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
-        // console.warn(`[CACHE-DIALOG] Cache deletion failed for msg=${file.id}:`, e);
-        if (attempt < 3) {
-          setTimeout(() => tryDelete(attempt + 1), 1000);
+        if (attempt < 5) {
+          setTimeout(() => tryDelete(attempt + 1), 2000);
         }
       });
     };
-    setTimeout(() => tryDelete(1), 1000);
+    setTimeout(() => tryDelete(1), 2000);
   }, [file.id, cacheSession, onClose]);
 
   const handleCacheKeepBuffers = useCallback(() => {
