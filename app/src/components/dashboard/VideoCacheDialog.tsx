@@ -5,9 +5,11 @@ interface VideoCacheDialogProps {
     percentage: number;
     filename: string;
     messageId: number;
+    isAlreadyDownloading: boolean;
     onDiscard: () => void;
     onKeepBuffers: () => void;
     onContinueDownload: (savePath: string) => void;
+    onAlreadyDownloadingClose: () => void;
     onCancel: () => void;
 }
 
@@ -15,9 +17,11 @@ export function VideoCacheDialog({
     percentage,
     filename,
     messageId,
+    isAlreadyDownloading,
     onDiscard,
     onKeepBuffers,
     onContinueDownload,
+    onAlreadyDownloadingClose,
     onCancel,
 }: VideoCacheDialogProps) {
     const dialogRef = useRef<HTMLDivElement>(null);
@@ -110,10 +114,13 @@ export function VideoCacheDialog({
                     {/* Close & Discard */}
                     <button
                         onClick={handleDiscard}
-                        className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-red-500/10 text-red-400 hover:bg-red-500/20 text-left"
+                        disabled={isAlreadyDownloading}
+                        className={`px-4 py-2.5 rounded-lg text-sm font-medium transition text-left ${isAlreadyDownloading ? 'bg-red-500/5 text-red-400/30 cursor-not-allowed' : 'bg-red-500/10 text-red-400 hover:bg-red-500/20'}`}
                     >
                         Close & Discard Cache
-                        <span className="block text-[11px] text-red-400/60 mt-0.5">Delete all cached data — next playback starts from scratch</span>
+                        <span className="block text-[11px] mt-0.5" style={{ color: isAlreadyDownloading ? 'rgba(239,68,68,0.25)' : 'rgba(239,68,68,0.6)' }}>
+                            {isAlreadyDownloading ? 'Cannot discard — active download is using this cache' : 'Delete all cached data — next playback starts from scratch'}
+                        </span>
                     </button>
 
                     {/* Keep Buffers */}
@@ -130,17 +137,29 @@ export function VideoCacheDialog({
                     </button>
 
                     {/* Continue Download */}
-                    <button
-                        onClick={handleContinueDownload}
-                        className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-telegram-primary text-white hover:bg-telegram-primary/90 text-left"
-                    >
-                        Continue Download in Download Panel
-                        <span className="block text-[11px] text-white/60 mt-0.5">
-                            {isFullyCached
-                                ? 'Save fully cached file to your device'
-                                : `Download continues from ${percentage}% — choose where to save`}
-                        </span>
-                    </button>
+                    {isAlreadyDownloading ? (
+                        <button
+                            onClick={onAlreadyDownloadingClose}
+                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-telegram-primary/40 text-white/70 hover:bg-telegram-primary/50 text-left"
+                        >
+                            Continue Download in Download Panel
+                            <span className="block text-[11px] text-white/50 mt-0.5">
+                                This file is already downloading — close and check the transfer panel
+                            </span>
+                        </button>
+                    ) : (
+                        <button
+                            onClick={handleContinueDownload}
+                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-telegram-primary text-white hover:bg-telegram-primary/90 text-left"
+                        >
+                            Continue Download in Download Panel
+                            <span className="block text-[11px] text-white/60 mt-0.5">
+                                {isFullyCached
+                                    ? 'Save fully cached file to your device'
+                                    : `Download continues from ${percentage}% — choose where to save`}
+                            </span>
+                        </button>
+                    )}
                 </div>
             </div>
         </div>
