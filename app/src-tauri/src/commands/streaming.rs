@@ -311,6 +311,21 @@ async fn background_cache_download(
             merge_ranges(&mut meta.cached_ranges);
             let _ = cache_mgr.save_meta(&meta);
 
+            // Throttle: sleep to enforce download speed limit for background cache.
+            // Semaphore is released after chunk fetch, so other tasks can use
+            // the connection during this sleep window.
+            let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+            if dl_limit_kb > 0 {
+                let sleep_ms = (to_write as u64 * 1000) / (dl_limit_kb * 1024);
+                let sleep_ms = sleep_ms.min(2000);
+                // log::info!("[THROTTLE-DBG][BG-CACHE] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
+                //     message_id, to_write, dl_limit_kb, sleep_ms, offset);
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            } else {
+                // log::info!("[THROTTLE-DBG][BG-CACHE] msg={}, unlimited, no throttle sleep, offset={}", 
+                //     message_id, offset);
+            }
+
             if offset > gap_end {
                 break;
             }

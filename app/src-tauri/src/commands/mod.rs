@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
@@ -33,6 +34,12 @@ pub struct TelegramState {
     /// Serializes all Telegram iter_download calls across player prebuffer and
     /// file download — only one chunk request at a time, preventing FLOOD_WAIT.
     pub download_semaphore: Arc<Semaphore>,
+    /// Speed limit for prebuffer/streaming in KB/s. 0 = unlimited.
+    /// Read by Actix server.rs after each chunk to inject sleep.
+    pub prebuffer_speed_limit_kb: Arc<AtomicU64>,
+    /// Speed limit for file downloads in KB/s. 0 = unlimited.
+    /// Read by cmd_download_file after each chunk to inject sleep.
+    pub download_speed_limit_kb: Arc<AtomicU64>,
 }
 
 pub mod auth;

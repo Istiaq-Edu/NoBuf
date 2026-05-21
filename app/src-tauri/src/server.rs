@@ -356,20 +356,20 @@ async fn stream_media(
                         break;
                     }
 
-                    let mut data = bytes;
+                    let mut chunk_data = bytes;
 
                     // On first chunk, discard leading bytes to align with start_byte
                     if first_chunk && bytes_to_discard > 0 {
-                        let discard = bytes_to_discard.min(data.len() as u64) as usize;
-                        data = data[discard..].to_vec();
+                        let discard = bytes_to_discard.min(chunk_data.len() as u64) as usize;
+                        chunk_data = chunk_data[discard..].to_vec();
                         first_chunk = false;
                     }
 
-                    let is_last = data.len() as u64 > remaining;
+                    let is_last = chunk_data.len() as u64 > remaining;
                     let final_data = if is_last {
-                        data[..remaining as usize].to_vec()
+                        chunk_data[..remaining as usize].to_vec()
                     } else {
-                        data
+                        chunk_data
                     };
 
                     let bytes_in_chunk = final_data.len() as u64;
@@ -459,6 +459,22 @@ async fn stream_media(
                     current_offset += bytes_in_chunk;
                     bytes_sent += bytes_in_chunk;
                     yield Ok::<_, actix_web::Error>(web::Bytes::from(final_data));
+
+                    // Throttle: sleep after chunk release to enforce prebuffer speed limit
+                    // Semaphore is already released (yield point), so download task can
+                    // use the connection during this sleep window.
+                    let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                    if limit_kb > 0 {
+                        // 512KB chunk at limit_kb KB/s → sleep_ms = bytes * 1000 / (limit_kb * 1024)
+                        let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
+                        let sleep_ms = sleep_ms.min(2000); // Cap to prevent excessive delays on tiny chunks
+                        // log::info!("[THROTTLE-DBG][PREBUFFER] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
+                        //     message_id, bytes_in_chunk, limit_kb, sleep_ms, current_offset);
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    } else {
+                        // log::info!("[THROTTLE-DBG][PREBUFFER] msg={}, unlimited (limit_kb=0), no throttle sleep, offset={}", 
+                        //     message_id, current_offset);
+                    }
 
                     if is_last {
                         break;

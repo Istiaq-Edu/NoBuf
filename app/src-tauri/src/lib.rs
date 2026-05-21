@@ -137,6 +137,8 @@ pub fn run() {
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 download_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
@@ -223,6 +225,7 @@ pub fn run() {
             commands::cmd_delete_cache,
             commands::cmd_start_background_cache,
             commands::cmd_stop_background_cache,
+            commands::cmd_set_speed_limits,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

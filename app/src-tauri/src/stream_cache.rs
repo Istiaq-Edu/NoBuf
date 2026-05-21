@@ -195,7 +195,7 @@ impl StreamCacheManager {
     pub fn load_meta(&self, message_id: i32) -> Option<CacheMeta> {
         let path = self.meta_path(message_id);
         if !path.exists() {
-            log::debug!("[META] load_meta: {} file does not exist", path.display());
+            // log::debug!("[META] load_meta: {} file does not exist", path.display());
             return None;
         }
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
