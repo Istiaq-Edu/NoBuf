@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Folder, Download, Trash2, Check } from 'lucide-react';
 import { TelegramFile } from '../../types';
 import { FileTypeIcon } from '../FileTypeIcon';
+import { useCacheSession } from '../../context/CacheSessionContext';
 
 interface FileListItemProps {
     file: TelegramFile;
@@ -23,6 +24,8 @@ export function FileListItem({
 }: FileListItemProps) {
     const [isDragOver, setIsDragOver] = useState(false);
     const isFolder = file.type === 'folder';
+    const cacheSession = useCacheSession();
+    const cacheInfo = cacheSession.getCacheInfo(file.id);
 
     return (
         <div
@@ -81,6 +84,20 @@ export function FileListItem({
                     {isFolder ? <Folder className="w-4 h-4 text-telegram-primary flex-shrink-0" /> : <FileTypeIcon filename={file.name} className="w-4 h-4 flex-shrink-0" />}
                     {file.name}
                 </span>
+                {/* Cache session badge — green text + mini progress bar */}
+                {cacheInfo && cacheInfo.percentage > 0 && !isFolder && (
+                    <div className="flex items-center gap-1 mt-0.5">
+                        <div className="w-16 h-[3px] bg-white/10 rounded-full overflow-hidden">
+                            <div
+                                className="h-full bg-green-400 rounded-full transition-all duration-300"
+                                style={{ width: `${cacheInfo.percentage}%` }}
+                            />
+                        </div>
+                        <span className="text-[10px] font-mono text-green-400">
+                            {cacheInfo.percentage >= 100 ? '100%' : `${cacheInfo.percentage}%`}
+                        </span>
+                    </div>
+                )}
                 {/* List Actions */}
                 <div className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 flex items-center bg-telegram-surface border border-telegram-border shadow-lg rounded px-1">
                     <button onClick={(e) => { e.stopPropagation(); onDownload(file.id, file.name) }} className="p-1 hover:text-telegram-text text-telegram-subtext" title="Download"><Download className="w-4 h-4" /></button>

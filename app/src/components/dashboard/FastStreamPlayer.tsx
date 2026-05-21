@@ -4,10 +4,12 @@ import { save } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
+import { isVideoFile } from '../../utils';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useConfirm } from '../../context/ConfirmContext';
 import { useSettings, SkipDuration, VideoFit, AutoHideDelay } from '../../context/SettingsContext';
+import { useCacheSession } from '../../context/CacheSessionContext';
+import { VideoCacheDialog } from './VideoCacheDialog';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -16,17 +18,18 @@ interface FastStreamPlayerProps {
   onNext?: () => void;
   onPrev?: () => void;
   activeFolderId: number | null;
+  onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
 }
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
-  const { confirm } = useConfirm();
   const { settings, updateSetting } = useSettings();
+  const cacheSession = useCacheSession();
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -49,8 +52,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [rotation, setRotation] = useState(0);
   const [brightness, setBrightness] = useState(1);
   const [pip, setPip] = useState(false);
-  const [bgCache, setBgCache] = useState(false);
   const [videoResolution, setVideoResolution] = useState<{ w: number; h: number } | null>(null);
+  // Video cache dialog state — replaces old bgCache auto-dialog
+  const [showCacheDialog, setShowCacheDialog] = useState(false);
+  const [pendingCachePercent, setPendingCachePercent] = useState(0);
   const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
   const skipFeedbackTimer = useRef<number>(0);
   const skipFeedbackKey = useRef(0);
@@ -111,47 +116,102 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [cachedTimes, getCachedThumbnailSync, thumbLoading]);
 
   // Close handler — background cache controls behavior
+  // Close handler — show VideoCacheDialog for video files with cache > 0%
   const handleClose = useCallback(async () => {
+    // Only show dialog for video files with cached data
+    if (!isVideoFile(file.name)) {
+      // console.log(`[CACHE-DIALOG] Not a video file — closing directly for "${file.name}"`);
+      onClose();
+      return;
+    }
+
     try {
       const cacheStatus = await invoke<any>('cmd_get_cache_status', {
         messageId: file.id,
       });
 
-      if (cacheStatus && cacheStatus.percentage > 0 && !cacheStatus.is_complete) {
-        if (bgCache) {
-          // Auto-start background caching (no dialog)
-          await invoke('cmd_start_background_cache', {
-            messageId: file.id,
-            folderId: activeFolderId ?? 0,
-          });
-          toast.success('Video caching in background');
-        } else {
-          // Show dialog — let user decide
-          const choice = await confirm({
-            title: 'Video partially cached',
-            message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
-            confirmText: 'Continue in Background',
-            cancelText: 'Close & Discard Cache',
-          });
+      if (cacheStatus && cacheStatus.percentage > 0) {
+        // Video has meaningful cache data — show VideoCacheDialog
+        // console.log(`[CACHE-DIALOG] Video has ${cacheStatus.percentage}% cache — showing dialog for msg=${file.id}`);
+        setPendingCachePercent(cacheStatus.percentage);
+        setShowCacheDialog(true);
+        return; // Don't close yet — wait for dialog choice
+      }
 
-          if (choice) {
-            await invoke('cmd_start_background_cache', {
-              messageId: file.id,
-              folderId: activeFolderId ?? 0,
-            });
-            toast.success('Video caching in background');
-          } else {
-            await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
-          }
-        }
+      if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
+        // Sub-1% cache (moov atom, init segments) — too small to resume from,
+        // silently auto-discard on close so orphaned files don't accumulate.
+        // console.log(`[CACHE-DIALOG] Sub-1% cache (${cacheStatus.cached_bytes} bytes) for msg=${file.id} — auto-discarding`);
+        onClose();
+        const tryDelete = (attempt: number) => {
+          invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+            if (attempt < 3) {
+              setTimeout(() => tryDelete(attempt + 1), 1000);
+            }
+          });
+        };
+        setTimeout(() => tryDelete(1), 1000);
+        return;
       }
     } catch {
-      // No cache or error — just close
+      // No cache data — just close directly
+      // console.log(`[CACHE-DIALOG] No cache status for msg=${file.id} — closing directly`);
     }
     onClose();
-  }, [file.id, activeFolderId, confirm, onClose, bgCache]);
+  }, [file.id, file.name, onClose]);
 
-  // Poll cache status every 5 seconds while playing
+  // VideoCacheDialog action handlers
+  const handleCacheDiscard = useCallback(() => {
+    // console.log(`[CACHE-DIALOG] Discard selected — closing player first, then deleting cache for msg=${file.id}`);
+    setShowCacheDialog(false);
+    cacheSession.removeCache(file.id);
+    onClose();
+    // Schedule cache deletion after player closes — the Actix stream needs time
+    // to drop its file handle before the OS can delete the .dat file.
+    // The Rust delete_cache now handles locked .dat files gracefully by:
+    // 1. Deleting the .meta.json sidecar (always succeeds)
+    // 2. Attempting to delete .dat; falling back to truncate if locked
+    // 3. Leaving .dat for clear_all at app exit if truncation also fails
+    const tryDelete = (attempt: number) => {
+      // console.log(`[CACHE-DIALOG] Deleting cache for msg=${file.id} (attempt ${attempt})`);
+      invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+        // console.warn(`[CACHE-DIALOG] Cache deletion failed for msg=${file.id}:`, e);
+        if (attempt < 3) {
+          setTimeout(() => tryDelete(attempt + 1), 1000);
+        }
+      });
+    };
+    setTimeout(() => tryDelete(1), 1000);
+  }, [file.id, cacheSession, onClose]);
+
+  const handleCacheKeepBuffers = useCallback(() => {
+    // console.log(`[CACHE-DIALOG] Keep Buffers selected — registering ${pendingCachePercent}% in session for msg=${file.id}`);
+    setShowCacheDialog(false);
+    cacheSession.registerCache(file.id, pendingCachePercent, file.name);
+    onClose();
+  }, [file.id, pendingCachePercent, file.name, cacheSession, onClose]);
+
+  const handleCacheContinueDownload = useCallback((savePath: string) => {
+    // console.log(`[CACHE-DIALOG] Continue Download selected — queuing download at ${pendingCachePercent}% for msg=${file.id}`);
+    setShowCacheDialog(false);
+    // Queue in download panel with fromCachePercent
+    // This will be wired from Dashboard via a prop callback
+    onContinueToDownload?.(file.id, file.name, activeFolderId, savePath, pendingCachePercent);
+    cacheSession.removeCache(file.id);
+    onClose();
+  }, [file.id, file.name, activeFolderId, pendingCachePercent, onContinueToDownload, cacheSession, onClose]);
+
+  const handleCacheDialogCancel = useCallback(() => {
+    // console.log(`[CACHE-DIALOG] Cancelled — returning to video player for msg=${file.id}`);
+    setShowCacheDialog(false);
+  }, [file.id]);
+
+  // Ref to cacheSession so the poll effect doesn't re-trigger on every updateCachePercent
+  // (which would create an infinite loop: poll → update → state change → effect re-run → new poll → ...)
+  const cacheSessionRef = useRef(cacheSession);
+  cacheSessionRef.current = cacheSession;
+
+  // Poll cache status every 5 seconds while playing — also updates session tracker
   useEffect(() => {
     let active = true;
     const poll = async () => {
@@ -161,6 +221,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
+            // Update session cache tracker via ref (avoids re-triggering this effect)
+            const cs = cacheSessionRef.current;
+            if (cs.getCacheInfo(file.id) && status.percentage > 0) {
+              cs.updateCachePercent(file.id, status.percentage);
+            }
             if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
               const ranges: [number, number][] = status.cached_ranges.map(
                 ([s, e]: [number, number]) => [
@@ -177,7 +242,21 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     };
     poll();
     return () => { active = false; };
-  }, [file.id]);
+  }, [file.id, byteToTime]); // Removed cacheSession — uses ref instead
+
+  // Show "Resuming from X% cache" toast ONCE when opening a video with session cache.
+  // A ref guard prevents the toast from re-showing on every cacheSession state change
+  // (updateCachePercent re-creates the context, which would otherwise re-trigger this effect).
+  const hasShownResumeToast = useRef(false);
+  useEffect(() => {
+    if (hasShownResumeToast.current) return;
+    const cached = cacheSession.getCacheInfo(file.id);
+    if (cached && cached.percentage > 0) {
+      hasShownResumeToast.current = true;
+      // console.log(`[CACHE-RESUME] Showing resuming toast: ${cached.percentage}% for msg=${file.id}`);
+      toast.info(`Resuming from ${cached.percentage}% cache`, { duration: 3000 });
+    }
+  }, [file.id, cacheSession]);
 
   // Listen for download-progress events for our transferId
   useEffect(() => {
@@ -223,7 +302,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (!savePath) return;
 
       const transferId = `dl-${file.id}-${Date.now()}`;
-      console.log(`[BUFFER-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
+      // console.log(`[BUFFER-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
       setDlOverlayVisible(true);
@@ -1023,17 +1102,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 ))}
               </div>
             </div>
-            {/* Background cache */}
-            <div className="flex items-center justify-between">
-              <span className="text-white/70 text-xs">Background cache</span>
-              <button
-                onClick={() => setBgCache(!bgCache)}
-                className={`w-10 h-5 rounded-full transition-colors relative ${bgCache ? 'bg-telegram-secondary' : 'bg-white/20'}`}
-              >
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${bgCache ? 'left-5' : 'left-0.5'}`} />
-              </button>
             </div>
-          </div>
 
           {/* Info */}
           <div className="px-4 py-3">
@@ -1151,6 +1220,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <svg className="w-8 h-8 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
           </div>
         </div>
+      )}
+      {/* VideoCacheDialog — shown when closing a video with cache > 0% */}
+      {showCacheDialog && (
+        <VideoCacheDialog
+          percentage={pendingCachePercent}
+          filename={file.name}
+          messageId={file.id}
+          onDiscard={handleCacheDiscard}
+          onKeepBuffers={handleCacheKeepBuffers}
+          onContinueDownload={handleCacheContinueDownload}
+          onCancel={handleCacheDialogCancel}
+        />
       )}
     </div>
   );

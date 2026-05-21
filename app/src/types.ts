@@ -42,6 +42,6 @@ export interface DownloadItem {
     uploadedBytes?: number;
     totalBytes?: number;
     speedBytesPerSec?: number;
-    cacheInfo?: string; // "From cache ✓" or "Using cache (67%)"
+    cacheInfo?: string; // "From cache" or "Using cache (67%)"
+    fromCachePercent?: number; // Initial progress from cached video data (e.g. 45)
 }
-
