@@ -140,18 +140,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       }
 
       if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
-        // Sub-1% cache (moov atom, init segments) — too small to resume from,
-        // silently auto-discard on close so orphaned files don't accumulate.
-        // console.log(`[CACHE-DIALOG] Sub-1% cache (${cacheStatus.cached_bytes} bytes) for msg=${file.id} — auto-discarding`);
         onClose();
         const tryDelete = (attempt: number) => {
           invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
-            if (attempt < 3) {
-              setTimeout(() => tryDelete(attempt + 1), 1000);
+            if (attempt < 5) {
+              setTimeout(() => tryDelete(attempt + 1), 2000);
             }
           });
         };
-        setTimeout(() => tryDelete(1), 1000);
+        setTimeout(() => tryDelete(1), 2000);
         return;
       }
     } catch {
