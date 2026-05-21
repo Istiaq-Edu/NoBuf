@@ -7,7 +7,7 @@ import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, AutoHideDelay } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, AutoHideDelay, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 
@@ -54,6 +54,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [brightness, setBrightness] = useState(1);
   const [pip, setPip] = useState(false);
   const [videoResolution, setVideoResolution] = useState<{ w: number; h: number } | null>(null);
+  // Speed limit custom input state
+  const [customPrebufferValue, setCustomPrebufferValue] = useState<string>('');
+  const [customPrebufferUnit, setCustomPrebufferUnit] = useState<'kb' | 'mb'>('mb');
+  const [customDownloadValue, setCustomDownloadValue] = useState<string>('');
+  const [customDownloadUnit, setCustomDownloadUnit] = useState<'kb' | 'mb'>('mb');
   // Video cache dialog state — replaces old bgCache auto-dialog
   const [showCacheDialog, setShowCacheDialog] = useState(false);
   const [pendingCachePercent, setPendingCachePercent] = useState(0);
@@ -896,6 +901,28 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </span>
               </button>
             )}
+            {/* Prebuffer speed limit indicator */}
+            {settings.prebufferSpeedLimit > 0 && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }}
+                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-0.5"
+                title={`Prebuffer limited to ${formatSpeedLimit(settings.prebufferSpeedLimit)}`}
+              >
+                <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                <span className="text-xs font-mono text-green-400">{formatSpeedLimitCompact(settings.prebufferSpeedLimit)}</span>
+              </button>
+            )}
+            {/* Download speed limit indicator */}
+            {settings.downloadSpeedLimit > 0 && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }}
+                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-0.5"
+                title={`Download limited to ${formatSpeedLimit(settings.downloadSpeedLimit)}`}
+              >
+                <svg className="w-3.5 h-3.5 text-blue-400" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                <span className="text-xs font-mono text-blue-400">{formatSpeedLimitCompact(settings.downloadSpeedLimit)}</span>
+              </button>
+            )}
             {/* Speed */}
             <div className="relative">
               <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback speed">
@@ -1101,6 +1128,132 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               </div>
             </div>
             </div>
+
+          {/* Bandwidth */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
+              <span className="inline-block w-2 h-2 rounded-full bg-blue-400" />
+              Bandwidth
+            </h3>
+            {/* Prebuffer speed limit */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400" />
+                Prebuffer speed
+              </label>
+              <div className="flex flex-wrap gap-1 items-center">
+                {SPEED_LIMIT_PRESETS.map(p => (
+                  <button
+                    key={p.value}
+                    onClick={() => { updateSetting('prebufferSpeedLimit', p.value as SpeedLimitValue); setCustomPrebufferValue(''); }}
+                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.prebufferSpeedLimit === p.value ? 'bg-green-500/30 text-green-400 ring-1 ring-green-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                {/* Custom input */}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number" min="1" max="102400"
+                    placeholder="Custom"
+                    value={customPrebufferValue}
+                    onChange={e => {
+                      const raw = e.target.value;
+                      setCustomPrebufferValue(raw);
+                      if (raw && Number(raw) > 0) {
+                        const kb = customPrebufferUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
+                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-green-400 focus:outline-none text-center"
+                  />
+                  <select
+                    value={customPrebufferUnit}
+                    onChange={e => {
+                      const unit = e.target.value as 'kb' | 'mb';
+                      setCustomPrebufferUnit(unit);
+                      if (customPrebufferValue && Number(customPrebufferValue) > 0) {
+                        const kb = unit === 'mb' ? Number(customPrebufferValue) * 1024 : Number(customPrebufferValue);
+                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-green-400 focus:outline-none"
+                  >
+                    <option value="kb">KB/s</option>
+                    <option value="mb">MB/s</option>
+                  </select>
+                </div>
+              </div>
+              {settings.prebufferSpeedLimit > 0 && (
+                <div className="mt-1.5 text-[10px] text-green-400/70">
+                  Active: {formatSpeedLimit(settings.prebufferSpeedLimit)}
+                </div>
+              )}
+            </div>
+            {/* Download speed limit */}
+            <div className="mb-2">
+              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-400" />
+                Download speed
+              </label>
+              <div className="flex flex-wrap gap-1 items-center">
+                {SPEED_LIMIT_PRESETS.map(p => (
+                  <button
+                    key={p.value}
+                    onClick={() => { updateSetting('downloadSpeedLimit', p.value as SpeedLimitValue); setCustomDownloadValue(''); }}
+                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.downloadSpeedLimit === p.value ? 'bg-blue-500/30 text-blue-400 ring-1 ring-blue-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                {/* Custom input */}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number" min="1" max="102400"
+                    placeholder="Custom"
+                    value={customDownloadValue}
+                    onChange={e => {
+                      const raw = e.target.value;
+                      setCustomDownloadValue(raw);
+                      if (raw && Number(raw) > 0) {
+                        const kb = customDownloadUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
+                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-blue-400 focus:outline-none text-center"
+                  />
+                  <select
+                    value={customDownloadUnit}
+                    onChange={e => {
+                      const unit = e.target.value as 'kb' | 'mb';
+                      setCustomDownloadUnit(unit);
+                      if (customDownloadValue && Number(customDownloadValue) > 0) {
+                        const kb = unit === 'mb' ? Number(customDownloadValue) * 1024 : Number(customDownloadValue);
+                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-blue-400 focus:outline-none"
+                  >
+                    <option value="kb">KB/s</option>
+                    <option value="mb">MB/s</option>
+                  </select>
+                </div>
+              </div>
+              {settings.downloadSpeedLimit > 0 && (
+                <div className="mt-1.5 text-[10px] text-blue-400/70">
+                  Active: {formatSpeedLimit(settings.downloadSpeedLimit)}
+                </div>
+              )}
+            </div>
+            {/* Conflict warning */}
+            {settings.prebufferSpeedLimit > 0 && settings.downloadSpeedLimit > 0 && (
+              <div className="flex items-start gap-1.5 px-2 py-1.5 rounded bg-yellow-500/10 text-yellow-400/80 text-[10px]">
+                <svg className="w-3 h-3 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                <span>Both limits share 1 Telegram connection — speeds may not reach their full ceiling simultaneously.</span>
+              </div>
+            )}
+          </div>
 
           {/* Info */}
           <div className="px-4 py-3">

@@ -2,8 +2,10 @@ use grammers_client::Client;
 use grammers_client::types::Peer;
 use tauri::State;
 use crate::bandwidth::BandwidthManager;
+use crate::commands::TelegramState;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
 
 /// Resolve a folder_id to a Telegram Peer, using the cache for O(1) lookups.
@@ -26,7 +28,7 @@ pub async fn resolve_peer(
         }
 
         // Slow path: scan dialogs and populate cache
-        log::debug!("Peer cache miss for folder_id={}, scanning dialogs...", fid);
+        // log::debug!("Peer cache miss for folder_id={}, scanning dialogs...", fid);
         let mut found: Option<Peer> = None;
         let mut dialogs = client.iter_dialogs();
         let mut cache = peer_cache.write().await;
@@ -85,4 +87,21 @@ pub fn map_error(e: impl std::fmt::Display) -> String {
         return "FLOOD_WAIT_60".to_string();
     }
     err_str
+}
+
+/// Set speed limits for prebuffer (streaming) and download (file download panel).
+/// Values in KB/s. 0 = unlimited. Stored atomically so the Actix server
+/// and download loops can read them without async locks.
+#[tauri::command]
+pub fn cmd_set_speed_limits(
+    prebuffer_limit_kb: u64,
+    download_limit_kb: u64,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    state.prebuffer_speed_limit_kb.store(prebuffer_limit_kb, Ordering::Relaxed);
+    state.download_speed_limit_kb.store(download_limit_kb, Ordering::Relaxed);
+    // let prebuf_str = if prebuffer_limit_kb == 0 { "unlimited" } else { &prebuffer_limit_kb.to_string() };
+    // let dl_str = if download_limit_kb == 0 { "unlimited" } else { &download_limit_kb.to_string() };
+    // log::info!("[THROTTLE-DBG] cmd_set_speed_limits called: prebuffer={} KB/s, download={} KB/s", prebuf_str, dl_str);
+    Ok(true)
 }

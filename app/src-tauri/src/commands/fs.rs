@@ -532,8 +532,20 @@ pub async fn cmd_download_file(
                     break;
                 }
 
-                // Yield briefly so player prebuffer gets a fair share of the semaphore;
-                // tokio::sync::Semaphore uses FIFO waiters so this is cooperative yielding.
+                // Throttle: sleep to enforce download speed limit.
+                // Semaphore is released after chunk fetch, so prebuffer can use
+                // the connection during this sleep window. Also yield cooperatively.
+                let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                if dl_limit_kb > 0 {
+                    let sleep_ms = (to_write as u64 * 1000) / (dl_limit_kb * 1024);
+                    let sleep_ms = sleep_ms.min(2000);
+                    // log::info!("[THROTTLE-DBG][DOWNLOAD-GAP] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
+                    //     message_id, to_write, dl_limit_kb, sleep_ms, offset);
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                } else {
+                    // log::info!("[THROTTLE-DBG][DOWNLOAD-GAP] msg={}, unlimited, no throttle sleep, offset={}", 
+                    //     message_id, offset);
+                }
                 tokio::task::yield_now().await;
             }
         }
@@ -628,6 +640,20 @@ pub async fn cmd_download_file(
             }
         }
 
+        // Throttle: sleep to enforce download speed limit.
+        // Semaphore is released after chunk fetch, so prebuffer can use
+        // the connection during this sleep window. Also yield cooperatively.
+        let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+        if dl_limit_kb > 0 {
+            let sleep_ms = (bytes.len() as u64 * 1000) / (dl_limit_kb * 1024);
+            let sleep_ms = sleep_ms.min(2000);
+            // log::info!("[THROTTLE-DBG][DOWNLOAD-FRESH] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, downloaded={}", 
+            //     message_id, bytes.len(), dl_limit_kb, sleep_ms, downloaded);
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        } else {
+            // log::info!("[THROTTLE-DBG][DOWNLOAD-FRESH] msg={}, unlimited, no throttle sleep, downloaded={}", 
+            //     message_id, downloaded);
+        }
         // Yield so player prebuffer gets a fair share of the semaphore
         tokio::task::yield_now().await;
     }
@@ -827,7 +853,7 @@ pub async fn cmd_scan_folders(
                 let name = c.raw.title.clone();
                 let access_hash = c.raw.access_hash.unwrap_or(0);
                 
-                log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
+                // log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
                 // Strategy 1: Title
                 if name.to_lowercase().contains("[td]") {
@@ -859,10 +885,10 @@ pub async fn cmd_scan_folders(
             },
             Peer::User(u) => {
                 peer_cache.insert(u.raw.id(), dialog.peer.clone());
-                log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
+                // log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
             },
-            peer => {
-                log::debug!("[SCAN] Skipped Peer: {:?}", peer);
+            _peer => {
+                // log::debug!("[SCAN] Skipped Peer: {:?}", peer);
             }
         }
     }
