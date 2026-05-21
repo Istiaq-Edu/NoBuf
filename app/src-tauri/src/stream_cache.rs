@@ -300,15 +300,58 @@ impl StreamCacheManager {
     /// Refuses to delete if the message is currently being streamed
     /// (frontend cmd_delete_cache during streaming caused catastrophic
     /// range loss because files enter "pending-delete" state on Windows).
+    ///
+    /// On Windows, the .dat file is opened with FILE_SHARE_READ|FILE_SHARE_WRITE
+    /// (no FILE_SHARE_DELETE) via open_data_file_write to protect from antivirus.
+    /// This means std::fs::remove_file can fail with ERROR_SHARING_VIOLATION (os
+    /// error 32) if any handle (stream or download task) hasn't been dropped yet,
+    /// even though streaming has been untracked. We handle this by:
+    /// 1. Always deleting the .meta.json sidecar (standard share modes)
+    /// 2. Attempting to delete the .dat file; on failure, leaving it in place
+    ///    (DO NOT truncate — truncating while another handle writes creates gaps
+    ///    that corrupt MSE player data, causing CHUNK_DEMUXER_ERROR_APPEND_FAILED).
+    /// 3. The .dat will be overwritten via OPEN_ALWAYS on next playback, or
+    ///    cleaned on app exit via clear_all().
+    /// The .meta.json deletion alone makes get_status() return None, effectively
+    /// discarding the cache from the frontend's perspective.
     pub fn delete_cache(&self, message_id: i32) -> std::io::Result<()> {
         if self.is_streaming(message_id) {
             log::warn!("[CACHE] delete_cache: msg {} has active streaming — skipping deletion, cache will be cleaned on exit", message_id);
             return Ok(());
         }
-        let data = self.data_path(message_id);
+
+        // Always delete the meta sidecar first — it uses standard share modes
+        // and can be deleted even while data file handles are open.
         let meta = self.meta_path(message_id);
-        if data.exists() { std::fs::remove_file(&data)?; }
-        if meta.exists() { std::fs::remove_file(&meta)?; }
+        if meta.exists() {
+            std::fs::remove_file(&meta)?;
+            log::info!("[CACHE] delete_cache: removed meta for msg {}", message_id);
+        }
+
+        // Try to delete the data file. If any handle is still open (stream or
+        // background download task opened via open_data_file_write with no
+        // FILE_SHARE_DELETE), deletion fails with os error 32. We do NOT
+        // truncate — truncating a file that another handle is writing to
+        // creates byte-range gaps that corrupt data fed to the MSE player.
+        // Instead, leave the .dat in place; it will be overwritten (OPEN_ALWAYS)
+        // on next playback or cleaned on app exit via clear_all().
+        let data = self.data_path(message_id);
+        if data.exists() {
+            match std::fs::remove_file(&data) {
+                Ok(()) => {
+                    log::info!("[CACHE] delete_cache: removed data file for msg {}", message_id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[CACHE] delete_cache: Could not delete data file for msg {} ({}), \
+                        left in place — will be overwritten on next playback or cleaned on exit",
+                        message_id, e
+                    );
+                    // Intentionally NOT truncating: truncating while another handle
+                    // writes to the file creates gaps that corrupt MSE data.
+                }
+            }
+        }
         Ok(())
     }
 

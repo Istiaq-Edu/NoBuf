@@ -1,3 +1,4 @@
+import { LayoutGrid, Sun, Moon, Settings } from 'lucide-react';
 import { LayoutGrid, Sun, Moon, Settings, ArrowLeftRight } from 'lucide-react';
 import { useTheme } from '../../context/ThemeContext';
 
