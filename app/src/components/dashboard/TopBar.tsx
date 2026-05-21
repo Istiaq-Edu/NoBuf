@@ -1,4 +1,4 @@
-import { HardDrive, LayoutGrid, Sun, Moon, Settings } from 'lucide-react';
+import { LayoutGrid, Sun, Moon, Settings, ArrowLeftRight } from 'lucide-react';
 import { useTheme } from '../../context/ThemeContext';
 
 interface TopBarProps {
@@ -13,11 +13,20 @@ interface TopBarProps {
     searchTerm: string;
     onSearchChange: (term: string) => void;
     onSettingsClick: () => void;
+    onToggleTransfers: () => void;
+    showTransferPanel: boolean;
+    uploadActiveCount?: number;
+    uploadFinishedCount?: number;
+    downloadActiveCount?: number;
+    downloadFinishedCount?: number;
 }
 
 export function TopBar({
     currentFolderName, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
-    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick
+    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick,
+    onToggleTransfers, showTransferPanel,
+    uploadActiveCount = 0, uploadFinishedCount = 0,
+    downloadActiveCount = 0, downloadFinishedCount = 0,
 }: TopBarProps) {
     const { theme, toggleTheme } = useTheme();
 
@@ -64,6 +73,29 @@ export function TopBar({
                 </button>
 
                 <div className="w-px h-6 bg-telegram-border mx-1"></div>
+
+                <button
+                    onClick={onToggleTransfers}
+                    className={`p-2 hover:bg-telegram-hover rounded-md transition relative group ${showTransferPanel ? 'text-telegram-primary bg-telegram-primary/10' : 'text-telegram-subtext hover:text-telegram-text'}`}
+                    title="Transfers"
+                >
+                    <ArrowLeftRight className="w-5 h-5" />
+                    {/* Upload badge — top-left, blue */}
+                    {(uploadActiveCount > 0 || (uploadActiveCount === 0 && uploadFinishedCount > 0)) && (
+                        <span className={`absolute -top-2 -left-2 min-w-[18px] h-[18px] px-1 rounded-full flex items-center justify-center text-[10px] text-white font-bold ${uploadActiveCount > 0 ? 'bg-blue-500 animate-pulse' : 'bg-blue-500/70'}`}>
+                            {uploadActiveCount > 0 ? (uploadActiveCount > 9 ? '9+' : uploadActiveCount) : (uploadFinishedCount > 9 ? '9+' : uploadFinishedCount)}
+                        </span>
+                    )}
+                    {/* Download badge — top-right, green */}
+                    {(downloadActiveCount > 0 || (downloadActiveCount === 0 && downloadFinishedCount > 0)) && (
+                        <span className={`absolute -top-2 -right-2 min-w-[18px] h-[18px] px-1 rounded-full flex items-center justify-center text-[10px] text-white font-bold ${downloadActiveCount > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-emerald-500/70'}`}>
+                            {downloadActiveCount > 0 ? (downloadActiveCount > 9 ? '9+' : downloadActiveCount) : (downloadFinishedCount > 9 ? '9+' : downloadFinishedCount)}
+                        </span>
+                    )}
+                    <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-telegram-surface border border-telegram-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
+                        Transfers
+                    </span>
+                </button>
 
                 <button
                     onClick={onSettingsClick}
