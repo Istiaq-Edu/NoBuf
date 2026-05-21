@@ -20,10 +20,8 @@ interface ProgressPayload {
 // cancellation flag and close its handle) then retry up to 3 times.
 function deleteCacheAfterCancel(messageId: number) {
     const tryDelete = (attempt: number) => {
-        // console.log(`[CACHE-DOWNLOAD] Deleting cache for msg=${messageId} (attempt ${attempt})`);
         invoke('cmd_delete_cache', { messageId }).catch(() => {
-            // console.warn(`[CACHE-DOWNLOAD] Cache deletion attempt ${attempt} failed for msg=${messageId}:`, e);
-            if (attempt < 3) {
+            if (attempt < 5) {
                 setTimeout(() => tryDelete(attempt + 1), 2000);
             }
         });
