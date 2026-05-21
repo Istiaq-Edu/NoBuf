@@ -20,10 +20,8 @@ interface ProgressPayload {
 // cancellation flag and close its handle) then retry up to 3 times.
 function deleteCacheAfterCancel(messageId: number) {
     const tryDelete = (attempt: number) => {
-        // console.log(`[CACHE-DOWNLOAD] Deleting cache for msg=${messageId} (attempt ${attempt})`);
         invoke('cmd_delete_cache', { messageId }).catch(() => {
-            // console.warn(`[CACHE-DOWNLOAD] Cache deletion attempt ${attempt} failed for msg=${messageId}:`, e);
-            if (attempt < 3) {
+            if (attempt < 5) {
                 setTimeout(() => tryDelete(attempt + 1), 2000);
             }
         });
@@ -128,6 +126,13 @@ export function useFileDownload(store: Store | null) {
     };
 
     const queueDownload = async (messageId: number, filename: string, folderId: number | null) => {
+        // Prevent duplicate downloads for the same messageId
+        const existing = downloadQueue.find(i => i.messageId === messageId && (i.status === 'pending' || i.status === 'downloading'));
+        if (existing) {
+            toast.info(`Already downloading: ${filename}`);
+            return;
+        }
+
         // Check cache status
         let cacheInfo: string | undefined;
         try {
@@ -246,6 +251,13 @@ export function useFileDownload(store: Store | null) {
         savePath: string,
         fromCachePercent?: number,
     ) => {
+        // Prevent duplicate downloads for the same messageId
+        const existing = downloadQueue.find(i => i.messageId === messageId && (i.status === 'pending' || i.status === 'downloading'));
+        if (existing) {
+            toast.info(`Already downloading: ${filename}`);
+            return;
+        }
+
         // console.log(`[CACHE-DOWNLOAD] queueDownloadWithSavePath: msg=${messageId} file="${filename}" savePath="${savePath}" fromCache=${fromCachePercent}%`);
         const id = `dl-${messageId}-${Date.now()}`;
 

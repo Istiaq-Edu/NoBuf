@@ -19,11 +19,12 @@ interface FastStreamPlayerProps {
   onPrev?: () => void;
   activeFolderId: number | null;
   onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
+  isAlreadyDownloading?: boolean;
 }
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -139,18 +140,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       }
 
       if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
-        // Sub-1% cache (moov atom, init segments) — too small to resume from,
-        // silently auto-discard on close so orphaned files don't accumulate.
-        // console.log(`[CACHE-DIALOG] Sub-1% cache (${cacheStatus.cached_bytes} bytes) for msg=${file.id} — auto-discarding`);
         onClose();
         const tryDelete = (attempt: number) => {
           invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
-            if (attempt < 3) {
-              setTimeout(() => tryDelete(attempt + 1), 1000);
+            if (attempt < 5) {
+              setTimeout(() => tryDelete(attempt + 1), 2000);
             }
           });
         };
-        setTimeout(() => tryDelete(1), 1000);
+        setTimeout(() => tryDelete(1), 2000);
         return;
       }
     } catch {
@@ -162,26 +160,20 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // VideoCacheDialog action handlers
   const handleCacheDiscard = useCallback(() => {
-    // console.log(`[CACHE-DIALOG] Discard selected — closing player first, then deleting cache for msg=${file.id}`);
     setShowCacheDialog(false);
     cacheSession.removeCache(file.id);
     onClose();
     // Schedule cache deletion after player closes — the Actix stream needs time
-    // to drop its file handle before the OS can delete the .dat file.
-    // The Rust delete_cache now handles locked .dat files gracefully by:
-    // 1. Deleting the .meta.json sidecar (always succeeds)
-    // 2. Attempting to delete .dat; falling back to truncate if locked
-    // 3. Leaving .dat for clear_all at app exit if truncation also fails
+    // to drop its StreamingGuard and file handle. cmd_delete_cache now returns
+    // an error when streaming is still active, so retries properly handle this.
     const tryDelete = (attempt: number) => {
-      // console.log(`[CACHE-DIALOG] Deleting cache for msg=${file.id} (attempt ${attempt})`);
       invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
-        // console.warn(`[CACHE-DIALOG] Cache deletion failed for msg=${file.id}:`, e);
-        if (attempt < 3) {
-          setTimeout(() => tryDelete(attempt + 1), 1000);
+        if (attempt < 5) {
+          setTimeout(() => tryDelete(attempt + 1), 2000);
         }
       });
     };
-    setTimeout(() => tryDelete(1), 1000);
+    setTimeout(() => tryDelete(1), 2000);
   }, [file.id, cacheSession, onClose]);
 
   const handleCacheKeepBuffers = useCallback(() => {
@@ -205,6 +197,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // console.log(`[CACHE-DIALOG] Cancelled — returning to video player for msg=${file.id}`);
     setShowCacheDialog(false);
   }, [file.id]);
+
+  const handleAlreadyDownloadingClose = useCallback(() => {
+    setShowCacheDialog(false);
+    toast.info(`${file.name} is already downloading — check the transfer panel`);
+    onClose();
+  }, [file.id, file.name, onClose]);
 
   // Ref to cacheSession so the poll effect doesn't re-trigger on every updateCachePercent
   // (which would create an infinite loop: poll → update → state change → effect re-run → new poll → ...)
@@ -1227,9 +1225,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           percentage={pendingCachePercent}
           filename={file.name}
           messageId={file.id}
+          isAlreadyDownloading={isAlreadyDownloading ?? false}
           onDiscard={handleCacheDiscard}
           onKeepBuffers={handleCacheKeepBuffers}
           onContinueDownload={handleCacheContinueDownload}
+          onAlreadyDownloadingClose={handleAlreadyDownloadingClose}
           onCancel={handleCacheDialogCancel}
         />
       )}

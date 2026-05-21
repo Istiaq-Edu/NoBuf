@@ -107,9 +107,12 @@ pub async fn cmd_delete_cache(
     message_id: i32,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
-    cache_state
+    let deleted = cache_state
         .delete_cache(message_id)
         .map_err(|e| format!("Failed to delete cache: {}", e))?;
+    if !deleted {
+        return Err("Cache is still streaming — retry later".to_string());
+    }
     Ok(true)
 }
 
