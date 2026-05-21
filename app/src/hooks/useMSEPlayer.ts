@@ -236,8 +236,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // Log first range after a seek reset for debugging
     if (justSeekedRef.current) {
       justSeekedRef.current = false;
-      const [ts, te] = timeRanges[timeRanges.length - 1];
-      console.log(`[BUFFER-BAR] First range after seek: bytes ${byteStart}-${byteEnd} → time ${ts.toFixed(1)}-${te.toFixed(1)}s`);
+      // const [ts, te] = timeRanges[timeRanges.length - 1];
+      // console.log(`[BUFFER-BAR] First range after seek: bytes ${byteStart}-${byteEnd} → time ${ts.toFixed(1)}-${te.toFixed(1)}s`);
     }
   }, []);
 
@@ -553,7 +553,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         table.push([byteOffset, t]);
       }
       byteToTimeTableRef.current = table;
-      console.log(`[BUFFER-BAR] VBR lookup table built: ${table.length} points, video duration=${state.current.duration.toFixed(1)}s`);
+      // console.log(`[BUFFER-BAR] VBR lookup table built: ${table.length} points, video duration=${state.current.duration.toFixed(1)}s`);
     }
 
     // Create SourceBuffers
@@ -661,8 +661,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const seekTime = (seekByte / state.current.fileLength) * state.current.duration;
         state.current.pendingSeek = -1;
 
-        const oldRangeCount = downloadedRangesRef.current.length;
-        console.log(`[BUFFER-BAR] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)}), clearing ${oldRangeCount} stale downloaded ranges`);
+        // const oldRangeCount = downloadedRangesRef.current.length;
+        // console.log(`[BUFFER-BAR] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)}), clearing ${oldRangeCount} stale downloaded ranges`);
 
         // 1. Clear old buffered data from SourceBuffers
         if (state.current.videoSourceBuffer) {
@@ -894,6 +894,7 @@ async function loadMP4Box(): Promise<any> {
   }
 }
 
+// @ts-expect-error — kept for potential future use, currently only referenced in commented-out debug logs
 function formatBytes(b: number): string {
   if (b < 1024) return `${b}B`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)}KB`;

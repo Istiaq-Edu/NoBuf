@@ -11,6 +11,7 @@ import "./App.css";
 
 import { Toaster } from "sonner";
 import { ConfirmProvider } from "./context/ConfirmContext";
+import { CacheSessionProvider } from "./context/CacheSessionContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
 import { DropZoneProvider } from "./contexts/DropZoneContext";
@@ -116,11 +117,13 @@ function App() {
       <ThemeProvider>
         <QueryClientProvider client={queryClient}>
           <ConfirmProvider>
-            <SettingsProvider>
-              <DropZoneProvider>
-                <AppContent />
-              </DropZoneProvider>
-            </SettingsProvider>
+            <CacheSessionProvider>
+              <SettingsProvider>
+                <DropZoneProvider>
+                  <AppContent />
+                </DropZoneProvider>
+              </SettingsProvider>
+            </CacheSessionProvider>
           </ConfirmProvider>
         </QueryClientProvider>
       </ThemeProvider>
