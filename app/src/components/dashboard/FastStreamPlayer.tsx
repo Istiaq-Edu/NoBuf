@@ -7,6 +7,7 @@ import { TelegramFile } from '../../types';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useConfirm } from '../../context/ConfirmContext';
+import { useSettings, SkipDuration, VideoFit, AutoHideDelay } from '../../context/SettingsContext';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -23,14 +24,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
+  const controlsRef = useRef<HTMLDivElement>(null);
   const { confirm } = useConfirm();
+  const { settings, updateSetting } = useSettings();
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
+  const durRef = useRef(0);
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [rate, setRate] = useState(1);
+  const [rate, setRate] = useState(settings.playerSpeed);
   const [buf, setBuf] = useState(0);
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -39,14 +43,30 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [menu, setMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
+  // Settings panel state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [loop, setLoop] = useState(false);
+  const [rotation, setRotation] = useState(0);
+  const [brightness, setBrightness] = useState(1);
+  const [pip, setPip] = useState(false);
+  const [bgCache, setBgCache] = useState(false);
+  const [videoResolution, setVideoResolution] = useState<{ w: number; h: number } | null>(null);
+  const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
+  const skipFeedbackTimer = useRef<number>(0);
+  const skipFeedbackKey = useRef(0);
+
   const [cachePercent, setCachePercent] = useState(0);
   const [cacheComplete, setCacheComplete] = useState(false);
   // Time ranges from backend cache (includes both playback buffer + download)
   const [cachedTimeRanges, setCachedTimeRanges] = useState<[number, number][]>([]);
+  const [controlsHeight, setControlsHeight] = useState(0);
+  const [miniBarVisible, setMiniBarVisible] = useState(false);
 
   // Download overlay state
-  const [dlOverlay, setDlOverlay] = useState<{ active: boolean; percent: number; fromCache: boolean; speed: number } | null>(null);
+  const [dlOverlay, setDlOverlay] = useState<{ active: boolean; percent: number; fromCache: boolean; speed: number; completed?: boolean } | null>(null);
+  const [dlOverlayVisible, setDlOverlayVisible] = useState(false);
   const dlTransferIdRef = useRef<string>('');
+  const dismissTimerRef = useRef<number>(0);
 
   // MSE player with native fallback
   const {
@@ -63,32 +83,34 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     resumePrefetch,
     seekTo,
     setVideoRef,
-    downloadedTimeRanges,
+    downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
+    byteToTime,
+    setSuppressBackendReports,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
-  // Debug: log player-tracked ranges changes
-  useEffect(() => {
-    if (downloadedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Player ranges updated: ${JSON.stringify(downloadedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [downloadedTimeRanges, dur]);
-
-  // Debug: log cache ranges changes
-  useEffect(() => {
-    if (cachedTimeRanges.length > 0) {
-      console.log(`[GREEN-BAR] Cache ranges updated: ${JSON.stringify(cachedTimeRanges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
-    }
-  }, [cachedTimeRanges, dur]);
-
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
 
-  // Thumbnail extractor — uses hidden video element with buffer-aware background generation
-  const { ready: thumbReady, getThumbnail, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
+  // Thumbnail extractor — ref-based hover processor + synchronous cache check
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
 
-  // Close handler — check cache status and offer to continue in background
+  // When cachedTimes updates (from on-demand capture), check if the current
+  // hover position is now cached and update the display. This is the key
+  // mechanism that makes on-demand thumbnails appear — the hover processor
+  // caches them, cachedTimes state updates, and this effect resolves the spinner.
+  useEffect(() => {
+    if (lastThumbTimeRef.current >= 0 && thumbLoading) {
+      const cachedUrl = getCachedThumbnailSync(lastThumbTimeRef.current);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+      }
+    }
+  }, [cachedTimes, getCachedThumbnailSync, thumbLoading]);
+
+  // Close handler — background cache controls behavior
   const handleClose = useCallback(async () => {
     try {
       const cacheStatus = await invoke<any>('cmd_get_cache_status', {
@@ -96,29 +118,38 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       });
 
       if (cacheStatus && cacheStatus.percentage > 0 && !cacheStatus.is_complete) {
-        const choice = await confirm({
-          title: 'Video partially cached',
-          message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
-          confirmText: 'Continue in Background',
-          cancelText: 'Close & Discard Cache',
-        });
-
-        if (choice) {
+        if (bgCache) {
+          // Auto-start background caching (no dialog)
           await invoke('cmd_start_background_cache', {
             messageId: file.id,
             folderId: activeFolderId ?? 0,
           });
           toast.success('Video caching in background');
         } else {
-          // Discard cache for this video
-          await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
+          // Show dialog — let user decide
+          const choice = await confirm({
+            title: 'Video partially cached',
+            message: `${cacheStatus.percentage}% of this video is cached locally. Continue downloading in the background for faster access later?`,
+            confirmText: 'Continue in Background',
+            cancelText: 'Close & Discard Cache',
+          });
+
+          if (choice) {
+            await invoke('cmd_start_background_cache', {
+              messageId: file.id,
+              folderId: activeFolderId ?? 0,
+            });
+            toast.success('Video caching in background');
+          } else {
+            await invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {});
+          }
         }
       }
     } catch {
       // No cache or error — just close
     }
     onClose();
-  }, [file.id, activeFolderId, confirm, onClose]);
+  }, [file.id, activeFolderId, confirm, onClose, bgCache]);
 
   // Poll cache status every 5 seconds while playing
   useEffect(() => {
@@ -130,17 +161,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
-            if (status.cached_ranges && dur > 0 && status.total_bytes > 0) {
+            if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
               const ranges: [number, number][] = status.cached_ranges.map(
                 ([s, e]: [number, number]) => [
-                  (s / status.total_bytes) * dur,
-                  ((e + 1) / status.total_bytes) * dur,
+                  byteToTime(s),
+                  byteToTime(e + 1),
                 ]
               );
-              console.log(`[GREEN-BAR] Cache poll: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))} dur=${dur.toFixed(1)}s`);
               setCachedTimeRanges(ranges);
-            } else {
-              console.log(`[GREEN-BAR] Cache poll: no ranges (cached_ranges=${JSON.stringify(status.cached_ranges)}, dur=${dur}, total=${status.total_bytes})`);
             }
           }
         } catch { /* ignore */ }
@@ -167,16 +195,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
             const ranges: [number, number][] = status.cached_ranges.map(
               ([s, e]: [number, number]) => [
-                (s / status.total_bytes) * dur,
-                ((e + 1) / status.total_bytes) * dur,
+                byteToTime(s),
+                byteToTime(e + 1),
               ]
             );
-            console.log(`[GREEN-BAR] DL-progress ${event.payload.percent}%: byteRanges=${JSON.stringify(status.cached_ranges)} → timeRanges=${JSON.stringify(ranges.map(([s,e]) => [s.toFixed(1), e.toFixed(1)]))}`);
             setCachedTimeRanges(ranges);
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
-          setTimeout(() => setDlOverlay(null), 3000);
+          setSuppressBackendReports(false);
+          setDlOverlay(prev => prev ? { ...prev, completed: true } : null);
           dlTransferIdRef.current = '';
         }
       }
@@ -184,16 +212,28 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => { unlisten?.(); };
   }, [cacheComplete, dur, totalBytes, file.id]);
 
-  // Download handler
+  // Download handler — player prebuffer and file download run simultaneously,
+  // interleaved at the Rust level via a Semaphore(1) that serializes all Telegram
+  // iter_download calls. Only one chunk request hits Telegram at a time → no FLOOD_WAIT.
+  // Green bar merges player's in-memory ranges (downloadedTimeRanges) and download's
+  // cache ranges (cachedTimeRanges from cmd_get_cache_status polling).
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
       if (!savePath) return;
 
       const transferId = `dl-${file.id}-${Date.now()}`;
-      console.log(`[GREEN-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
+      console.log(`[BUFFER-BAR] Download starting: transferId=${transferId} savePath=${savePath} dur=${dur.toFixed(1)}s totalBytes=${totalBytes}`);
       dlTransferIdRef.current = transferId;
       setDlOverlay({ active: true, percent: 0, fromCache: cacheComplete, speed: 0 });
+      setDlOverlayVisible(true);
+      clearTimeout(dismissTimerRef.current);
+
+      // Suppress player's cache meta reports during download — download updates
+      // CacheMeta per-chunk instead (protected by per-message Mutex in Rust).
+      // Player prebuffer continues running — both interleave through Semaphore(1)
+      // at the Rust level (one Telegram iter_download call at a time → no FLOOD_WAIT).
+      setSuppressBackendReports(true);
 
       await invoke('cmd_download_file', {
         messageId: file.id,
@@ -202,26 +242,44 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         transferId,
       });
 
+      setSuppressBackendReports(false);
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
+      setSuppressBackendReports(false);
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
-      setDlOverlay(null);
-      dlTransferIdRef.current = '';
+      setDlOverlayVisible(false);
+      clearTimeout(dismissTimerRef.current);
+      dismissTimerRef.current = window.setTimeout(() => {
+        setDlOverlay(null);
+        dlTransferIdRef.current = '';
+      }, 300);
     }
-  }, [file, activeFolderId, cacheComplete]);
+  }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
 
-  // Cancel download
+  // Cancel or dismiss download overlay
   const handleCancelDownload = useCallback(async () => {
+    // If download completed, just dismiss the overlay
+    if (dlOverlay?.completed) {
+      setDlOverlayVisible(false);
+      clearTimeout(dismissTimerRef.current);
+      dismissTimerRef.current = window.setTimeout(() => setDlOverlay(null), 300);
+      return;
+    }
     if (!dlTransferIdRef.current) return;
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
-    setDlOverlay(null);
-    dlTransferIdRef.current = '';
-  }, []);
+    setSuppressBackendReports(false);
+    setDlOverlayVisible(false);
+    clearTimeout(dismissTimerRef.current);
+    dismissTimerRef.current = window.setTimeout(() => {
+      setDlOverlay(null);
+      dlTransferIdRef.current = '';
+    }, 300);
+  }, [setSuppressBackendReports, dlOverlay?.completed]);
 
 
   const fmt = (s: number) => {
@@ -256,8 +314,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
       setDur(v.duration);
+      durRef.current = v.duration;
       setVol(v.volume);
       setMuted(v.muted);
+      setVideoResolution({ w: v.videoWidth, h: v.videoHeight });
+      v.playbackRate = settings.playerSpeed;
+      v.loop = loop;
       setLoad(false);
       // Ensure playback starts (autoplay may be blocked by browser)
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
@@ -323,45 +385,111 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // Buffer state is already updated by timeupdate and progress events above
 
-  // Auto-hide controls — stay visible when cursor is over controls area
-  const overControlsRef = useRef(false);
+  // Auto-hide controls — show on mouse activity, hide after idle during playback
+  const lastMousePos = useRef({ x: 0, y: 0 });
+  const hideDelayMs = settings.playerAutoHideDelay === 0 ? 0 : settings.playerAutoHideDelay * 1000;
   useEffect(() => {
-    let t: number;
-    const scheduleHide = () => {
-      clearTimeout(t);
-      t = window.setTimeout(() => {
-        if (playing && !overControlsRef.current) setVis(false);
-      }, 3000);
-    };
-    const mv = (e: MouseEvent) => {
+    // Always show controls when paused or settings panel is open
+    if (!playing || settingsOpen) {
       setVis(true);
-      // Track if cursor is in bottom controls area (bottom 120px)
-      const h = window.innerHeight;
-      overControlsRef.current = (h - e.clientY) < 120;
+      return;
+    }
+    // Never auto-hide if delay is 0
+    if (hideDelayMs === 0) {
+      setVis(true);
+      return;
+    }
+
+    let hideTimer: number;
+
+    const scheduleHide = () => {
+      clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(() => {
+        // CSS :hover works with stationary mouse — unlike JS event tracking
+        if (playing && !settingsOpen && !controlsRef.current?.matches(':hover')) {
+          setVis(false);
+        }
+      }, hideDelayMs);
+    };
+
+    // Schedule initial hide — handles case where mouse is already outside window
+    scheduleHide();
+
+    const mv = (e: MouseEvent) => {
+      // Only trigger visibility if mouse moved > 5px — prevents sub-pixel jitter
+      const dx = e.clientX - lastMousePos.current.x;
+      const dy = e.clientY - lastMousePos.current.y;
+      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+        lastMousePos.current = { x: e.clientX, y: e.clientY };
+        setVis(true);
+      }
       scheduleHide();
     };
-    // Reset hover ref when mouse stops moving (fallback for edge case)
-    const resetHover = () => { overControlsRef.current = false; };
-    let idleTimer: number;
-    const mv2 = () => {
-      clearTimeout(idleTimer);
-      idleTimer = window.setTimeout(resetHover, 4000);
+
+    // Mouse left the app window — schedule hide with shorter delay
+    const onMouseLeave = () => {
+      clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(() => {
+        if (playing && !settingsOpen) setVis(false);
+      }, 1500);
     };
+
     document.addEventListener('mousemove', mv);
-    document.addEventListener('mousemove', mv2);
+    document.addEventListener('mouseleave', onMouseLeave);
     return () => {
       document.removeEventListener('mousemove', mv);
-      document.removeEventListener('mousemove', mv2);
-      clearTimeout(t);
-      clearTimeout(idleTimer);
+      document.removeEventListener('mouseleave', onMouseLeave);
+      clearTimeout(hideTimer);
     };
-  }, [playing]);
+  }, [playing, settingsOpen, hideDelayMs]);
+
+  // Mini progress bar — appears after controls have fully hidden (300ms delay)
+  useEffect(() => {
+    if (!vis && playing) {
+      const timer = window.setTimeout(() => setMiniBarVisible(true), 300);
+      return () => clearTimeout(timer);
+    }
+    setMiniBarVisible(false);
+  }, [vis, playing]);
 
   // Fullscreen
   useEffect(() => {
     const ch = () => setFs(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', ch);
     return () => document.removeEventListener('fullscreenchange', ch);
+  }, []);
+
+  // Sync player settings to video element
+  useEffect(() => {
+    const v = vidRef.current;
+    if (v) v.loop = loop;
+  }, [loop]);
+
+  useEffect(() => {
+    const v = vidRef.current;
+    if (v) v.playbackRate = rate;
+    updateSetting('playerSpeed', rate);
+  }, [rate, updateSetting]);
+
+  useEffect(() => {
+    if (pip && vidRef.current) {
+      vidRef.current.requestPictureInPicture?.().catch(() => { toast.error('PiP not supported'); setPip(false); });
+    } else if (!pip && document.pictureInPictureElement) {
+      document.exitPictureInPicture?.().catch(() => {});
+    }
+  }, [pip]);
+
+  // Track controls overlay height for download overlay positioning
+  useEffect(() => {
+    const el = controlsRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setControlsHeight(entry.contentRect.height);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
   }, []);
 
   const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; v.paused ? v.play().catch(() => {}) : v.pause(); }, []);
@@ -375,6 +503,22 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       seekTo(target);
     }
   }, [dur, useNative, seekTo]);
+  const seekFwd = useCallback(() => {
+    seek(settings.playerSkipForward);
+    setVis(true);
+    clearTimeout(skipFeedbackTimer.current);
+    skipFeedbackKey.current += 1;
+    setSkipFeedback({ direction: 'forward', amount: settings.playerSkipForward });
+    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
+  }, [seek, settings.playerSkipForward]);
+  const seekBwd = useCallback(() => {
+    seek(-settings.playerSkipBackward);
+    setVis(true);
+    clearTimeout(skipFeedbackTimer.current);
+    skipFeedbackKey.current += 1;
+    setSkipFeedback({ direction: 'backward', amount: settings.playerSkipBackward });
+    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
+  }, [seek, settings.playerSkipBackward]);
   const setVol2 = useCallback((n: number) => { const v = vidRef.current; if (!v) return; v.volume = Math.max(0, Math.min(1, n)); setVol(v.volume); if (n > 0) { v.muted = false; setMuted(false); } }, []);
   const mute = useCallback(() => { const v = vidRef.current; if (!v) return; v.muted = !v.muted; setMuted(v.muted); }, []);
   const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
@@ -392,6 +536,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [dur, useNative, seekTo]);
 
   const tipRafRef = useRef(0);
+  const hoverDebounceRef = useRef(0);
   const onBarMove = useCallback((e: React.MouseEvent) => {
     if (!barRef.current) return;
     const r = barRef.current.getBoundingClientRect();
@@ -403,30 +548,34 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setTip({ t: hoverTime, x: e.clientX - r.left, show: true });
     });
 
-    if (thumbReady && getThumbnail) {
-      const roundedTime = Math.floor(hoverTime / 2) * 2;
-      if (roundedTime !== lastThumbTimeRef.current) {
-        lastThumbTimeRef.current = roundedTime;
+    const roundedTime = Math.floor(hoverTime / 2) * 2;
+    if (roundedTime !== lastThumbTimeRef.current) {
+      lastThumbTimeRef.current = roundedTime;
 
+      // Synchronous cache check — instant display for already-cached thumbnails
+      const cachedUrl = getCachedThumbnailSync(hoverTime);
+      if (cachedUrl) {
+        setThumbUrl(cachedUrl);
+        setThumbLoading(false);
+        // Cancel any pending on-demand request (we have the thumbnail)
+        clearTimeout(hoverDebounceRef.current);
+        clearDesiredHover();
+      } else {
+        // Not cached: show spinner immediately, but delay the on-demand seek
+        // by 1 second. This prevents accidental/sweep hovers from triggering
+        // expensive network seeks. If the user stays at this position for 1s,
+        // the hover processor starts generating the thumbnail.
         setThumbUrl(null);
         setThumbLoading(true);
 
-        const requestedTime = roundedTime;
-        getThumbnail(hoverTime).then((result) => {
-          // Only apply if this is still the latest request
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(result?.dataUrl ?? null);
-            setThumbLoading(false);
-          }
-        }).catch(() => {
-          if (requestedTime === lastThumbTimeRef.current) {
-            setThumbUrl(null);
-            setThumbLoading(false);
-          }
-        });
+        // Cancel previous debounce timer
+        clearTimeout(hoverDebounceRef.current);
+        hoverDebounceRef.current = window.setTimeout(() => {
+          setDesiredHoverTime(hoverTime);
+        }, 1000);
       }
     }
-  }, [dur, thumbReady, getThumbnail]);
+  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
 
   // Keyboard
   useEffect(() => {
@@ -435,15 +584,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
       switch (e.key.toLowerCase()) {
         case ' ': case 'k': e.preventDefault(); toggle(); break;
-        case 'arrowleft': e.preventDefault(); e.shiftKey ? onPrev?.() : seek(-5); break;
-        case 'arrowright': e.preventDefault(); e.shiftKey ? onNext?.() : seek(5); break;
+        case 'arrowleft': e.preventDefault(); e.shiftKey ? onPrev?.() : seekBwd(); break;
+        case 'arrowright': e.preventDefault(); e.shiftKey ? onNext?.() : seekFwd(); break;
         case 'arrowup': e.preventDefault(); setVol2(vol + 0.1); break;
         case 'arrowdown': e.preventDefault(); setVol2(vol - 0.1); break;
         case 'm': e.preventDefault(); mute(); break;
         case 'f': e.preventDefault(); fs2(); break;
         case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : handleClose(); break;
-        case 'j': e.preventDefault(); seek(-10); break;
-        case 'l': e.preventDefault(); seek(10); break;
+        case 'j': e.preventDefault(); seekBwd(); break;
+        case 'l': e.preventDefault(); seekFwd(); break;
         case ',': e.preventDefault(); rate2(Math.max(0.25, rate - 0.25)); break;
         case '.': e.preventDefault(); rate2(Math.min(16, rate + 0.25)); break;
         case '<': e.preventDefault(); rate2(Math.max(0.25, rate / 2)); break;
@@ -468,7 +617,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
           </div>
         ) : (
-          <video ref={vidRef} className="max-w-full max-h-full" playsInline />
+          <video
+            ref={vidRef}
+            className="w-full h-full"
+            playsInline
+            style={{
+              objectFit: settings.playerVideoFit === 'original' ? 'none' : settings.playerVideoFit,
+              filter: `brightness(${brightness})`,
+              transform: rotation ? `rotate(${rotation}deg)` : undefined,
+            }}
+          />
         )}
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -477,15 +635,23 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         )}
       </div>
 
-      {/* Hover zone — invisible, always captures mouse events over controls area */}
-      <div
-        className="absolute bottom-0 left-0 right-0 h-28"
-        onMouseEnter={() => { overControlsRef.current = true; }}
-        onMouseLeave={() => { overControlsRef.current = false; }}
-      />
+      {/* Persistent mini progress bar — visible when controls are hidden */}
+      {miniBarVisible && !err && dur > 0 && (
+        <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-white/20 z-40 pointer-events-none transition-opacity duration-300">
+          <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+        </div>
+      )}
 
       {/* Controls - FastStream-style */}
-      <div className={`absolute bottom-0 left-0 right-0 transition-opacity duration-300 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+      <div
+        ref={controlsRef}
+        className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
+        style={{
+          opacity: vis ? 1 : 0,
+          transform: vis ? 'translateY(0)' : 'translateY(20px)',
+          transition: 'opacity 300ms ease-out, transform 300ms ease-out',
+        }}
+      >
         {/* Progress bar — unified with buffer, position, and preview indicators */}
         <div
           ref={barRef}
@@ -494,20 +660,27 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           onMouseMove={onBarMove}
           onMouseLeave={() => {
             setTip(p => ({ ...p, show: false }));
+            clearTimeout(hoverDebounceRef.current);
+            clearDesiredHover();
           }}
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Downloaded (green) buffer coverage — merged from player + backend cache */}
+            {/* Green buffer bar — all locally available data (SourceBuffer + disk cache) */}
             {(() => {
-              // Merge player-tracked ranges (instant) with cache ranges (includes downloads)
-              const merged = [...downloadedTimeRanges, ...cachedTimeRanges];
+              const vid = vidRef.current;
+              const bufferedRanges: [number, number][] = [];
+              if (vid && vid.buffered && vid.buffered.length > 0) {
+                for (let i = 0; i < vid.buffered.length; i++) {
+                  bufferedRanges.push([vid.buffered.start(i), vid.buffered.end(i)]);
+                }
+              }
+              const merged = [...bufferedRanges, ...cachedTimeRanges];
               if (merged.length === 0 || dur <= 0) return null;
-              // Sort and deduplicate overlapping ranges
               const sorted = merged.sort((a, b) => a[0] - b[0]);
               const deduped: [number, number][] = [];
               for (const r of sorted) {
-                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1]) {
+                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1] + 0.01) {
                   deduped.push(r);
                 } else {
                   deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
@@ -519,13 +692,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={`buf-${i}`}
-                    className="absolute bottom-0 h-[3px] bg-green-400/60 rounded-full z-5"
+                    className="absolute bottom-0 h-[3px] bg-green-400/70 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* Preview thumbnail coverage — segments at each cached position */}
+            {/* Preview thumbnail coverage — yellow bar, hover-only */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
               const sorted = Array.from(cachedTimes).sort((a, b) => a - b);
@@ -576,7 +749,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                     style={{ width: 114, height: 64, objectFit: 'cover' }}
                     alt=""
                   />
-                ) : thumbLoading && thumbReady ? (
+                ) : thumbLoading ? (
                   <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
                   </div>
@@ -646,9 +819,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </span>
               </button>
             )}
-            {/* Rate */}
+            {/* Speed */}
             <div className="relative">
-              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback rate">
+              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback speed">
                 {rate}x
               </button>
               {menu && (
@@ -661,9 +834,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </div>
               )}
             </div>
+            {/* Settings */}
+            <button onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }} className="p-1.5 hover:bg-white/10 rounded text-white" title="Settings">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z" /></svg>
+            </button>
             {/* Download */}
             <button onClick={handleDownload} className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1" title="Download">
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
+              <svg className={`w-5 h-5 ${dlOverlayVisible && !dlOverlay?.completed ? 'animate-subtle-pulse' : ''}`} fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
               {cachePercent > 0 && (
                 <span className="text-xs font-mono">
                   {cacheComplete ? <span className="text-green-400">✓</span> : `${cachePercent}%`}
@@ -685,46 +862,287 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           </div>
         </div>
 
-        {/* Buffer status text */}
-        {(isPrefetching || prefetchPaused) && !prefetchComplete && prefetchedBytes > 0 && (
-          <div className="flex items-center justify-between mt-1 px-1">
-            <span className="text-white/40 text-[10px]">
-              {prefetchPaused ? 'Buffering paused' : `Buffering${speed > 0 ? ` • ${formatSpeed(speed)}` : ''}`}
-            </span>
-            <span className="text-white/40 text-[10px]">
-              {totalBytes > 0 ? `${formatBytes(prefetchedBytes)} / ${formatBytes(totalBytes)}` : `${formatBytes(prefetchedBytes)} downloaded`}
-            </span>
-          </div>
-        )}
+        
       </div>
+
+      {/* Settings overlay panel */}
+      {settingsOpen && (
+        <div
+          className="absolute right-0 top-0 bottom-0 w-[40%] max-w-[320px] z-30 bg-black/70 backdrop-blur-xl border-l border-white/10 overflow-y-auto"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+            <span className="text-white text-sm font-semibold">Settings</span>
+            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded text-white/60 hover:text-white transition-colors" title="Close settings">
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+            </button>
+          </div>
+
+          {/* Playback */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Playback</h3>
+            {/* Loop */}
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-white/70 text-xs">Loop</span>
+              <button
+                onClick={() => setLoop(!loop)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${loop ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${loop ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+            {/* Skip forward */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Skip forward</label>
+              <div className="flex gap-1 items-center">
+                {[5, 10, 15, 30].map(s => (
+                  <button
+                    key={s}
+                    onClick={() => updateSetting('playerSkipForward', s as SkipDuration)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipForward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+                <input
+                  type="number" min="1" max="60"
+                  value={settings.playerSkipForward}
+                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipForward', v as SkipDuration); }}
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  title="Custom seconds (1-60)"
+                />
+              </div>
+            </div>
+            {/* Skip backward */}
+            <div className="mb-0">
+              <label className="text-white/70 text-xs mb-1.5 block">Skip backward</label>
+              <div className="flex gap-1 items-center">
+                {[5, 10, 15, 30].map(s => (
+                  <button
+                    key={s}
+                    onClick={() => updateSetting('playerSkipBackward', s as SkipDuration)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipBackward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+                <input
+                  type="number" min="1" max="60"
+                  value={settings.playerSkipBackward}
+                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipBackward', v as SkipDuration); }}
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  title="Custom seconds (1-60)"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Display */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Display</h3>
+            {/* Video fit */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Video fit</label>
+              <div className="flex gap-1">
+                {([
+                  ['original', 'Original'],
+                  ['contain', 'Fit'],
+                  ['fill', 'Fill'],
+                ] as [VideoFit, string][]).map(([val, label]) => (
+                  <button
+                    key={val}
+                    onClick={() => updateSetting('playerVideoFit', val)}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerVideoFit === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Rotation */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Rotation</label>
+              <div className="flex gap-1">
+                {[0, 90, 180, 270].map(r => (
+                  <button
+                    key={r}
+                    onClick={() => setRotation(r)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${rotation === r ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {r}°
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Brightness */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-white/70 text-xs">Brightness</label>
+                <span className="text-white/50 text-xs font-mono">{brightness.toFixed(1)}</span>
+              </div>
+              <input
+                type="range" min="0.5" max="2" step="0.1"
+                value={brightness}
+                onChange={e => setBrightness(parseFloat(e.target.value))}
+                className="w-full accent-telegram-secondary h-1"
+              />
+            </div>
+            {/* PiP */}
+            <div className="flex items-center justify-between">
+              <span className="text-white/70 text-xs">Picture-in-Picture</span>
+              <button
+                onClick={() => setPip(!pip)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${pip ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${pip ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Behavior */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Behavior</h3>
+            {/* Auto-hide delay */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block">Auto-hide controls</label>
+              <div className="flex gap-1">
+                {([
+                  [3, '3s'],
+                  [5, '5s'],
+                  [10, '10s'],
+                  [0, 'Never'],
+                ] as [AutoHideDelay, string][]).map(([val, label]) => (
+                  <button
+                    key={val}
+                    onClick={() => updateSetting('playerAutoHideDelay', val)}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Background cache */}
+            <div className="flex items-center justify-between">
+              <span className="text-white/70 text-xs">Background cache</span>
+              <button
+                onClick={() => setBgCache(!bgCache)}
+                className={`w-10 h-5 rounded-full transition-colors relative ${bgCache ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${bgCache ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
+
+          {/* Info */}
+          <div className="px-4 py-3">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Video info</h3>
+            <div className="space-y-1">
+              {videoResolution && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">Resolution</span>
+                  <span className="text-white/80 font-mono">{videoResolution.w}×{videoResolution.h}</span>
+                </div>
+              )}
+              {dur > 0 && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">Duration</span>
+                  <span className="text-white/80 font-mono">{fmt(dur)}</span>
+                </div>
+              )}
+              {totalBytes > 0 && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/50">File size</span>
+                  <span className="text-white/80 font-mono">{formatBytes(totalBytes)}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-xs">
+                <span className="text-white/50">Cache</span>
+                <span className="text-white/80 font-mono">{cacheComplete ? 'Complete ✓' : cachePercent > 0 ? `${cachePercent}%` : 'None'}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* File name */}
       <div className={`absolute top-3 left-3 right-3 text-white text-sm truncate transition-opacity duration-300 ${vis ? 'opacity-100' : 'opacity-0'}`} style={{ textShadow: '0 1px 3px rgba(0,0,0,0.5)' }}>
         {file.name}
       </div>
 
-      {/* Download overlay */}
-      {dlOverlay && dlOverlay.active && (
-        <div className="absolute bottom-16 left-4 right-4 flex items-center gap-2">
-          <div className="flex-1 bg-white/10 rounded-full h-2 overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-300 ${dlOverlay.fromCache ? 'bg-green-400' : 'bg-telegram-secondary'}`}
-              style={{ width: `${dlOverlay.percent}%` }}
-            />
+      {/* Download overlay — always rendered for smooth fade transitions */}
+      <div
+        className={`absolute left-4 right-4 transition-all duration-300 ease-out ${dlOverlayVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+        style={{ bottom: dlOverlayVisible ? (vis && controlsHeight > 0 ? controlsHeight + 12 : 64) : 64 }}
+      >
+        {dlOverlay && (
+          <div className={`flex items-center gap-2 bg-black/40 rounded-lg px-3 py-2 backdrop-blur-sm transition-opacity duration-300 ${dlOverlay.completed ? 'opacity-80' : 'opacity-100'}`}>
+            <div className="flex-1 bg-white/10 rounded-full h-2 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ${dlOverlay.completed || dlOverlay.fromCache ? 'bg-green-400' : 'bg-telegram-secondary'}`}
+                style={{ width: `${dlOverlay.percent}%` }}
+              />
+            </div>
+            <span className="text-white/90 text-xs font-mono whitespace-nowrap">
+              {dlOverlay.completed
+                ? 'Completed'
+                : dlOverlay.fromCache
+                  ? 'From cache'
+                  : dlOverlay.speed > 0
+                    ? `${formatBytes(dlOverlay.speed)}/s`
+                    : 'Downloading...'
+              }
+            </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); handleCancelDownload(); }}
+              className={`p-1 hover:bg-white/10 rounded transition-colors flex-shrink-0 ${dlOverlay.completed ? 'text-white/60 hover:text-white' : 'text-white/60 hover:text-red-400'}`}
+              title={dlOverlay.completed ? 'Close' : 'Cancel download'}
+            >
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
+            </button>
           </div>
-          <span className="text-white/80 text-xs font-mono whitespace-nowrap">
-            {dlOverlay.fromCache ? 'Cache' : dlOverlay.speed > 0 ? `${formatBytes(dlOverlay.speed)}/s` : ''}
-            {dlOverlay.percent}%
-          </span>
-          <button
-            onClick={(e) => { e.stopPropagation(); handleCancelDownload(); }}
-            className="p-1 hover:bg-white/10 rounded text-white/60 hover:text-red-400 transition-colors flex-shrink-0"
-            title="Cancel download"
+        )}
+      </div>
+
+      {/* Skip feedback overlay */}
+      {skipFeedback && (() => {
+        const fromTime = time;
+        const toTime = skipFeedback.direction === 'forward'
+          ? Math.min(fromTime + skipFeedback.amount, dur)
+          : Math.max(fromTime - skipFeedback.amount, 0);
+        const isForward = skipFeedback.direction === 'forward';
+        return (
+          <div
+            key={skipFeedbackKey.current}
+            className="absolute inset-0 flex items-center justify-center pointer-events-none z-20 animate-[skipPop_1.5s_ease-out_forwards]"
           >
-            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
-          </button>
-        </div>
-      )}
+            <div className="flex flex-col items-center gap-2 bg-black/30 backdrop-blur-xl rounded-2xl px-10 py-6">
+              {/* Icon + delta */}
+              <div className="flex items-center gap-2">
+                {isForward ? (
+                  <svg className="w-7 h-7 text-telegram-primary" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M5.59 7.41L10.18 12l-4.59 4.59L7 18l6-6-6-6zM16 18l6-6-6-6-1.41 1.41L20.18 12l-5.59 4.59L16 18z" />
+                  </svg>
+                ) : (
+                  <svg className="w-7 h-7 text-white" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M18.41 16.59L13.82 12l4.59-4.59L17 6l-6 6 6 6zM8 6l-6 6 6 6 1.41-1.41L3.82 12l5.59-4.59L8 6z" />
+                  </svg>
+                )}
+                <span className={`text-xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>
+                  {isForward ? '+' : '-'}{skipFeedback.amount}s
+                </span>
+              </div>
+              {/* FROM → TO — big, bold, dominant */}
+              <div className="flex items-center gap-4">
+                <span className="text-2xl font-bold text-white font-mono">{fmt(fromTime)}</span>
+                <svg className={`w-6 h-6 ${isForward ? 'text-telegram-primary' : 'text-white/60'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" /></svg>
+                <span className={`text-2xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>{fmt(toTime)}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Big play */}
       {!playing && !load && !err && (
