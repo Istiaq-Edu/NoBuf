@@ -189,8 +189,8 @@ export function FileExplorer({
 
 
     const listItems = useMemo(() => {
-        return activeFolderId === null ? [...sortedFiles, 'upload' as const] : sortedFiles;
-    }, [sortedFiles, activeFolderId]);
+        return sortedFiles;
+    }, [sortedFiles]);
 
 
     const gridVirtualizer = useVirtualizer({
@@ -369,25 +369,7 @@ export function FileExplorer({
                         style={{ height: `${listVirtualizer.getTotalSize()}px` }}
                     >
                         {listVirtualizer.getVirtualItems().map((virtualItem) => {
-                            const item = listItems[virtualItem.index];
-                            if (item === 'upload') {
-                                return (
-                                    <div
-                                        key="upload"
-                                        className="absolute top-0 left-0 w-full"
-                                        style={{ transform: `translateY(${virtualItem.start}px)` }}
-                                    >
-                                        <button
-                                            onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                            className="flex items-center gap-4 px-4 py-3 rounded-lg cursor-pointer border border-dashed border-telegram-border text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover w-full"
-                                        >
-                                            <div className="w-5 h-5 flex items-center justify-center"><Plus className="w-4 h-4" /></div>
-                                            <span className="text-sm font-medium">Upload File...</span>
-                                        </button>
-                                    </div>
-                                );
-                            }
-                            const file = item;
+                            const file = listItems[virtualItem.index];
                             return (
                                 <div
                                     key={file.id}
