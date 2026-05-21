@@ -28,7 +28,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         let unlisten: UnlistenFn | undefined;
         listen<ProgressPayload>('upload-progress', (event) => {
             setUploadQueue(q => q.map(i =>
-                i.id === event.payload.id ? {
+                i.id === event.payload.id && i.status !== 'cancelled' && i.status !== 'error' ? {
                     ...i,
                     progress: event.payload.percent,
                     uploadedBytes: event.payload.uploaded_bytes,

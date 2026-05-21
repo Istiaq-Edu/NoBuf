@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { load } from '@tauri-apps/plugin-store';
+import { FileCategory } from '../utils';
 
 export type GridDensity = 'compact' | 'default' | 'spacious';
 export type SortField = 'name' | 'size' | 'date';
@@ -13,6 +14,7 @@ export interface Settings {
     gridDensity: GridDensity;
     sortField: SortField;
     sortDirection: SortDirection;
+    fileFilter: FileCategory[];
 }
 
 const defaultSettings: Settings = {
@@ -23,6 +25,7 @@ const defaultSettings: Settings = {
     gridDensity: 'default',
     sortField: 'name',
     sortDirection: 'asc',
+    fileFilter: ['videos'],
 };
 
 interface SettingsContextType {

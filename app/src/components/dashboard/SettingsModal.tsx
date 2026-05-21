@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, LayoutGrid } from 'lucide-react';
+import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, LayoutGrid, Film, Music, ImageIcon, FileText, Package } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useSettings } from '../../context/SettingsContext';
 import { useConfirm } from '../../context/ConfirmContext';
+import { FileCategory, ALL_FILE_CATEGORIES } from '../../utils';
 
 interface SettingsModalProps {
     isOpen: boolean;
@@ -22,6 +23,23 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     const { settings, updateSetting, resetSettings } = useSettings();
     const { confirm } = useConfirm();
     const [clearing, setClearing] = useState(false);
+
+    // File filter helpers
+    const CATEGORY_META: Record<FileCategory, { label: string; icon: typeof Film; color: string }> = {
+        videos:     { label: 'Videos',     icon: Film,      color: 'bg-blue-500' },
+        audio:      { label: 'Audio',      icon: Music,     color: 'bg-purple-500' },
+        images:     { label: 'Images',     icon: ImageIcon, color: 'bg-pink-500' },
+        documents:  { label: 'Documents',  icon: FileText,  color: 'bg-amber-500' },
+        misc:       { label: 'Misc',       icon: Package,   color: 'bg-gray-500' },
+    };
+
+    const toggleCategory = useCallback((cat: FileCategory) => {
+        const current = settings.fileFilter;
+        const next = current.includes(cat)
+            ? current.filter(c => c !== cat)
+            : [...current, cat];
+        updateSetting('fileFilter', next);
+    }, [settings.fileFilter, updateSetting]);
 
     // API settings state
     const [apiSettings, setApiSettings] = useState<ApiSettings>({ enabled: false, port: 8550, key_set: false, running: false });
@@ -256,6 +274,42 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                 {option.label}
                                             </button>
                                         ))}
+                                    </div>
+                                </div>
+                            </section>
+
+                            {/* File Filter Section */}
+                            <section className="space-y-3">
+                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                    <FileText className="w-3.5 h-3.5" />
+                                    File Filter
+                                </h3>
+
+                                <div className="p-3 rounded-lg bg-telegram-hover/50">
+                                    <p className="text-sm text-telegram-text font-medium mb-1">Show Categories</p>
+                                    <p className="text-xs text-telegram-subtext mb-3">
+                                        Select which file types to show. Toggle none or all to show everything.
+                                    </p>
+                                    <div className="flex flex-wrap gap-2">
+                                        {ALL_FILE_CATEGORIES.map(cat => {
+                                            const meta = CATEGORY_META[cat];
+                                            const Icon = meta.icon;
+                                            const isActive = settings.fileFilter.includes(cat);
+                                            return (
+                                                <button
+                                                    key={cat}
+                                                    onClick={() => toggleCategory(cat)}
+                                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all border ${
+                                                        isActive
+                                                            ? `${meta.color} text-white border-transparent shadow-sm`
+                                                            : 'bg-telegram-bg text-telegram-subtext border-telegram-border hover:border-telegram-subtext hover:text-telegram-text'
+                                                    }`}
+                                                >
+                                                    <Icon className="w-3.5 h-3.5" />
+                                                    {meta.label}
+                                                </button>
+                                            );
+                                        })}
                                     </div>
                                 </div>
                             </section>

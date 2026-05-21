@@ -25,7 +25,7 @@ export function useFileDownload(store: Store | null) {
         let unlisten: UnlistenFn | undefined;
         listen<ProgressPayload>('download-progress', (event) => {
             setDownloadQueue(q => q.map(i =>
-                i.id === event.payload.id ? {
+                i.id === event.payload.id && i.status !== 'cancelled' && i.status !== 'error' ? {
                     ...i,
                     progress: event.payload.percent,
                     uploadedBytes: event.payload.uploaded_bytes,
@@ -160,7 +160,7 @@ export function useFileDownload(store: Store | null) {
     };
 
     const clearFinished = () => {
-        setDownloadQueue(q => q.filter(i => i.status !== 'success'));
+        setDownloadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'));
     };
 
     const cancelAll = () => {

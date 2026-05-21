@@ -5,14 +5,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
 import { TelegramFile, BandwidthStats } from '../types';
-import { formatBytes, isMediaFile, isPdfFile } from '../utils';
+import { formatBytes, isMediaFile, isPdfFile, getFileCategory, ALL_FILE_CATEGORIES } from '../utils';
 
 // Components
 import { Sidebar } from './dashboard/Sidebar';
 import { TopBar } from './dashboard/TopBar';
 import { FileExplorer } from './dashboard/FileExplorer';
-import { UploadQueue } from './dashboard/UploadQueue';
-import { DownloadQueue } from './dashboard/DownloadQueue';
+import { TransferPanel } from './dashboard/TransferPanel';
 import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
@@ -47,6 +46,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [selectedIds, setSelectedIds] = useState<number[]>([]);
     const [showMoveModal, setShowMoveModal] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+    const [showTransferPanel, setShowTransferPanel] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -84,9 +84,22 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         enabled: !!store,
     });
 
-    const displayedFiles = searchTerm.length > 2
-        ? searchResults
-        : allFiles.filter((f: TelegramFile) => f.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    const displayedFiles = (() => {
+        // 1. Apply search filter
+        const searchFiltered = searchTerm.length > 2
+            ? searchResults
+            : allFiles.filter((f: TelegramFile) => f.name.toLowerCase().includes(searchTerm.toLowerCase()));
+
+        // 2. Apply category filter (folders always pass through)
+        const activeFilter = settings.fileFilter;
+        if (activeFilter.length === 0 || activeFilter.length === ALL_FILE_CATEGORIES.length) {
+            return searchFiltered; // no filter or all selected = show everything
+        }
+        return searchFiltered.filter((f: TelegramFile) => {
+            if (f.type === 'folder') return true; // folders always visible
+            return activeFilter.includes(getFileCategory(f.name));
+        });
+    })();
 
     const { data: bandwidth } = useQuery({
         queryKey: ['bandwidth'],
@@ -109,6 +122,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const handleSelectAll = useCallback(() => {
         setSelectedIds(displayedFiles.map(f => f.id));
     }, [displayedFiles]);
+
+    // Auto-open transfer panel only when NEW items are added to queue
+    const prevQueueLenRef = useRef({ u: uploadQueue.length, d: downloadQueue.length });
+    useEffect(() => {
+        const prevU = prevQueueLenRef.current.u;
+        const prevD = prevQueueLenRef.current.d;
+        prevQueueLenRef.current = { u: uploadQueue.length, d: downloadQueue.length };
+        if (uploadQueue.length > prevU || downloadQueue.length > prevD) {
+            setShowTransferPanel(true);
+        }
+    }, [uploadQueue.length, downloadQueue.length]);
 
     const handleKeyboardDelete = useCallback(() => {
         if (selectedIds.length > 0) {
@@ -369,6 +393,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const previewNeighbors = previewNeighborFiles();
 
+    // Compute transfer counts for badge (separate upload/download)
+    const uploadActiveCount = uploadQueue.filter(i => i.status === 'pending' || i.status === 'uploading').length;
+    const uploadFinishedCount = uploadQueue.filter(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled').length;
+    const downloadActiveCount = downloadQueue.filter(i => i.status === 'pending' || i.status === 'downloading').length;
+    const downloadFinishedCount = downloadQueue.filter(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled').length;
+
     return (
         <div
             className="flex h-screen w-full overflow-hidden bg-telegram-bg relative"
@@ -445,6 +475,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     searchTerm={searchTerm}
                     onSearchChange={setSearchTerm}
                     onSettingsClick={() => setShowSettings(true)}
+                    onToggleTransfers={() => setShowTransferPanel(p => !p)}
+                    showTransferPanel={showTransferPanel}
+                    uploadActiveCount={uploadActiveCount}
+                    uploadFinishedCount={uploadFinishedCount}
+                    downloadActiveCount={downloadActiveCount}
+                    downloadFinishedCount={downloadFinishedCount}
                 />
                 {searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">
@@ -489,19 +525,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             )}
 
 
-            <UploadQueue
-                items={uploadQueue}
-                onClearFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
-                onCancelAll={cancelUploads}
-                onCancelItem={cancelUploadItem}
-                onRetryItem={retryUploadItem}
-            />
-            <DownloadQueue
-                items={downloadQueue}
-                onClearFinished={clearDownloads}
-                onCancelAll={cancelDownloads}
-                onCancelItem={cancelDownloadItem}
-                onRetryItem={retryDownloadItem}
+            <TransferPanel
+                isOpen={showTransferPanel}
+                onClose={() => setShowTransferPanel(false)}
+                uploadItems={uploadQueue}
+                onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
+                onCancelAllUploads={cancelUploads}
+                onCancelUploadItem={cancelUploadItem}
+                onRetryUploadItem={retryUploadItem}
+                downloadItems={downloadQueue}
+                onClearDownloadFinished={clearDownloads}
+                onCancelAllDownloads={cancelDownloads}
+                onCancelDownloadItem={cancelDownloadItem}
+                onRetryDownloadItem={retryDownloadItem}
             />
 
             <SettingsModal
