@@ -116,7 +116,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
     const { uploadQueue, setUploadQueue, handleManualUpload, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
-    const { downloadQueue, queueDownload, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
+    const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
+
+    // Handle "Continue Download" from VideoCacheDialog — queues download in panel with cache percentage
+    const handleContinueToDownload = useCallback(async (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => {
+        // console.log(`[CACHE-DOWNLOAD] Queuing download from ${fromCachePercent}% for msg=${messageId}`);
+        queueDownloadWithSavePath(messageId, filename, folderId, savePath, fromCachePercent);
+    }, [queueDownloadWithSavePath]);
 
 
     const handleSelectAll = useCallback(() => {
@@ -428,6 +434,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         currentIndex={previewContextIndex}
                         totalItems={previewContextFiles.length}
                         activeFolderId={activeFolderId}
+                        onContinueToDownload={handleContinueToDownload}
                         key="media-player"
                     />
                 )}

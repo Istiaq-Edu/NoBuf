@@ -4,6 +4,7 @@ import { Folder, Trash2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../types';
 import { FileTypeIcon } from '../FileTypeIcon';
+import { useCacheSession } from '../../context/CacheSessionContext';
 
 interface FileCardProps {
     file: TelegramFile;
@@ -31,6 +32,8 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
     const [isDragOver, setIsDragOver] = useState(false);
     const [thumbnail, setThumbnail] = useState<string | null>(null);
     const [thumbnailLoading, setThumbnailLoading] = useState(false);
+    const cacheSession = useCacheSession();
+    const cacheInfo = cacheSession.getCacheInfo(file.id);
 
     // Lazy load thumbnail for image files
     useEffect(() => {
@@ -135,6 +138,23 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                 >
                     {isSelected && <div className="w-1.5 h-1.5 bg-black rounded-full" />}
                 </div>
+
+                {/* Cache session badge — green progress bar + percentage */}
+                {cacheInfo && cacheInfo.percentage > 0 && !isFolder && (
+                    <div className="absolute bottom-0 left-0 right-0 z-10">
+                        {/* Green progress bar at bottom edge */}
+                        <div className="h-[3px] bg-white/10">
+                            <div
+                                className="h-full bg-green-400 transition-all duration-300"
+                                style={{ width: `${cacheInfo.percentage}%` }}
+                            />
+                        </div>
+                        {/* Percentage label */}
+                        <div className="absolute bottom-1 right-2 text-[10px] font-mono text-green-400 bg-black/50 px-1 rounded">
+                            {cacheInfo.percentage >= 100 ? '100% cached' : `${cacheInfo.percentage}% cached`}
+                        </div>
+                    </div>
+                )}
 
                 {/* File info overlay at bottom */}
                 <div className={`absolute bottom-0 left-0 right-0 p-3 ${thumbnail ? 'text-white' : 'text-telegram-text'}`}>
