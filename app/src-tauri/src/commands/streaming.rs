@@ -59,7 +59,7 @@ pub async fn cmd_report_cached_ranges(
     let data_path = cache_state.data_path(message_id);
     if !data_path.exists() {
         // No cache file yet — ranges can't be present
-        log::warn!("cmd_report_cached_ranges: no .dat file for msg {}", message_id);
+        log::warn!("[PREBUFFER] REPORT: no .dat file for msg {}", message_id);
         return Ok(false);
     }
 
@@ -77,7 +77,8 @@ pub async fn cmd_report_cached_ranges(
         return Ok(false);
     }
 
-    // Load existing meta or create new one
+    // Load existing meta or create new one (serialized via per-message lock)
+    let _lock = cache_state.lock_meta(message_id).await;
     let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
         message_id,
         folder_id,
@@ -88,14 +89,14 @@ pub async fn cmd_report_cached_ranges(
     });
 
     // Add verified ranges and merge
-    meta.cached_ranges.extend(verified_ranges);
+    meta.cached_ranges.extend(verified_ranges.clone());
     merge_ranges(&mut meta.cached_ranges);
 
     cache_state.save_meta(&meta)
         .map_err(|e| format!("Failed to save meta: {}", e))?;
 
-    log::info!("cmd_report_cached_ranges: msg {} now has {} cached ranges ({:.1}% complete)",
-        message_id, meta.cached_ranges.len(), meta.cached_percentage());
+    log::info!("[PREBUFFER] REPORT: msg {} adding verified_ranges {:?}, meta now has {} ranges ({:.1}% complete)",
+        message_id, verified_ranges, meta.cached_ranges.len(), meta.cached_percentage());
 
     Ok(true)
 }
@@ -236,11 +237,7 @@ async fn background_cache_download(
     let mime_type = crate::server::mime_type_from_media(&media);
 
     // Download gaps to cache file
-    let cache_path = cache_mgr.data_path(message_id);
-    let mut cache_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&cache_path)
+    let mut cache_file = cache_mgr.open_data_file_write(message_id)
         .map_err(|e| format!("Failed to open cache file: {}", e))?;
 
     let chunk_size: i32 = 512 * 1024;
@@ -258,7 +255,10 @@ async fn background_cache_download(
         let mut offset = gap_start;
         let mut first_chunk = true;
 
-        while let Ok(Some(chunk_result)) = iter.next().await {
+        while let Ok(Some(chunk_result)) = {
+            let _permit = state.download_semaphore.acquire().await.unwrap();
+            iter.next().await
+        } {
             // Check cancellation
             if state
                 .cancelled_transfers
@@ -294,7 +294,8 @@ async fn background_cache_download(
 
             offset += to_write as u64;
 
-            // Update meta
+            // Update meta (serialized via per-message lock)
+            let _lock = cache_mgr.lock_meta(message_id).await;
             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                 message_id,
                 folder_id,

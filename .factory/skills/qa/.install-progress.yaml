@@ -1,0 +1,32 @@
+category_1:
+  default_target: local_dev_build
+  restrictions: none
+category_2:
+  personas:
+    - name: authenticated_user
+      description: "Single Telegram-authenticated user"
+      credentials_source: env-var
+      secret_names: ["TELEGRAM_API_ID", "TELEGRAM_API_HASH"]
+category_3:
+  flows:
+    - auth
+    - file_browsing
+    - file_upload
+    - file_download
+    - media_preview
+    - folder_management
+    - settings
+    - rest_api
+    - qr_login
+    - theme_toggle
+  scope: diff-targeted
+category_5:
+  cleanup: delete_via_commands
+category_6:
+  imagemagick: false
+category_7:
+  generate_workflow: true
+  required: false
+  note: "REST API tests only in CI (desktop GUI cannot run headless). GUI flows manual-only."
+category_8:
+  failure_learning: suggest_in_report

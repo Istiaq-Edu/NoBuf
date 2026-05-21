@@ -5,30 +5,19 @@ import { useState, useEffect, useCallback, useRef } from 'react';
  *
  * Design:
  * - Captures frames from MAIN video during playback (zero bandwidth cost)
- * - Thumbnails never go ahead of the buffer — only captures what's already buffered
- * - Delayed start: waits for MSE ready + 5 seconds before capturing
- * - On-demand: hidden video used ONLY for unbuffered hover positions
- * - Per-request Promise pattern for hover (no race conditions)
- * - FIFO eviction at 300 entries
+ * - Delayed start: waits for MSE ready + 2 seconds before capturing
+ * - On-demand: hidden video used for unplayed hover positions (lazy metadata load)
+ * - Ref-based desired position: hover processor continuously targets current hover position
+ *   (no queue, no cancellation, no stale results)
+ * - Synchronous cache check for instant display of already-cached thumbnails
+ * - FIFO eviction at 5000 entries (~166 min at 2s intervals)
  */
-
-export interface ThumbnailResult {
-  dataUrl: string;
-  width: number;
-  height: number;
-  time: number;
-}
 
 const THUMBNAIL_WIDTH = 114;
 const THUMBNAIL_HEIGHT = 64;
 const BUCKET_SIZE = 2;
-const MAX_BUFFER_SIZE = 300;
-const CAPTURE_DELAY_MS = 5000; // Wait 5s after MSE ready before starting capture
-
-interface PendingRequest {
-  time: number;
-  resolve: (result: ThumbnailResult | null) => void;
-}
+const MAX_BUFFER_SIZE = 5000;
+const CAPTURE_DELAY_MS = 2000;
 
 export function useThumbnailExtractor(
   mainVideoRef: React.RefObject<HTMLVideoElement | null>,
@@ -38,21 +27,16 @@ export function useThumbnailExtractor(
   const [ready, setReady] = useState(false);
   const [cachedTimes, setCachedTimes] = useState<Set<number>>(new Set());
 
-  // Frame storage — FIFO with max size
   const frameBufferRef = useRef<Map<number, string>>(new Map());
   const insertionOrderRef = useRef<number[]>([]);
-  const doneRangesRef = useRef<{ start: number; end: number }[]>([]);
 
-  // Hidden video (for on-demand only)
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const mainTimeRef = useRef(0);
   const durationRef = useRef(0);
 
-  // Hover request protocol
-  const hoverQueueRef = useRef<PendingRequest[]>([]);
+  const desiredHoverTimeRef = useRef<number>(-1);
+  const hoverActiveRef = useRef(false);
 
-  // Throttle for cachedTimes updates
   const lastCachedUpdateRef = useRef(0);
 
   // Create hidden video element (for on-demand hover to unbuffered positions)
@@ -62,7 +46,7 @@ export function useThumbnailExtractor(
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
-    video.preload = 'auto'; // Allow downloading on demand for seeking
+    video.preload = 'none';
     video.crossOrigin = 'anonymous';
     video.style.position = 'absolute';
     video.style.left = '-9999px';
@@ -77,14 +61,13 @@ export function useThumbnailExtractor(
 
     video.src = streamUrl;
 
-    video.addEventListener('loadeddata', () => {
-      console.log('[ThumbnailExtractor] Hidden video loaded (on-demand only)');
+    video.addEventListener('loadedmetadata', () => {
       durationRef.current = video.duration;
       setReady(true);
     });
 
     video.addEventListener('error', () => {
-      console.warn('[ThumbnailExtractor] Hidden video error:', video.error);
+      console.warn('[ThumbnailExtractor] Hidden video error:', video.error?.code, video.error?.message);
     });
 
     hiddenVideoRef.current = video;
@@ -100,40 +83,37 @@ export function useThumbnailExtractor(
 
       frameBufferRef.current.clear();
       insertionOrderRef.current = [];
-      doneRangesRef.current = [];
       setReady(false);
-
-      for (const req of hoverQueueRef.current) {
-        req.resolve(null);
-      }
-      hoverQueueRef.current = [];
+      desiredHoverTimeRef.current = -1;
+      hoverActiveRef.current = false;
     };
   }, [streamUrl]);
 
-  // Track main video time
+  // Track main video duration
   useEffect(() => {
     const video = mainVideoRef.current;
     if (!video) return;
 
-    const onTimeUpdate = () => {
-      mainTimeRef.current = video.currentTime;
-    };
     const onDurationChange = () => {
       durationRef.current = video.duration;
     };
 
-    video.addEventListener('timeupdate', onTimeUpdate);
     video.addEventListener('durationchange', onDurationChange);
-    mainTimeRef.current = video.currentTime;
     durationRef.current = video.duration;
 
     return () => {
-      video.removeEventListener('timeupdate', onTimeUpdate);
       video.removeEventListener('durationchange', onDurationChange);
     };
   }, [mainVideoRef]);
 
-  // Throttled cachedTimes update
+  // Force-update cachedTimes (bypass throttle — used after on-demand captures
+  // so the yellow bar and display effect update promptly)
+  const forceUpdateCachedTimes = useCallback(() => {
+    lastCachedUpdateRef.current = Date.now();
+    setCachedTimes(new Set(frameBufferRef.current.keys()));
+  }, []);
+
+  // Throttled cachedTimes update (for main video capture — high frequency)
   const updateCachedTimes = useCallback(() => {
     const now = Date.now();
     if (now - lastCachedUpdateRef.current > 500) {
@@ -152,23 +132,8 @@ export function useThumbnailExtractor(
     }
   }, []);
 
-  // Done-range helpers
-  const markDone = useCallback((bucket: number) => {
-    doneRangesRef.current.push({ start: bucket, end: bucket });
-    const ranges = doneRangesRef.current.sort((a, b) => a.start - b.start);
-    const merged: { start: number; end: number }[] = [];
-    for (const r of ranges) {
-      if (merged.length > 0 && r.start <= merged[merged.length - 1].end + BUCKET_SIZE) {
-        merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, r.end);
-      } else {
-        merged.push({ ...r });
-      }
-    }
-    doneRangesRef.current = merged;
-  }, []);
-
   // Capture frame using reusable canvas
-  const captureFrame = useCallback((video: HTMLVideoElement, bucket: number): boolean => {
+  const captureFrame = useCallback((video: HTMLVideoElement, bucket: number, isOnDemand: boolean = false): boolean => {
     if (frameBufferRef.current.has(bucket)) return true;
     const canvas = canvasRef.current;
     if (!canvas) return false;
@@ -181,16 +146,21 @@ export function useThumbnailExtractor(
       frameBufferRef.current.set(bucket, dataUrl);
       insertionOrderRef.current.push(bucket);
       evictIfNeeded();
-      markDone(bucket);
-      updateCachedTimes();
+
+      // Force update after on-demand capture so display effect and yellow bar
+      // update promptly. Throttled update for main video capture.
+      if (isOnDemand) {
+        forceUpdateCachedTimes();
+      } else {
+        updateCachedTimes();
+      }
       return true;
     } catch {
       return false;
     }
-  }, [markDone, evictIfNeeded, updateCachedTimes]);
+  }, [evictIfNeeded, forceUpdateCachedTimes, updateCachedTimes]);
 
   // Capture frames from main video during playback (zero bandwidth cost)
-  // Starts after delay to let video buffer first
   useEffect(() => {
     const video = mainVideoRef.current;
     if (!video || !mseReady || !('requestVideoFrameCallback' in video)) return;
@@ -201,8 +171,6 @@ export function useThumbnailExtractor(
 
     const timer = setTimeout(() => {
       started = true;
-      console.log(`[MAIN-CAP] Starting main video frame capture after ${CAPTURE_DELAY_MS}ms delay`);
-      let mainCaptureCount = 0;
 
       const onFrame = () => {
         if (!active || !started) return;
@@ -212,11 +180,7 @@ export function useThumbnailExtractor(
 
         if (bucket !== lastCaptureBucket && !frameBufferRef.current.has(bucket) && video.readyState >= 2) {
           lastCaptureBucket = bucket;
-          const captured = captureFrame(video, bucket);
-          mainCaptureCount++;
-          if (mainCaptureCount <= 5 || mainCaptureCount % 20 === 0) {
-            console.log(`[MAIN-CAP] #${mainCaptureCount}: ${time.toFixed(1)}s (bucket ${bucket}), success=${captured}, cacheSize=${frameBufferRef.current.size}`);
-          }
+          captureFrame(video, bucket);
         }
 
         (video as any).requestVideoFrameCallback(onFrame);
@@ -253,118 +217,102 @@ export function useThumbnailExtractor(
           video.removeEventListener('seeked', onSeeked);
           resolve(false);
         }
-      }, 5000);
+      }, 10000);
     });
   }, []);
 
-  // No background hidden video loop — main video capture via requestVideoFrameCallback handles buffered content.
-  // Hidden video is used ONLY for on-demand hover requests (see hover processor below).
+  // Ensure hidden video metadata is loaded (lazy load on first request)
+  const ensureMetadata = useCallback(async (video: HTMLVideoElement): Promise<boolean> => {
+    if (video.readyState >= 1) return true;
 
-  // Hover request processor — processes one request at a time
+    video.load();
+
+    return new Promise((resolve) => {
+      let done = false;
+      const onLoaded = () => {
+        if (done) return;
+        done = true;
+        video.removeEventListener('loadedmetadata', onLoaded);
+        durationRef.current = video.duration;
+        setReady(true);
+        resolve(true);
+      };
+      video.addEventListener('loadedmetadata', onLoaded);
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          video.removeEventListener('loadedmetadata', onLoaded);
+          resolve(false);
+        }
+      }, 10000);
+    });
+  }, []);
+
+  // Hover processor — ref-based: continuously targets desiredHoverTimeRef.
+  // No queue, no cancellation, no stale results. When the user moves, the
+  // desired position changes and the processor adjusts naturally.
   useEffect(() => {
-    if (!ready) return;
     let active = true;
 
-    let hoverCount = 0;
-
     const processLoop = async () => {
-      console.log(`[HOVER] Process loop started, ready=${ready}`);
       while (active) {
-        const request = await new Promise<PendingRequest | null>((resolve) => {
-          const checkQueue = () => {
-            if (!active) { resolve(null); return; }
-            const req = hoverQueueRef.current.shift();
-            if (req) { resolve(req); return; }
-            setTimeout(checkQueue, 50);
-          };
-          checkQueue();
-        });
+        const desiredTime = desiredHoverTimeRef.current;
 
-        if (!active || !request) continue;
+        if (!hoverActiveRef.current || desiredTime < 0) {
+          await new Promise(r => setTimeout(r, 100));
+          continue;
+        }
 
-        hoverCount++;
+        const bucket = Math.floor(desiredTime / BUCKET_SIZE) * BUCKET_SIZE;
+
+        if (frameBufferRef.current.has(bucket)) {
+          await new Promise(r => setTimeout(r, 50));
+          continue;
+        }
+
         const video = hiddenVideoRef.current;
         if (!video) {
-          request.resolve(null);
+          await new Promise(r => setTimeout(r, 200));
           continue;
         }
 
-        const bucket = Math.floor(request.time / BUCKET_SIZE) * BUCKET_SIZE;
+        const metadataOk = await ensureMetadata(video);
+        if (!metadataOk || !active) continue;
 
-        // Check cache first
-        const cached = frameBufferRef.current.get(bucket);
-        if (cached) {
-          request.resolve({ dataUrl: cached, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket });
-          continue;
-        }
-
-        // Not cached — use hidden video for on-demand capture
-        if (video.readyState < 1) {
-          request.resolve(null);
-          continue;
-        }
-
-        // Seek hidden video to requested position
         video.pause();
-        const seekStart = performance.now();
-        const ok = await seekTo(video, request.time);
-        const seekMs = performance.now() - seekStart;
+        const ok = await seekTo(video, desiredTime);
 
-        console.log(`[HOVER] #${hoverCount}: time=${request.time.toFixed(1)}s, seek=${seekMs.toFixed(0)}ms, ok=${ok}`);
-
-        if (ok) {
-          captureFrame(video, bucket);
+        if (ok && active) {
+          captureFrame(video, bucket, true);
         }
 
-        // Stop hidden video after capture — no background loop to resume
         video.pause();
 
-        const result = frameBufferRef.current.get(bucket);
-        request.resolve(result ? { dataUrl: result, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket } : null);
+        await new Promise(r => setTimeout(r, 50));
       }
     };
 
     processLoop();
     return () => { active = false; };
-  }, [ready, seekTo, captureFrame]);
+  }, [seekTo, ensureMetadata, captureFrame]);
 
-  // Public API: getThumbnail — latest request wins
-  const getThumbnail = useCallback(async (timeSeconds: number): Promise<ThumbnailResult | null> => {
+  // Public API: getCachedThumbnailSync — returns cached dataUrl synchronously
+  const getCachedThumbnailSync = useCallback((timeSeconds: number): string | null => {
     const bucket = Math.floor(timeSeconds / BUCKET_SIZE) * BUCKET_SIZE;
-
-    // Check cache first (instant — captured during playback)
-    const cached = frameBufferRef.current.get(bucket);
-    if (cached) {
-      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, bucket=${bucket} → CACHE_HIT`);
-      return { dataUrl: cached, width: THUMBNAIL_WIDTH, height: THUMBNAIL_HEIGHT, time: bucket };
-    }
-
-    // Cancel all previous pending requests
-    const cancelled = hoverQueueRef.current.length;
-    if (cancelled > 0) {
-      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, cancelling ${cancelled} pending requests`);
-    }
-    for (const req of hoverQueueRef.current) {
-      req.resolve(null);
-    }
-    hoverQueueRef.current = [];
-
-    // Create per-request Promise
-    return new Promise<ThumbnailResult | null>((resolve) => {
-      const request: PendingRequest = { time: timeSeconds, resolve };
-      hoverQueueRef.current.push(request);
-      console.log(`[GET] time=${timeSeconds.toFixed(1)}s, bucket=${bucket} → QUEUED (queue=${hoverQueueRef.current.length})`);
-
-      setTimeout(() => {
-        const idx = hoverQueueRef.current.indexOf(request);
-        if (idx >= 0) {
-          console.warn(`[GET] time=${timeSeconds.toFixed(1)}s → TIMEOUT (5s)`);
-          hoverQueueRef.current.splice(idx, 1);
-          resolve(null);
-        }
-      }, 5000);
-    });
+    return frameBufferRef.current.get(bucket) ?? null;
   }, []);
 
-  return { ready, getThumbnail, cachedTimes };
+  // Public API: setDesiredHoverTime — updates the desired position for the hover processor
+  const setDesiredHoverTime = useCallback((time: number) => {
+    desiredHoverTimeRef.current = time;
+    hoverActiveRef.current = true;
+  }, []);
+
+  // Public API: clearDesiredHover — called when mouse leaves the progress bar
+  const clearDesiredHover = useCallback(() => {
+    hoverActiveRef.current = false;
+    desiredHoverTimeRef.current = -1;
+  }, []);
+
+  return { ready, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes };
 }

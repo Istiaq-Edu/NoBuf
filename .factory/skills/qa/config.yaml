@@ -1,0 +1,67 @@
+project: Telegram-Drive
+imagemagick: false
+environments:
+  local:
+    url: http://localhost:1420
+    description: "Local Tauri dev build (npm run tauri dev). Frontend at :1420, media streaming at :14201, REST API at :8550."
+
+default_target: local
+
+auth:
+  method: api-credentials
+  provider: telegram
+  description: >
+    Telegram API authentication via api_id + api_hash. Users enter phone number,
+    receive a verification code, and optionally provide a 2FA password.
+    Session is persisted as a SQLite file (telegram.session).
+
+personas:
+  - name: authenticated_user
+    description: "Telegram-authenticated user with access to Saved Messages and channels"
+    email: null
+    credentials_source: env-var
+    secret_name: "TELEGRAM_API_ID, TELEGRAM_API_HASH"
+    test_focus:
+      - file_browsing
+      - file_upload
+      - file_download
+      - media_preview
+      - folder_management
+      - settings
+      - rest_api
+    cannot_do: []
+
+apps:
+  app:
+    path_patterns:
+      - "app/src/**"
+      - "app/src-tauri/src/**"
+      - "app/src-tauri/Cargo.toml"
+      - "app/package.json"
+      - "app/vite.config.ts"
+      - "app/tsconfig.json"
+      - "app/index.html"
+    skill: qa-app
+    test_tool: curl
+    build_command: "cd app && npm install && npm run tauri build"
+    description: >
+      Telegram Drive is a Tauri v2 desktop app. The frontend (React/TypeScript/TailwindCSS)
+      runs in a webview and requires the Rust backend. GUI testing requires a local desktop
+      environment and cannot run in headless CI. REST API testing (port 8550) can run
+      in CI via curl when the API server is enabled.
+
+feature_flags:
+  provider: none
+
+integrations: {}
+
+cleanup:
+  auto_cleanup: true
+  strategy: delete-test-users
+  instructions: >
+    Test files and folders created during QA should be deleted via
+    cmd_delete_file and cmd_delete_folder Tauri commands after testing.
+    For REST API tests, use the download endpoint to verify and no cleanup
+    is needed (read-only unless explicitly testing upload).
+
+failure_learning: suggest_in_report

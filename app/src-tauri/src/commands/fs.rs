@@ -1,4 +1,4 @@
-use tauri::{State, Emitter};
+﻿use tauri::{State, Emitter};
 use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
@@ -6,7 +6,7 @@ use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
-use crate::stream_cache::{self, StreamCacheManager};
+use crate::stream_cache::{self, StreamCacheManager, CacheMeta};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Chunk size for downloads (512 KB) — matches server.rs
@@ -359,7 +359,8 @@ pub async fn cmd_download_file(
     
     bw_state.can_transfer(total_size)?;
 
-    // Emit start
+    // Emit 0% start — percentage will rapidly jump to cached% once prebuffered
+    // data is processed, then climb gradually as gaps are filled from Telegram
     if !tid.is_empty() {
         let _ = app_handle.emit("download-progress", ProgressPayload {
             id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
@@ -426,13 +427,19 @@ pub async fn cmd_download_file(
         let mut last_emit_time = std::time::Instant::now();
         let mut last_emit_bytes: u64 = base_bytes;
 
-        let mut cache_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&cache_path)
-            .ok();
+        // Emit initial progress reflecting cached bytes already written to output
+        if !tid.is_empty() {
+            let percent = if total_size > 0 {
+                ((base_bytes as f64 / total_size as f64) * 100.0).min(100.0) as u8
+            } else { 0 };
+            let _ = app_handle.emit("download-progress", ProgressPayload {
+                id: tid.clone(), percent, uploaded_bytes: base_bytes, total_bytes: total_size, speed_bytes_per_sec: 0,
+            });
+        }
 
-        log::info!("[DL-DEBUG] Per-gap download: base_bytes={}, gaps={:?}, total={}", base_bytes, gaps, total_size);
+        let mut cache_file = cache_state.open_data_file_write(message_id).ok();
+
+        log::info!("Download {} filling {} gap(s)", message_id, gaps.len());
 
         for (gap_idx, &(gap_start, gap_end)) in gaps.iter().enumerate() {
             if state.cancelled_transfers.read().await.contains(&tid) {
@@ -456,7 +463,10 @@ pub async fn cmd_download_file(
             let mut offset = gap_start;
             let mut first_chunk = true;
 
-            while let Some(chunk_result) = iter.next().await.transpose() {
+            while let Some(chunk_result) = {
+                let _permit = state.download_semaphore.acquire().await.unwrap();
+                iter.next().await.transpose()
+            } {
                 if state.cancelled_transfers.read().await.contains(&tid) {
                     state.cancelled_transfers.write().await.remove(&tid);
                     drop(output_file);
@@ -487,6 +497,16 @@ pub async fn cmd_download_file(
                 if let Some(ref mut cf) = cache_file {
                     let _ = cf.seek(SeekFrom::Start(offset));
                     let _ = cf.write_all(slice);
+
+                    // Update cache meta incrementally (per-chunk) so the green bar
+                    // tracks download progress in real-time via cmd_get_cache_status
+                    let _lock = cache_state.lock_meta(message_id).await;
+                    if let Some(mut m) = cache_state.load_meta(message_id) {
+                        let chunk_end = offset + to_write as u64;
+                        m.cached_ranges.push((offset, chunk_end - 1));
+                        stream_cache::merge_ranges(&mut m.cached_ranges);
+                        let _ = cache_state.save_meta(&m);
+                    }
                 }
 
                 offset += to_write as u64;
@@ -507,21 +527,15 @@ pub async fn cmd_download_file(
                     }
                 }
 
-                // Throttle to avoid FLOOD_PREMIUM_WAIT from concurrent player requests
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
                 if offset > gap_end {
-                    log::info!("[DL-DEBUG] Gap {} filled: {}-{}", gap_idx, gap_start, gap_end);
-                    if let Some(mut m) = cache_state.load_meta(message_id) {
-                        m.cached_ranges.push((gap_start, gap_end));
-                        stream_cache::merge_ranges(&mut m.cached_ranges);
-                        let _ = cache_state.save_meta(&m);
-                    }
+                    log::info!("Gap {} filled: {}-{}", gap_idx, gap_start, gap_end);
                     break;
                 }
+
+                // Yield briefly so player prebuffer gets a fair share of the semaphore;
+                // tokio::sync::Semaphore uses FIFO waiters so this is cooperative yielding.
+                tokio::task::yield_now().await;
             }
-            // Brief pause between gaps to avoid rate limiting
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         bw_state.add_down(total_size);
@@ -535,14 +549,37 @@ pub async fn cmd_download_file(
     }
 
     // No cache available — fall through to standard download
-    // Stream download with per-chunk progress
+    // Stream download with per-chunk progress -- also cache to disk so download
+    // chunks serve as buffers. The green bar polls cmd_get_cache_status to track
+    // download progress in real-time, and future downloads benefit from cached data.
+    let mut cache_file = cache_state.open_data_file_write(message_id).ok();
+    let dl_filename = match &media {
+        Media::Document(d) => d.name().to_string(),
+        _ => format!("{}.mp4", message_id),
+    };
+    let dl_mime = match &media {
+        Media::Document(d) => d.mime_type().unwrap_or("application/octet-stream").to_string(),
+        Media::Photo(_) => "image/jpeg".to_string(),
+        _ => "application/octet-stream".to_string(),
+    };
+
     let mut download_iter = client.iter_download(&media);
     let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
     let mut downloaded: u64 = 0;
     let mut last_emit_time = std::time::Instant::now();
     let mut last_emit_bytes: u64 = 0;
 
-    while let Some(chunk) = download_iter.next().await.transpose() {
+    // Emit initial progress for fresh (non-cached) download
+    if !tid.is_empty() {
+        let _ = app_handle.emit("download-progress", ProgressPayload {
+            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
+        });
+    }
+
+    while let Some(chunk) = {
+        let _permit = state.download_semaphore.acquire().await.unwrap();
+        download_iter.next().await.transpose()
+    } {
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&tid) {
             state.cancelled_transfers.write().await.remove(&tid);
@@ -553,7 +590,28 @@ pub async fn cmd_download_file(
 
         let bytes = chunk.map_err(|e| format!("Download chunk error: {}", e))?;
         std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())?;
+        let chunk_start = downloaded;
         downloaded += bytes.len() as u64;
+
+        // Write to cache file and update meta incrementally so the green bar
+        // tracks download progress in real-time via cmd_get_cache_status
+        if let Some(ref mut cf) = cache_file {
+            let _ = cf.seek(SeekFrom::Start(chunk_start));
+            let _ = cf.write_all(&bytes);
+
+            let _lock = cache_state.lock_meta(message_id).await;
+            let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                message_id,
+                folder_id: folder_id.unwrap_or(0),
+                total_size,
+                filename: dl_filename.clone(),
+                cached_ranges: Vec::new(),
+                mime_type: dl_mime.clone(),
+            });
+            meta.cached_ranges.push((chunk_start, downloaded - 1));
+            stream_cache::merge_ranges(&mut meta.cached_ranges);
+            let _ = cache_state.save_meta(&meta);
+        }
         
         // Time-based progress emission (every 250ms)
         if !tid.is_empty() {
@@ -569,6 +627,9 @@ pub async fn cmd_download_file(
                 last_emit_bytes = downloaded;
             }
         }
+
+        // Yield so player prebuffer gets a fair share of the semaphore
+        tokio::task::yield_now().await;
     }
 
     bw_state.add_down(total_size);

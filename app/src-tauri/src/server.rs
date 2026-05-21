@@ -10,6 +10,22 @@ use std::sync::Arc;
 use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom};
 
+/// Drop-guard that untracks streaming when the Actix response ends
+/// (including client disconnect). Prevents cmd_delete_cache from
+/// deleting files while the stream is still active.
+struct StreamingGuard {
+    cache_mgr: Option<StreamCacheManager>,
+    message_id: i32,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        if let Some(ref cm) = self.cache_mgr {
+            cm.untrack_streaming(self.message_id);
+        }
+    }
+}
+
 /// Holds the per-session streaming token for Actix validation
 pub(crate) struct StreamTokenData {
     pub(crate) token: String,
@@ -134,8 +150,6 @@ async fn resolve_media_from_path(
         _ => 0,
     };
 
-    log::info!("Document size for msg {}: {} bytes", message_id, size);
-
     Ok((media, size))
 }
 
@@ -162,7 +176,6 @@ async fn stream_media_head(
     match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
         Ok((media, size)) => {
             let mime = mime_type_from_media(&media);
-            log::info!("HEAD response for msg {}: size={}, mime={}", message_id, size, mime);
             HttpResponse::Ok()
                 .insert_header(("Content-Type", mime))
                 .insert_header(("Content-Length", size.to_string()))
@@ -170,7 +183,6 @@ async fn stream_media_head(
                 .finish()
         }
         Err(resp) => {
-            log::error!("HEAD request failed for msg {}", message_id);
             resp
         },
     }
@@ -186,39 +198,23 @@ async fn stream_media(
     cache: web::Data<Option<StreamCacheManager>>,
 ) -> impl Responder {
     let (folder_id_str, message_id) = path.into_inner();
-    log::debug!("Stream request: Received request for message {} in folder '{}'", message_id, folder_id_str);
-
     let (media, size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
         Ok(result) => result,
         Err(resp) => return resp,
     };
 
     let mime = mime_type_from_media(&media);
-    log::debug!("Stream request: Starting download for msg {} (mime: {}, size: {})", message_id, mime, size);
+    let mime_stream = mime.clone(); // Clone for use inside the async stream
 
-    // Set up cache file if cache manager is available — every range request
-    // caches its bytes independently (no write-lock needed, seek+write is atomic).
-    let mut cache_setup: Option<(std::fs::File, StreamCacheManager, i32, i64, String, String)> =
+    // Extract cache-related variables BEFORE the stream to avoid
+    // partial-borrow issues inside async_stream::stream! and to
+    // use the per-message lock for serialized meta updates.
+    let cache_file_opt: Option<std::fs::File> =
         if let Some(ref cache_mgr) = **cache {
-            let data_path = cache_mgr.data_path(message_id);
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&data_path)
-            {
-                Ok(f) => Some((
-                    f,
-                    cache_mgr.clone(),
-                    message_id,
-                    folder_id_str.parse::<i64>().unwrap_or(0),
-                    match &media {
-                        Media::Document(d) => d.name().to_string(),
-                        _ => format!("{}.mp4", message_id),
-                    },
-                    mime.clone(),
-                )),
+            match cache_mgr.open_data_file_write(message_id) {
+                Ok(f) => Some(f),
                 Err(e) => {
-                    log::warn!("Failed to open cache file for {}: {}", message_id, e);
+                    log::warn!("[PREBUFFER] Failed to open cache file for {}: {}", message_id, e);
                     None
                 }
             }
@@ -226,17 +222,39 @@ async fn stream_media(
             None
         };
 
+    let cache_mgr_opt: Option<StreamCacheManager> =
+        (**cache).as_ref().map(|cm| cm.clone());
+
+    // Track streaming activity so cmd_delete_cache refuses to delete
+    // files while this Actix response is active (prevents catastrophic
+    // range loss on Windows where FILE_SHARE_DELETE allows deletion
+    // of files with open handles).
+    let _stream_guard = if let Some(ref cache_mgr) = **cache {
+        cache_mgr.track_streaming(message_id);
+        StreamingGuard {
+            cache_mgr: Some(cache_mgr.clone()),
+            message_id,
+        }
+    } else {
+        StreamingGuard { cache_mgr: None, message_id }
+    };
+
+    let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
+    let cache_filename = match &media {
+        Media::Document(d) => d.name().to_string(),
+        _ => format!("{}.mp4", message_id),
+    };
+
     // Parse Range header if present
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
 
     let (start_byte, end_byte, is_partial) = if let Some(range_str) = range_header {
         match parse_range_header(range_str, size) {
             Some((start, end)) => {
-                log::debug!("Stream request: Range request bytes={}-{} for msg {}", start, end, message_id);
                 (start, end, true)
             }
             None => {
-                log::warn!("Stream request: Invalid Range header '{}' for msg {}", range_str, message_id);
+                log::warn!("[PREBUFFER] Invalid Range header '{}' for msg {}", range_str, message_id);
                 return HttpResponse::build(actix_web::http::StatusCode::RANGE_NOT_SATISFIABLE)
                     .insert_header(("Content-Range", format!("bytes */{}", size)))
                     .body("Invalid Range header");
@@ -248,9 +266,15 @@ async fn stream_media(
 
     let content_length = end_byte - start_byte + 1;
 
-    // FAST PATH: If the requested range is fully cached, serve from disk immediately
+    // FAST PATH: if the requested range is fully cached, serve from disk immediately
+    // Acquire lock_meta before load_meta to prevent concurrent save_meta from
+    // truncating the file mid-read (which caused meta corruption in test round 4).
     if let Some(ref cache_mgr) = **cache {
-        if let Some(meta) = cache_mgr.load_meta(message_id) {
+        let _fast_lock = cache_mgr.lock_meta(message_id).await;
+        let fast_meta = cache_mgr.load_meta(message_id);
+        drop(_fast_lock); // Release immediately — meta data is in memory now
+
+        if let Some(meta) = fast_meta {
             if is_range_cached(&meta.cached_ranges, start_byte, end_byte) {
                 let cache_path = cache_mgr.data_path(message_id);
                 match (|| -> std::io::Result<Vec<u8>> {
@@ -262,8 +286,8 @@ async fn stream_media(
                     Ok(buf)
                 })() {
                     Ok(slice) => {
-                        log::info!("Cache HIT for msg {} range {}-{} ({} bytes served from disk)",
-                            message_id, start_byte, end_byte, slice.len());
+                        log::info!("[PREBUFFER] HIT: msg {} range {}-{} served from disk cache",
+                            message_id, start_byte, end_byte);
 
                         let response = if is_partial {
                             HttpResponse::PartialContent()
@@ -284,10 +308,15 @@ async fn stream_media(
                         return response;
                     }
                     Err(e) => {
-                        log::warn!("Cache read failed for msg {}, falling back to Telegram: {}", message_id, e);
+                        log::warn!("[PREBUFFER] Cache read failed for msg {}, falling back to Telegram: {}", message_id, e);
                     }
                 }
+            } else {
+                log::info!("[PREBUFFER] MISS: msg {} range {}-{} not cached",
+                    message_id, start_byte, end_byte);
             }
+        } else {
+            log::info!("[PREBUFFER] MISS: msg {} no meta found", message_id);
         }
     }
 
@@ -312,8 +341,14 @@ async fn stream_media(
         let mut first_chunk = true;
         let mut iter = download_iter;
         let mut current_offset = start_byte;
+        let mut cache_file_mut = cache_file_opt;
 
-        while let Some(chunk) = iter.next().await.transpose() {
+        while let Some(chunk) = {
+            // Acquire the global semaphore before hitting Telegram's API —
+            // serializes with cmd_download_file to prevent FLOOD_WAIT
+            let _permit = data.download_semaphore.acquire().await.unwrap();
+            iter.next().await.transpose()
+        } {
             match chunk {
                 Ok(bytes) => {
                     let remaining = content_length - bytes_sent;
@@ -338,23 +373,87 @@ async fn stream_media(
                     };
 
                     let bytes_in_chunk = final_data.len() as u64;
+                    let chunk_range_end = current_offset + bytes_in_chunk - 1;
 
-                    // Write to disk cache if available
-                    if let Some((ref mut cache_file, ref cache_mgr, mid, fid, ref fname, ref mime)) = cache_setup {
+                    // 1) Write data to cache file (seek+write is atomic, no lock needed)
+                    if let Some(ref mut cache_file) = cache_file_mut {
                         let _ = cache_file.seek(SeekFrom::Start(current_offset));
                         let _ = cache_file.write_all(&final_data);
+                    }
 
-                        let mut meta = cache_mgr.load_meta(mid).unwrap_or_else(|| CacheMeta {
-                            message_id: mid,
-                            folder_id: fid,
-                            total_size: size,
-                            filename: fname.clone(),
-                            cached_ranges: Vec::new(),
-                            mime_type: mime.clone(),
-                        });
-                        meta.cached_ranges.push((current_offset, current_offset + bytes_in_chunk - 1));
+                    // 2) Update meta with per-message lock (serialized with
+                    //    cmd_report_cached_ranges and other streaming requests)
+                    if let Some(ref cache_mgr) = cache_mgr_opt {
+                        let _lock = cache_mgr.lock_meta(message_id).await;
+                        let mut meta = match cache_mgr.load_meta(message_id) {
+                            Some(m) => m,
+                            None => {
+                                // Meta file temporarily unreadable (filesystem cache,
+                                // antivirus scan, save_meta race). Retry 3 times
+                                // with increasing delays before creating recovery meta.
+                                // NEVER lose all existing ranges by creating empty
+                                // cached_ranges — always try to recover from data file.
+                                log::warn!("[PREBUFFER] Meta load returned None for msg {}, retrying", message_id);
+                                let mut recovered = None;
+                                for (attempt, delay_ms) in [(1, 20), (2, 50), (3, 100)] {
+                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                    if let Some(m) = cache_mgr.load_meta(message_id) {
+                                        log::info!("[PREBUFFER] Meta recovered for msg {} on attempt {}", message_id, attempt);
+                                        recovered = Some(m);
+                                        break;
+                                    }
+                                }
+                                match recovered {
+                                    Some(m) => m,
+                                    None => {
+                                        // All retries failed. Create recovery meta that
+                                        // preserves as much info as possible. On Windows,
+                                        // files can enter "pending delete" state where
+                                        // the directory entry is gone but open handles
+                                        // remain valid — use the open cache file handle
+                                        // as a fallback for file size detection.
+                                        let data_path = cache_mgr.data_path(message_id);
+                                        let data_exists = data_path.exists();
+                                        let fs_data_size = if data_exists {
+                                            std::fs::metadata(&data_path)
+                                                .map(|m| m.len()).unwrap_or(0)
+                                        } else { 0 };
+                                        // Fallback: open handle metadata (handles
+                                        // Windows "pending delete" where directory
+                                        // entry is gone but handle is still valid)
+                                        let handle_data_size = cache_file_mut
+                                            .as_ref()
+                                            .and_then(|f| f.metadata().ok())
+                                            .map(|m| m.len())
+                                            .unwrap_or(0);
+                                        let data_size = fs_data_size.max(handle_data_size);
+                                        log::warn!("[PREBUFFER] Meta recovery for msg {}: data_file_exists={}, fs_data_size={}, handle_data_size={}, total_size={}", 
+                                            message_id, data_exists, fs_data_size, handle_data_size, size);
+                                        let recovery_ranges = if data_size > 0 && data_size <= size {
+                                            vec![(0u64, data_size - 1)]
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        CacheMeta {
+                                            message_id,
+                                            folder_id: cache_folder_id,
+                                            total_size: size,
+                                            filename: cache_filename.clone(),
+                                            cached_ranges: recovery_ranges,
+                                            mime_type: mime_stream.clone(),
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        meta.cached_ranges.push((current_offset, chunk_range_end));
                         merge_ranges(&mut meta.cached_ranges);
-                        let _ = cache_mgr.save_meta(&meta);
+                        if let Err(e) = cache_mgr.save_meta(&meta) {
+                            log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
+                        } else {
+                            log::info!("[PREBUFFER] ADD: msg {} range {}-{} written to cache, meta ranges: {:?}",
+                                message_id, current_offset, chunk_range_end, meta.cached_ranges);
+                        }
                     }
 
                     current_offset += bytes_in_chunk;
@@ -366,12 +465,11 @@ async fn stream_media(
                     }
                 }
                 Err(e) => {
-                    log::error!("Stream error for msg {}: {}", message_id, e);
+                    log::error!("[PREBUFFER] Stream error for msg {}: {}", message_id, e);
                     break;
                 }
             }
         }
-        log::debug!("Stream complete for msg {}: sent {} bytes", message_id, bytes_sent);
     };
 
     if is_partial {
@@ -406,7 +504,7 @@ pub async fn start_streaming_server(
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
             .max_age(3600);
 
         App::new()
