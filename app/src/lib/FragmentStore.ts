@@ -4,7 +4,7 @@
  * Cleared on video change. IndexedDB cleared on app start.
  */
 
-const DB_NAME = 'telegram-drive-fragments';
+const DB_NAME = 'nobuff-fragments';
 const DB_VERSION = 1;
 const STORE_NAME = 'fragments';
 
