@@ -48,10 +48,12 @@ const FRAGMENT_SIZES = [
   512 * 1024,   // 512KB — fast first frame after seek
   1024 * 1024,  // 1MB
   2 * 1024 * 1024,  // 2MB
-  4 * 1024 * 1024,  // 4MB — steady state
+  4 * 1024 * 1024,  // 4MB
+  8 * 1024 * 1024,  // 8MB — steady state, saturates bandwidth
 ];
-const MAX_BUFFER_BYTES = 100 * 1024 * 1024; // 100MB max buffer before eviction
+const MAX_BUFFER_BYTES = 50 * 1024 * 1024; // 50MB max buffer before eviction (Bug #16: reduced from 100MB)
 const BUFFER_KEEP_BEHIND = 30; // Keep 30s behind current playback position
+const MAX_BUFFER_AHEAD_SECONDS = 120; // Bug #16: backpressure — stop downloading when >2min buffered ahead
 
 /** Get chunk size based on how many chunks have been fetched since last seek */
 function getChunkSize(chunksAfterSeek: number): number {
@@ -103,6 +105,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(false); // Ref so seekTo can check without React state delay
   const [isComplete, setIsComplete] = useState(false);
+  const isCompleteRef = useRef(false);
+  // Once the download loop reaches fileLength, the backend has all data cached.
+  // This ref never resets — even if a backward seek resets isComplete=false,
+  // the near-end guard still works because hasEverCompleted stays true.
+  const hasEverCompletedRef = useRef(false);
   const [speed, setSpeed] = useState(0);
   // Downloaded byte-range → time-range for green buffer bar
   const [downloadedTimeRanges, setDownloadedTimeRanges] = useState<[number, number][]>([]);
@@ -114,6 +121,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const chunksAfterSeek = useRef(0); // For progressive chunk sizing
   const pendingRangesRef = useRef<[number, number][]>([]); // Accumulated ranges to report
   const rangeReportTimer = useRef<number | null>(null); // Debounce timer for range reporting
+  // Seek debouncing: for unbuffered positions, delay seek execution by SEEK_DEBOUNCE_MS
+  // so rapid clicks/arrow-key skips only trigger the LAST position, reducing wasteful
+  // overlapping downloads on unbuffered parts
+  const seekDebounceTimerRef = useRef<number | null>(null);
+  const SEEK_DEBOUNCE_MS = 500; // 500ms debounce for unbuffered seeks — prevents overlapping downloads from rapid arrow-key spam while still feeling responsive
+  // Track when the last unbuffered seek was actually executed (instant or debounce expired).
+  // The FIRST seek is instant; subsequent seeks within SEEK_DEBOUNCE_MS are debounced.
+  const lastSeekTimeRef = useRef<number>(0);
   // Downloaded byte ranges — merged and converted to time for green buffer bar
   const downloadedRangesRef = useRef<[number, number][]>([]);
   // Cached init segments (codec config) — re-appended after each SourceBuffer clear
@@ -284,6 +299,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     setTotalBytes(0);
     setIsPrefetching(false);
     setIsComplete(false);
+    isCompleteRef.current = false;
     setSpeed(0);
     setError(null);
     setMseUrl(null);
@@ -318,6 +334,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     return () => {
       cancelledRef.current = true;
+      // Clear seek debounce timer
+      if (seekDebounceTimerRef.current !== null) {
+        clearTimeout(seekDebounceTimerRef.current);
+        seekDebounceTimerRef.current = null;
+      }
       // Flush remaining range reports before cleanup
       flushRangeReport();
       // Revoke blob URL on cleanup
@@ -329,6 +350,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   const cleanup = () => {
     abortRef.current?.abort();
+    if (seekDebounceTimerRef.current !== null) {
+      clearTimeout(seekDebounceTimerRef.current);
+      seekDebounceTimerRef.current = null;
+    }
     state.current.videoSourceBuffer?.destroy();
     state.current.audioSourceBuffer?.destroy();
     state.current.videoSourceBuffer = null;
@@ -338,14 +363,32 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     clearDownloadedRanges();
   };
 
-  /** Remove buffered data older than (currentTime - BUFFER_KEEP_BEHIND) when buffer is too large */
+  /** Calculate how many seconds of video are buffered ahead of current playback.
+   *  Used for backpressure — stop downloading when enough data is buffered ahead. */
+  const getBufferedAheadSeconds = (): number => {
+    const video = videoRef.current;
+    if (!video) return 0;
+    const buffered = video.buffered;
+    const currentTime = video.currentTime;
+    let totalAhead = 0;
+    for (let i = 0; i < buffered.length; i++) {
+      if (buffered.end(i) > currentTime) {
+        const start = Math.max(buffered.start(i), currentTime);
+        totalAhead += buffered.end(i) - start;
+      }
+    }
+    return totalAhead;
+  };
+
+  /** Remove buffered data older than (currentTime - BUFFER_KEEP_BEHIND) when buffer is too large.
+   *  Bug #16 fix: also evict when currentTime is 0 (initial buffering case).
+   *  In that case, evict data that's far ahead of position 0. */
   const evictOldBuffer = () => {
     const video = videoRef.current;
-    if (!video || video.currentTime <= 0) return;
-
     const sbVideo = state.current.videoSourceBuffer;
     const sbAudio = state.current.audioSourceBuffer;
     if (!sbVideo && !sbAudio) return;
+    if (!video) return;
 
     // Check total buffered bytes
     let totalBuffered = 0;
@@ -361,7 +404,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // Only evict if buffer exceeds threshold (rough estimate: seconds * bitrate)
     if (totalBuffered * state.current.bitrate < MAX_BUFFER_BYTES) return;
 
-    const evictBefore = Math.max(0, video.currentTime - BUFFER_KEEP_BEHIND);
+    const currentTime = video.currentTime;
+    // When currentTime is 0 (initial buffering), keep only first 60s.
+    // When playing, keep BUFFER_KEEP_BEHIND (30s) behind current position.
+    const evictBefore = currentTime <= 0
+      ? 0  // Don't evict during initial buffering — keep everything from 0
+      : Math.max(0, currentTime - BUFFER_KEEP_BEHIND);
+
+    if (evictBefore <= 0) return; // Nothing to evict at the start
+
     const evictRange = (sb: SourceBufferWrapper) => {
       const ranges = sb.buffered;
       for (let i = 0; i < ranges.length; i++) {
@@ -620,6 +671,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       mp4box.onSegment = (trackId: number, _user: any, buffer: ArrayBuffer, _sampleNum: number, _isLast: boolean) => {
         if (cancelledRef.current) return;
 
+        // Bug #4 fix: stop appending if SourceBuffer is fatally broken
+        if ((state.current.videoSourceBuffer && state.current.videoSourceBuffer.hasFatalError) ||
+            (state.current.audioSourceBuffer && state.current.audioSourceBuffer.hasFatalError)) {
+          return;
+        }
+
+        // Bug #16 fix: evict BEFORE appending to prevent QuotaExceededError.
+        // Previously eviction ran AFTER append, but QuotaExceededError happens
+        // during append before eviction can free space. Moving eviction before
+        // the append ensures space is available for new data.
+        evictOldBuffer();
+
         const isVideo = trackId === videoTrackId;
         const isAudio = trackId === audioTrackId;
 
@@ -629,9 +692,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         if (isAudio && state.current.audioSourceBuffer) {
           state.current.audioSourceBuffer.appendBuffer(buffer);
         }
-
-        // Evict old buffer to prevent memory growth
-        evictOldBuffer();
       };
 
       // Start mp4box segment generation
@@ -654,6 +714,29 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     while (!cancelledRef.current && state.current.downloading && gen === loopGeneration.current &&
            state.current.currentOffset < state.current.fileLength) {
+      // Bug #4 fix: check if SourceBuffer is fatally broken (HTMLMediaElement.error
+      // set after CHUNK_DEMUXER_ERROR_APPEND_FAILED). No more data can be appended,
+      // so stop downloading immediately to prevent infinite InvalidStateError cascade.
+      if ((state.current.videoSourceBuffer && state.current.videoSourceBuffer.hasFatalError) ||
+          (state.current.audioSourceBuffer && state.current.audioSourceBuffer.hasFatalError)) {
+        console.warn('[Player] SourceBuffer fatal error detected — stopping download loop');
+        break;
+      }
+
+      // Bug #16 fix: backpressure — if buffer ahead exceeds threshold,
+      // pause downloading until playback consumes enough data.
+      // This prevents SourceBuffer from filling up past Chrome's quota
+      // and triggering QuotaExceededError.
+      while (!cancelledRef.current && state.current.downloading && gen === loopGeneration.current) {
+        const ahead = getBufferedAheadSeconds();
+        if (ahead <= MAX_BUFFER_AHEAD_SECONDS) break;
+        // Sleep 2s — let playback consume buffered data before downloading more
+        await new Promise(r => setTimeout(r, 2000));
+        // Proactively evict during the wait to free space
+        evictOldBuffer();
+      }
+      if (cancelledRef.current || !state.current.downloading || gen !== loopGeneration.current) break;
+
       // Check for pending seek (set by seekTo when user clicks progress bar
       // on an unbuffered position)
       if (state.current.pendingSeek >= 0) {
@@ -661,8 +744,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const seekTime = (seekByte / state.current.fileLength) * state.current.duration;
         state.current.pendingSeek = -1;
 
-        // const oldRangeCount = downloadedRangesRef.current.length;
-        // console.log(`[BUFFER-BAR] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)}), clearing ${oldRangeCount} stale downloaded ranges`);
+        const oldRangeCount = downloadedRangesRef.current.length;
+        console.log(`[BUFFER-BAR] SEEK: target=${seekTime.toFixed(1)}s (${formatBytes(seekByte)}), clearing ${oldRangeCount} stale downloaded ranges`);
 
         // 1. Clear old buffered data from SourceBuffers
         if (state.current.videoSourceBuffer) {
@@ -684,8 +767,29 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const syncOffset = (seekInfo && typeof seekInfo.offset === 'number')
           ? seekInfo.offset
           : seekByte;
+
+        // If mp4box says the nearest sync sample is at/past fileLength,
+        // the seek target is at the very end of the file — no data to download.
+        // Set isComplete and trigger the video 'ended' event by setting
+        // currentTime to duration and calling play() (which immediately ends).
+        if (syncOffset >= state.current.fileLength) {
+          console.log(`[MSE] Seek at end: syncOffset=${syncOffset} >= fileLength=${state.current.fileLength} — marking complete`);
+          state.current.currentOffset = state.current.fileLength;
+          setIsComplete(true);
+          isCompleteRef.current = true;
+          hasEverCompletedRef.current = true;
+          // Do NOT set currentTime=duration or call play() here — that jumps
+          // backward seeks near the end to duration and triggers 'ended',
+          // creating infinite cycles. The video will reach the end naturally
+          // during playback and fire 'ended' on its own.
+          break; // Exit download loop — no more data to fetch
+        }
+
         state.current.currentOffset = syncOffset;
         chunksAfterSeek.current = 1;
+
+        // Bug #17 debug: seek-after-completion re-entered loop with new offset
+        console.log(`[MSE] Seek processed: seekByte=${seekByte}, syncOffset=${syncOffset}, seekTime=${seekTime.toFixed(1)}s`);
 
         if (videoRef.current) {
           videoRef.current.currentTime = seekTime;
@@ -781,11 +885,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     // Only set isComplete if we reached the end (not interrupted by seek)
     const reachedEnd = state.current.currentOffset >= state.current.fileLength;
+    console.log(`[MSE] Download loop exited: offset=${state.current.currentOffset}, fileLength=${state.current.fileLength}, reachedEnd=${reachedEnd}`);
     if (!cancelledRef.current) {
       // Flush any remaining range reports
       flushRangeReport();
       if (reachedEnd) {
+        console.log('[MSE] isComplete=true — video reached end');
         setIsComplete(true);
+        isCompleteRef.current = true;
+          hasEverCompletedRef.current = true;
       }
       setIsPrefetching(false);
       setSpeed(0);
@@ -795,39 +903,169 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   // Direct seek function — avoids hard-restarting the download loop.
   // For already-buffered positions: just set currentTime, no download restart.
-  // For unbuffered positions: jump byte offset and let the running loop continue naturally.
+  // For unbuffered positions: the FIRST seek is instant (responsive feel),
+  // then subsequent rapid seeks within SEEK_DEBOUNCE_MS are debounced so
+  // only the LAST position in the rapid-fire window actually executes.
+  // This prevents overlapping downloads from arrow-key spam while keeping
+  // deliberate single-clicks feeling instant.
   const seekTo = useCallback((timeSeconds: number) => {
     if (!state.current.initialized || !streamUrl || useNative) return;
     if (state.current.fileLength <= 0 || !isFinite(timeSeconds) || timeSeconds < 0) return;
 
+    // Clamp timeSeconds to just below duration so seeks near the end still
+    // go through the normal flow. The download loop's syncOffset >= fileLength
+    // guard handles the true end-of-file case (preventing 416 errors).
+    // Without this clamp, clicking the progress bar at the very edge produces
+    // timeSeconds = duration exactly, which previously caused invalid range
+    // requests.
+    const clampedTime = Math.min(timeSeconds, state.current.duration - 0.001);
+
+    // Near-end FORWARD seek after completion — directly end the video.
+    // Only force the replay overlay for FORWARD seeks near the end (user
+    // holding right arrow to reach the end). BACKWARD seeks (user pressing
+    // left arrow to re-watch content) must fall through to normal seek flow —
+    // otherwise an infinite cycle occurs: guard→ended→seekBwd clears→backward
+    // seek target still within threshold→guard→ended→cycle repeats forever.
+    // A backward seek from duration lands at duration-5, which is STILL above
+    // the threshold (duration-5.1), so the guard would catch it again.
+    if (hasEverCompletedRef.current && clampedTime >= state.current.duration - 5.1) {
+      if (videoRef.current) {
+        if (videoRef.current.ended) return;
+        const isForwardSeek = clampedTime > videoRef.current.currentTime;
+        if (isForwardSeek) {
+          // Clear any pending debounce timer — prevents a previously scheduled
+          // executeSeek() from firing after the guard has already ended the video,
+          // which would restart the download loop and undo the guard's work.
+          if (seekDebounceTimerRef.current !== null) {
+            clearTimeout(seekDebounceTimerRef.current);
+            seekDebounceTimerRef.current = null;
+          }
+          console.log(`[MSE] Near-end FORWARD seek after completion: ${clampedTime.toFixed(1)}s — forcing video end`);
+          // Must pause BEFORE changing currentTime — otherwise the browser may
+          // fire 'play'/'playing' events from the seek, causing onPlay to fire
+          // while videoEnded=true and the overlay logic gets confused.
+          videoRef.current.pause();
+          // Move currentTime to a buffered position near the end, NOT to the
+          // global last buffered end (which could be far from duration after
+          // backward seeks that evict near-end data). Find the buffered range
+          // that actually overlaps with the near-end threshold. If no such
+          // range exists, don't change currentTime at all — the replay overlay
+          // covers the video regardless of what frame is displayed underneath.
+          const sb = videoRef.current.buffered;
+          const nearEndThreshold = state.current.duration - 5.1;
+          let nearEndTime: number | null = null;
+          for (let i = 0; i < sb.length; i++) {
+            // Find a buffered range that extends past the near-end threshold
+            if (sb.end(i) >= nearEndThreshold) {
+              // Use the end of this range (slightly inward to avoid edge)
+              nearEndTime = Math.min(sb.end(i) - 0.05, state.current.duration);
+              break;
+            }
+          }
+          if (nearEndTime !== null) {
+            videoRef.current.currentTime = nearEndTime;
+            console.log(`[MSE] Forward guard: moved currentTime to near-end buffered position ${nearEndTime.toFixed(1)}s`);
+          } else {
+            console.log(`[MSE] Forward guard: no buffered data near the end — leaving currentTime at ${videoRef.current.currentTime.toFixed(1)}s`);
+          }
+          videoRef.current.dispatchEvent(new Event('ended'));
+          return;
+        } else {
+          // Backward seek near the end — allow normal seek flow. The SourceBuffer
+          // likely has data from the previous download near the end. The user
+          // wants to re-watch content, not see the replay overlay.
+          console.log(`[MSE] Near-end BACKWARD seek after completion: ${clampedTime.toFixed(1)}s — allowing normal seek`);
+          // Fall through to buffered check and executeSeek below
+        }
+      } else {
+        // No videoRef — can't determine direction, force video end for safety
+        return;
+      }
+    }
+
     // 1. Check if the target position is already buffered in the SourceBuffer
     if (videoRef.current && videoRef.current.buffered.length > 0) {
       for (let i = 0; i < videoRef.current.buffered.length; i++) {
-        if (timeSeconds >= videoRef.current.buffered.start(i) &&
-            timeSeconds <= videoRef.current.buffered.end(i)) {
+        if (clampedTime >= videoRef.current.buffered.start(i) &&
+            clampedTime <= videoRef.current.buffered.end(i)) {
           // Already buffered — just set currentTime, browser seeks within buffer
-          videoRef.current.currentTime = timeSeconds;
+          // No debounce needed for buffered positions
+          console.log(`[MSE] Seek buffered: ${clampedTime.toFixed(1)}s — instant, no download`);
+          if (seekDebounceTimerRef.current !== null) {
+            clearTimeout(seekDebounceTimerRef.current);
+            seekDebounceTimerRef.current = null;
+          }
+          videoRef.current.currentTime = clampedTime;
           return;
         }
       }
     }
 
-    // 2. Position is NOT buffered — jump the download to the new byte offset
-    const seekByte = Math.floor((timeSeconds / state.current.duration) * state.current.fileLength);
-    state.current.pendingSeek = seekByte;
-    chunksAfterSeek.current = 0;
-    setIsComplete(false);
+    // 2. Position is NOT buffered
+    // Set video currentTime immediately for visual feedback (scrubber jumps)
+    const isFirstSeek = lastSeekTimeRef.current === 0 || (Date.now() - lastSeekTimeRef.current) >= SEEK_DEBOUNCE_MS;
+    console.log(`[MSE] Seek unbuffered: ${clampedTime.toFixed(1)}s — ${isFirstSeek ? 'instant (first)' : 'debounced'}`);
+    if (videoRef.current) {
+      videoRef.current.currentTime = clampedTime;
+    }
 
-    // Abort the in-flight fetch so the download loop processes the pending seek
-    abortRef.current?.abort();
+    // Helper: actually execute the unbuffered seek
+    const executeSeek = () => {
+      const seekByte = Math.min(
+        Math.floor((clampedTime / state.current.duration) * state.current.fileLength),
+        state.current.fileLength - 1  // Clamp: clampedTime ≈ duration can produce seekByte ≈ fileLength
+      );
+      state.current.pendingSeek = seekByte;
+      // Bug fix: reset currentOffset so the download loop can re-enter after
+      // completion. When the video finishes, currentOffset >= fileLength,
+      // which makes the while condition (currentOffset < fileLength) false,
+      // preventing the loop from entering and processing pendingSeek.
+      // Resetting to seekByte allows the loop to enter, where the pendingSeek
+      // handler will set currentOffset to the correct mp4box sync offset.
+      state.current.currentOffset = seekByte;
+      chunksAfterSeek.current = 0;
+      setIsComplete(false);
+      isCompleteRef.current = false;
+      lastSeekTimeRef.current = Date.now();
 
-    // If the download loop isn't running AND we're not paused, restart it.
-    // When paused, we store the pendingSeek but don't resume — the user must
-    // explicitly click "resume buffering" to continue downloading.
-    if (!state.current.downloading && !isPausedRef.current && downloadLoopRef.current) {
-      state.current.downloading = true;
-      setIsPrefetching(true);
-      downloadLoopRef.current(streamUrl);
+      // Abort the in-flight fetch so the download loop processes the pending seek
+      abortRef.current?.abort();
+
+      // Restart download loop — seeking to an unbuffered position means the
+      // user wants to watch from there, so downloads must resume regardless
+      // of pause state. Clear isPaused so resumePrefetch() doesn't get stuck
+      // (it checks !state.current.downloading which would be true if loop is
+      // already running from this restart).
+      if (!state.current.downloading && downloadLoopRef.current) {
+        console.log('[MSE] Restarting download loop after seek (offset was at completion)');
+        isPausedRef.current = false;
+        setIsPaused(false);
+        state.current.downloading = true;
+        setIsPrefetching(true);
+        downloadLoopRef.current(streamUrl);
+      }
+    };
+
+    // First seek is instant; subsequent seeks within SEEK_DEBOUNCE_MS are debounced
+    const timeSinceLastSeek = Date.now() - lastSeekTimeRef.current;
+    if (timeSinceLastSeek >= SEEK_DEBOUNCE_MS || lastSeekTimeRef.current === 0) {
+      // First seek or debounce window has expired — execute immediately
+      if (seekDebounceTimerRef.current !== null) {
+        clearTimeout(seekDebounceTimerRef.current);
+        seekDebounceTimerRef.current = null;
+      }
+      executeSeek();
+    } else {
+      // Within debounce window — delay execution, only the last position in
+      // this rapid-fire window will actually execute
+      if (seekDebounceTimerRef.current !== null) {
+        clearTimeout(seekDebounceTimerRef.current);
+      }
+      const remainingDebounce = SEEK_DEBOUNCE_MS - timeSinceLastSeek;
+      seekDebounceTimerRef.current = window.setTimeout(() => {
+        seekDebounceTimerRef.current = null;
+        executeSeek();
+      }, remainingDebounce);
     }
   }, [streamUrl, useNative]);
 
@@ -836,6 +1074,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     isPausedRef.current = true;
     loopGeneration.current++;
     abortRef.current?.abort();
+    // Clear any pending seek debounce timer on pause
+    if (seekDebounceTimerRef.current !== null) {
+      clearTimeout(seekDebounceTimerRef.current);
+      seekDebounceTimerRef.current = null;
+    }
     setIsPaused(true);
     setIsPrefetching(false);
     setSpeed(0);
@@ -851,6 +1094,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   };
 
   const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    // Bug #4 fix: when the video element encounters a fatal decoder error
+    // (CHUNK_DEMUXER_ERROR_APPEND_FAILED), fall back to native playback.
+    // The error is permanent — once HTMLMediaElement.error is set, no more
+    // data can be appended to the SourceBuffer, so MSE is irrecoverable.
+    if (el) {
+      el.addEventListener('error', () => {
+        const err = el.error;
+        if (err && (err.code === MediaError.MEDIA_ERR_DECODE ||
+                    err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)) {
+          if (!cancelledRef.current && !useNative) {
+            console.warn('[MSE] Fatal video error (code', err.code, ') — falling back to native playback');
+            setUseNative(true);
+          }
+        }
+      });
+    }
     videoRef.current = el;
   }, []);
 
@@ -894,7 +1153,6 @@ async function loadMP4Box(): Promise<any> {
   }
 }
 
-// @ts-expect-error — kept for potential future use, currently only referenced in commented-out debug logs
 function formatBytes(b: number): string {
   if (b < 1024) return `${b}B`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)}KB`;

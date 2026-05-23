@@ -15,6 +15,7 @@ use rand::Rng;
 pub mod server;
 pub mod api_routes;
 pub mod hls;
+pub mod download_pool;
 
 /// Single source of truth for the Actix streaming server port.
 /// Referenced in lib.rs (server startup) and exposed to the frontend
@@ -136,9 +137,10 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                download_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                download_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
                 prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                download_pool: Arc::new(tokio::sync::Mutex::new(None)),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
