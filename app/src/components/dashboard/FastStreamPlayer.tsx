@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+﻿import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -1009,8 +1009,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 className="p-1.5 hover:bg-white/10 rounded flex items-center gap-0.5"
                 title={`Download limited to ${formatSpeedLimit(settings.downloadSpeedLimit)}`}
               >
-                <svg className="w-3.5 h-3.5 text-blue-400" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                <span className="text-xs font-mono text-blue-400">{formatSpeedLimitCompact(settings.downloadSpeedLimit)}</span>
+                <svg className="w-3.5 h-3.5 text-nobuf-primary" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                <span className="text-xs font-mono text-nobuf-primary">{formatSpeedLimitCompact(settings.downloadSpeedLimit)}</span>
               </button>
             )}
             {/* Speed */}
@@ -1081,7 +1081,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               <span className="text-white/70 text-xs">Loop</span>
               <button
                 onClick={() => setLoop(!loop)}
-                className={`w-10 h-5 rounded-full transition-colors relative ${loop ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+                className={`w-10 h-5 rounded-full transition-colors relative ${loop ? 'bg-nobuf-secondary' : 'bg-white/20'}`}
               >
                 <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${loop ? 'left-5' : 'left-0.5'}`} />
               </button>
@@ -1094,7 +1094,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={s}
                     onClick={() => updateSetting('playerSkipForward', s as SkipDuration)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipForward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipForward === s ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {s}s
                   </button>
@@ -1103,7 +1103,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   type="number" min="1" max="60"
                   value={settings.playerSkipForward}
                   onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipForward', v as SkipDuration); }}
-                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-secondary focus:outline-none text-center"
                   title="Custom seconds (1-60)"
                 />
               </div>
@@ -1116,7 +1116,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={s}
                     onClick={() => updateSetting('playerSkipBackward', s as SkipDuration)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipBackward === s ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipBackward === s ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {s}s
                   </button>
@@ -1125,7 +1125,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   type="number" min="1" max="60"
                   value={settings.playerSkipBackward}
                   onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipBackward', v as SkipDuration); }}
-                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-telegram-secondary focus:outline-none text-center"
+                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-secondary focus:outline-none text-center"
                   title="Custom seconds (1-60)"
                 />
               </div>
@@ -1147,7 +1147,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={val}
                     onClick={() => updateSetting('playerVideoFit', val)}
-                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerVideoFit === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerVideoFit === val ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {label}
                   </button>
@@ -1162,7 +1162,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={r}
                     onClick={() => setRotation(r)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${rotation === r ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${rotation === r ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {r}°
                   </button>
@@ -1179,7 +1179,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 type="range" min="0.5" max="2" step="0.1"
                 value={brightness}
                 onChange={e => setBrightness(parseFloat(e.target.value))}
-                className="w-full accent-telegram-secondary h-1"
+                className="w-full accent-nobuf-secondary h-1"
               />
             </div>
             {/* PiP */}
@@ -1187,7 +1187,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               <span className="text-white/70 text-xs">Picture-in-Picture</span>
               <button
                 onClick={() => setPip(!pip)}
-                className={`w-10 h-5 rounded-full transition-colors relative ${pip ? 'bg-telegram-secondary' : 'bg-white/20'}`}
+                className={`w-10 h-5 rounded-full transition-colors relative ${pip ? 'bg-nobuf-secondary' : 'bg-white/20'}`}
               >
                 <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${pip ? 'left-5' : 'left-0.5'}`} />
               </button>
@@ -1210,7 +1210,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={val}
                     onClick={() => updateSetting('playerAutoHideDelay', val)}
-                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-telegram-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {label}
                   </button>
@@ -1223,7 +1223,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           <div className="px-4 py-3 border-b border-white/10">
             <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1.5">
               <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
-              <span className="inline-block w-2 h-2 rounded-full bg-blue-400" />
+              <span className="inline-block w-2 h-2 rounded-full bg-nobuf-primary" />
               Bandwidth
             </h3>
             {/* Prebuffer speed limit */}
@@ -1284,7 +1284,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             {/* Download speed limit */}
             <div className="mb-2">
               <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-400" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-nobuf-primary" />
                 Download speed
               </label>
               <div className="flex flex-wrap gap-1 items-center">
@@ -1292,7 +1292,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <button
                     key={p.value}
                     onClick={() => { updateSetting('downloadSpeedLimit', p.value as SpeedLimitValue); setCustomDownloadValue(''); }}
-                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.downloadSpeedLimit === p.value ? 'bg-blue-500/30 text-blue-400 ring-1 ring-blue-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.downloadSpeedLimit === p.value ? 'bg-nobuf-primary/30 text-nobuf-primary ring-1 ring-nobuf-primary' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
                   >
                     {p.label}
                   </button>
@@ -1311,7 +1311,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                         updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
                       }
                     }}
-                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-blue-400 focus:outline-none text-center"
+                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-primary focus:outline-none text-center"
                   />
                   <select
                     value={customDownloadUnit}
@@ -1323,7 +1323,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                         updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
                       }
                     }}
-                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-blue-400 focus:outline-none"
+                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-nobuf-primary focus:outline-none"
                   >
                     <option value="kb">KB/s</option>
                     <option value="mb">MB/s</option>
@@ -1331,7 +1331,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </div>
               </div>
               {settings.downloadSpeedLimit > 0 && (
-                <div className="mt-1.5 text-[10px] text-blue-400/70">
+                <div className="mt-1.5 text-[10px] text-nobuf-primary/70">
                   Active: {formatSpeedLimit(settings.downloadSpeedLimit)}
                 </div>
               )}
@@ -1390,7 +1390,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           <div className={`flex items-center gap-2 bg-black/40 rounded-lg px-3 py-2 backdrop-blur-sm transition-opacity duration-300 ${dlOverlay.completed ? 'opacity-80' : 'opacity-100'}`}>
             <div className="flex-1 bg-white/10 rounded-full h-2 overflow-hidden">
               <div
-                className={`h-full rounded-full transition-all duration-300 ${dlOverlay.completed || dlOverlay.fromCache ? 'bg-green-400' : 'bg-telegram-secondary'}`}
+                className={`h-full rounded-full transition-all duration-300 ${dlOverlay.completed || dlOverlay.fromCache ? 'bg-green-400' : 'bg-nobuf-secondary'}`}
                 style={{ width: `${dlOverlay.percent}%` }}
               />
             </div>
@@ -1431,7 +1431,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               {/* Icon + delta */}
               <div className="flex items-center gap-2">
                 {isForward ? (
-                  <svg className="w-7 h-7 text-telegram-primary" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-7 h-7 text-nobuf-primary" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M5.59 7.41L10.18 12l-4.59 4.59L7 18l6-6-6-6zM16 18l6-6-6-6-1.41 1.41L20.18 12l-5.59 4.59L16 18z" />
                   </svg>
                 ) : (
@@ -1439,15 +1439,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                     <path d="M18.41 16.59L13.82 12l4.59-4.59L17 6l-6 6 6 6zM8 6l-6 6 6 6 1.41-1.41L3.82 12l5.59-4.59L8 6z" />
                   </svg>
                 )}
-                <span className={`text-xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>
+                <span className={`text-xl font-bold font-mono ${isForward ? 'text-nobuf-primary' : 'text-white'}`}>
                   {isForward ? '+' : '-'}{skipFeedback.amount}s
                 </span>
               </div>
               {/* FROM → TO — big, bold, dominant */}
               <div className="flex items-center gap-4">
                 <span className="text-2xl font-bold text-white font-mono">{fmt(fromTime)}</span>
-                <svg className={`w-6 h-6 ${isForward ? 'text-telegram-primary' : 'text-white/60'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" /></svg>
-                <span className={`text-2xl font-bold font-mono ${isForward ? 'text-telegram-primary' : 'text-white'}`}>{fmt(toTime)}</span>
+                <svg className={`w-6 h-6 ${isForward ? 'text-nobuf-primary' : 'text-white/60'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" /></svg>
+                <span className={`text-2xl font-bold font-mono ${isForward ? 'text-nobuf-primary' : 'text-white'}`}>{fmt(toTime)}</span>
               </div>
             </div>
           </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { Folder, Download, Trash2, Check } from 'lucide-react';
 import { TelegramFile } from '../../types';
 import { FileTypeIcon } from '../FileTypeIcon';
@@ -62,9 +62,9 @@ export function FileListItem({
                     onDrop(e, file.id);
                 }
             }}
-            className={`group grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 items-center px-4 py-3 rounded-lg cursor-pointer border border-transparent transition-all hover:bg-telegram-hover 
-                ${selectedIds.includes(file.id) ? 'bg-telegram-primary/10 border-telegram-primary/20' : ''}
-                ${isDragOver ? 'ring-2 ring-telegram-primary bg-telegram-primary/20' : ''}
+            className={`group grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 items-center px-4 py-3 rounded-lg cursor-pointer border border-transparent transition-all hover:bg-nobuf-hover 
+                ${selectedIds.includes(file.id) ? 'bg-nobuf-primary/10 border-nobuf-primary/20' : ''}
+                ${isDragOver ? 'ring-2 ring-nobuf-primary bg-nobuf-primary/20' : ''}
             `}
         >
             <div
@@ -73,15 +73,15 @@ export function FileListItem({
             >
                 <div className={`w-[18px] h-[18px] rounded border-2 flex items-center justify-center transition-all ${
                     selectedIds.includes(file.id)
-                        ? 'bg-telegram-primary border-telegram-primary'
-                        : 'border-telegram-border/60 hover:border-telegram-subtext'
+                        ? 'bg-nobuf-primary border-nobuf-primary'
+                        : 'border-nobuf-border/60 hover:border-nobuf-subtext'
                 }`}>
                     {selectedIds.includes(file.id) && <Check className="w-3 h-3 text-black" strokeWidth={3} />}
                 </div>
             </div>
-            <div className="truncate text-sm text-telegram-text font-medium relative pr-8">
+            <div className="truncate text-sm text-nobuf-text font-medium relative pr-8">
                 <span className="inline-flex items-center gap-2">
-                    {isFolder ? <Folder className="w-4 h-4 text-telegram-primary flex-shrink-0" /> : <FileTypeIcon filename={file.name} className="w-4 h-4 flex-shrink-0" />}
+                    {isFolder ? <Folder className="w-4 h-4 text-nobuf-primary flex-shrink-0" /> : <FileTypeIcon filename={file.name} className="w-4 h-4 flex-shrink-0" />}
                     {file.name}
                 </span>
                 {/* Cache session badge — green text + mini progress bar */}
@@ -99,13 +99,13 @@ export function FileListItem({
                     </div>
                 )}
                 {/* List Actions */}
-                <div className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 flex items-center bg-telegram-surface border border-telegram-border shadow-lg rounded px-1">
-                    <button onClick={(e) => { e.stopPropagation(); onDownload(file.id, file.name) }} className="p-1 hover:text-telegram-text text-telegram-subtext" title="Download"><Download className="w-4 h-4" /></button>
-                    <button onClick={(e) => { e.stopPropagation(); onDelete(file.id) }} className="p-1 hover:text-red-400 text-telegram-subtext" title="Delete"><Trash2 className="w-4 h-4" /></button>
+                <div className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 flex items-center bg-nobuf-surface border border-nobuf-border shadow-lg rounded px-1">
+                    <button onClick={(e) => { e.stopPropagation(); onDownload(file.id, file.name) }} className="p-1 hover:text-nobuf-text text-nobuf-subtext" title="Download"><Download className="w-4 h-4" /></button>
+                    <button onClick={(e) => { e.stopPropagation(); onDelete(file.id) }} className="p-1 hover:text-red-400 text-nobuf-subtext" title="Delete"><Trash2 className="w-4 h-4" /></button>
                 </div>
             </div>
-            <div className="text-right text-xs text-telegram-subtext truncate">{file.sizeStr}</div>
-            <div className="text-right text-xs text-telegram-subtext font-mono opacity-50 truncate">{file.created_at || '-'}</div>
+            <div className="text-right text-xs text-nobuf-subtext truncate">{file.sizeStr}</div>
+            <div className="text-right text-xs text-nobuf-subtext font-mono opacity-50 truncate">{file.created_at || '-'}</div>
         </div>
     );
 }

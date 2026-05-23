@@ -1,4 +1,4 @@
-import { BandwidthStats } from '../../types';
+﻿import { BandwidthStats } from '../../types';
 import { formatBytes } from '../../utils';
 
 interface BandwidthWidgetProps {
@@ -13,13 +13,13 @@ export function BandwidthWidget({ bandwidth }: BandwidthWidgetProps) {
     const percent = Math.min((totalBytes / limit) * 100, 100);
 
     return (
-        <div className="mt-3 text-xs text-telegram-subtext space-y-1">
+        <div className="mt-3 text-xs text-nobuf-subtext space-y-1">
             <div className="flex justify-between">
                 <span>Used Today:</span>
             </div>
-            <div className="w-full bg-telegram-border rounded-full h-1.5 overflow-hidden">
+            <div className="w-full bg-nobuf-border rounded-full h-1.5 overflow-hidden">
                 <div
-                    className="bg-telegram-primary h-full rounded-full transition-all duration-500"
+                    className="bg-nobuf-primary h-full rounded-full transition-all duration-500"
                     style={{ width: `${percent}%` }}
                 ></div>
             </div>

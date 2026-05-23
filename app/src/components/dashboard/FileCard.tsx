@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+﻿import { motion } from 'framer-motion';
 import { useState, useEffect } from 'react';
 import { Folder, Trash2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -100,9 +100,9 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                     if (onDragEnd) onDragEnd();
                 }}
                 whileHover={{ y: -4 }}
-                className={`group cursor-pointer bg-telegram-surface rounded-xl overflow-hidden border hover:shadow-[0_4px_20px_rgba(0,0,0,0.2)] transition-all relative
-                ${isSelected ? 'border-telegram-primary bg-telegram-primary/5 ring-1 ring-telegram-primary' : 'border-telegram-border hover:border-telegram-primary/50'}
-                ${isDragOver ? 'ring-2 ring-telegram-primary bg-telegram-primary/20 scale-105' : ''}`}
+                className={`group cursor-pointer bg-nobuf-surface rounded-xl overflow-hidden border hover:shadow-[0_4px_20px_rgba(0,0,0,0.2)] transition-all relative
+                ${isSelected ? 'border-nobuf-primary bg-nobuf-primary/5 ring-1 ring-nobuf-primary' : 'border-nobuf-border hover:border-nobuf-primary/50'}
+                ${isDragOver ? 'ring-2 ring-nobuf-primary bg-nobuf-primary/20 scale-105' : ''}`}
                 style={height ? { height: `${height}px` } : { aspectRatio: '4/3' }}
             >
                 {/* Thumbnail or Icon */}
@@ -119,9 +119,9 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                 ) : (
                     <div className="absolute inset-0 flex items-center justify-center p-4">
                         {isFolder ? (
-                            <Folder className="w-12 h-12 text-telegram-primary" />
+                            <Folder className="w-12 h-12 text-nobuf-primary" />
                         ) : thumbnailLoading && isImageFile(file.name) ? (
-                            <div className="w-8 h-8 border-2 border-telegram-primary/30 border-t-telegram-primary rounded-full animate-spin" />
+                            <div className="w-8 h-8 border-2 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
                         ) : (
                             <FileTypeIcon filename={file.name} size="lg" />
                         )}
@@ -134,7 +134,7 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                         e.stopPropagation();
                         if (onToggleSelection) onToggleSelection();
                     }}
-                    className={`absolute top-2 left-2 w-5 h-5 rounded-full border flex items-center justify-center transition-all z-10 cursor-pointer ${isSelected ? 'bg-telegram-primary border-telegram-primary' : 'border-white/50 bg-black/30 opacity-0 group-hover:opacity-100'}`}
+                    className={`absolute top-2 left-2 w-5 h-5 rounded-full border flex items-center justify-center transition-all z-10 cursor-pointer ${isSelected ? 'bg-nobuf-primary border-nobuf-primary' : 'border-white/50 bg-black/30 opacity-0 group-hover:opacity-100'}`}
                 >
                     {isSelected && <div className="w-1.5 h-1.5 bg-black rounded-full" />}
                 </div>
@@ -157,9 +157,9 @@ export function FileCard({ file, onDelete, onDownload, isSelected, onClick, onCo
                 )}
 
                 {/* File info overlay at bottom */}
-                <div className={`absolute bottom-0 left-0 right-0 p-3 ${thumbnail ? 'text-white' : 'text-telegram-text'}`}>
+                <div className={`absolute bottom-0 left-0 right-0 p-3 ${thumbnail ? 'text-white' : 'text-nobuf-text'}`}>
                     <h3 className="text-sm font-medium truncate w-full" title={file.name}>{file.name}</h3>
-                    <p className={`text-xs mt-0.5 ${thumbnail ? 'text-white/70' : 'text-telegram-subtext'}`}>{file.sizeStr}</p>
+                    <p className={`text-xs mt-0.5 ${thumbnail ? 'text-white/70' : 'text-nobuf-subtext'}`}>{file.sizeStr}</p>
                 </div>
 
                 {/* Quick actions on hover */}
