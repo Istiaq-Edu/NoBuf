@@ -44,12 +44,12 @@ jobs:
           script: |
             const version = `${{ steps.get_version.outputs.VERSION }}`;
             const isBeta = version.includes('beta') || version.includes('alpha');
-            const body = `nobuff v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of nobuff.'}\n\nnobuff is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux\n\nSee the assets below to download and install.`;
+            const body = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\nNoBuf is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux\n\nSee the assets below to download and install.`;
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: `v${version}`,
-              name: `nobuff v${version}`,
+              name: `NoBuf v${version}`,
               body: body,
               draft: true,
               prerelease: isBeta
@@ -183,7 +183,7 @@ jobs:
           # ── Write new AppRun ──
           cat > squashfs-root/AppRun << 'APPRUN_EOF'
           #!/usr/bin/env bash
-          # ── nobuff — cross-distro AppRun wrapper ──
+          # ── NoBuf — cross-distro AppRun wrapper ──
           # Fixes EGL_BAD_ALLOC on Arch/Fedora/rolling-release distros by ensuring
           # the host's GPU driver stack is used instead of bundled Ubuntu Mesa libs.
           set -u

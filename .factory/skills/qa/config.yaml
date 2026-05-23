@@ -1,4 +1,4 @@
-project: nobuff
+project: NoBuf
 imagemagick: false
 environments:
   local:
@@ -45,7 +45,7 @@ apps:
     test_tool: curl
     build_command: "cd app && npm install && npm run tauri build"
     description: >
-      nobuff is a Tauri v2 desktop app. The frontend (React/TypeScript/TailwindCSS)
+      NoBuf is a Tauri v2 desktop app. The frontend (React/TypeScript/TailwindCSS)
       runs in a webview and requires the Rust backend. GUI testing requires a local desktop
       environment and cannot run in headless CI. REST API testing (port 8550) can run
       in CI via curl when the API server is enabled.
