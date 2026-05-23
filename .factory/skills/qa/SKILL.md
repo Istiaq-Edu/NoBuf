@@ -1,13 +1,13 @@
 ---
 name: qa
 description: >
-  Run QA tests for nobuff. Analyzes git diff to determine affected areas,
+  Run QA tests for NoBuf. Analyzes git diff to determine affected areas,
   runs configured test flows with curl (REST API) and GUI (manual), and generates
   diff-targeted reports. REST API tests can run in CI; GUI flows require local desktop.
   Use when testing PRs, releases, or smoke testing environments.
 ---
 
-# QA Orchestrator for nobuff
+# QA Orchestrator for NoBuf
 
 **SCOPE: This skill performs manual/functional QA only — verifying that the application actually works by interacting with it as a real user would. Do NOT run or report on CI checks, linting, ESLint, typecheck, unit tests, or any static analysis. Those are handled by separate workflows.**
 

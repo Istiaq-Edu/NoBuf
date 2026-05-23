@@ -42,7 +42,7 @@ pub async fn cmd_create_folder(
         broadcast: true,
         megagroup: false,
         title: format!("{} [NB]", name),
-        about: "nobuff Storage Folder\n[nobuff-folder]".to_string(),
+        about: "NoBuf Storage Folder\n[NoBuf-folder]".to_string(),
         geo_point: None,
         address: None,
         for_import: false,
@@ -992,7 +992,7 @@ pub async fn cmd_scan_folders(
                 }).await {
                     Ok(tl::enums::messages::ChatFull::Full(f)) => {
                         if let tl::enums::ChatFull::Full(cf) = f.full_chat {
-                             if cf.about.contains("[telegram-drive-folder]") || cf.about.contains("[nobuff-folder]") {
+                             if cf.about.contains("[telegram-drive-folder]") || cf.about.contains("[NoBuf-folder]") {
                                  log::info!(" -> MATCH via About: {}", name);
                                  folders.push(FolderMetadata { id, name: name.clone(), parent_id: None });
                              }

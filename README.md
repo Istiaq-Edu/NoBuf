@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="nobuff-baner.png" alt="nobuff" width="100%">
+  <img src="nobuf-banner.png" alt="NoBuf" width="100%">
 </p>
 
 <h3 align="center">Zero-buffer video streaming. Powered by Telegram.</h3>
@@ -10,23 +10,23 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Istiaq-Edu/nobuff/releases"><img alt="Beta" src="https://img.shields.io/badge/Status-Beta_0.1.0-orange"></a>
-  <a href="https://github.com/Istiaq-Edu/nobuff/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+  <a href="https://github.com/Istiaq-Edu/nobuf/releases"><img alt="Beta" src="https://img.shields.io/badge/Status-Beta_0.1.0-orange"></a>
+  <a href="https://github.com/Istiaq-Edu/nobuf/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue">
-  <a href="https://github.com/Istiaq-Edu/nobuff/actions"><img alt="CI" src="https://github.com/Istiaq-Edu/nobuff/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/Istiaq-Edu/nobuf/actions"><img alt="CI" src="https://github.com/Istiaq-Edu/nobuf/actions/workflows/release.yml/badge.svg"></a>
   <img alt="Made with Tauri" src="https://img.shields.io/badge/Made_with-Tauri_2-fc4b24?logo=tauri">
   <img alt="Built with Rust" src="https://img.shields.io/badge/Backend-Rust-ff6f00?logo=rust">
 </p>
 
 ---
 
-## Why "nobuff"?
+## Why "NoBuf"?
 
 Because buffering is a solved problem — we just solved it differently.
 
-nobuff uses **Media Source Extensions** (MSE) to stream video directly from Telegram's servers into your browser engine. There's no download-first, no transcode-wait, no spinner. The player continuously prebuffers the next 60 seconds while you watch, so playback never stalls.
+NoBuf uses **Media Source Extensions** (MSE) to stream video directly from Telegram's servers into your browser engine. There's no download-first, no transcode-wait, no spinner. The player continuously prebuffers the next 60 seconds while you watch, so playback never stalls.
 
-Telegram channels become your video library. Telegram's CDN becomes your streaming backend. **nobuff is the player that makes it feel local.**
+Telegram channels become your video library. Telegram's CDN becomes your streaming backend. **NoBuf is the player that makes it feel local.**
 
 ---
 
@@ -110,7 +110,7 @@ You click play
 | **Zero cost** | Free for all users, no subscription needed |
 | **Instant availability** | No processing delays — upload, stream, or download immediately |
 
-Your Telegram channels become a video library. Your Saved Messages become a quick-access drive. nobuff gives you the explorer UI and streaming engine to make it seamless.
+Your Telegram channels become a video library. Your Saved Messages become a quick-access drive. NoBuf gives you the explorer UI and streaming engine to make it seamless.
 
 ---
 
@@ -139,7 +139,7 @@ Your Telegram channels become a video library. Your Saved Messages become a quic
 - 🤖 **REST API** — Local HTTP API (off by default) with API key auth. Enables AI agents and automation.
 - 📊 **Bandwidth Monitor** — Daily upload/download tracking with configurable limits.
 - 🎚️ **Speed Limiter** — Per-session throttle for streaming and downloads.
-- 🔄 **Auto-Updates** — built-in update delivery via Tauri's updater plugin. *(Not yet active in beta — watch [Releases](https://github.com/Istiaq-Edu/nobuff/releases) for new builds.)*
+- 🔄 **Auto-Updates** — built-in update delivery via Tauri's updater plugin. *(Not yet active in beta — watch [Releases](https://github.com/Istiaq-Edu/nobuf/releases) for new builds.)*
 - 🔒 **Local-Only** — All credentials and data stay on your machine. No telemetry, no third-party servers.
 - 🖥️ **Cross-Platform** — Windows, macOS (Intel + Apple Silicon), Linux (AppImage + .deb).
 
@@ -276,8 +276,8 @@ sudo apt update && sudo apt install libwebkit2gtk-4.1-dev build-essential curl w
 
 ```bash
 # 1. Clone
-git clone https://github.com/Istiaq-Edu/nobuff.git
-cd nobuff
+git clone https://github.com/Istiaq-Edu/nobuf.git
+cd nobuf
 
 # 2. Install frontend dependencies
 cd app
@@ -296,7 +296,7 @@ npm run tauri build
 
 ## REST API
 
-nobuff includes a local REST API for programmatic access and AI integration. **Disabled by default** — enable in Settings.
+NoBuf includes a local REST API for programmatic access and AI integration. **Disabled by default** — enable in Settings.
 
 ### Endpoints
 
@@ -320,7 +320,7 @@ curl -H "X-API-Key: YOUR_KEY" http://localhost:PORT/api/v1/files?limit=10
 
 ## Acknowledgments
 
-- **[Telegram-Drive](https://github.com/caamer20/Telegram-Drive)** — nobuff's core architecture is based on caamer20's Telegram-Drive project. The idea of using Telegram channels as a file storage backend and the initial Tauri + Grammers integration originate from this work.
+- **[Telegram-Drive](https://github.com/caamer20/Telegram-Drive)** — NoBuf's core architecture is based on caamer20's Telegram-Drive project. The idea of using Telegram channels as a file storage backend and the initial Tauri + Grammers integration originate from this work.
 - **[FastStream](https://github.com/Andrews54757/FastStream)** — the MSE video prebuffering engine and progressive fragment strategy were adapted from Andrews54757's FastStream project. The `lib/faststream/` module is based on their approach to Media Source Extensions streaming.
 
 ---
