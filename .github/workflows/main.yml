@@ -1,15 +1,13 @@
-name: "Publish"
+name: "Build Validation"
 on:
   push:
     branches:
       - main
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
-  publish-tauri:
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+  build-validation:
     strategy:
       fail-fast: false
       matrix:
@@ -54,25 +52,15 @@ jobs:
             libssl-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            libfuse2
 
       - name: install frontend dependencies
         working-directory: app
         run: npm install
 
-      - name: build the app
-        uses: tauri-apps/tauri-action@v0
+      - name: build the app (validation only)
+        working-directory: app
+        run: npm run tauri build -- ${{ matrix.args }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apple signing disabled - produces unsigned app
-          # To enable signing, add APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, 
-          # and APPLE_SIGNING_IDENTITY secrets to your repository
-        with:
-          tagName: app-v__VERSION__ 
-          releaseName: 'App v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
-          releaseDraft: true
-          prerelease: false
-          projectPath: ./app
-          # This pulls the 'args' from the matrix above (e.g., forcing ARM on Mac)
-          args: ${{ matrix.args }}
+          CI: true
