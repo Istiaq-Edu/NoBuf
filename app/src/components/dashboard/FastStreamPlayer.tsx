@@ -65,6 +65,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
   const skipFeedbackTimer = useRef<number>(0);
   const skipFeedbackKey = useRef(0);
+  const [videoEnded, setVideoEnded] = useState(false);
+  // Ref synced alongside videoEnded state — prevents stale closure in
+  // onPlay handler (which is inside a useEffect and doesn't have videoEnded
+  // in its deps). Also used by seekFwd/seekBwd for synchronous checks.
+  const videoEndedRef = useRef(false);
 
   const [cachePercent, setCachePercent] = useState(0);
   const [cacheComplete, setCacheComplete] = useState(false);
@@ -407,6 +412,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
     };
     const onCanPlay = () => {
+      // Don't auto-play when the replay overlay is showing — the MSE guard
+      // already paused the video and dispatched 'ended'. canplay fires from
+      // the currentTime change, and calling play() here would resume playback
+      // under the overlay, eventually causing the video to hit 'waiting' at
+      // duration (the "loading on finish" bug).
+      if (videoEndedRef.current) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
@@ -426,8 +437,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         setBuf(maxBuf);
       }
     };
-    const onPlay = () => setPlaying(true);
+    const onPlay = () => {
+      setPlaying(true);
+      // Only clear videoEnded if the video is NOT at the end.
+      // When the MSE guard dispatches a synthetic 'ended' event, it also
+      // calls pause(). If a download loop restart then causes play(), onPlay
+      // fires and would clear videoEnded=false — destroying the replay overlay.
+      // Only clear when the user intentionally starts a replay from the beginning.
+      if (videoEndedRef.current && v.currentTime > 1) {
+        // Video ended but now playing from a non-start position — keep overlay.
+        // This happens when a seek restarts the download loop after the MSE
+        // guard forced videoEnded=true. The replay overlay should stay.
+        console.log(`[Player] onPlay while videoEnded=true at currentTime=${v.currentTime.toFixed(1)}s — keeping replay overlay`);
+      } else {
+        console.log('[Player] onPlay — clearing videoEnded');
+        setVideoEnded(false);
+        videoEndedRef.current = false;
+      }
+    };
     const onPause = () => setPlaying(false);
+    const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
     const onWait = () => setLoad(true);
     const onPlay2 = () => setLoad(false);
     const onProgress = () => {
@@ -447,6 +476,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     v.addEventListener('timeupdate', onTime);
     v.addEventListener('play', onPlay);
     v.addEventListener('pause', onPause);
+    v.addEventListener('ended', onEnded);
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
@@ -458,6 +488,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('timeupdate', onTime);
       v.removeEventListener('play', onPlay);
       v.removeEventListener('pause', onPause);
+      v.removeEventListener('ended', onEnded);
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
@@ -553,6 +584,20 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     updateSetting('playerSpeed', rate);
   }, [rate, updateSetting]);
 
+  const replay = useCallback(() => {
+    const v = vidRef.current;
+    if (!v) return;
+    setVideoEnded(false);
+    videoEndedRef.current = false;
+    if (useNative) {
+      v.play().catch(() => {});
+    } else {
+      seekTo(0);
+      // seekTo sets pendingSeek + restarts download loop; video.play() starts playback
+      v.play().catch(() => {});
+    }
+  }, [useNative, seekTo]);
+
   useEffect(() => {
     if (pip && vidRef.current) {
       vidRef.current.requestPictureInPicture?.().catch(() => { toast.error('PiP not supported'); setPip(false); });
@@ -574,18 +619,33 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => observer.disconnect();
   }, []);
 
-  const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; v.paused ? v.play().catch(() => {}) : v.pause(); }, []);
+  const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; if (videoEndedRef.current) { replay(); } else { v.paused ? v.play().catch(() => {}) : v.pause(); } }, [replay]);
   const seek = useCallback((s: number) => {
     const v = vidRef.current;
     if (!v) return;
     const target = Math.max(0, Math.min(v.currentTime + s, dur));
     if (useNative) {
       v.currentTime = target;
+    } else if (target >= dur) {
+      // Seeking to/past the end → directly show replay overlay.
+      // Playing through the last fraction of a second with MSE is unreliable
+      // (SourceBuffer may lack data, 'ended' event may not fire, and React
+      // state prefetchComplete can be stale after backward seeks reset it).
+      // Directly ending the video is the most reliable approach.
+      v.currentTime = dur;
+      v.pause();
+      setVideoEnded(true);
+      videoEndedRef.current = true;
+      setPlaying(false);
+      setLoad(false);
     } else {
       seekTo(target);
     }
   }, [dur, useNative, seekTo]);
   const seekFwd = useCallback(() => {
+    // When replay overlay is showing, ignore forward seeks — the video
+    // has already ended. Pressing space/k calls replay() via toggle().
+    if (videoEndedRef.current) return;
     seek(settings.playerSkipForward);
     setVis(true);
     clearTimeout(skipFeedbackTimer.current);
@@ -594,7 +654,24 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
   }, [seek, settings.playerSkipForward]);
   const seekBwd = useCallback(() => {
+    // When replay overlay is showing, allow backward seeks — the user
+    // wants to re-watch content near the end. Clear videoEnded so the
+    // overlay disappears and the video resumes from the new position.
+    const wasVideoEnded = videoEndedRef.current;
+    if (wasVideoEnded) {
+      console.log('[Player] seekBwd while videoEnded=true — clearing overlay, resuming playback');
+      setVideoEnded(false);
+      videoEndedRef.current = false;
+    }
     seek(-settings.playerSkipBackward);
+    // Resume playback AFTER the backward seek — must not call play() before
+    // seek() because currentTime might be at duration (from MSE guard), and
+    // play() at duration fires 'ended' immediately, re-setting videoEnded=true
+    // right after we just cleared it. After seek(), currentTime is at the
+    // backward position, so play() resumes normally without firing 'ended'.
+    if (wasVideoEnded) {
+      vidRef.current?.play().catch(() => {});
+    }
     setVis(true);
     clearTimeout(skipFeedbackTimer.current);
     skipFeedbackKey.current += 1;
@@ -608,10 +685,23 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   const onBarClick = useCallback((e: React.MouseEvent) => {
     if (!barRef.current || !vidRef.current || !isFinite(dur) || dur <= 0) return;
+    // If replay overlay is showing, clicking the progress bar means the user
+    // wants to resume from that position. Clear videoEnded and proceed.
+    if (videoEndedRef.current) {
+      setVideoEnded(false);
+      videoEndedRef.current = false;
+    }
     const r = barRef.current.getBoundingClientRect();
     const targetTime = ((e.clientX - r.left) / r.width) * dur;
     if (useNative) {
       vidRef.current.currentTime = targetTime;
+    } else if (targetTime >= dur) {
+      vidRef.current.currentTime = dur;
+      vidRef.current.pause();
+      setVideoEnded(true);
+      videoEndedRef.current = true;
+      setPlaying(false);
+      setLoad(false);
     } else {
       seekTo(targetTime);
     }
@@ -1364,8 +1454,24 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         );
       })()}
 
-      {/* Big play */}
-      {!playing && !load && !err && (
+      {/* Replay overlay — shown when video has ended */}
+      {videoEnded && !load && !err && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="flex flex-col items-center gap-3">
+            <button
+              onClick={(e) => { e.stopPropagation(); replay(); }}
+              className="w-20 h-20 bg-white/15 hover:bg-white/25 backdrop-blur-sm rounded-full flex items-center justify-center transition-all duration-200 hover:scale-105 group pointer-events-auto"
+            >
+              <svg className="w-10 h-10 text-white group-hover:text-white/90" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+              </svg>
+            </button>
+            <span className="text-white/70 text-sm font-medium tracking-wide">Replay</span>
+          </div>
+        </div>
+      )}
+      {/* Paused play icon — shown when paused mid-video (not ended) */}
+      {!playing && !videoEnded && !load && !err && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="w-16 h-16 bg-black/50 rounded-full flex items-center justify-center">
             <svg className="w-8 h-8 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
+use crate::download_pool::DownloadPool;
 
 /// Tracks the lifecycle of the Telegram connection
 /// 
@@ -32,7 +33,8 @@ pub struct TelegramState {
     /// Paths of partial download files — cleaned up on app close.
     pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Serializes all Telegram iter_download calls across player prebuffer and
-    /// file download — only one chunk request at a time, preventing FLOOD_WAIT.
+    /// file download. Increased from 1 to 4 to allow concurrent streaming +
+    /// background cache + file downloads via the DownloadPool.
     pub download_semaphore: Arc<Semaphore>,
     /// Speed limit for prebuffer/streaming in KB/s. 0 = unlimited.
     /// Read by Actix server.rs after each chunk to inject sleep.
@@ -40,6 +42,11 @@ pub struct TelegramState {
     /// Speed limit for file downloads in KB/s. 0 = unlimited.
     /// Read by cmd_download_file after each chunk to inject sleep.
     pub download_speed_limit_kb: Arc<AtomicU64>,
+    /// Multi-connection download pool for parallel file transfers.
+    /// Each worker has its own TCP connection to the Telegram media DC,
+    /// following Telegram's official recommendation for parallel downloads.
+    /// Initialized on first successful connection; None until then.
+    pub download_pool: Arc<Mutex<Option<DownloadPool>>>,
 }
 
 pub mod auth;

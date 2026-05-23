@@ -2,6 +2,7 @@ use actix_web::{get, head, web, App, HttpServer, HttpRequest, HttpResponse, Resp
 use actix_cors::Cors;
 use crate::commands::TelegramState;
 use crate::commands::utils::resolve_peer;
+use crate::download_pool::StreamChunk;
 use crate::hls;
 use grammers_client::types::Media;
 use grammers_tl_types as tl;
@@ -26,6 +27,35 @@ impl Drop for StreamingGuard {
     }
 }
 
+/// Drop-guard that unregisters a download from the coordinator when
+/// the Actix response ends (including client disconnect). This ensures
+/// the download is always deregistered even if the client disconnects
+/// mid-stream, preventing stale entries in active_downloads.
+/// Bug #13 fix: stores start_byte and end_byte so unregister_download
+/// can remove the specific download from the Vec, not the entire entry.
+struct DownloadGuard {
+    cache_mgr: Option<StreamCacheManager>,
+    message_id: i32,
+    start_byte: u64,
+    end_byte: u64,
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        if let Some(ref cm) = self.cache_mgr {
+            // Spawn an async task to unregister — Drop::drop can't be async,
+            // but unregister_download is async (uses Mutex).
+            let cm_clone = cm.clone();
+            let msg_id = self.message_id;
+            let start = self.start_byte;
+            let end = self.end_byte;
+            tokio::spawn(async move {
+                cm_clone.unregister_download(msg_id, start, end).await;
+            });
+        }
+    }
+}
+
 /// Holds the per-session streaming token for Actix validation
 pub(crate) struct StreamTokenData {
     pub(crate) token: String,
@@ -36,8 +66,10 @@ pub(crate) struct StreamQuery {
     pub(crate) token: Option<String>,
 }
 
-/// Chunk size for downloads (512 KB) — balances between request overhead and memory
-const DOWNLOAD_CHUNK_SIZE: i32 = 512 * 1024;
+/// Telegram download chunk size. Gammers-client enforces a hard cap of
+/// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
+/// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
+const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
@@ -225,19 +257,7 @@ async fn stream_media(
     let cache_mgr_opt: Option<StreamCacheManager> =
         (**cache).as_ref().map(|cm| cm.clone());
 
-    // Track streaming activity so cmd_delete_cache refuses to delete
-    // files while this Actix response is active (prevents catastrophic
-    // range loss on Windows where FILE_SHARE_DELETE allows deletion
-    // of files with open handles).
-    let _stream_guard = if let Some(ref cache_mgr) = **cache {
-        cache_mgr.track_streaming(message_id);
-        StreamingGuard {
-            cache_mgr: Some(cache_mgr.clone()),
-            message_id,
-        }
-    } else {
-        StreamingGuard { cache_mgr: None, message_id }
-    };
+    
 
     let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
     let cache_filename = match &media {
@@ -320,23 +340,546 @@ async fn stream_media(
         }
     }
 
+    // === COORDINATOR: Check if an active SEQUENTIAL download already covers our range ===
+    // Bug #6 fix: overlapping range requests subscribe to existing downloads instead of
+    // spawning duplicates. This eliminates the 15+ concurrent overlapping SEQUENTIAL
+    // downloads observed in 3rd terminal logs (633MB-1.4GB, 634MB-1.4GB, etc.).
+    if let Some(ref cache_mgr) = **cache {
+        let dl_info = cache_mgr.find_covering_download(message_id, start_byte, end_byte).await;
+        if let Some(dl) = dl_info {
+            log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} subscribing to active download {}-{}",
+                message_id, start_byte, end_byte, dl.start_byte, dl.end_byte);
+
+            let cache_mgr_clone = cache_mgr.clone();
+            let data_path = cache_mgr.data_path(message_id);
+            let subscriber_content_length = content_length;
+            let subscriber_start = start_byte;
+            let subscriber_end = end_byte;
+            let subscriber_mime = mime.clone();
+            let subscriber_size = size;
+            let subscriber_msg = message_id;
+            let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+
+            let subscriber_stream = async_stream::stream! {
+                // Track streaming activity so cmd_delete_cache refuses to delete
+                // files while this stream is active (Bug #11 fix — same pattern as
+                // Bug #10: guard must live inside stream block to persist for the
+                // entire streaming lifetime, not just the function scope).
+                let _subscriber_stream_guard = {
+                    cache_mgr_clone.track_streaming(subscriber_msg);
+                    StreamingGuard {
+                        cache_mgr: Some(cache_mgr_clone.clone()),
+                        message_id: subscriber_msg,
+                    }
+                };
+
+                let mut progress_rx = dl.progress_rx;
+                let mut read_offset = subscriber_start;
+                let mut bytes_remaining = subscriber_content_length;
+
+                // Open cache data file for reading (share modes allow concurrent read+write)
+                let mut read_file = match std::fs::File::open(&data_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::error!("[PREBUFFER] COORDINATOR: Failed to open cache file for reading msg {}: {}", subscriber_msg, e);
+                        return;
+                    }
+                };
+
+                loop {
+                    // Check current progress — how much data has the active download cached?
+                    let current_progress = *progress_rx.borrow();
+
+                    if current_progress >= read_offset {
+                        // Data is available at our read_offset — read from cache
+                    } else {
+                        // Wait for the active download to advance past our read_offset
+                        match progress_rx.changed().await {
+                            Ok(()) => {
+                                let new_progress = *progress_rx.borrow();
+                                if new_progress < read_offset {
+                                    // Progress advanced but hasn't reached our offset yet
+                                    continue;
+                                }
+                                // Data is now available
+                            }
+                            Err(_) => {
+                                // Download ended (progress_tx dropped by unregister_download)
+                                // Bug #12 + #14 fix: Instead of just logging and breaking,
+                                // deliver ALL available cached data from disk. Even if the
+                                // full range isn't cached, deliver whatever we have — this
+                                // prevents ERR_CONTENT_LENGTH_MISMATCH (since we use
+                                // chunked transfer encoding without Content-Length, the
+                                // browser won't reject partial delivery).
+                                let _lock = cache_mgr_clone.lock_meta(subscriber_msg).await;
+                                let meta = cache_mgr_clone.load_meta(subscriber_msg);
+                                drop(_lock);
+
+                                if let Some(meta) = meta {
+                                    // Find the furthest contiguous cached byte from read_offset
+                                    let max_cached_end = meta.cached_ranges.iter()
+                                        .filter(|&(s, _)| *s <= read_offset)
+                                        .map(|&(_, e)| e)
+                                        .max()
+                                        .unwrap_or(0);
+
+                                    if max_cached_end >= read_offset {
+                                        // There's cached data starting at or before read_offset
+                                        let available_end = max_cached_end.min(subscriber_end);
+                                        let read_len = (available_end - read_offset + 1) as usize;
+                                        use std::io::Read;
+                                        read_file.seek(SeekFrom::Start(read_offset)).ok();
+                                        let mut buf = vec![0u8; read_len];
+                                        match read_file.read_exact(&mut buf) {
+                                            Ok(()) => {
+                                                bytes_remaining -= read_len as u64;
+                                                read_offset += read_len as u64;
+                                                yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
+                                            }
+                                            Err(e) => {
+                                                log::error!("[PREBUFFER] COORDINATOR: Final cache read failed for msg {}: {}", subscriber_msg, e);
+                                            }
+                                        }
+                                    }
+
+                                    if bytes_remaining > 0 {
+                                        log::warn!("[PREBUFFER] COORDINATOR: Active download ended before covering full range for msg {} (need {}-{}, progress reached {}, delivered up to {})",
+                                            subscriber_msg, read_offset, subscriber_end, current_progress, read_offset - 1);
+                                    }
+                                } else {
+                                    log::warn!("[PREBUFFER] COORDINATOR: Active download ended before covering full range for msg {} (need {}-{}, progress reached {})",
+                                        subscriber_msg, read_offset, subscriber_end, current_progress);
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    // Calculate how many bytes we can read right now
+                    let progress = *progress_rx.borrow();
+                    let available_end = progress.min(subscriber_end);
+                    let readable = (available_end - read_offset + 1) as usize;
+                    let chunk_size = readable
+                        .min(TELEGRAM_CHUNK_SIZE as usize)
+                        .min(bytes_remaining as usize);
+
+                    if chunk_size == 0 {
+                        // No more data to read at this offset
+                        if bytes_remaining == 0 {
+                            break; // All data served
+                        }
+                        // Need more data but progress hasn't advanced — wait
+                        continue;
+                    }
+
+                    // Read chunk from cache file
+                    use std::io::Read;
+                    read_file.seek(SeekFrom::Start(read_offset)).ok();
+                    let mut buf = vec![0u8; chunk_size];
+                    match read_file.read_exact(&mut buf) {
+                        Ok(()) => {
+                            bytes_remaining -= chunk_size as u64;
+                            read_offset += chunk_size as u64;
+                            yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
+                        }
+                        Err(e) => {
+                            log::error!("[PREBUFFER] COORDINATOR: Cache read failed for msg {} at offset {}: {}",
+                                subscriber_msg, read_offset, e);
+                            break;
+                        }
+                    }
+
+                    // Throttle (same logic as SEQUENTIAL download)
+                    if limit_kb > 0 {
+                        let sleep_ms = (chunk_size as u64 * 1000) / (limit_kb * 1024);
+                        let sleep_ms = sleep_ms.min(2000);
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    }
+
+                    if bytes_remaining == 0 {
+                        break;
+                    }
+                }
+
+                log::info!("[PREBUFFER] COORDINATOR: Subscriber for msg {} range {}-{} completed (bytes_remaining={})",
+                    subscriber_msg, subscriber_start, subscriber_end, bytes_remaining);
+            };
+
+            if is_partial {
+                // Bug #14 fix: Use chunked transfer encoding (no Content-Length)
+                // for subscriber responses. This eliminates ERR_CONTENT_LENGTH_MISMATCH
+                // because the browser doesn't expect a specific byte count. The
+                // subscriber stream may deliver fewer bytes than originally requested
+                // if the active download ends before covering the full range.
+                // Content-Range is still included so the MSE player knows what
+                // byte offsets the data corresponds to.
+                return HttpResponse::PartialContent()
+                    .insert_header(("Content-Type", subscriber_mime))
+                    .insert_header(("Content-Range", format!("bytes {}-{}/{}", subscriber_start, subscriber_end, subscriber_size)))
+                    .insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Connection", "keep-alive"))
+                    .insert_header(("X-Download-Mode", "subscriber"))
+                    .streaming(subscriber_stream);
+            } else {
+                return HttpResponse::Ok()
+                    .insert_header(("Content-Type", subscriber_mime))
+                    .insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("X-Download-Mode", "subscriber"))
+                    .streaming(subscriber_stream);
+            }
+        }
+    }
+
+    // No active download covers our range — check if we can start a new one
+    // Bug #15 fix: When MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE is reached,
+    // subscribe to the nearest existing download instead of spawning a new one.
+    // This prevents FLOOD_PREMIUM_WAIT bombardment from 10+ simultaneous
+    // Telegram API calls (observed in 7th terminal logs).
+    if let Some(ref cache_mgr) = **cache {
+        let active_count = cache_mgr.active_download_count(message_id).await;
+        if active_count >= 3 { // MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE
+            log::warn!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} max concurrent downloads ({}) reached",
+                message_id, start_byte, end_byte, active_count);
+            // Try to subscribe to the nearest existing download
+            if let Some(nearest) = cache_mgr.find_nearest_download(message_id, start_byte).await {
+                log::info!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} subscribing to nearest download {}-{}",
+                    message_id, start_byte, end_byte, nearest.start_byte, nearest.end_byte);
+                // Re-use the subscriber stream logic from above — create a
+                // subscriber response that reads from cache as nearest download progresses
+                let dl_info = nearest;
+                let cache_mgr_clone = cache_mgr.clone();
+                let data_path = cache_mgr.data_path(message_id);
+                let subscriber_content_length = content_length;
+                let subscriber_start = start_byte;
+                let subscriber_end = end_byte;
+                let subscriber_mime = mime.clone();
+                let subscriber_size = size;
+                let subscriber_msg = message_id;
+                let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+
+                let subscriber_stream = async_stream::stream! {
+                    let _subscriber_stream_guard = {
+                        cache_mgr_clone.track_streaming(subscriber_msg);
+                        StreamingGuard {
+                            cache_mgr: Some(cache_mgr_clone.clone()),
+                            message_id: subscriber_msg,
+                        }
+                    };
+
+                    let mut progress_rx = dl_info.progress_rx;
+                    let mut read_offset = subscriber_start;
+                    let mut bytes_remaining = subscriber_content_length;
+
+                    let mut read_file = match std::fs::File::open(&data_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::error!("[PREBUFFER] COORDINATOR_LIMIT: Failed to open cache file for reading msg {}: {}", subscriber_msg, e);
+                            return;
+                        }
+                    };
+
+                    loop {
+                        let current_progress = *progress_rx.borrow();
+                        if current_progress >= read_offset {
+                            // Data available at read_offset
+                        } else {
+                            match progress_rx.changed().await {
+                                Ok(()) => {
+                                    if *progress_rx.borrow() < read_offset { continue; }
+                                }
+                                Err(_) => {
+                                    // Download ended — deliver all available cached data
+                                    let _lock = cache_mgr_clone.lock_meta(subscriber_msg).await;
+                                    let meta = cache_mgr_clone.load_meta(subscriber_msg);
+                                    drop(_lock);
+                                    if let Some(meta) = meta {
+                                        let max_cached_end = meta.cached_ranges.iter()
+                                            .filter(|&(s, _)| *s <= read_offset)
+                                            .map(|&(_, e)| e)
+                                            .max()
+                                            .unwrap_or(0);
+                                        if max_cached_end >= read_offset {
+                                            let available_end = max_cached_end.min(subscriber_end);
+                                            let read_len = (available_end - read_offset + 1) as usize;
+                                            use std::io::Read;
+                                            read_file.seek(SeekFrom::Start(read_offset)).ok();
+                                            let mut buf = vec![0u8; read_len];
+                                            match read_file.read_exact(&mut buf) {
+                                                Ok(()) => {
+                                                    bytes_remaining -= read_len as u64;
+                                                    read_offset += read_len as u64;
+                                                    yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
+                                                }
+                                                Err(e) => {
+                                                    log::error!("[PREBUFFER] COORDINATOR_LIMIT: Cache read failed for msg {} at offset {}: {}", subscriber_msg, read_offset, e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    log::warn!("[PREBUFFER] COORDINATOR_LIMIT: Active download ended before covering full range for msg {} (need {}-{}, delivered up to {})",
+                                        subscriber_msg, subscriber_start, subscriber_end, read_offset);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Read available data from cache
+                        let max_cached_end = *progress_rx.borrow();
+                        let available_end = max_cached_end.min(subscriber_end);
+                        let readable = (available_end - read_offset + 1) as usize;
+                        let chunk_size = readable
+                            .min(TELEGRAM_CHUNK_SIZE as usize)
+                            .min(bytes_remaining as usize);
+
+                        if chunk_size == 0 {
+                            if bytes_remaining == 0 { break; }
+                            continue;
+                        }
+
+                        use std::io::Read;
+                        read_file.seek(SeekFrom::Start(read_offset)).ok();
+                        let mut buf = vec![0u8; chunk_size];
+                        match read_file.read_exact(&mut buf) {
+                            Ok(()) => {
+                                bytes_remaining -= chunk_size as u64;
+                                read_offset += chunk_size as u64;
+                                yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
+                            }
+                            Err(e) => {
+                                log::error!("[PREBUFFER] COORDINATOR_LIMIT: Cache read failed for msg {} at offset {}: {}", subscriber_msg, read_offset, e);
+                                break;
+                            }
+                        }
+
+                        if limit_kb > 0 {
+                            let sleep_ms = (chunk_size as u64 * 1000) / (limit_kb * 1024);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms.min(2000))).await;
+                        }
+                        if bytes_remaining == 0 { break; }
+                    }
+                    log::info!("[PREBUFFER] COORDINATOR_LIMIT: Subscriber for msg {} range {}-{} completed (bytes_remaining={})",
+                        subscriber_msg, subscriber_start, subscriber_end, bytes_remaining);
+                };
+
+                if is_partial {
+                    return HttpResponse::PartialContent()
+                        .insert_header(("Content-Type", subscriber_mime))
+                        .insert_header(("Content-Range", format!("bytes {}-{}/{}", subscriber_start, subscriber_end, subscriber_size)))
+                        .insert_header(("Accept-Ranges", "bytes"))
+                        .insert_header(("Connection", "keep-alive"))
+                        .insert_header(("X-Download-Mode", "subscriber-limit"))
+                        .streaming(subscriber_stream);
+                } else {
+                    return HttpResponse::Ok()
+                        .insert_header(("Content-Type", subscriber_mime))
+                        .insert_header(("Accept-Ranges", "bytes"))
+                        .insert_header(("X-Download-Mode", "subscriber-limit"))
+                        .streaming(subscriber_stream);
+                }
+            }
+            // No nearest download found either — proceed unregistered
+            log::warn!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} no nearest download found, proceeding unregistered",
+                message_id, start_byte, end_byte);
+        }
+    }
+
+    // No active download covers our range — proceed with new SEQUENTIAL download
+
     let client_guard = { data.client.lock().await.clone() };
     let client = match client_guard {
         Some(c) => c,
         None => return HttpResponse::ServiceUnavailable().body("Telegram client not connected"),
     };
 
-    // Calculate chunk skip count for the requested byte offset
-    let chunk_size = DOWNLOAD_CHUNK_SIZE as u64;
-    let chunks_to_skip = start_byte / chunk_size;
-    let bytes_to_discard = start_byte % chunk_size;
+    // === STREAMING PATH ===
+    // NOTE: Parallel streaming via DownloadPool is disabled for the player-facing
+    // HTTP response because out-of-order/corrupted chunk delivery causes
+    // CHUNK_DEMUXER_ERROR in the MSE player. Sequential single-connection
+    // streaming is used instead, which guarantees in-order, correct data.
+    // The DownloadPool is still available for background cache gap filling
+    // (streaming.rs) where data correctness can be validated independently.
+    let use_parallel = false; // Disabled until parallel stream data correctness is verified
+    let _pool_guard = { data.download_pool.lock().await.clone() }; // Available when parallel is re-enabled
 
-    // Build the download iterator with proper offset via skip_chunks
-    let download_iter = client.iter_download(&media)
-        .chunk_size(DOWNLOAD_CHUNK_SIZE)
-        .skip_chunks(chunks_to_skip as i32);
+    if use_parallel {
+        let pool = _pool_guard.unwrap();
+        log::info!("[PREBUFFER] PARALLEL: msg {} range {}-{} ({} bytes) using {} workers",
+            message_id, start_byte, end_byte, content_length, 3);
+
+        let mut rx = pool.stream_range(
+            &media, start_byte, end_byte, size, data.download_semaphore.clone(),
+        );
+
+        let stream = async_stream::stream! {
+            // Track streaming activity so cmd_delete_cache refuses to delete
+            // files while this stream is active (Bug #11 fix).
+            let _stream_guard = if let Some(ref cache_mgr) = cache_mgr_opt {
+                cache_mgr.track_streaming(message_id);
+                StreamingGuard {
+                    cache_mgr: Some(cache_mgr.clone()),
+                    message_id,
+                }
+            } else {
+                StreamingGuard { cache_mgr: None, message_id }
+            };
+
+            let mut bytes_sent: u64 = 0;
+            #[allow(unused_assignments)]
+            let mut current_offset = start_byte; // Set from chunk offsets in parallel mode
+            let mut cache_file_mut = cache_file_opt;
+
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    Ok(StreamChunk { offset, data: chunk_data }) => {
+                        // Use the offset from the chunk (reorder buffer guarantees
+                        // in-order delivery, but offset field provides correctness)
+                        current_offset = offset;
+                        let remaining = content_length - bytes_sent;
+                        if remaining == 0 { break; }
+
+                        // The chunk might be larger than remaining (last chunk)
+                        let final_data = if chunk_data.len() as u64 > remaining {
+                            chunk_data[..remaining as usize].to_vec()
+                        } else {
+                            chunk_data
+                        };
+
+                        let bytes_in_chunk = final_data.len() as u64;
+                        let chunk_range_end = current_offset + bytes_in_chunk - 1;
+
+                        // 1) Write to cache file at the correct offset
+                        if let Some(ref mut cache_file) = cache_file_mut {
+                            let _ = cache_file.seek(SeekFrom::Start(current_offset));
+                            let _ = cache_file.write_all(&final_data);
+                        }
+
+                        // 2) Update meta
+                        if let Some(ref cache_mgr) = cache_mgr_opt {
+                            let _lock = cache_mgr.lock_meta(message_id).await;
+                            let mut meta = match cache_mgr.load_meta(message_id) {
+                                Some(m) => m,
+                                None => {
+                                    CacheMeta {
+                                        message_id,
+                                        folder_id: cache_folder_id,
+                                        total_size: size,
+                                        filename: cache_filename.clone(),
+                                        cached_ranges: Vec::new(),
+                                        mime_type: mime_stream.clone(),
+                                    }
+                                }
+                            };
+                            meta.cached_ranges.push((current_offset, chunk_range_end));
+                            merge_ranges(&mut meta.cached_ranges);
+                            if let Err(e) = cache_mgr.save_meta(&meta) {
+                                log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
+                            }
+                        }
+
+                        bytes_sent += bytes_in_chunk;
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(final_data));
+
+                        // Throttle
+                        let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                        if limit_kb > 0 {
+                            let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
+                            let sleep_ms = sleep_ms.min(2000);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+
+                        if bytes_sent >= content_length { break; }
+                    }
+                    Err(e) => {
+                        log::error!("[PREBUFFER] Parallel stream error for msg {}: {}", message_id, e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        if is_partial {
+            HttpResponse::PartialContent()
+                .insert_header(("Content-Type", mime))
+                .insert_header(("Content-Length", content_length.to_string()))
+                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Connection", "keep-alive"))
+                .insert_header(("X-Download-Mode", "parallel"))
+                .streaming(stream)
+        } else {
+            HttpResponse::Ok()
+                .insert_header(("Content-Type", mime))
+                .insert_header(("Content-Length", size.to_string()))
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("X-Download-Mode", "parallel"))
+                .streaming(stream)
+        }
+    } else {
+        // === FALLBACK: Single-connection streaming via iter_download ===
+        // Used for small ranges (<1MB) or when DownloadPool is not available.
+        log::info!("[PREBUFFER] SEQUENTIAL: msg {} range {}-{} using single connection",
+            message_id, start_byte, end_byte);
+
+        // Clone cache_mgr for use inside the async_stream block —
+        // register_download and DownloadGuard must live inside the stream
+        // so they're only dropped when the stream itself is dropped (Bug #10 fix).
+        let cache_mgr_for_stream = (**cache).as_ref().map(|cm| cm.clone());
+
+        let chunks_to_skip = (start_byte / TELEGRAM_CHUNK_SIZE as u64) as i32;
+        let bytes_to_discard = start_byte % TELEGRAM_CHUNK_SIZE as u64;
+
+        let download_iter = client.iter_download(&media)
+            .chunk_size(TELEGRAM_CHUNK_SIZE)
+            .skip_chunks(chunks_to_skip);
 
     let stream = async_stream::stream! {
+        // Track streaming activity so cmd_delete_cache refuses to delete
+        // files while this stream is active (Bug #11 fix — same pattern as
+        // Bug #10: guard must live inside stream block to persist for the
+        // entire streaming lifetime, not just the function scope).
+        let _stream_guard = if let Some(ref cm) = cache_mgr_for_stream {
+            cm.track_streaming(message_id);
+            StreamingGuard {
+                cache_mgr: Some(cm.clone()),
+                message_id,
+            }
+        } else {
+            StreamingGuard { cache_mgr: None, message_id }
+        };
+
+        // Register this download with the coordinator so overlapping requests
+        // can subscribe instead of spawning duplicates (Bug #6 fix).
+        // MUST be inside the stream block so the registration persists for
+        // the entire streaming lifetime — not just the function scope.
+        // Bug #15 fix: register_download now returns Option — if the
+        // MAX_CONCURRENT_DOWNLOADS limit is reached (shouldn't happen since
+        // we checked above), just proceed without registration.
+        let _registered = if let Some(ref cm) = cache_mgr_for_stream {
+            cm.register_download(message_id, start_byte, end_byte).await.is_some()
+        } else {
+            false
+        };
+
+        // Drop-guard that unregisters the download from the coordinator when
+        // the Actix response ends. Only created if the download was actually
+        // registered (Bug #15: may not be registered if limit was reached).
+        // Lives inside the stream so it's dropped when the stream is dropped,
+        // not when stream_media() returns (Bug #10 fix).
+        // Bug #13 fix: stores start_byte and end_byte so the specific download
+        // can be removed from Vec<ActiveDownload> without affecting other
+        // concurrent downloads for the same message.
+        let _download_guard = if _registered {
+            Some(DownloadGuard {
+                cache_mgr: cache_mgr_for_stream.clone(),
+                message_id,
+                start_byte,
+                end_byte,
+            })
+        } else {
+            None
+        };
+
         let mut bytes_sent: u64 = 0;
         let mut first_chunk = true;
         let mut iter = download_iter;
@@ -426,14 +969,17 @@ async fn stream_media(
                                             .and_then(|f| f.metadata().ok())
                                             .map(|m| m.len())
                                             .unwrap_or(0);
-                                        let data_size = fs_data_size.max(handle_data_size);
+                                        let _data_size = fs_data_size.max(handle_data_size);
                                         log::warn!("[PREBUFFER] Meta recovery for msg {}: data_file_exists={}, fs_data_size={}, handle_data_size={}, total_size={}", 
                                             message_id, data_exists, fs_data_size, handle_data_size, size);
-                                        let recovery_ranges = if data_size > 0 && data_size <= size {
-                                            vec![(0u64, data_size - 1)]
-                                        } else {
-                                            Vec::new()
-                                        };
+                                        // Bug #8 fix: DO NOT claim (0, data_size-1) is cached.
+                                        // The .dat file may be sparse (only partially downloaded
+                                        // from previous sessions). Over-claiming causes the
+                                        // player to read zero-filled data from uncached regions,
+                                        // which corrupts MSE playback.
+                                        // Instead, start with empty cached_ranges and let the
+                                        // normal chunk writes populate the correct ranges.
+                                        let recovery_ranges = Vec::new();
                                         CacheMeta {
                                             message_id,
                                             folder_id: cache_folder_id,
@@ -450,9 +996,16 @@ async fn stream_media(
                         merge_ranges(&mut meta.cached_ranges);
                         if let Err(e) = cache_mgr.save_meta(&meta) {
                             log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
-                        } else {
-                            log::info!("[PREBUFFER] ADD: msg {} range {}-{} written to cache, meta ranges: {:?}",
-                                message_id, current_offset, chunk_range_end, meta.cached_ranges);
+                        }
+                        // Per-chunk ADD log is too verbose for large videos — commented out
+                        // log::info!("[PREBUFFER] ADD: msg {} range {}-{} written to cache, meta ranges: {:?}",
+                        //     message_id, current_offset, chunk_range_end, meta.cached_ranges);
+                        // Broadcast progress to subscribers (Bug #6 coordinator)
+                        // Bug #13 fix: pass start_byte so update_download_progress
+                        // can find the correct download in Vec<ActiveDownload>
+                        // Bug #15 fix: only update progress if registered
+                        if _registered {
+                            cache_mgr.update_download_progress(message_id, start_byte, chunk_range_end).await;
                         }
                     }
 
@@ -488,20 +1041,23 @@ async fn stream_media(
         }
     };
 
-    if is_partial {
-        HttpResponse::PartialContent()
-            .insert_header(("Content-Type", mime))
-            .insert_header(("Content-Length", content_length.to_string()))
-            .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
-            .insert_header(("Accept-Ranges", "bytes"))
-            .insert_header(("Connection", "keep-alive"))
-            .streaming(stream)
-    } else {
-        HttpResponse::Ok()
-            .insert_header(("Content-Type", mime))
-            .insert_header(("Content-Length", size.to_string()))
-            .insert_header(("Accept-Ranges", "bytes"))
-            .streaming(stream)
+        if is_partial {
+            HttpResponse::PartialContent()
+                .insert_header(("Content-Type", mime))
+                .insert_header(("Content-Length", content_length.to_string()))
+                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Connection", "keep-alive"))
+                .insert_header(("X-Download-Mode", "sequential"))
+                .streaming(stream)
+        } else {
+            HttpResponse::Ok()
+                .insert_header(("Content-Type", mime))
+                .insert_header(("Content-Length", size.to_string()))
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("X-Download-Mode", "sequential"))
+                .streaming(stream)
+        }
     }
 }
 
