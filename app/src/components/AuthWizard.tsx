@@ -40,7 +40,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     This application cannot function here because it requires access to the system backend (Rust).
                 </p>
                 <div className="p-4 bg-gray-800 rounded-xl border border-gray-700 text-sm text-gray-300">
-                    Please open the <strong>nobuff</strong> window in your OS taskbar/dock to continue.
+                    Please open the <strong>NoBuf</strong> window in your OS taskbar/dock to continue.
                 </div>
             </div>
         )
@@ -269,7 +269,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     <div className="w-20 h-20 mb-6 mx-auto flex items-center justify-center filter drop-shadow-lg">
                         <img src="/logo.png" alt="Logo" className="w-full h-full" />
                     </div>
-                    <h1 className="text-2xl font-bold text-white mb-1 tracking-tight">nobuff</h1>
+                    <h1 className="text-2xl font-bold text-white mb-1 tracking-tight">NoBuf</h1>
                     <p className="text-sm text-white/60 font-medium">Self-Hosted Secure Storage</p>
                 </div>
 
@@ -614,7 +614,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                             <div className="space-y-6 text-telegram-text">
                                 <div className="p-4 bg-telegram-primary/10 border border-telegram-primary/20 rounded-xl">
                                     <p className="text-sm text-telegram-subtext">
-                                        <strong className="text-telegram-primary">nobuff</strong> uses your Telegram account as secure cloud storage. You'll need a Telegram account and API credentials to get started.
+                                        <strong className="text-telegram-primary">NoBuf</strong> uses your Telegram account as secure cloud storage. You'll need a Telegram account and API credentials to get started.
                                     </p>
                                 </div>
 

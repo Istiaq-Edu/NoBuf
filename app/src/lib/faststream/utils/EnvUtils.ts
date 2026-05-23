@@ -12,7 +12,7 @@ export class EnvUtils {
   }
 
   static getVersion(): string {
-    return '1.4.0'; // nobuff version
+    return '1.4.0'; // NoBuf version
   }
 
   static isMobile(): boolean {
