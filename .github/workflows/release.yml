@@ -7,9 +7,6 @@ on:
         description: 'Release version (e.g. 0.1.0-beta)'
         required: true
         type: string
-  push:
-    tags:
-      - 'v*'  # Also trigger on version tags like v0.1.0-beta
 
 jobs:
   create-release:
