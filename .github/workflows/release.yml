@@ -1,37 +1,58 @@
 name: "Release"
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0-beta)'
+        required: true
+        type: string
   push:
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0, v1.0.1
+      - 'v*'  # Also trigger on version tags like v0.1.0-beta
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create-release.outputs.result }}
+      prerelease: ${{ steps.get_version.outputs.PRERELEASE }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       
-      - name: Get version from tag
+      - name: Get version
         id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          if echo "$VERSION" | grep -qi "beta\|alpha"; then
+            echo "PRERELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "PRERELEASE=false" >> $GITHUB_OUTPUT
+          fi
       
       - name: Create Release
         id: create-release
         uses: actions/github-script@v7
         with:
           script: |
+            const version = `${{ steps.get_version.outputs.VERSION }}`;
+            const isBeta = version.includes('beta') || version.includes('alpha');
+            const body = `nobuff v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of nobuff.'}\n\nnobuff is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux\n\nSee the assets below to download and install.`;
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
-              name: `nobuff v${{ steps.get_version.outputs.VERSION }}`,
-              body: `Feature: Added a donation button and popup modal to the main login screen to support the project via PayPal, Litecoin, and Bitcoin.\n\nSee the assets below to download and install.`,
+              tag_name: `v${version}`,
+              name: `nobuff v${version}`,
+              body: body,
               draft: true,
-              prerelease: false
+              prerelease: isBeta
             });
             return data.id
 
@@ -259,6 +280,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           release_id: ${{ needs.create-release.outputs.release_id }}
+          prerelease: ${{ needs.create-release.outputs.prerelease }}
         with:
           script: |
             github.rest.repos.updateRelease({
@@ -266,5 +288,5 @@ jobs:
               repo: context.repo.repo,
               release_id: process.env.release_id,
               draft: false,
-              prerelease: false
+              prerelease: process.env.prerelease === 'true'
             })

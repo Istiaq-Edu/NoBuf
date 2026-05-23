@@ -96,6 +96,8 @@ You click play
 | **VBR byte→time table** | Built from mp4box calibration points | Accurate seek-to-byte for variable bitrate content |
 | **50MB buffer cap + 2min backpressure** | Stops downloading when ahead enough | Prevents memory bloat on long videos |
 
+> **Note:** The MSE prebuffer pipeline currently supports **`.mp4`** files only. Support for **`.ts`** (MPEG-TS) and **`.mkv`** containers is planned for a future release. Non-MP4 video files fall back to direct download playback.
+
 ---
 
 ## Why Telegram?
@@ -137,7 +139,7 @@ Your Telegram channels become a video library. Your Saved Messages become a quic
 - 🤖 **REST API** — Local HTTP API (off by default) with API key auth. Enables AI agents and automation.
 - 📊 **Bandwidth Monitor** — Daily upload/download tracking with configurable limits.
 - 🎚️ **Speed Limiter** — Per-session throttle for streaming and downloads.
-- 🔄 **Auto-Updates** — Signed update delivery via Tauri's updater. No manual downloads.
+- 🔄 **Auto-Updates** — built-in update delivery via Tauri's updater plugin. *(Not yet active in beta — watch [Releases](https://github.com/Istiaq-Edu/nobuff/releases) for new builds.)*
 - 🔒 **Local-Only** — All credentials and data stay on your machine. No telemetry, no third-party servers.
 - 🖥️ **Cross-Platform** — Windows, macOS (Intel + Apple Silicon), Linux (AppImage + .deb).
 
@@ -313,6 +315,13 @@ All endpoints require the `X-API-Key` header. Generate a key in Settings → API
 ```
 curl -H "X-API-Key: YOUR_KEY" http://localhost:PORT/api/v1/files?limit=10
 ```
+
+---
+
+## Acknowledgments
+
+- **[Telegram-Drive](https://github.com/caamer20/Telegram-Drive)** — nobuff's core architecture is based on caamer20's Telegram-Drive project. The idea of using Telegram channels as a file storage backend and the initial Tauri + Grammers integration originate from this work.
+- **[FastStream](https://github.com/Andrews54757/FastStream)** — the MSE video prebuffering engine and progressive fragment strategy were adapted from Andrews54757's FastStream project. The `lib/faststream/` module is based on their approach to Media Source Extensions streaming.
 
 ---
 
