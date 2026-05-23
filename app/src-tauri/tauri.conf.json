@@ -3,14 +3,14 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/caamer20/Telegram-Drive/releases/latest/download/latest.json"
+        "https://github.com/Istiaq-Edu/nobuff/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBBRkI4QUZDNjZEMzZCRTIKUldUaWE5Tm0vSXI3Q3JrRDBtY2lZYUtGL3RTR2JuUTNYSCswVjNaVURXa1FSRWRPMzNPZk92YS8K"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZBRkYxNUVCMDdGMzQyMTQKUldRVVF2TUg2eFgvYXRCM1FDaWh1M3luRjZ1WS9FZStkVzR5Z0NDSmJ3azkwRE9mU3VRWjB3R1AK"
     }
   },
-  "productName": "Telegram Drive",
+  "productName": "nobuff",
   "version": "1.4.0",
-  "identifier": "com.cameronamer.telegramdrive",
+  "identifier": "com.istiaq.nobuff",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -20,7 +20,7 @@
   "app": {
     "windows": [
       {
-        "title": "Telegram Drive",
+        "title": "nobuff",
         "width": 1200,
         "height": 800,
         "minWidth": 1000,
@@ -30,9 +30,7 @@
     ],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' http://localhost:14201; media-src 'self' http://localhost:14201; img-src 'self' data: blob: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:;",
-      "capabilities": [
-        "default"
-      ]
+      "capabilities": ["default"]
     }
   },
   "bundle": {
