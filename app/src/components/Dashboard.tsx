@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
@@ -18,7 +18,7 @@ import { MediaPlayer } from './dashboard/MediaPlayer';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
 import { PdfViewer } from './dashboard/PdfViewer';
-import { SettingsModal } from './dashboard/SettingsModal';
+import { SettingsPage } from './dashboard/SettingsPage';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -429,7 +429,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     return (
         <div
-            className="flex h-screen w-full overflow-hidden bg-telegram-bg relative"
+            className="flex h-screen w-full overflow-hidden bg-nobuf-bg relative"
             onClick={() => setSelectedIds([])}
             onDragOver={handleRootDragOver}
             onDragEnter={handleRootDragEnter}
@@ -514,8 +514,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 />
                 {searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">
-                        <h2 className="text-sm font-medium text-telegram-subtext">
-                            Search Results for <span className="text-telegram-primary">"{searchTerm}"</span>
+                        <h2 className="text-sm font-medium text-nobuf-subtext">
+                            Search Results for <span className="text-nobuf-primary">"{searchTerm}"</span>
                         </h2>
                     </div>
                 )}
@@ -570,10 +570,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onRetryDownloadItem={retryDownloadItem}
             />
 
-            <SettingsModal
-                isOpen={showSettings}
-                onClose={() => setShowSettings(false)}
-            />
+            <AnimatePresence>
+                {showSettings && (
+                    <SettingsPage onClose={() => setShowSettings(false)} />
+                )}
+            </AnimatePresence>
         </div>
     );
 }

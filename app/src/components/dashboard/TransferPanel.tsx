@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { Upload, Download, X, RotateCcw, AlertCircle, Check } from 'lucide-react';
 import { QueueItem, DownloadItem } from '../../types';
 
@@ -60,66 +60,66 @@ export function TransferPanel({
                 />
             )}
             <div
-                className={`fixed right-0 top-14 bottom-0 w-[380px] bg-telegram-surface border-l border-telegram-border shadow-2xl z-40 flex flex-col transition-transform duration-300 ease-in-out ${
+                className={`fixed right-0 top-14 bottom-0 w-[380px] bg-nobuf-surface border-l border-nobuf-border shadow-2xl z-40 flex flex-col transition-transform duration-300 ease-in-out ${
                     isOpen ? 'translate-x-0' : 'translate-x-full'
                 }`}
             >
             {/* Header */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-telegram-border bg-telegram-hover/50">
-                <h3 className="text-sm font-semibold text-telegram-text">Transfers</h3>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-nobuf-border bg-nobuf-hover/50">
+                <h3 className="text-sm font-semibold text-nobuf-text">Transfers</h3>
                 <button
                     onClick={onClose}
-                    className="p-1 hover:bg-telegram-border rounded text-telegram-subtext hover:text-telegram-text transition-colors"
+                    className="p-1 hover:bg-nobuf-border rounded text-nobuf-subtext hover:text-nobuf-text transition-colors"
                 >
                     <X className="w-4 h-4" />
                 </button>
             </div>
 
             {/* Tabs */}
-            <div className="flex border-b border-telegram-border">
+            <div className="flex border-b border-nobuf-border">
                 <button
                     onClick={() => setActiveTab('uploads')}
                     className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-medium transition-colors relative ${
                         effectiveTab === 'uploads'
-                            ? 'text-telegram-primary'
-                            : 'text-telegram-subtext hover:text-telegram-text'
+                            ? 'text-nobuf-primary'
+                            : 'text-nobuf-subtext hover:text-nobuf-text'
                     }`}
                 >
                     <Upload className="w-3.5 h-3.5" />
                     Uploads
                     {uploadActive > 0 && (
-                        <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded-full text-[10px]">
+                        <span className="px-1.5 py-0.5 bg-nobuf-ocean-green/20 text-nobuf-ocean-green rounded-full text-[10px]">
                             {uploadActive}
                         </span>
                     )}
                     {effectiveTab === 'uploads' && (
-                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-telegram-primary" />
+                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-nobuf-primary" />
                     )}
                 </button>
                 <button
                     onClick={() => setActiveTab('downloads')}
                     className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-medium transition-colors relative ${
                         effectiveTab === 'downloads'
-                            ? 'text-telegram-primary'
-                            : 'text-telegram-subtext hover:text-telegram-text'
+                            ? 'text-nobuf-primary'
+                            : 'text-nobuf-subtext hover:text-nobuf-text'
                     }`}
                 >
                     <Download className="w-3.5 h-3.5" />
                     Downloads
                     {downloadActive > 0 && (
-                        <span className="px-1.5 py-0.5 bg-telegram-secondary/20 text-telegram-secondary rounded-full text-[10px]">
+                        <span className="px-1.5 py-0.5 bg-nobuf-secondary/20 text-nobuf-secondary rounded-full text-[10px]">
                             {downloadActive}
                         </span>
                     )}
                     {effectiveTab === 'downloads' && (
-                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-telegram-primary" />
+                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-nobuf-primary" />
                     )}
                 </button>
             </div>
 
             {/* Actions bar */}
-            <div className="flex items-center justify-between px-4 py-2 border-b border-telegram-border/50">
-                <span className="text-[11px] text-telegram-subtext">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-nobuf-border/50">
+                <span className="text-[11px] text-nobuf-subtext">
                     {items.length} {items.length === 1 ? 'item' : 'items'}
                 </span>
                 <div className="flex gap-2">
@@ -134,7 +134,7 @@ export function TransferPanel({
                     {hasFinished && (
                         <button
                             onClick={effectiveTab === 'uploads' ? onClearUploadFinished : onClearDownloadFinished}
-                            className="text-[11px] text-telegram-primary hover:text-telegram-text transition-colors"
+                            className="text-[11px] text-nobuf-primary hover:text-nobuf-text transition-colors"
                         >
                             Clear Finished
                         </button>
@@ -145,7 +145,7 @@ export function TransferPanel({
             {/* Items list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
                 {items.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center h-full text-telegram-subtext">
+                    <div className="flex flex-col items-center justify-center h-full text-nobuf-subtext">
                         {effectiveTab === 'uploads' ? (
                             <Upload className="w-8 h-8 mb-2 opacity-30" />
                         ) : (
@@ -155,7 +155,7 @@ export function TransferPanel({
                     </div>
                 ) : (
                     items.map(item => (
-                        <div key={item.id} className="flex flex-col gap-1 p-2.5 bg-telegram-hover rounded-lg">
+                        <div key={item.id} className="flex flex-col gap-1 p-2.5 bg-nobuf-hover rounded-lg">
                             <div className="flex items-center gap-3 text-sm">
                                 {/* Status icon */}
                                 <div className="flex-shrink-0">
@@ -165,7 +165,7 @@ export function TransferPanel({
                                         </div>
                                     )}
                                     {(item.status === 'uploading' || item.status === 'downloading') && (
-                                        <div className={`w-4 h-4 rounded-full border-2 ${effectiveTab === 'uploads' ? 'border-blue-500' : 'border-telegram-secondary'} border-t-transparent animate-spin`} />
+                                        <div className={`w-4 h-4 rounded-full border-2 ${effectiveTab === 'uploads' ? 'border-nobuf-ocean-green' : 'border-nobuf-secondary'} border-t-transparent animate-spin`} />
                                     )}
                                     {item.status === 'success' && (
                                         <div className="w-4 h-4 rounded-full bg-green-500/20 flex items-center justify-center">
@@ -185,13 +185,13 @@ export function TransferPanel({
                                 </div>
 
                                 {/* Filename */}
-                                <div className="flex-1 text-telegram-subtext text-xs line-clamp-2 break-all leading-snug" title={'filename' in item ? (item as DownloadItem).filename : (item as QueueItem).path}>
+                                <div className="flex-1 text-nobuf-subtext text-xs line-clamp-2 break-all leading-snug" title={'filename' in item ? (item as DownloadItem).filename : (item as QueueItem).path}>
                                     {('filename' in item ? (item as DownloadItem).filename : (item as QueueItem).path || '').split('/').pop()}
                                 </div>
 
                                 {/* Cache info for downloads */}
                                 {'cacheInfo' in item && item.cacheInfo && (
-                                    <span className="text-[10px] text-blue-400 flex-shrink-0">{item.cacheInfo}</span>
+                                    <span className="text-[10px] text-nobuf-ocean-green flex-shrink-0">{item.cacheInfo}</span>
                                 )}
 
                                 {/* Action buttons */}
@@ -207,7 +207,7 @@ export function TransferPanel({
                                 {(item.status === 'error' || item.status === 'cancelled') && (
                                     <button
                                         onClick={() => effectiveTab === 'uploads' ? onRetryUploadItem(item.id) : onRetryDownloadItem(item.id)}
-                                        className="text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0"
+                                        className="text-gray-400 hover:text-nobuf-ocean-green transition-colors flex-shrink-0"
                                         title="Retry"
                                     >
                                         <RotateCcw className="w-3.5 h-3.5" />
@@ -218,21 +218,21 @@ export function TransferPanel({
                             {/* Progress bar */}
                             {(item.status === 'uploading' || item.status === 'downloading') && (
                                 <>
-                                    <div className="w-full bg-telegram-border h-1 mt-1 rounded-full overflow-hidden">
+                                    <div className="w-full bg-nobuf-border h-1 mt-1 rounded-full overflow-hidden">
                                         {item.progress !== undefined ? (
                                             <div
                                                 className={`h-full rounded-full transition-all duration-300 ${
-                                                    effectiveTab === 'uploads' ? 'bg-blue-500' : 'bg-telegram-secondary'
+                                                    effectiveTab === 'uploads' ? 'bg-nobuf-ocean-green' : 'bg-nobuf-secondary'
                                                 }`}
                                                 style={{ width: `${item.progress}%` }}
                                             />
                                         ) : (
                                             <div className={`h-full w-full animate-progress-indeterminate ${
-                                                effectiveTab === 'uploads' ? 'bg-blue-500' : 'bg-telegram-secondary'
+                                                effectiveTab === 'uploads' ? 'bg-nobuf-ocean-green' : 'bg-nobuf-secondary'
                                             }`} />
                                         )}
                                     </div>
-                                    <div className="flex justify-between text-[10px] text-telegram-subtext mt-0.5">
+                                    <div className="flex justify-between text-[10px] text-nobuf-subtext mt-0.5">
                                         <span>
                                             {item.uploadedBytes !== undefined && item.totalBytes !== undefined
                                                 ? `${formatBytes(item.uploadedBytes)} / ${formatBytes(item.totalBytes)}`

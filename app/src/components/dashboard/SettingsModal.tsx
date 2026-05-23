@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, RotateCcw, Download, Upload, Trash2, HardDrive, Globe, Key, Copy, Check, RefreshCw, LayoutGrid, Film, Music, ImageIcon, FileText, Package } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -26,7 +26,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
     // File filter helpers
     const CATEGORY_META: Record<FileCategory, { label: string; icon: typeof Film; color: string }> = {
-        videos:     { label: 'Videos',     icon: Film,      color: 'bg-blue-500' },
+        videos:     { label: 'Videos',     icon: Film,      color: 'bg-nobuf-ocean-green' },
         audio:      { label: 'Audio',      icon: Music,     color: 'bg-purple-500' },
         images:     { label: 'Images',     icon: ImageIcon, color: 'bg-pink-500' },
         documents:  { label: 'Documents',  icon: FileText,  color: 'bg-amber-500' },
@@ -165,15 +165,15 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         animate={{ opacity: 1, scale: 1, y: 0 }}
                         exit={{ opacity: 0, scale: 0.95, y: 10 }}
                         transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-                        className="bg-telegram-surface border border-telegram-border rounded-xl w-[440px] shadow-2xl overflow-hidden"
+                        className="bg-nobuf-surface border border-nobuf-border rounded-xl w-[440px] shadow-2xl overflow-hidden"
                         onClick={e => e.stopPropagation()}
                     >
                         {/* Header */}
-                        <div className="px-5 py-4 border-b border-telegram-border flex justify-between items-center">
-                            <h2 className="text-telegram-text font-semibold text-base">Settings</h2>
+                        <div className="px-5 py-4 border-b border-nobuf-border flex justify-between items-center">
+                            <h2 className="text-nobuf-text font-semibold text-base">Settings</h2>
                             <button
                                 onClick={onClose}
-                                className="p-1.5 hover:bg-telegram-hover rounded-lg text-telegram-subtext hover:text-telegram-text transition"
+                                className="p-1.5 hover:bg-nobuf-hover rounded-lg text-nobuf-subtext hover:text-nobuf-text transition"
                             >
                                 <X className="w-4 h-4" />
                             </button>
@@ -184,33 +184,33 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Transfers Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider flex items-center gap-2">
                                     <Upload className="w-3.5 h-3.5" />
                                     Transfers
                                 </h3>
 
                                 {/* Max Concurrent Uploads */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="flex items-center justify-between p-3 rounded-lg bg-nobuf-hover/50">
                                     <div className="flex items-center gap-2">
-                                        <Upload className="w-4 h-4 text-telegram-subtext" />
+                                        <Upload className="w-4 h-4 text-nobuf-subtext" />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">Concurrent Uploads</p>
-                                            <p className="text-xs text-telegram-subtext">Max parallel uploads</p>
+                                            <p className="text-sm text-nobuf-text font-medium">Concurrent Uploads</p>
+                                            <p className="text-xs text-nobuf-subtext">Max parallel uploads</p>
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <button
                                             onClick={() => updateSetting('maxConcurrentUploads', Math.max(1, settings.maxConcurrentUploads - 1))}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
+                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-nobuf-bg text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-border transition text-sm font-medium"
                                         >
                                             -
                                         </button>
-                                        <span className="text-sm text-telegram-text font-medium w-5 text-center">
+                                        <span className="text-sm text-nobuf-text font-medium w-5 text-center">
                                             {settings.maxConcurrentUploads}
                                         </span>
                                         <button
                                             onClick={() => updateSetting('maxConcurrentUploads', Math.min(10, settings.maxConcurrentUploads + 1))}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
+                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-nobuf-bg text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-border transition text-sm font-medium"
                                         >
                                             +
                                         </button>
@@ -218,27 +218,27 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                 </div>
 
                                 {/* Max Concurrent Downloads */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="flex items-center justify-between p-3 rounded-lg bg-nobuf-hover/50">
                                     <div className="flex items-center gap-2">
-                                        <Download className="w-4 h-4 text-telegram-subtext" />
+                                        <Download className="w-4 h-4 text-nobuf-subtext" />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">Concurrent Downloads</p>
-                                            <p className="text-xs text-telegram-subtext">Max parallel downloads</p>
+                                            <p className="text-sm text-nobuf-text font-medium">Concurrent Downloads</p>
+                                            <p className="text-xs text-nobuf-subtext">Max parallel downloads</p>
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <button
                                             onClick={() => updateSetting('maxConcurrentDownloads', Math.max(1, settings.maxConcurrentDownloads - 1))}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
+                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-nobuf-bg text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-border transition text-sm font-medium"
                                         >
                                             -
                                         </button>
-                                        <span className="text-sm text-telegram-text font-medium w-5 text-center">
+                                        <span className="text-sm text-nobuf-text font-medium w-5 text-center">
                                             {settings.maxConcurrentDownloads}
                                         </span>
                                         <button
                                             onClick={() => updateSetting('maxConcurrentDownloads', Math.min(10, settings.maxConcurrentDownloads + 1))}
-                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-telegram-bg text-telegram-subtext hover:text-telegram-text hover:bg-telegram-border transition text-sm font-medium"
+                                            className="w-7 h-7 flex items-center justify-center rounded-md bg-nobuf-bg text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-border transition text-sm font-medium"
                                         >
                                             +
                                         </button>
@@ -248,15 +248,15 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Grid Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider flex items-center gap-2">
                                     <LayoutGrid className="w-3.5 h-3.5" />
                                     Grid Density
                                 </h3>
 
-                                <div className="p-3 rounded-lg bg-telegram-hover/50">
-                                    <p className="text-sm text-telegram-text font-medium mb-1">Card Size</p>
-                                    <p className="text-xs text-telegram-subtext mb-3">Adjust how many files appear per row</p>
-                                    <div className="flex gap-1 p-1 bg-telegram-bg rounded-lg">
+                                <div className="p-3 rounded-lg bg-nobuf-hover/50">
+                                    <p className="text-sm text-nobuf-text font-medium mb-1">Card Size</p>
+                                    <p className="text-xs text-nobuf-subtext mb-3">Adjust how many files appear per row</p>
+                                    <div className="flex gap-1 p-1 bg-nobuf-bg rounded-lg">
                                         {([
                                             { value: 'compact' as const, label: 'Compact' },
                                             { value: 'default' as const, label: 'Default' },
@@ -267,8 +267,8 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                 onClick={() => updateSetting('gridDensity', option.value)}
                                                 className={`flex-1 px-2 py-2 rounded-md text-xs font-medium transition-all ${
                                                     settings.gridDensity === option.value
-                                                        ? 'bg-telegram-primary text-white shadow-sm'
-                                                        : 'text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover'
+                                                        ? 'bg-nobuf-primary text-white shadow-sm'
+                                                        : 'text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-hover'
                                                 }`}
                                             >
                                                 {option.label}
@@ -280,14 +280,14 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* File Filter Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider flex items-center gap-2">
                                     <FileText className="w-3.5 h-3.5" />
                                     File Filter
                                 </h3>
 
-                                <div className="p-3 rounded-lg bg-telegram-hover/50">
-                                    <p className="text-sm text-telegram-text font-medium mb-1">Show Categories</p>
-                                    <p className="text-xs text-telegram-subtext mb-3">
+                                <div className="p-3 rounded-lg bg-nobuf-hover/50">
+                                    <p className="text-sm text-nobuf-text font-medium mb-1">Show Categories</p>
+                                    <p className="text-xs text-nobuf-subtext mb-3">
                                         Select which file types to show. Toggle none or all to show everything.
                                     </p>
                                     <div className="flex flex-wrap gap-2">
@@ -302,7 +302,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all border ${
                                                         isActive
                                                             ? `${meta.color} text-white border-transparent shadow-sm`
-                                                            : 'bg-telegram-bg text-telegram-subtext border-telegram-border hover:border-telegram-subtext hover:text-telegram-text'
+                                                            : 'bg-nobuf-bg text-nobuf-subtext border-nobuf-border hover:border-nobuf-subtext hover:text-nobuf-text'
                                                     }`}
                                                 >
                                                     <Icon className="w-3.5 h-3.5" />
@@ -316,18 +316,18 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* REST API Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider flex items-center gap-2">
                                     <Globe className="w-3.5 h-3.5" />
                                     REST API
                                 </h3>
 
                                 {/* Enable Toggle */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="flex items-center justify-between p-3 rounded-lg bg-nobuf-hover/50">
                                     <div className="flex items-center gap-2">
                                         <div className={`w-2 h-2 rounded-full ${apiSettings.running ? 'bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.5)]' : 'bg-gray-500'}`} />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">Enable API Server</p>
-                                            <p className="text-xs text-telegram-subtext">
+                                            <p className="text-sm text-nobuf-text font-medium">Enable API Server</p>
+                                            <p className="text-xs text-nobuf-subtext">
                                                 {apiSettings.running ? `Running on port ${apiSettings.port}` : 'Localhost only (127.0.0.1)'}
                                             </p>
                                         </div>
@@ -335,17 +335,17 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                     <button
                                         onClick={handleApiToggle}
                                         disabled={apiLoading}
-                                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${apiSettings.enabled ? 'bg-telegram-primary' : 'bg-telegram-border'} disabled:opacity-50`}
+                                        className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${apiSettings.enabled ? 'bg-nobuf-primary' : 'bg-nobuf-border'} disabled:opacity-50`}
                                     >
                                         <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${apiSettings.enabled ? 'translate-x-5' : 'translate-x-0'}`} />
                                     </button>
                                 </div>
 
                                 {/* Port */}
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="flex items-center justify-between p-3 rounded-lg bg-nobuf-hover/50">
                                     <div>
-                                        <p className="text-sm text-telegram-text font-medium">Port</p>
-                                        <p className="text-xs text-telegram-subtext">1024 - 65535</p>
+                                        <p className="text-sm text-nobuf-text font-medium">Port</p>
+                                        <p className="text-xs text-nobuf-subtext">1024 - 65535</p>
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <input
@@ -356,26 +356,26 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                                             onChange={e => setApiPort(e.target.value)}
                                             onBlur={handlePortApply}
                                             onKeyDown={e => { if (e.key === 'Enter') handlePortApply(); }}
-                                            className="w-20 bg-telegram-bg border border-telegram-border rounded-md px-2 py-1 text-sm text-telegram-text text-center focus:outline-none focus:border-telegram-primary/50 transition"
+                                            className="w-20 bg-nobuf-bg border border-nobuf-border rounded-md px-2 py-1 text-sm text-nobuf-text text-center focus:outline-none focus:border-nobuf-primary/50 transition"
                                         />
                                     </div>
                                 </div>
 
                                 {/* API Key */}
-                                <div className="p-3 rounded-lg bg-telegram-hover/50 space-y-2.5">
+                                <div className="p-3 rounded-lg bg-nobuf-hover/50 space-y-2.5">
                                     <div className="flex items-center justify-between">
                                         <div className="flex items-center gap-2">
-                                            <Key className="w-4 h-4 text-telegram-subtext" />
+                                            <Key className="w-4 h-4 text-nobuf-subtext" />
                                             <div>
-                                                <p className="text-sm text-telegram-text font-medium">API Key</p>
-                                                <p className="text-xs text-telegram-subtext">
+                                                <p className="text-sm text-nobuf-text font-medium">API Key</p>
+                                                <p className="text-xs text-nobuf-subtext">
                                                     {apiSettings.key_set ? 'Key configured' : 'No key set'}
                                                 </p>
                                             </div>
                                         </div>
                                         <button
                                             onClick={handleGenerateKey}
-                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary/10 text-telegram-primary hover:bg-telegram-primary/20 transition"
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-nobuf-primary/10 text-nobuf-primary hover:bg-nobuf-primary/20 transition"
                                         >
                                             <RefreshCw className="w-3 h-3" />
                                             {apiSettings.key_set ? 'Regenerate' : 'Generate'}
@@ -384,17 +384,17 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                                     {/* One-time key reveal */}
                                     {generatedKey && (
-                                        <div className="mt-2 p-2.5 bg-telegram-bg rounded-lg border border-yellow-500/20">
+                                        <div className="mt-2 p-2.5 bg-nobuf-bg rounded-lg border border-yellow-500/20">
                                             <p className="text-[10px] text-yellow-400/80 uppercase tracking-wider font-semibold mb-1.5">
                                                 Copy now — this key will not be shown again
                                             </p>
                                             <div className="flex items-center gap-2">
-                                                <code className="flex-1 text-xs text-telegram-text font-mono bg-telegram-hover rounded px-2 py-1.5 overflow-x-auto select-all">
+                                                <code className="flex-1 text-xs text-nobuf-text font-mono bg-nobuf-hover rounded px-2 py-1.5 overflow-x-auto select-all">
                                                     {generatedKey}
                                                 </code>
                                                 <button
                                                     onClick={handleCopyKey}
-                                                    className="p-1.5 rounded-md hover:bg-telegram-hover text-telegram-subtext hover:text-telegram-text transition flex-shrink-0"
+                                                    className="p-1.5 rounded-md hover:bg-nobuf-hover text-nobuf-subtext hover:text-nobuf-text transition flex-shrink-0"
                                                     title="Copy to clipboard"
                                                 >
                                                     {keyCopied ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
@@ -407,17 +407,17 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
                             {/* Storage Section */}
                             <section className="space-y-3">
-                                <h3 className="text-xs font-semibold text-telegram-subtext uppercase tracking-wider flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider flex items-center gap-2">
                                     <HardDrive className="w-3.5 h-3.5" />
                                     Storage
                                 </h3>
 
-                                <div className="flex items-center justify-between p-3 rounded-lg bg-telegram-hover/50">
+                                <div className="flex items-center justify-between p-3 rounded-lg bg-nobuf-hover/50">
                                     <div className="flex items-center gap-2">
-                                        <Trash2 className="w-4 h-4 text-telegram-subtext" />
+                                        <Trash2 className="w-4 h-4 text-nobuf-subtext" />
                                         <div>
-                                            <p className="text-sm text-telegram-text font-medium">Clear Local Cache</p>
-                                            <p className="text-xs text-telegram-subtext">Remove cached previews and temp files</p>
+                                            <p className="text-sm text-nobuf-text font-medium">Clear Local Cache</p>
+                                            <p className="text-xs text-nobuf-subtext">Remove cached previews and temp files</p>
                                         </div>
                                     </div>
                                     <button
@@ -449,17 +449,17 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                         </div>
 
                         {/* Footer */}
-                        <div className="px-5 py-3 border-t border-telegram-border flex items-center justify-between">
+                        <div className="px-5 py-3 border-t border-nobuf-border flex items-center justify-between">
                             <button
                                 onClick={resetSettings}
-                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-telegram-subtext hover:text-red-400 hover:bg-red-500/10 transition font-medium"
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-nobuf-subtext hover:text-red-400 hover:bg-red-500/10 transition font-medium"
                             >
                                 <RotateCcw className="w-3.5 h-3.5" />
                                 Reset to Defaults
                             </button>
                             <button
                                 onClick={onClose}
-                                className="px-4 py-1.5 rounded-lg text-xs font-medium bg-telegram-primary text-white hover:bg-telegram-primary/90 transition"
+                                className="px-4 py-1.5 rounded-lg text-xs font-medium bg-nobuf-primary text-white hover:bg-nobuf-primary/90 transition"
                             >
                                 Done
                             </button>

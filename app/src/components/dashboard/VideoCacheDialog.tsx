@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+﻿import { useCallback, useEffect, useRef } from 'react';
 import { save } from '@tauri-apps/plugin-dialog';
 
 interface VideoCacheDialogProps {
@@ -103,7 +103,7 @@ export function VideoCacheDialog({
                 </h3>
 
                 {/* Message */}
-                <p className="text-telegram-subtext text-sm mb-6">
+                <p className="text-nobuf-subtext text-sm mb-6">
                     {isFullyCached
                         ? `${filename} is 100% cached locally. Keep it for faster access this session, or download it to your device.`
                         : `${percentage}% of "${filename}" is cached locally. Choose what to do with the cached data.`}
@@ -140,7 +140,7 @@ export function VideoCacheDialog({
                     {isAlreadyDownloading ? (
                         <button
                             onClick={onAlreadyDownloadingClose}
-                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-telegram-primary/40 text-white/70 hover:bg-telegram-primary/50 text-left"
+                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-nobuf-primary/40 text-white/70 hover:bg-nobuf-primary/50 text-left"
                         >
                             Continue Download in Download Panel
                             <span className="block text-[11px] text-white/50 mt-0.5">
@@ -150,7 +150,7 @@ export function VideoCacheDialog({
                     ) : (
                         <button
                             onClick={handleContinueDownload}
-                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-telegram-primary text-white hover:bg-telegram-primary/90 text-left"
+                            className="px-4 py-2.5 rounded-lg text-sm font-medium transition bg-nobuf-primary text-white hover:bg-nobuf-primary/90 text-left"
                         >
                             Continue Download in Download Panel
                             <span className="block text-[11px] text-white/60 mt-0.5">

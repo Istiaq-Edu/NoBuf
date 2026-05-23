@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { Plus } from 'lucide-react';
 
 interface SidebarItemProps {
@@ -58,13 +58,13 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
             }}
             title={collapsed ? label : undefined}
             className={`group w-full flex items-center rounded-lg text-sm font-medium transition-all duration-150 overflow-hidden ${collapsed ? 'relative justify-center py-2' : 'px-3 py-2 gap-3'} ${active
-                ? 'bg-telegram-primary/10 text-telegram-primary'
+                ? 'bg-nobuf-primary/10 text-nobuf-primary'
                 : isOver
-                    ? 'bg-telegram-primary/30 text-telegram-text ring-2 ring-telegram-primary scale-[1.02] shadow-lg'
-                    : 'text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text'
+                    ? 'bg-nobuf-primary/30 text-nobuf-text ring-2 ring-nobuf-primary scale-[1.02] shadow-lg'
+                    : 'text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text'
                 }`}
         >
-            <Icon className={`w-4 h-4 shrink-0 ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-telegram-primary' : ''}`} />
+            <Icon className={`w-4 h-4 shrink-0 ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-nobuf-primary' : ''}`} />
             <span className={`flex-1 text-left truncate whitespace-nowrap transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>{label}</span>
             {onDelete && (
                 <div onClick={(e) => { e.stopPropagation(); onDelete(); }} className={`shrink-0 p-1 hover:text-red-400 transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-0 group-hover:opacity-100'}`}>

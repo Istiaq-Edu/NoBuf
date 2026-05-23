@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { HardDrive, Folder, Plus, RefreshCw, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
@@ -39,13 +39,13 @@ export function Sidebar({
     }
 
     return (
-        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-telegram-surface border-r border-telegram-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0`} onClick={e => e.stopPropagation()}>
+        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-nobuf-surface border-r border-nobuf-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0`} onClick={e => e.stopPropagation()}>
 
             {/* Toggle button — always in the same spot */}
             <div className="p-3 flex items-center">
                 <button
                     onClick={onToggleCollapse}
-                    className="w-8 h-8 rounded-lg flex items-center justify-center text-telegram-subtext hover:text-telegram-text hover:bg-telegram-hover transition-colors"
+                    className="w-8 h-8 rounded-lg flex items-center justify-center text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-hover transition-colors"
                     title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
                 >
                     {collapsed
@@ -82,13 +82,13 @@ export function Sidebar({
             </nav>
 
             {/* Create Folder */}
-            <div className="px-2 pb-2 border-b border-telegram-border">
+            <div className="px-2 pb-2 border-b border-nobuf-border">
                 {showNewFolderInput ? (
                     <div className="px-3 py-2">
                         <input
                             autoFocus
                             type="text"
-                            className="w-full bg-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-telegram-primary"
+                            className="w-full bg-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-nobuf-primary"
                             placeholder="Folder Name"
                             value={newFolderName}
                             onChange={e => setNewFolderName(e.target.value)}
@@ -102,7 +102,7 @@ export function Sidebar({
                             if (collapsed) { onToggleCollapse(); }
                             setShowNewFolderInput(true);
                         }}
-                        className={`w-full flex items-center px-3 py-2 rounded-lg text-sm font-medium text-telegram-subtext hover:bg-telegram-hover hover:text-telegram-text transition-colors border border-dashed border-telegram-border overflow-hidden ${collapsed ? 'justify-center' : 'gap-3'}`}
+                        className={`w-full flex items-center px-3 py-2 rounded-lg text-sm font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-colors border border-dashed border-nobuf-border overflow-hidden ${collapsed ? 'justify-center' : 'gap-3'}`}
                         title="Create Folder"
                     >
                         <Plus className="w-4 h-4 shrink-0" />
@@ -112,9 +112,9 @@ export function Sidebar({
             </div>
 
             {/* Footer — single structure, text fades out */}
-            <div className="p-3 border-t border-telegram-border">
-                <div className={`flex items-center text-telegram-subtext text-xs mb-3 ${collapsed ? 'justify-center' : 'gap-2'}`}>
-                    <div className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+            <div className="p-3 border-t border-nobuf-border">
+                <div className={`flex items-center text-nobuf-subtext text-xs mb-3 ${collapsed ? 'justify-center' : 'gap-2'}`}>
+                    <div className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-nobuf-primary animate-pulse' : 'bg-red-500'}`}></div>
                     <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'max-w-0 opacity-0' : 'max-w-[200px] opacity-100'}`}>
                         {isConnected ? 'Connected' : 'Disconnected'}
                     </span>
@@ -124,7 +124,7 @@ export function Sidebar({
                     <button
                         onClick={onSync}
                         disabled={isSyncing}
-                        className={`flex items-center justify-center text-xs font-medium text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'} ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        className={`btn-shine flex items-center justify-center text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:bg-nobuf-primary/90 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'} ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
                         title={isSyncing ? 'Syncing...' : 'Sync'}
                     >
                         <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isSyncing ? 'animate-spin' : ''}`} />
@@ -134,7 +134,7 @@ export function Sidebar({
                     </button>
                     <button
                         onClick={onLogout}
-                        className={`flex items-center justify-center text-xs font-medium text-red-500 hover:text-red-600 bg-red-500/10 hover:bg-red-500/20 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'}`}
+                        className={`btn-shine flex items-center justify-center text-xs font-medium bg-red-500 text-white hover:bg-red-600 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'}`}
                         title="Sign Out"
                     >
                         <LogOut className="w-3.5 h-3.5 shrink-0" />

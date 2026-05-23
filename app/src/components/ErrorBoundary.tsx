@@ -1,4 +1,4 @@
-import { Component, ReactNode } from 'react';
+﻿import { Component, ReactNode } from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface Props {
@@ -31,22 +31,22 @@ export class ErrorBoundary extends Component<Props, State> {
     render() {
         if (this.state.hasError) {
             return (
-                <div className="h-screen w-screen flex items-center justify-center bg-telegram-bg p-8">
-                    <div className="max-w-md w-full bg-telegram-surface border border-telegram-border rounded-2xl p-8 text-center shadow-2xl">
+                <div className="h-screen w-screen flex items-center justify-center bg-nobuf-bg p-8">
+                    <div className="max-w-md w-full bg-nobuf-surface border border-nobuf-border rounded-2xl p-8 text-center shadow-2xl">
                         <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-red-500/10 flex items-center justify-center">
                             <AlertTriangle className="w-8 h-8 text-red-400" />
                         </div>
-                        <h1 className="text-xl font-semibold text-telegram-text mb-2">Something went wrong</h1>
-                        <p className="text-telegram-subtext text-sm mb-6">
+                        <h1 className="text-xl font-semibold text-nobuf-text mb-2">Something went wrong</h1>
+                        <p className="text-nobuf-subtext text-sm mb-6">
                             The application encountered an unexpected error. Please try reloading.
                         </p>
 
                         {this.state.error && (
                             <details className="mb-6 text-left">
-                                <summary className="text-xs text-telegram-subtext cursor-pointer hover:text-telegram-text transition-colors">
+                                <summary className="text-xs text-nobuf-subtext cursor-pointer hover:text-nobuf-text transition-colors">
                                     Technical Details
                                 </summary>
-                                <pre className="mt-2 p-3 bg-telegram-hover rounded-lg text-xs text-red-400 overflow-auto max-h-32">
+                                <pre className="mt-2 p-3 bg-nobuf-hover rounded-lg text-xs text-red-400 overflow-auto max-h-32">
                                     {this.state.error.message}
                                 </pre>
                             </details>
@@ -54,7 +54,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
                         <button
                             onClick={this.handleReload}
-                            className="inline-flex items-center gap-2 px-6 py-3 bg-telegram-primary text-black font-medium rounded-lg hover:bg-telegram-primary/90 transition-colors"
+                            className="inline-flex items-center gap-2 px-6 py-3 bg-nobuf-primary text-black font-medium rounded-lg hover:bg-nobuf-primary/90 transition-colors"
                         >
                             <RefreshCw className="w-4 h-4" />
                             Reload Application
