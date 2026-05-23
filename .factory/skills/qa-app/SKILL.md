@@ -1,12 +1,12 @@
 ---
 name: qa-app
 description: >
-  QA tests for the nobuff desktop app. Covers REST API endpoints (CI-compatible
+  QA tests for the NoBuf desktop app. Covers REST API endpoints (CI-compatible
   via curl) and GUI flows (local desktop only). The app is a Tauri v2 desktop application
   with a React frontend and Rust backend using the Telegram API via grammers.
 ---
 
-# QA: nobuff App
+# QA: NoBuf App
 
 ## App Overview
 
@@ -187,7 +187,7 @@ curl -s -o /tmp/test-range -H "X-API-Key: $QA_API_KEY" \
 6. If 2FA is enabled, enter the password
 7. Verify the Dashboard appears with Saved Messages loaded
 
-**Success criteria:** Dashboard shows files/folders from Saved Messages. Sidebar shows folder list. Top bar shows "nobuff" with connection status.
+**Success criteria:** Dashboard shows files/folders from Saved Messages. Sidebar shows folder list. Top bar shows "NoBuf" with connection status.
 
 **Negative test — invalid phone:**
 Enter an invalid phone number. Verify error message appears.
