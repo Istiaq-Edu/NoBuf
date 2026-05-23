@@ -7,10 +7,13 @@ use crate::models::{FolderMetadata, FileMetadata};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta};
+use crate::download_pool::StreamChunk;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-/// Chunk size for downloads (512 KB) — matches server.rs
-const DOWNLOAD_CHUNK_SIZE: i32 = 512 * 1024;
+/// Telegram download chunk size. Gammers-client enforces a hard cap of
+/// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
+/// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
+const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 #[tauri::command]
 pub async fn cmd_create_folder(
@@ -449,13 +452,11 @@ pub async fn cmd_download_file(
                 return Err("Transfer cancelled".to_string());
             }
 
-
-
-            let skip_chunks = gap_start / DOWNLOAD_CHUNK_SIZE as u64;
-            let skip_bytes = gap_start % DOWNLOAD_CHUNK_SIZE as u64;
+            let skip_chunks = gap_start / TELEGRAM_CHUNK_SIZE as u64;
+            let skip_bytes = gap_start % TELEGRAM_CHUNK_SIZE as u64;
 
             let mut iter = client.iter_download(&media)
-                .chunk_size(DOWNLOAD_CHUNK_SIZE)
+                .chunk_size(TELEGRAM_CHUNK_SIZE)
                 .skip_chunks(skip_chunks as i32);
 
             output_file.seek(SeekFrom::Start(gap_start))
@@ -532,8 +533,20 @@ pub async fn cmd_download_file(
                     break;
                 }
 
-                // Yield briefly so player prebuffer gets a fair share of the semaphore;
-                // tokio::sync::Semaphore uses FIFO waiters so this is cooperative yielding.
+                // Throttle: sleep to enforce download speed limit.
+                // Semaphore is released after chunk fetch, so prebuffer can use
+                // the connection during this sleep window. Also yield cooperatively.
+                let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                if dl_limit_kb > 0 {
+                    let sleep_ms = (to_write as u64 * 1000) / (dl_limit_kb * 1024);
+                    let sleep_ms = sleep_ms.min(2000);
+                    // log::info!("[THROTTLE-DBG][DOWNLOAD-GAP] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
+                    //     message_id, to_write, dl_limit_kb, sleep_ms, offset);
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                } else {
+                    // log::info!("[THROTTLE-DBG][DOWNLOAD-GAP] msg={}, unlimited, no throttle sleep, offset={}", 
+                    //     message_id, offset);
+                }
                 tokio::task::yield_now().await;
             }
         }
@@ -563,7 +576,129 @@ pub async fn cmd_download_file(
         _ => "application/octet-stream".to_string(),
     };
 
-    let mut download_iter = client.iter_download(&media);
+    // === PARALLEL DOWNLOAD PATH (DownloadPool) ===
+    // Use 3 workers with separate TCP connections for large files (>1MB).
+    // Gives ~3x bandwidth improvement per Telegram's official recommendation.
+    let pool_clone = { state.download_pool.lock().await.clone() };
+    if let Some(pool) = pool_clone {
+        if total_size > 1024 * 1024 {
+            log::info!("Download {} using parallel pool ({} bytes)", message_id, total_size);
+            let mut rx = pool.stream_range(
+                &media, 0, total_size - 1, total_size, state.download_semaphore.clone(),
+            );
+
+            let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+            let mut downloaded: u64 = 0;
+            let mut last_emit_time = std::time::Instant::now();
+            let mut last_emit_bytes: u64 = 0;
+
+            if !tid.is_empty() {
+                let _ = app_handle.emit("download-progress", ProgressPayload {
+                    id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: total_size, speed_bytes_per_sec: 0,
+                });
+            }
+
+            while let Some(msg) = rx.recv().await {
+                // Check cancellation
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    state.cancelled_transfers.write().await.remove(&tid);
+                    drop(file);
+                    cleanup_partial_file(&save_path);
+                    return Err("Transfer cancelled".to_string());
+                }
+
+                match msg {
+                    Ok(StreamChunk { offset, data: chunk_data }) => {
+                        let remaining = total_size - downloaded;
+                        if remaining == 0 { break; }
+
+                        let final_data = if chunk_data.len() as u64 > remaining {
+                            chunk_data[..remaining as usize].to_vec()
+                        } else {
+                            chunk_data
+                        };
+
+                        let bytes_in_chunk = final_data.len() as u64;
+                        let chunk_range_end = offset + bytes_in_chunk - 1;
+
+                        // Write to output file at correct offset
+                        file.seek(SeekFrom::Start(offset))
+                            .map_err(|e| format!("Seek error: {}", e))?;
+                        std::io::Write::write_all(&mut file, &final_data)
+                            .map_err(|e| format!("Write error: {}", e))?;
+
+                        // Write to cache file and update meta incrementally
+                        if let Some(ref mut cf) = cache_file {
+                            let _ = cf.seek(SeekFrom::Start(offset));
+                            let _ = cf.write_all(&final_data);
+
+                            let _lock = cache_state.lock_meta(message_id).await;
+                            let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                                message_id,
+                                folder_id: folder_id.unwrap_or(0),
+                                total_size,
+                                filename: dl_filename.clone(),
+                                cached_ranges: Vec::new(),
+                                mime_type: dl_mime.clone(),
+                            });
+                            meta.cached_ranges.push((offset, chunk_range_end));
+                            stream_cache::merge_ranges(&mut meta.cached_ranges);
+                            let _ = cache_state.save_meta(&meta);
+                        }
+
+                        downloaded += bytes_in_chunk;
+
+                        // Time-based progress emission (every 250ms)
+                        if !tid.is_empty() {
+                            let now = std::time::Instant::now();
+                            let dt = now.duration_since(last_emit_time).as_secs_f64();
+                            if dt >= 0.25 || downloaded >= total_size {
+                                let speed = if dt > 0.0 { ((downloaded - last_emit_bytes) as f64 / dt) as u64 } else { 0 };
+                                let percent = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u8 } else { 0 };
+                                let _ = app_handle.emit("download-progress", ProgressPayload {
+                                    id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: speed,
+                                });
+                                last_emit_time = now;
+                                last_emit_bytes = downloaded;
+                            }
+                        }
+
+                        // Throttle: sleep to enforce download speed limit.
+                        let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                        if dl_limit_kb > 0 {
+                            let sleep_ms = (bytes_in_chunk * 1000) / (dl_limit_kb * 1024);
+                            let sleep_ms = sleep_ms.min(2000);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+
+                        if downloaded >= total_size { break; }
+                    }
+                    Err(e) => {
+                        log::error!("Parallel download error for {}: {}", message_id, e);
+                        drop(file);
+                        cleanup_partial_file(&save_path);
+                        return Err(format!("Parallel download error: {}", e));
+                    }
+                }
+            }
+
+            bw_state.add_down(total_size);
+
+            if !tid.is_empty() {
+                let _ = app_handle.emit("download-progress", ProgressPayload {
+                    id: tid, percent: 100, uploaded_bytes: downloaded, total_bytes: total_size, speed_bytes_per_sec: 0,
+                });
+            }
+
+            return Ok("Download successful (parallel)".to_string());
+        }
+    }
+
+    // === SEQUENTIAL FALLBACK ===
+    // Progressive chunk sizing for fresh downloads.
+    // Gammers-client caps chunk_size at 512KB — use TELEGRAM_CHUNK_SIZE.
+    let mut download_iter = client.iter_download(&media)
+        .chunk_size(TELEGRAM_CHUNK_SIZE);
     let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
     let mut downloaded: u64 = 0;
     let mut last_emit_time = std::time::Instant::now();
@@ -628,6 +763,13 @@ pub async fn cmd_download_file(
             }
         }
 
+        // Throttle: sleep to enforce download speed limit.
+        let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+        if dl_limit_kb > 0 {
+            let sleep_ms = (bytes.len() as u64 * 1000) / (dl_limit_kb * 1024);
+            let sleep_ms = sleep_ms.min(2000);
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        }
         // Yield so player prebuffer gets a fair share of the semaphore
         tokio::task::yield_now().await;
     }
@@ -827,7 +969,7 @@ pub async fn cmd_scan_folders(
                 let name = c.raw.title.clone();
                 let access_hash = c.raw.access_hash.unwrap_or(0);
                 
-                log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
+                // log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
                 // Strategy 1: Title
                 if name.to_lowercase().contains("[td]") {
@@ -859,10 +1001,10 @@ pub async fn cmd_scan_folders(
             },
             Peer::User(u) => {
                 peer_cache.insert(u.raw.id(), dialog.peer.clone());
-                log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
+                // log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
             },
-            peer => {
-                log::debug!("[SCAN] Skipped Peer: {:?}", peer);
+            _peer => {
+                // log::debug!("[SCAN] Skipped Peer: {:?}", peer);
             }
         }
     }

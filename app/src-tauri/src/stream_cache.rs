@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Windows FILE_SHARE_DELETE protection
@@ -87,6 +87,56 @@ mod win32 {
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Download Coordinator (Bug #6 fix)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Without coordination, concurrent HTTP range requests for the same
+// message spawn overlapping SEQUENTIAL downloads. Example: the player
+// requests bytes=633MB-1.4GB, then bytes=634MB-1.4GB — each starts
+// an independent download, wasting bandwidth and fragmenting meta.
+//
+// The ActiveDownload registry ensures that for any given message,
+// overlapping range requests subscribe to the same download instead
+// of spawning duplicates. A watch::Channel broadcasts the last byte
+// written to cache, allowing subscribers to read from cache as data
+// arrives (no duplicate Telegram API calls for overlapping ranges).
+//
+// Non-overlapping ranges (e.g., bytes=0-8MB vs bytes=520MB-530MB)
+// CAN start separate downloads since they fetch different data.
+// The coordinator limits concurrent downloads per message to prevent
+// flooding Telegram's API.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Bug #15 fix: Limit concurrent downloads per message to prevent
+// FLOOD_PREMIUM_WAIT bombardment. Without this, a rapidly-seeking
+// player can spawn 10+ simultaneous downloads (each ~1MB prebuffer
+// request), all hitting Telegram API concurrently and triggering
+// FLOOD_PREMIUM_WAIT retries. When the limit is reached, new requests
+// subscribe to the nearest existing download instead of spawning a new one.
+const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 3;
+
+/// Tracks an active SEQUENTIAL download for a message.
+/// Other overlapping range requests subscribe via the progress channel
+/// and read from cache as data becomes available.
+pub struct ActiveDownload {
+    /// Byte offset where the download started
+    pub start_byte: u64,
+    /// Byte offset where the download will end (inclusive)
+    pub end_byte: u64,
+    /// Broadcasts the last byte written to cache (subscribers watch this
+    /// to know when data they need is available). Sender is dropped when
+    /// the download completes, which signals subscribers via changed() → Err.
+    pub progress_tx: watch::Sender<u64>,
+}
+
+/// Information returned to a subscriber (read-only snapshot of an ActiveDownload)
+pub struct ActiveDownloadInfo {
+    pub start_byte: u64,
+    pub end_byte: u64,
+    /// Receiver that tracks the last byte written to cache
+    pub progress_rx: watch::Receiver<u64>,
+}
+
 /// Metadata sidecar for a cached file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
@@ -148,6 +198,19 @@ pub struct StreamCacheManager {
     meta_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
     /// Tracks messages currently being streamed (synchronous, for Drop guards)
     streaming_active: Arc<std::sync::Mutex<Vec<i32>>>,
+    /// Active SEQUENTIAL downloads per message (download coordinator).
+    /// Prevents overlapping range requests from spawning duplicate downloads.
+    /// Each entry has a watch::Sender that broadcasts download progress.
+    /// Bug #13 fix: Vec<ActiveDownload> allows multiple concurrent downloads
+    /// per message (different byte ranges). Previously HashMap<i32, ActiveDownload>
+    /// keyed only by message_id, so a second download for the same message
+    /// would overwrite the first, dropping its progress_tx and orphaning subscribers.
+    active_downloads: Arc<Mutex<HashMap<i32, Vec<ActiveDownload>>>>,
+    /// Deferred deletion queue (Bug #8 remaining): message_ids whose .dat files
+    /// couldn't be deleted immediately because file handles were still open on
+    /// Windows (ERROR_SHARING_VIOLATION / os error 32). When both streaming
+    /// and downloads end for a queued message, we retry the .dat deletion.
+    pending_deletions: Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl StreamCacheManager {
@@ -158,6 +221,8 @@ impl StreamCacheManager {
             active_tasks: Arc::new(Mutex::new(Vec::new())),
             meta_locks: Arc::new(Mutex::new(HashMap::new())),
             streaming_active: Arc::new(std::sync::Mutex::new(Vec::new())),
+            active_downloads: Arc::new(Mutex::new(HashMap::new())),
+            pending_deletions: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -195,7 +260,7 @@ impl StreamCacheManager {
     pub fn load_meta(&self, message_id: i32) -> Option<CacheMeta> {
         let path = self.meta_path(message_id);
         if !path.exists() {
-            log::debug!("[META] load_meta: {} file does not exist", path.display());
+            // log::debug!("[META] load_meta: {} file does not exist", path.display());
             return None;
         }
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -296,6 +361,152 @@ impl StreamCacheManager {
         lock.lock_owned().await
     }
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Download Coordinator methods (Bug #6 fix)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// Check if there's an active download for this message that covers
+    /// the requested byte range. Returns ActiveDownloadInfo if any active
+    /// download for this message will eventually reach our start_byte
+    /// (its start_byte <= our start_byte AND its end_byte >= our start_byte).
+    ///
+    /// Bug #13 fix: Searches through ALL active downloads for this message
+    /// (Vec<ActiveDownload>), not just one.
+    pub async fn find_covering_download(&self, message_id: i32, start_byte: u64, _end_byte: u64) -> Option<ActiveDownloadInfo> {
+        let downloads = self.active_downloads.lock().await;
+        let dls = downloads.get(&message_id)?;
+        for dl in dls.iter() {
+            if dl.start_byte <= start_byte && dl.end_byte >= start_byte {
+                return Some(ActiveDownloadInfo {
+                    start_byte: dl.start_byte,
+                    end_byte: dl.end_byte,
+                    progress_rx: dl.progress_tx.subscribe(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Find the nearest active download for a message (closest start_byte
+    /// to the requested range). Used when MAX_CONCURRENT_DOWNLOADS limit
+    /// is reached — new requests subscribe to the closest download instead
+    /// of spawning a new one. Bug #15 fix.
+    pub async fn find_nearest_download(&self, message_id: i32, start_byte: u64) -> Option<ActiveDownloadInfo> {
+        let downloads = self.active_downloads.lock().await;
+        let dls = downloads.get(&message_id)?;
+        let best = dls.iter().min_by_key(|dl| {
+            if dl.end_byte < start_byte {
+                start_byte - dl.end_byte
+            } else if dl.start_byte > start_byte {
+                dl.start_byte - start_byte
+            } else {
+                0u64
+            }
+        })?;
+        Some(ActiveDownloadInfo {
+            start_byte: best.start_byte,
+            end_byte: best.end_byte,
+            progress_rx: best.progress_tx.subscribe(),
+        })
+    }
+
+    /// Count active downloads for a message. Bug #15 fix: used to enforce
+    /// MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE limit.
+    pub async fn active_download_count(&self, message_id: i32) -> usize {
+        let downloads = self.active_downloads.lock().await;
+        downloads.get(&message_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Register a new active download for a message. Creates a watch channel
+    /// for progress broadcasting. Returns the progress receiver.
+    /// Bug #13 fix: Pushes into Vec<ActiveDownload>.
+    /// Bug #15 fix: Refuses to register if MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE
+    /// is already reached. Caller should use find_nearest_download instead.
+    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64) -> Option<watch::Receiver<u64>> {
+        let mut downloads = self.active_downloads.lock().await;
+        let current_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
+        if current_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
+            log::warn!("[COORDINATOR] Max concurrent downloads ({}) reached for msg {}, cannot register range {}-{}",
+                MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE, message_id, start_byte, end_byte);
+            return None;
+        }
+        let (progress_tx, progress_rx) = watch::channel(0u64);
+        let dl = ActiveDownload {
+            start_byte,
+            end_byte,
+            progress_tx,
+        };
+        downloads.entry(message_id)
+            .or_insert_with(Vec::new)
+            .push(dl);
+        let new_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
+        log::info!("[COORDINATOR] Registered download for msg {} range {}-{} (total active: {})",
+            message_id, start_byte, end_byte, new_count);
+        Some(progress_rx)
+    }
+
+    /// Update download progress (last byte written to cache). Called by
+    /// the SEQUENTIAL download stream after each chunk is written to cache.
+    /// Subscribers watching the progress_rx will be notified.
+    /// Bug #13 fix: Searches Vec<ActiveDownload> to find the download
+    /// that matches the exact range, not just any download for the message.
+    pub async fn update_download_progress(&self, message_id: i32, start_byte: u64, last_cached_byte: u64) {
+        let downloads = self.active_downloads.lock().await;
+        if let Some(dls) = downloads.get(&message_id) {
+            // Find the download that started at start_byte (the download that
+            // called this method). This avoids updating the wrong download's
+            // progress when multiple concurrent downloads exist for the same message.
+            for dl in dls.iter() {
+                if dl.start_byte == start_byte {
+                    let _ = dl.progress_tx.send(last_cached_byte);
+                    return;
+                }
+            }
+            // Fallback: if we can't find the exact download by start_byte,
+            // update any download whose range includes last_cached_byte.
+            // This handles edge cases where the download's start_byte changed.
+            for dl in dls.iter() {
+                if dl.start_byte <= last_cached_byte && dl.end_byte >= last_cached_byte {
+                    let _ = dl.progress_tx.send(last_cached_byte);
+                    return;
+                }
+            }
+            log::warn!("[COORDINATOR] Could not find active download for msg {} to update progress to {}", message_id, last_cached_byte);
+        }
+    }
+
+    /// Unregister an active download (called when the download completes
+    /// or the Actix response ends). Drops the progress_tx which signals
+    /// subscribers that the download is finished (changed() returns Err).
+    /// Bug #13 fix: Removes the specific download (identified by start_byte
+    /// and end_byte) from the Vec, not the entire HashMap entry. This
+    /// preserves other concurrent downloads for the same message.
+    pub async fn unregister_download(&self, message_id: i32, start_byte: u64, end_byte: u64) {
+        let mut downloads = self.active_downloads.lock().await;
+        if let Some(dls) = downloads.get_mut(&message_id) {
+            if let Some(pos) = dls.iter().position(|dl| dl.start_byte == start_byte && dl.end_byte == end_byte) {
+                let dl = dls.remove(pos);
+                log::info!("[COORDINATOR] Unregistered download for msg {} (range {}-{}, remaining: {})",
+                    message_id, dl.start_byte, dl.end_byte, dls.len());
+                // Dropping dl.progress_tx signals all subscribers watching this
+                // specific download that it has ended.
+            } else {
+                log::warn!("[COORDINATOR] Could not find download to unregister for msg {} range {}-{}",
+                    message_id, start_byte, end_byte);
+            }
+            // Clean up empty Vec entries
+            if dls.is_empty() {
+                downloads.remove(&message_id);
+            }
+        }
+        // Bug #8 deferred deletion: When downloads end, try to delete
+        // .dat files that previously failed due to open handles.
+        // (This is async, so try_deferred_deletions is called after
+        // the Mutex is released — the .dat file handles from the
+        // download stream should now be dropped.)
+        self.try_deferred_deletions(message_id);
+    }
+
     /// Delete cache for a specific message.
     /// Refuses to delete if the message is currently being streamed
     /// (frontend cmd_delete_cache during streaming caused catastrophic
@@ -307,11 +518,11 @@ impl StreamCacheManager {
     /// error 32) if any handle (stream or download task) hasn't been dropped yet,
     /// even though streaming has been untracked. We handle this by:
     /// 1. Always deleting the .meta.json sidecar (standard share modes)
-    /// 2. Attempting to delete the .dat file; on failure, leaving it in place
-    ///    (DO NOT truncate — truncating while another handle writes creates gaps
-    ///    that corrupt MSE player data, causing CHUNK_DEMUXER_ERROR_APPEND_FAILED).
-    /// 3. The .dat will be overwritten via OPEN_ALWAYS on next playback, or
-    ///    cleaned on app exit via clear_all().
+    /// 2. Attempting to delete the .dat file; on failure, queuing it for
+    ///    deferred deletion via the pending_deletions queue (Bug #8 fix).
+    /// 3. The deferred deletion retries when untrack_streaming() or
+    ///    unregister_download() detects that handles have closed.
+    /// 4. As a final fallback, .dat files are cleaned on app exit via clear_all().
     /// The .meta.json deletion alone makes get_status() return None, effectively
     /// discarding the cache from the frontend's perspective.
     pub fn delete_cache(&self, message_id: i32) -> std::io::Result<bool> {
@@ -344,9 +555,16 @@ impl StreamCacheManager {
                 Err(e) => {
                     log::warn!(
                         "[CACHE] delete_cache: Could not delete data file for msg {} ({}), \
-                        left in place — will be overwritten on next playback or cleaned on exit",
+                        queued for deferred deletion after handles close",
                         message_id, e
                     );
+                    // Bug #8 deferred deletion: Queue the message_id for retry
+                    // when all handles close (streaming + downloads end).
+                    if let Ok(mut pending) = self.pending_deletions.lock() {
+                        if !pending.contains(&message_id) {
+                            pending.push(message_id);
+                        }
+                    }
                     // Intentionally NOT truncating: truncating while another handle
                     // writes to the file creates gaps that corrupt MSE data.
                 }
@@ -394,17 +612,63 @@ impl StreamCacheManager {
     /// Removes only ONE entry — concurrent streams for the same message_id
     /// (e.g. player seeks spawning a new range request) each track/untrack
     /// independently.
+    /// Bug #8 deferred deletion: When streaming ends, also tries to delete
+    /// .dat files that previously failed deletion due to open handles.
     pub fn untrack_streaming(&self, message_id: i32) {
         if let Ok(mut v) = self.streaming_active.lock() {
             if let Some(pos) = v.iter().position(|&id| id == message_id) {
                 v.remove(pos);
             }
         }
+        self.try_deferred_deletions(message_id);
     }
 
     /// Check if a message is currently being streamed by Actix.
     pub fn is_streaming(&self, message_id: i32) -> bool {
         self.streaming_active.lock().map(|v| v.contains(&message_id)).unwrap_or(false)
+    }
+
+    /// Bug #8 deferred deletion: Attempt to delete .dat files that were
+    /// queued when delete_cache failed due to open file handles on Windows.
+    /// Called from untrack_streaming() and unregister_download() — when
+    /// all handles should be closed and the .dat file should be deletable.
+    fn try_deferred_deletions(&self, message_id: i32) {
+        // Only attempt deletion if streaming has ended for this message
+        if self.is_streaming(message_id) {
+            return;
+        }
+        // Check if this message is queued for deferred deletion
+        let should_try = self.pending_deletions.lock()
+            .map(|pending| pending.contains(&message_id))
+            .unwrap_or(false);
+        if !should_try {
+            return;
+        }
+
+        let data_path = self.data_path(message_id);
+        if data_path.exists() {
+            match std::fs::remove_file(&data_path) {
+                Ok(()) => {
+                    log::info!("[CACHE] Deferred deletion: removed .dat file for msg {}", message_id);
+                    if let Ok(mut pending) = self.pending_deletions.lock() {
+                        pending.retain(|id| *id != message_id);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[CACHE] Deferred deletion: still can't delete .dat for msg {} ({}) \
+                        — will retry on next handle close or app exit",
+                        message_id, e
+                    );
+                    // Leave in pending queue — will retry on next untrack/unregister
+                }
+            }
+        } else {
+            // .dat already gone — clean up pending queue
+            if let Ok(mut pending) = self.pending_deletions.lock() {
+                pending.retain(|id| *id != message_id);
+            }
+        }
     }
 }
 

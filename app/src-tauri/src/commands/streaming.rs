@@ -95,8 +95,9 @@ pub async fn cmd_report_cached_ranges(
     cache_state.save_meta(&meta)
         .map_err(|e| format!("Failed to save meta: {}", e))?;
 
-    log::info!("[PREBUFFER] REPORT: msg {} adding verified_ranges {:?}, meta now has {} ranges ({:.1}% complete)",
-        message_id, verified_ranges, meta.cached_ranges.len(), meta.cached_percentage());
+    // Per-chunk REPORT log is too verbose — commented out for testing
+    // log::info!("[PREBUFFER] REPORT: msg {} adding verified_ranges {:?}, meta now has {} ranges ({:.1}% complete)",
+    //     message_id, verified_ranges, meta.cached_ranges.len(), meta.cached_percentage());
 
     Ok(true)
 }
@@ -243,10 +244,57 @@ async fn background_cache_download(
     let mut cache_file = cache_mgr.open_data_file_write(message_id)
         .map_err(|e| format!("Failed to open cache file: {}", e))?;
 
+    // Gammers-client chunk size cap (512KB). See fs.rs TELEGRAM_CHUNK_SIZE.
     let chunk_size: i32 = 512 * 1024;
     let transfer_id = format!("bg-cache-{}", message_id);
 
+    // Get DownloadPool for parallel gap-filling of large gaps (>1MB)
+    let pool_clone = { state.download_pool.lock().await.clone() };
+
     for (gap_start, gap_end) in gaps {
+        let gap_size = gap_end - gap_start + 1;
+
+        // Check cancellation
+        if state.cancelled_transfers.read().await.contains(&transfer_id) {
+            log::info!("Background cache cancelled for {}", message_id);
+            return Ok(());
+        }
+
+        // Use parallel download for large gaps when DownloadPool is available
+        if let Some(ref pool) = pool_clone {
+            if gap_size > 1024 * 1024 {
+                log::info!("Background cache {}: parallel download gap {}-{} ({:.1}MB)",
+                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0));
+
+                let data = pool.download_range(&media, gap_start, gap_end, total_size).await
+                    .map_err(|e| format!("Parallel gap download error: {}", e))?;
+
+                cache_file
+                    .seek(SeekFrom::Start(gap_start))
+                    .map_err(|e| format!("Seek error: {}", e))?;
+                cache_file
+                    .write_all(&data)
+                    .map_err(|e| format!("Write error: {}", e))?;
+
+                // Update meta (serialized via per-message lock)
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                    message_id,
+                    folder_id,
+                    total_size,
+                    filename: filename.clone(),
+                    cached_ranges: Vec::new(),
+                    mime_type: mime_type.clone(),
+                });
+                meta.cached_ranges.push((gap_start, gap_end));
+                merge_ranges(&mut meta.cached_ranges);
+                let _ = cache_mgr.save_meta(&meta);
+
+                continue; // Skip sequential download for this gap
+            }
+        }
+
+        // Sequential iter_download for small gaps or when pool unavailable
         let skip_chunks = gap_start / chunk_size as u64;
         let skip_bytes = gap_start % chunk_size as u64;
 
@@ -310,6 +358,21 @@ async fn background_cache_download(
             meta.cached_ranges.push((gap_start, offset - 1));
             merge_ranges(&mut meta.cached_ranges);
             let _ = cache_mgr.save_meta(&meta);
+
+            // Throttle: sleep to enforce download speed limit for background cache.
+            // Semaphore is released after chunk fetch, so other tasks can use
+            // the connection during this sleep window.
+            let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+            if dl_limit_kb > 0 {
+                let sleep_ms = (to_write as u64 * 1000) / (dl_limit_kb * 1024);
+                let sleep_ms = sleep_ms.min(2000);
+                // log::info!("[THROTTLE-DBG][BG-CACHE] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
+                //     message_id, to_write, dl_limit_kb, sleep_ms, offset);
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            } else {
+                // log::info!("[THROTTLE-DBG][BG-CACHE] msg={}, unlimited, no throttle sleep, offset={}", 
+                //     message_id, offset);
+            }
 
             if offset > gap_end {
                 break;

@@ -7,7 +7,7 @@ import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, AutoHideDelay } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, AutoHideDelay, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 
@@ -54,12 +54,22 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [brightness, setBrightness] = useState(1);
   const [pip, setPip] = useState(false);
   const [videoResolution, setVideoResolution] = useState<{ w: number; h: number } | null>(null);
+  // Speed limit custom input state
+  const [customPrebufferValue, setCustomPrebufferValue] = useState<string>('');
+  const [customPrebufferUnit, setCustomPrebufferUnit] = useState<'kb' | 'mb'>('mb');
+  const [customDownloadValue, setCustomDownloadValue] = useState<string>('');
+  const [customDownloadUnit, setCustomDownloadUnit] = useState<'kb' | 'mb'>('mb');
   // Video cache dialog state — replaces old bgCache auto-dialog
   const [showCacheDialog, setShowCacheDialog] = useState(false);
   const [pendingCachePercent, setPendingCachePercent] = useState(0);
   const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
   const skipFeedbackTimer = useRef<number>(0);
   const skipFeedbackKey = useRef(0);
+  const [videoEnded, setVideoEnded] = useState(false);
+  // Ref synced alongside videoEnded state — prevents stale closure in
+  // onPlay handler (which is inside a useEffect and doesn't have videoEnded
+  // in its deps). Also used by seekFwd/seekBwd for synchronous checks.
+  const videoEndedRef = useRef(false);
 
   const [cachePercent, setCachePercent] = useState(0);
   const [cacheComplete, setCacheComplete] = useState(false);
@@ -402,6 +412,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
     };
     const onCanPlay = () => {
+      // Don't auto-play when the replay overlay is showing — the MSE guard
+      // already paused the video and dispatched 'ended'. canplay fires from
+      // the currentTime change, and calling play() here would resume playback
+      // under the overlay, eventually causing the video to hit 'waiting' at
+      // duration (the "loading on finish" bug).
+      if (videoEndedRef.current) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
@@ -421,8 +437,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         setBuf(maxBuf);
       }
     };
-    const onPlay = () => setPlaying(true);
+    const onPlay = () => {
+      setPlaying(true);
+      // Only clear videoEnded if the video is NOT at the end.
+      // When the MSE guard dispatches a synthetic 'ended' event, it also
+      // calls pause(). If a download loop restart then causes play(), onPlay
+      // fires and would clear videoEnded=false — destroying the replay overlay.
+      // Only clear when the user intentionally starts a replay from the beginning.
+      if (videoEndedRef.current && v.currentTime > 1) {
+        // Video ended but now playing from a non-start position — keep overlay.
+        // This happens when a seek restarts the download loop after the MSE
+        // guard forced videoEnded=true. The replay overlay should stay.
+        console.log(`[Player] onPlay while videoEnded=true at currentTime=${v.currentTime.toFixed(1)}s — keeping replay overlay`);
+      } else {
+        console.log('[Player] onPlay — clearing videoEnded');
+        setVideoEnded(false);
+        videoEndedRef.current = false;
+      }
+    };
     const onPause = () => setPlaying(false);
+    const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
     const onWait = () => setLoad(true);
     const onPlay2 = () => setLoad(false);
     const onProgress = () => {
@@ -442,6 +476,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     v.addEventListener('timeupdate', onTime);
     v.addEventListener('play', onPlay);
     v.addEventListener('pause', onPause);
+    v.addEventListener('ended', onEnded);
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
@@ -453,6 +488,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('timeupdate', onTime);
       v.removeEventListener('play', onPlay);
       v.removeEventListener('pause', onPause);
+      v.removeEventListener('ended', onEnded);
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
@@ -548,6 +584,20 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     updateSetting('playerSpeed', rate);
   }, [rate, updateSetting]);
 
+  const replay = useCallback(() => {
+    const v = vidRef.current;
+    if (!v) return;
+    setVideoEnded(false);
+    videoEndedRef.current = false;
+    if (useNative) {
+      v.play().catch(() => {});
+    } else {
+      seekTo(0);
+      // seekTo sets pendingSeek + restarts download loop; video.play() starts playback
+      v.play().catch(() => {});
+    }
+  }, [useNative, seekTo]);
+
   useEffect(() => {
     if (pip && vidRef.current) {
       vidRef.current.requestPictureInPicture?.().catch(() => { toast.error('PiP not supported'); setPip(false); });
@@ -569,18 +619,33 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     return () => observer.disconnect();
   }, []);
 
-  const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; v.paused ? v.play().catch(() => {}) : v.pause(); }, []);
+  const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; if (videoEndedRef.current) { replay(); } else { v.paused ? v.play().catch(() => {}) : v.pause(); } }, [replay]);
   const seek = useCallback((s: number) => {
     const v = vidRef.current;
     if (!v) return;
     const target = Math.max(0, Math.min(v.currentTime + s, dur));
     if (useNative) {
       v.currentTime = target;
+    } else if (target >= dur) {
+      // Seeking to/past the end → directly show replay overlay.
+      // Playing through the last fraction of a second with MSE is unreliable
+      // (SourceBuffer may lack data, 'ended' event may not fire, and React
+      // state prefetchComplete can be stale after backward seeks reset it).
+      // Directly ending the video is the most reliable approach.
+      v.currentTime = dur;
+      v.pause();
+      setVideoEnded(true);
+      videoEndedRef.current = true;
+      setPlaying(false);
+      setLoad(false);
     } else {
       seekTo(target);
     }
   }, [dur, useNative, seekTo]);
   const seekFwd = useCallback(() => {
+    // When replay overlay is showing, ignore forward seeks — the video
+    // has already ended. Pressing space/k calls replay() via toggle().
+    if (videoEndedRef.current) return;
     seek(settings.playerSkipForward);
     setVis(true);
     clearTimeout(skipFeedbackTimer.current);
@@ -589,7 +654,24 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
   }, [seek, settings.playerSkipForward]);
   const seekBwd = useCallback(() => {
+    // When replay overlay is showing, allow backward seeks — the user
+    // wants to re-watch content near the end. Clear videoEnded so the
+    // overlay disappears and the video resumes from the new position.
+    const wasVideoEnded = videoEndedRef.current;
+    if (wasVideoEnded) {
+      console.log('[Player] seekBwd while videoEnded=true — clearing overlay, resuming playback');
+      setVideoEnded(false);
+      videoEndedRef.current = false;
+    }
     seek(-settings.playerSkipBackward);
+    // Resume playback AFTER the backward seek — must not call play() before
+    // seek() because currentTime might be at duration (from MSE guard), and
+    // play() at duration fires 'ended' immediately, re-setting videoEnded=true
+    // right after we just cleared it. After seek(), currentTime is at the
+    // backward position, so play() resumes normally without firing 'ended'.
+    if (wasVideoEnded) {
+      vidRef.current?.play().catch(() => {});
+    }
     setVis(true);
     clearTimeout(skipFeedbackTimer.current);
     skipFeedbackKey.current += 1;
@@ -603,10 +685,23 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   const onBarClick = useCallback((e: React.MouseEvent) => {
     if (!barRef.current || !vidRef.current || !isFinite(dur) || dur <= 0) return;
+    // If replay overlay is showing, clicking the progress bar means the user
+    // wants to resume from that position. Clear videoEnded and proceed.
+    if (videoEndedRef.current) {
+      setVideoEnded(false);
+      videoEndedRef.current = false;
+    }
     const r = barRef.current.getBoundingClientRect();
     const targetTime = ((e.clientX - r.left) / r.width) * dur;
     if (useNative) {
       vidRef.current.currentTime = targetTime;
+    } else if (targetTime >= dur) {
+      vidRef.current.currentTime = dur;
+      vidRef.current.pause();
+      setVideoEnded(true);
+      videoEndedRef.current = true;
+      setPlaying(false);
+      setLoad(false);
     } else {
       seekTo(targetTime);
     }
@@ -896,6 +991,28 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 </span>
               </button>
             )}
+            {/* Prebuffer speed limit indicator */}
+            {settings.prebufferSpeedLimit > 0 && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }}
+                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-0.5"
+                title={`Prebuffer limited to ${formatSpeedLimit(settings.prebufferSpeedLimit)}`}
+              >
+                <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                <span className="text-xs font-mono text-green-400">{formatSpeedLimitCompact(settings.prebufferSpeedLimit)}</span>
+              </button>
+            )}
+            {/* Download speed limit indicator */}
+            {settings.downloadSpeedLimit > 0 && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }}
+                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-0.5"
+                title={`Download limited to ${formatSpeedLimit(settings.downloadSpeedLimit)}`}
+              >
+                <svg className="w-3.5 h-3.5 text-blue-400" fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                <span className="text-xs font-mono text-blue-400">{formatSpeedLimitCompact(settings.downloadSpeedLimit)}</span>
+              </button>
+            )}
             {/* Speed */}
             <div className="relative">
               <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback speed">
@@ -1102,6 +1219,132 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             </div>
             </div>
 
+          {/* Bandwidth */}
+          <div className="px-4 py-3 border-b border-white/10">
+            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
+              <span className="inline-block w-2 h-2 rounded-full bg-blue-400" />
+              Bandwidth
+            </h3>
+            {/* Prebuffer speed limit */}
+            <div className="mb-3">
+              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400" />
+                Prebuffer speed
+              </label>
+              <div className="flex flex-wrap gap-1 items-center">
+                {SPEED_LIMIT_PRESETS.map(p => (
+                  <button
+                    key={p.value}
+                    onClick={() => { updateSetting('prebufferSpeedLimit', p.value as SpeedLimitValue); setCustomPrebufferValue(''); }}
+                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.prebufferSpeedLimit === p.value ? 'bg-green-500/30 text-green-400 ring-1 ring-green-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                {/* Custom input */}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number" min="1" max="102400"
+                    placeholder="Custom"
+                    value={customPrebufferValue}
+                    onChange={e => {
+                      const raw = e.target.value;
+                      setCustomPrebufferValue(raw);
+                      if (raw && Number(raw) > 0) {
+                        const kb = customPrebufferUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
+                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-green-400 focus:outline-none text-center"
+                  />
+                  <select
+                    value={customPrebufferUnit}
+                    onChange={e => {
+                      const unit = e.target.value as 'kb' | 'mb';
+                      setCustomPrebufferUnit(unit);
+                      if (customPrebufferValue && Number(customPrebufferValue) > 0) {
+                        const kb = unit === 'mb' ? Number(customPrebufferValue) * 1024 : Number(customPrebufferValue);
+                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-green-400 focus:outline-none"
+                  >
+                    <option value="kb">KB/s</option>
+                    <option value="mb">MB/s</option>
+                  </select>
+                </div>
+              </div>
+              {settings.prebufferSpeedLimit > 0 && (
+                <div className="mt-1.5 text-[10px] text-green-400/70">
+                  Active: {formatSpeedLimit(settings.prebufferSpeedLimit)}
+                </div>
+              )}
+            </div>
+            {/* Download speed limit */}
+            <div className="mb-2">
+              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-400" />
+                Download speed
+              </label>
+              <div className="flex flex-wrap gap-1 items-center">
+                {SPEED_LIMIT_PRESETS.map(p => (
+                  <button
+                    key={p.value}
+                    onClick={() => { updateSetting('downloadSpeedLimit', p.value as SpeedLimitValue); setCustomDownloadValue(''); }}
+                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.downloadSpeedLimit === p.value ? 'bg-blue-500/30 text-blue-400 ring-1 ring-blue-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                {/* Custom input */}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number" min="1" max="102400"
+                    placeholder="Custom"
+                    value={customDownloadValue}
+                    onChange={e => {
+                      const raw = e.target.value;
+                      setCustomDownloadValue(raw);
+                      if (raw && Number(raw) > 0) {
+                        const kb = customDownloadUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
+                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-blue-400 focus:outline-none text-center"
+                  />
+                  <select
+                    value={customDownloadUnit}
+                    onChange={e => {
+                      const unit = e.target.value as 'kb' | 'mb';
+                      setCustomDownloadUnit(unit);
+                      if (customDownloadValue && Number(customDownloadValue) > 0) {
+                        const kb = unit === 'mb' ? Number(customDownloadValue) * 1024 : Number(customDownloadValue);
+                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
+                      }
+                    }}
+                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-blue-400 focus:outline-none"
+                  >
+                    <option value="kb">KB/s</option>
+                    <option value="mb">MB/s</option>
+                  </select>
+                </div>
+              </div>
+              {settings.downloadSpeedLimit > 0 && (
+                <div className="mt-1.5 text-[10px] text-blue-400/70">
+                  Active: {formatSpeedLimit(settings.downloadSpeedLimit)}
+                </div>
+              )}
+            </div>
+            {/* Conflict warning */}
+            {settings.prebufferSpeedLimit > 0 && settings.downloadSpeedLimit > 0 && (
+              <div className="flex items-start gap-1.5 px-2 py-1.5 rounded bg-yellow-500/10 text-yellow-400/80 text-[10px]">
+                <svg className="w-3 h-3 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                <span>Both limits share 1 Telegram connection — speeds may not reach their full ceiling simultaneously.</span>
+              </div>
+            )}
+          </div>
+
           {/* Info */}
           <div className="px-4 py-3">
             <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Video info</h3>
@@ -1211,8 +1454,24 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         );
       })()}
 
-      {/* Big play */}
-      {!playing && !load && !err && (
+      {/* Replay overlay — shown when video has ended */}
+      {videoEnded && !load && !err && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="flex flex-col items-center gap-3">
+            <button
+              onClick={(e) => { e.stopPropagation(); replay(); }}
+              className="w-20 h-20 bg-white/15 hover:bg-white/25 backdrop-blur-sm rounded-full flex items-center justify-center transition-all duration-200 hover:scale-105 group pointer-events-auto"
+            >
+              <svg className="w-10 h-10 text-white group-hover:text-white/90" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+              </svg>
+            </button>
+            <span className="text-white/70 text-sm font-medium tracking-wide">Replay</span>
+          </div>
+        </div>
+      )}
+      {/* Paused play icon — shown when paused mid-video (not ended) */}
+      {!playing && !videoEnded && !load && !err && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="w-16 h-16 bg-black/50 rounded-full flex items-center justify-center">
             <svg className="w-8 h-8 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>

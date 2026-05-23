@@ -13,6 +13,7 @@ use grammers_tl_types as tl;
 use crate::TelegramState;
 use crate::models::{AuthResult};
 use crate::commands::utils::map_error;
+use crate::download_pool::DownloadPool;
 use grammers_client::SignInError;
 
 /// Ensures the Telegram client is initialized.
@@ -100,6 +101,27 @@ pub async fn ensure_client_initialized(
     });
     
     *client_guard = Some(client.clone());
+
+    // Initialize the download pool for parallel file transfers.
+    // Each worker creates its own TCP connection to the Telegram media DC,
+    // following Telegram's official recommendation for parallel downloads.
+    // We use separate session file copies (grammers requires separate sessions per pool).
+    let session_path_str_for_pool = session_path_str.clone();
+    let pool_api_id = api_id;
+    let mut pool_guard = state.download_pool.lock().await;
+    if pool_guard.is_none() {
+        match DownloadPool::new(&session_path_str_for_pool, pool_api_id) {
+            Ok(pool) => {
+                log::info!("DownloadPool initialized with {} workers", 3);
+                *pool_guard = Some(pool);
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize DownloadPool (will use single-connection fallback): {}", e);
+                // Not critical - single-connection downloads still work
+            }
+        }
+    }
+
     Ok(client)
 }
 
@@ -189,6 +211,17 @@ pub async fn cmd_logout(
     *state.api_id.lock().await = None;
     crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
     state.cancelled_transfers.write().await.clear();
+
+    // 3b. Clean up DownloadPool worker session files
+    {
+        let mut pool_guard = state.download_pool.lock().await;
+        if let Some(pool) = pool_guard.take() {
+            let app_data_dir = app_handle.path().app_data_dir().unwrap();
+            let main_session_path = app_data_dir.join("telegram.session").to_string_lossy().to_string();
+            pool.cleanup_session_files(&main_session_path);
+            log::info!("DownloadPool worker session files cleaned up");
+        }
+    }
 
     // 4. Remove Session File
     let app_data_dir = app_handle.path().app_data_dir().unwrap();
