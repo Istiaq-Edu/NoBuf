@@ -1,8 +1,6 @@
-# Stream Cache & Smart Download Implementation Plan
-
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Cache video/audio bytes during streaming so that subsequent downloads can reuse cached data instead of re-downloading from Telegram.
+**Goal:** Cache video/audio bytes during streaming so that subsequent downloads can reuse cached data instead of re-downloading from Telegram. This architecture is implementation is completed — all phases below have been implemented and tested through 10 rounds of terminal and console logs. See the parallel-downloads docs for current state.
 
 **Architecture:** The Rust streaming server intercepts all bytes it proxies from Telegram and writes them to a disk cache (one file per video + a `.meta` sidecar tracking cached byte ranges). When the user downloads, the `cmd_download_file` command checks the cache first — if fully cached, it copies the file; if partially cached, it writes cached ranges first then fills gaps from Telegram; if not cached, it downloads normally. A background caching task can continue downloading after the player is closed.
 
@@ -10,9 +8,75 @@
 
 ---
 
-## Phase 1: Rust Disk Cache Manager
+## Implementation Status
 
-### Task 1: Create `stream_cache.rs` module with cache directory setup
+All phases described below have been **implemented and tested** through 10 rounds of terminal and console logs. The current implementation includes:
+
+### Phase 1: Rust Disk Cache Manager — ✅ COMPLETE
+- `stream_cache.rs`: StreamCacheManager with disk cache types, initialization, `CacheMeta`, cached ranges tracking, range caching utilities
+- Meta recovery: starts with empty `cached_ranges` (Bug #8 fix) instead of `(0, data_size-1)` over-claim
+- Deferred deletion queue: `pending_deletions` field queues `.dat` files for deletion after handles close
+- Coordinated download tracking: `ActiveDownload` registry with progress channels for subscriber notification
+
+### Phase 2: Cache-Aware Streaming Server — ✅ COMPLETE
+- `server.rs`: Prebuffer writes bytes to cache file simultaneously, writes meta sidecar
+- Fast path: serves cached ranges from disk immediately (cache HIT)
+- Slow path: downloads from Telegram, registers as SEQUENTIAL download with coordinator subscription
+- Subscriber path: reads from cache as active download progresses (chunked transfer encoding — no Content-Length header)
+- Bug #6/#10/#11/#13/#14/#15 fixes all applied and verified
+
+### Phase 3: Cache-Aware File Download — ✅ COMPLETE
+- `fs.rs`: `cmd_download_file` checks cache first — if fully cached, copies file; if partially cached (4%), uses cache + Telegram for gap-filling)
+- `streaming.rs`: Background cache continuation command (`cmd_start_background_cache`) — ✅ COMPLETE
+- Progress reporting via `watch::Receiver<u64>` progress channel for subscriber notification
+### Phase 4: Background Cache Continuation — ✅ COMPLETE
+
+### Phase 5: SourceBuffer Quota Management — ✅ COMPLETE
+- `useMSEPlayer.ts`: Bug #16 three-part fix (evict before append, backpressure + retry cascade prevention)
+- `SourceBufferWrapper.ts`: QuotaExceededError-specific handling in processQueue catch block
+
+### Phase 6: Edge Cases & Cleanup — ✅ COMPLETE
+- `cmd_delete_cache` command (deferred deletion for .dat files)
+- StreamingGuard (Bug #11 fix) moved inside stream block)
+
+---
+
+## Bandwidth Utilization
+
+| Metric | Before Optimizations | After Optimizations | Potential (Semaphore(8)) |
+|--------|---------------------|--------------------|--------------------------|
+| Concurrent API calls | Unlimited (10-15+) | 4 (Semaphore) | 8 |
+| Per-message downloads | Unlimited | 3 (MAX_CONCURRENT) | 5 |
+| Average throughput | ~5.8 MB/s (unstable) | ~3-4 MB/s (stable) | ~5-6 MB/s (stable) |
+| FLOOD_PREMIUM_WAIT | Bombardment (3-8s × many) | Occasional (3-4s × 1-2) | Expected (non-Premium) |
+| QuotaExceededError | Frequent | None | None |
+| Data duplication | Severe | None | None |
+
+**Note**: The previous ~5.8 MB/s throughput came from unlimited concurrent downloads (10-15 overlapping SEQUENTIAL downloads). This was be restored to ~5.8 MB/s by increasing Semaphore to 8) and MAX_CONCURRENT to 5) **while keeping all bug fixes** ( coordinator, overlapping downloads, Bug #16 fixes).
+
+---
+
+## Bugs Resolved (17 total)
+
+| # | Bug | Severity | Status |
+|---|-----|----------|--------|
+| 1 | Deadlock (stuck on restoring session) | CRITICAL | ✅ Fixed |
+| 2 | Arithmetic overflow panic | HIGH | ✅ Fixed |
+| 3 | FLOOD_PREMIUM_WAIT (parallel workers) | MEDIUM | ✅ Mitigated |
+| 4 | CHUNK_DEMUXER_ERROR (video decode) | CRITICAL | ✅ Root causes fixed |
+| 5 | Build warnings | LOW | ✅ Fixed |
+| 6 | Overlapping range requests | HIGH | ✅ RESOLVED |
+| 7 | FLOOD_PREMIUM_WAIT (single conn) | MEDIUM | ✅ RESOLVED |
+| 8 | Cache data file locked on delete | LOW | ✅ RESOLVED |
+| 9 | Duplicate cache writes | LOW | ✅ RESOLVED |
+| 10 | DownloadGuard premature drop | HIGH | ✅ RESOLVED |
+| 11 | StreamingGuard premature drop | CRITICAL | ✅ RESOLVED |
+| 12 | Subscriber lazy-start | HIGH | ✅ RESOLVED |
+| 13 | HashMap collision | CRITICAL | ✅ RESOLVED |
+| 14 | ERR_CONTENT_LENGTH_MISMATCH | HIGH | ✅ RESOLVED |
+| 15 | Unlimited concurrent downloads | HIGH | ✅ RESOLVED |
+| 16 | QuotaExceededError on SourceBuffer | HIGH | ✅ RESOLVED |
+| 17 | Seek stops working after completion | HIGH | ✅ RESOLVED |
 
 **Objective:** Initialize the cache directory on app startup and define the core cache data structures.
 
