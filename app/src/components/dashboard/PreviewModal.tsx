@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import { X, File, ChevronLeft, ChevronRight } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
@@ -209,7 +209,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
 
                 {loading && (
                     <div className="flex flex-col items-center gap-4 text-white">
-                        <div className="w-10 h-10 border-4 border-telegram-primary border-t-transparent rounded-full animate-spin"></div>
+                        <div className="w-10 h-10 border-4 border-nobuf-primary border-t-transparent rounded-full animate-spin"></div>
                         <p>Loading preview...</p>
                         <p className="text-xs text-white/50">Downloading from Telegram...</p>
                     </div>
@@ -244,7 +244,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                             />
                         ) : (
                             <div className="bg-[#1c1c1c] p-8 rounded-xl text-center border border-white/10 shadow-2xl">
-                                <File className="w-16 h-16 text-telegram-primary mx-auto mb-4" />
+                                <File className="w-16 h-16 text-nobuf-primary mx-auto mb-4" />
                                 <h3 className="text-xl text-white font-medium mb-2">{file.name}</h3>
                                 <p className="text-gray-400 mb-6">Preview not supported in app.</p>
                                 <p className="text-xs text-gray-500">File type: {file.name.split('.').pop()}</p>

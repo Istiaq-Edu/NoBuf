@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
+﻿import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
 import { Plus, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileCard } from './FileCard';
@@ -225,14 +225,14 @@ export function FileExplorer({
     const SortIcon = ({ field }: { field: SortField }) => {
         if (sortField !== field) return <ArrowUpDown className="w-3 h-3 opacity-30" />;
         return sortDirection === 'asc'
-            ? <ArrowUp className="w-3 h-3 text-telegram-primary" />
-            : <ArrowDown className="w-3 h-3 text-telegram-primary" />;
+            ? <ArrowUp className="w-3 h-3 text-nobuf-primary" />
+            : <ArrowDown className="w-3 h-3 text-nobuf-primary" />;
     };
 
     if (loading) {
         return (
-            <div className="flex-1 p-6 flex justify-center items-center text-telegram-subtext flex-col gap-4">
-                <div className="w-8 h-8 border-4 border-telegram-primary border-t-transparent rounded-full animate-spin"></div>
+            <div className="flex-1 p-6 flex justify-center items-center text-nobuf-subtext flex-col gap-4">
+                <div className="w-8 h-8 border-4 border-nobuf-primary border-t-transparent rounded-full animate-spin"></div>
                 Loading your files...
             </div>
         )
@@ -262,31 +262,31 @@ export function FileExplorer({
             {viewMode === 'grid' ? (
                 <>
 
-                    <div className="sticky top-0 z-10 bg-telegram-bg flex items-center justify-between px-4 pt-3 pb-2 text-xs text-telegram-subtext border-b border-telegram-border select-none">
+                    <div className="sticky top-0 z-10 bg-nobuf-bg flex items-center justify-between px-4 pt-3 pb-2 text-xs text-nobuf-subtext border-b border-nobuf-border select-none">
                         <div className="flex items-center gap-2">
                             <span className="font-semibold">Sort by:</span>
                             <button
                                 onClick={() => handleSort('name')}
-                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'name' ? 'text-telegram-primary' : ''}`}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'name' ? 'text-nobuf-primary' : ''}`}
                             >
                                 Name <SortIcon field="name" />
                             </button>
                             <button
                                 onClick={() => handleSort('size')}
-                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'size' ? 'text-telegram-primary' : ''}`}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'size' ? 'text-nobuf-primary' : ''}`}
                             >
                                 Size <SortIcon field="size" />
                             </button>
                             <button
                                 onClick={() => handleSort('date')}
-                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'date' ? 'text-telegram-primary' : ''}`}
+                                className={`px-2 py-1 rounded flex items-center gap-1 hover:bg-white/5 ${sortField === 'date' ? 'text-nobuf-primary' : ''}`}
                             >
                                 Date <SortIcon field="date" />
                             </button>
                         </div>
                         <button
                             onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                            className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-telegram-primary text-black hover:brightness-110 active:scale-95 transition-all"
+                            className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
                         >
                             <Plus className="w-3.5 h-3.5" />
                             Upload
@@ -341,24 +341,24 @@ export function FileExplorer({
             ) : (
                 <div className="flex flex-col w-full">
                     {/* List Header — pinned */}
-                    <div className="sticky top-0 z-10 bg-telegram-bg grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 px-4 pt-3 pb-2 text-xs font-semibold text-telegram-subtext border-b border-telegram-border select-none items-center">
+                    <div className="sticky top-0 z-10 bg-nobuf-bg grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 px-4 pt-3 pb-2 text-xs font-semibold text-nobuf-subtext border-b border-nobuf-border select-none items-center">
                         <div className="text-center">#</div>
                         <div className="flex items-center justify-between">
-                            <button onClick={() => handleSort('name')} className="flex items-center gap-1 hover:text-telegram-text transition-colors">
+                            <button onClick={() => handleSort('name')} className="flex items-center gap-1 hover:text-nobuf-text transition-colors">
                                 Name <SortIcon field="name" />
                             </button>
                             <button
                                 onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-telegram-primary text-black hover:brightness-110 active:scale-95 transition-all"
+                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
                             >
                                 <Plus className="w-3.5 h-3.5" />
                                 Upload
                             </button>
                         </div>
-                        <button onClick={() => handleSort('size')} className="flex items-center gap-1 justify-end hover:text-telegram-text transition-colors">
+                        <button onClick={() => handleSort('size')} className="flex items-center gap-1 justify-end hover:text-nobuf-text transition-colors">
                             Size <SortIcon field="size" />
                         </button>
-                        <button onClick={() => handleSort('date')} className="flex items-center gap-1 justify-end hover:text-telegram-text transition-colors">
+                        <button onClick={() => handleSort('date')} className="flex items-center gap-1 justify-end hover:text-nobuf-text transition-colors">
                             Date <SortIcon field="date" />
                         </button>
                     </div>

@@ -1,4 +1,4 @@
-import {
+﻿import {
     File, FileText, FileImage, FileVideo, FileAudio,
     FileArchive, FileCode, FileSpreadsheet, Presentation,
     FileType
@@ -70,7 +70,7 @@ const extensionMap: Record<string, { icon: typeof File; color: string }> = {
 
 export function getFileTypeInfo(filename: string): { icon: typeof File; color: string } {
     const ext = filename.split('.').pop()?.toLowerCase() || '';
-    return extensionMap[ext] || { icon: File, color: 'text-telegram-subtext' };
+    return extensionMap[ext] || { icon: File, color: 'text-nobuf-subtext' };
 }
 
 interface FileTypeIconProps {

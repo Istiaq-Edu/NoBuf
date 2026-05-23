@@ -1,4 +1,4 @@
-import { motion, AnimatePresence } from 'framer-motion';
+﻿import { motion, AnimatePresence } from 'framer-motion';
 import { Download, X, RefreshCw, Sparkles } from 'lucide-react';
 
 interface UpdateBannerProps {
@@ -25,7 +25,7 @@ export function UpdateBanner({
                     initial={{ opacity: 0, y: -50 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -50 }}
-                    className="fixed top-0 left-0 right-0 z-50 p-3 bg-gradient-to-r from-telegram-primary/90 via-blue-500/90 to-purple-500/90 backdrop-blur-sm shadow-lg"
+                    className="fixed top-0 left-0 right-0 z-50 p-3 bg-gradient-to-r from-nobuf-county-green/90 via-nobuf-ocean-green/90 to-nobuf-jewel/90 backdrop-blur-sm shadow-lg"
                 >
                     <div className="flex items-center justify-center gap-4 max-w-screen-lg mx-auto">
                         <Sparkles className="w-5 h-5 text-yellow-300 animate-pulse" />
@@ -52,7 +52,7 @@ export function UpdateBanner({
                         ) : (
                             <button
                                 onClick={onUpdate}
-                                className="flex items-center gap-2 px-4 py-1.5 bg-white text-telegram-primary font-semibold rounded-full hover:bg-white/90 transition-colors shadow-md"
+                                className="flex items-center gap-2 px-4 py-1.5 bg-white text-nobuf-primary font-semibold rounded-full hover:bg-white/90 transition-colors shadow-md"
                             >
                                 <Download className="w-4 h-4" />
                                 Update Now
