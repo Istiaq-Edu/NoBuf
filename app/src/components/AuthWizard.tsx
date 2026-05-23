@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
-import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, HelpCircle, ExternalLink, X, Heart, QrCode } from "lucide-react";
+import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, ExternalLink, QrCode, Cloud, Play, HardDrive } from "lucide-react";
 import { load } from '@tauri-apps/plugin-store';
 import { useTheme } from '../context/ThemeContext';
 import { open } from '@tauri-apps/plugin-shell';
@@ -14,56 +14,260 @@ function AuthThemeToggle() {
     return (
         <button
             onClick={toggleTheme}
-            className="absolute top-4 right-4 p-3 rounded-full bg-white/10 hover:bg-white/20 transition-colors z-10"
+            className="absolute top-4 right-4 p-3 rounded-full bg-nobuf-primary/10 hover:bg-nobuf-primary/20 transition-colors z-10"
             title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
         >
             {theme === 'dark' ? (
-                <Sun className="w-5 h-5 text-white" />
+                <Sun className="w-5 h-5 text-nobuf-primary" />
             ) : (
-                <Moon className="w-5 h-5 text-white" />
+                <Moon className="w-5 h-5 text-nobuf-primary" />
             )}
         </button>
     );
 }
+
+/* ── Right Panel: Setup Guide ──────────────────────────── */
+function SetupGuide() {
+    return (
+        <div className="space-y-6">
+            <div className="p-4 bg-nobuf-primary/10 border border-nobuf-primary/20 rounded-xl">
+                <p className="text-sm text-nobuf-subtext">
+                    <strong className="text-nobuf-primary">NoBuf</strong> uses your Telegram account as secure cloud storage. You'll need a Telegram account and API credentials to get started.
+                </p>
+            </div>
+
+            <div className="space-y-5">
+                <div className="space-y-2">
+                    <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
+                        <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">1</span>
+                        Go to Telegram's Developer Portal
+                    </h3>
+                    <p className="text-sm text-nobuf-subtext ml-8">
+                        Visit <button type="button" onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }} className="text-nobuf-primary underline hover:text-nobuf-text cursor-pointer">my.telegram.org</button> and log in with your phone number.
+                    </p>
+                </div>
+
+                <div className="space-y-2">
+                    <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
+                        <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">2</span>
+                        Create a New Application
+                    </h3>
+                    <p className="text-sm text-nobuf-subtext ml-8">
+                        Click on <strong>"API development tools"</strong> and create a new application. Use any name and description you like.
+                    </p>
+                </div>
+
+                <div className="space-y-2">
+                    <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
+                        <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">3</span>
+                        Copy Your Credentials
+                    </h3>
+                    <p className="text-sm text-nobuf-subtext ml-8">
+                        After creating the app, you'll see your <strong>API ID</strong> (a number) and <strong>API Hash</strong> (a string). Copy both and paste them into the fields on the left.
+                    </p>
+                </div>
+            </div>
+
+            <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border">
+                <p className="text-xs text-nobuf-subtext">
+                    <strong>🔒 Privacy:</strong> Your credentials are stored locally on your device and are never sent to any third-party servers. All data goes directly between you and Telegram.
+                </p>
+            </div>
+
+            <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }}
+                className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-semibold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-nobuf-primary/90 transition-colors"
+            >
+                <ExternalLink className="w-4 h-4" />
+                Open my.telegram.org
+            </button>
+        </div>
+    );
+}
+
+/* ── Right Panel: Phone Context ──────────────────────────── */
+function PhoneContext() {
+    return (
+        <div className="space-y-6">
+            <h2 className="text-lg font-semibold text-nobuf-text">Verify Your Identity</h2>
+            <p className="text-sm text-nobuf-subtext leading-relaxed">
+                Telegram will send a verification code to confirm your identity. You can receive it via:
+            </p>
+            <div className="space-y-3">
+                <div className="flex items-start gap-3 p-3 bg-nobuf-primary/5 rounded-lg border border-nobuf-primary/10">
+                    <Phone className="w-4 h-4 text-nobuf-primary mt-0.5 shrink-0" />
+                    <div>
+                        <p className="text-sm font-medium text-nobuf-text">Telegram App Notification</p>
+                        <p className="text-xs text-nobuf-subtext">The code appears as an in-app message from Telegram itself.</p>
+                    </div>
+                </div>
+                <div className="flex items-start gap-3 p-3 bg-nobuf-hover rounded-lg border border-nobuf-border">
+                    <span className="text-sm font-bold text-nobuf-secondary mt-0.5 shrink-0">SMS</span>
+                    <div>
+                        <p className="text-sm font-medium text-nobuf-text">SMS Fallback</p>
+                        <p className="text-xs text-nobuf-subtext">If you don't receive the in-app message, Telegram sends it via SMS.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border mt-4">
+                <p className="text-xs text-nobuf-subtext">
+                    <strong>🔒 Privacy:</strong> Your phone number and credentials are stored locally. No data is sent to third-party servers.
+                </p>
+            </div>
+
+            <div className="space-y-4 mt-4">
+                <h3 className="text-sm font-semibold text-nobuf-text">What you get with NoBuf</h3>
+                <div className="flex items-start gap-3">
+                    <Play className="w-4 h-4 text-nobuf-primary shrink-0" />
+                    <p className="text-xs text-nobuf-subtext">Zero-buffer video streaming from Telegram's servers</p>
+                </div>
+                <div className="flex items-start gap-3">
+                    <Cloud className="w-4 h-4 text-nobuf-primary shrink-0" />
+                    <p className="text-xs text-nobuf-subtext">Unlimited cloud storage via your Telegram account</p>
+                </div>
+                <div className="flex items-start gap-3">
+                    <HardDrive className="w-4 h-4 text-nobuf-primary shrink-0" />
+                    <p className="text-xs text-nobuf-subtext">REST API for programmatic access and AI integration</p>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+/* ── Right Panel: Code Context ──────────────────────────── */
+function CodeContext({ phone }: { phone: string }) {
+    return (
+        <div className="space-y-6">
+            <h2 className="text-lg font-semibold text-nobuf-text">Enter Your Verification Code</h2>
+            <div className="p-4 bg-nobuf-primary/10 border border-nobuf-primary/20 rounded-xl">
+                <p className="text-sm text-nobuf-subtext">
+                    We sent a verification code to <strong className="text-nobuf-primary">{phone || 'your Telegram app'}</strong>.
+                    Enter the 5-digit code in the field on the left.
+                </p>
+            </div>
+            <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-nobuf-text">Where to find the code</h3>
+                <div className="flex items-start gap-3 p-3 bg-nobuf-primary/5 rounded-lg border border-nobuf-primary/10">
+                    <Phone className="w-4 h-4 text-nobuf-primary mt-0.5 shrink-0" />
+                    <div>
+                        <p className="text-sm font-medium text-nobuf-text">Telegram App</p>
+                        <p className="text-xs text-nobuf-subtext">Check your chat list for a message from Telegram. The code appears as an unread message from "Telegram" itself.</p>
+                    </div>
+                </div>
+                <div className="flex items-start gap-3 p-3 bg-nobuf-hover rounded-lg border border-nobuf-border">
+                    <span className="text-sm font-bold text-nobuf-secondary mt-0.5 shrink-0">SMS</span>
+                    <div>
+                        <p className="text-sm font-medium text-nobuf-text">SMS Message</p>
+                        <p className="text-xs text-nobuf-subtext">If no Telegram message arrived, check your SMS inbox for the code.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border">
+                <p className="text-xs text-nobuf-subtext">
+                    <strong>🔒 Privacy:</strong> The code is verified directly with Telegram's servers. It is never stored or transmitted elsewhere.
+                </p>
+            </div>
+        </div>
+    );
+}
+
+/* ── Right Panel: Password Context ──────────────────────────── */
+function PasswordContext() {
+    return (
+        <div className="space-y-6">
+            <h2 className="text-lg font-semibold text-nobuf-text">Two-Factor Authentication</h2>
+            <div className="p-4 bg-nobuf-primary/10 border border-nobuf-primary/20 rounded-xl">
+                <p className="text-sm text-nobuf-subtext">
+                    Your Telegram account has <strong className="text-nobuf-primary">Two-Factor Authentication</strong> enabled. This is an extra security layer beyond the login code.
+                </p>
+            </div>
+            <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-nobuf-text">What is 2FA?</h3>
+                <p className="text-sm text-nobuf-subtext leading-relaxed">
+                    Two-Factor Authentication (also called "cloud password") is a password you set up in Telegram that is required <em>after</em> the login code. It protects your account even if someone intercepts your SMS.
+                </p>
+                <div className="flex items-start gap-3 p-3 bg-nobuf-hover rounded-lg border border-nobuf-border">
+                    <Lock className="w-4 h-4 text-nobuf-primary mt-0.5 shrink-0" />
+                    <div>
+                        <p className="text-sm font-medium text-nobuf-text">Cloud Password vs Local Password</p>
+                        <p className="text-xs text-nobuf-subtext">This is the password you configured in Telegram's Settings &gt; Privacy &gt; Two-Step Verification. It is not a NoBuf-specific password.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border">
+                <p className="text-xs text-nobuf-subtext">
+                    <strong>🔒 Privacy:</strong> Your password is verified directly with Telegram. NoBuf never stores or sees your cloud password.
+                </p>
+            </div>
+        </div>
+    );
+}
+
+/* ── Right Panel: Flood Wait Context ──────────────────────────── */
+function FloodWaitContext() {
+    return (
+        <div className="space-y-6">
+            <h2 className="text-lg font-semibold text-nobuf-text">Rate Limit Reached</h2>
+            <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl">
+                <p className="text-sm text-nobuf-subtext">
+                    Telegram has temporarily limited login attempts from this device. This is a safety mechanism to prevent abuse.
+                </p>
+            </div>
+            <div className="space-y-3">
+                <h3 className="text-sm font-semibold text-nobuf-text">What happened?</h3>
+                <p className="text-sm text-nobuf-subtext leading-relaxed">
+                    Too many authentication requests were sent in a short period. Telegram enforces a cooldown to protect accounts from unauthorized access attempts.
+                </p>
+            </div>
+            <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border">
+                <p className="text-xs text-nobuf-subtext">
+                    <strong>⚠ Important:</strong> Do not restart the app during the wait period. The timer will reset if you do, requiring you to wait again from the beginning.
+                </p>
+            </div>
+        </div>
+    );
+}
+
 export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     const isBrowser = typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window);
 
     if (isBrowser) {
         return (
-            <div className="flex flex-col items-center justify-center h-full max-w-lg mx-auto p-8 text-center">
-                <div className="w-20 h-20 bg-red-500/20 rounded-full flex items-center justify-center mb-6">
-                    <ShieldCheck className="w-10 h-10 text-red-500" />
-                </div>
-                <h1 className="text-2xl font-bold text-white mb-4">Desktop App Required</h1>
-                <p className="text-gray-400 mb-6 leading-relaxed">
-                    You are viewing the internal development server in a browser.
-                    This application cannot function here because it requires access to the system backend (Rust).
-                </p>
-                <div className="p-4 bg-gray-800 rounded-xl border border-gray-700 text-sm text-gray-300">
-                    Please open the <strong>NoBuf</strong> window in your OS taskbar/dock to continue.
+            <div className="auth-gradient h-screen w-screen flex items-center justify-center p-6">
+                <div className="auth-glass p-8 rounded-2xl shadow-2xl max-w-md w-full text-center">
+                    <div className="w-20 h-20 bg-red-500/20 rounded-full flex items-center justify-center mb-6 mx-auto">
+                        <ShieldCheck className="w-10 h-10 text-red-500" />
+                    </div>
+                    <h1 className="text-2xl font-bold text-nobuf-text mb-4">Desktop App Required</h1>
+                    <p className="text-nobuf-subtext mb-6 leading-relaxed">
+                        You are viewing the internal development server in a browser.
+                        This application cannot function here because it requires access to the system backend (Rust).
+                    </p>
+                    <div className="p-4 bg-nobuf-hover rounded-xl border border-nobuf-border text-sm text-nobuf-subtext">
+                        Please open the <strong className="text-nobuf-primary">NoBuf</strong> window in your OS taskbar/dock to continue.
+                    </div>
                 </div>
             </div>
-        )
+        );
     }
 
     const [step, setStep] = useState<Step>("setup");
     const [loading, setLoading] = useState(false);
-
     const [apiId, setApiId] = useState("");
     const [apiHash, setApiHash] = useState("");
-
     const [phone, setPhone] = useState("");
     const [code, setCode] = useState("");
     const [password, setPassword] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [floodWait, setFloodWait] = useState<number | null>(null);
-    const [showHelp, setShowHelp] = useState(false);
-    const [showDonate, setShowDonate] = useState(false);
     const [loginMethod, setLoginMethod] = useState<'phone' | 'qr'>('phone');
     const [qrUrl, setQrUrl] = useState<string | null>(null);
     const [qrPolling, setQrPolling] = useState(false);
     const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
 
     useEffect(() => {
         if (!floodWait) return;
@@ -82,7 +286,6 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 const store = await load('config.json');
                 const savedId = await store.get<string>('api_id');
                 const savedHash = await store.get<string>('api_hash');
-
                 if (savedId && savedHash) {
                     setApiId(savedId);
                     setApiHash(savedHash);
@@ -107,12 +310,10 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
     const handleSetupSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-
         if (apiId.includes(' ') || apiHash.includes(' ')) {
             setError("API ID and API Hash cannot contain spaces. Please remove any spaces.");
             return;
         }
-
         if (!apiId || !apiHash) {
             setError("Both API ID and Hash are required.");
             return;
@@ -131,17 +332,11 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         try {
             const idInt = parseInt(apiId, 10);
             if (isNaN(idInt)) throw new Error("API ID must be a number");
-
-            const url = await invoke<string>("cmd_auth_qr_login", {
-                apiId: idInt,
-                apiHash: apiHash
-            });
-
+            const url = await invoke<string>("cmd_auth_qr_login", { apiId: idInt, apiHash: apiHash });
             if (url === "__authorized__") {
                 onLogin();
                 return;
             }
-
             setQrUrl(url);
             setQrPolling(true);
         } catch (err: unknown) {
@@ -151,39 +346,23 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         }
     };
 
-    // QR polling effect
     useEffect(() => {
         if (!qrPolling) {
-            if (qrPollRef.current) {
-                clearInterval(qrPollRef.current);
-                qrPollRef.current = null;
-            }
+            if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; }
             return;
         }
-
         qrPollRef.current = setInterval(async () => {
             try {
                 const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_qr_poll");
                 if (res.success) {
                     setQrPolling(false);
-                    if (res.next_step === "password") {
-                        setStep("password");
-                    } else {
-                        onLogin();
-                    }
+                    if (res.next_step === "password") { setStep("password"); } else { onLogin(); }
                 }
-                // If next_step === "waiting", keep polling
             } catch {
                 // Polling error — keep trying silently
             }
         }, 3000);
-
-        return () => {
-            if (qrPollRef.current) {
-                clearInterval(qrPollRef.current);
-                qrPollRef.current = null;
-            }
-        };
+        return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } };
     }, [qrPolling, apiId, apiHash]);
 
     const handlePhoneSubmit = async (e: React.FormEvent) => {
@@ -193,12 +372,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         try {
             const idInt = parseInt(apiId, 10);
             if (isNaN(idInt)) throw new Error("API ID must be a number");
-
-            await invoke("cmd_auth_request_code", {
-                phone,
-                apiId: idInt,
-                apiHash: apiHash
-            });
+            await invoke("cmd_auth_request_code", { phone, apiId: idInt, apiHash: apiHash });
             setStep("code");
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : JSON.stringify(err);
@@ -206,16 +380,11 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 const parts = msg.split("FLOOD_WAIT_");
                 if (parts[1]) {
                     const seconds = parseInt(parts[1]);
-                    if (!isNaN(seconds)) {
-                        setFloodWait(seconds);
-                        return;
-                    }
+                    if (!isNaN(seconds)) { setFloodWait(seconds); return; }
                 }
             }
             setError(msg);
-        } finally {
-            setLoading(false);
-        }
+        } finally { setLoading(false); }
     };
 
     const handleCodeSubmit = async (e: React.FormEvent) => {
@@ -224,18 +393,11 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         try {
             const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_sign_in", { code });
-            if (res.success) {
-                onLogin();
-            } else if (res.next_step === "password") {
-                setStep("password");
-            } else {
-                setError("Unknown error");
-            }
-        } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : String(err));
-        } finally {
-            setLoading(false);
-        }
+            if (res.success) { onLogin(); }
+            else if (res.next_step === "password") { setStep("password"); }
+            else { setError("Unknown error"); }
+        } catch (err: unknown) { setError(err instanceof Error ? err.message : String(err)); }
+        finally { setLoading(false); }
     };
 
     const handlePasswordSubmit = async (e: React.FormEvent) => {
@@ -244,64 +406,59 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         try {
             const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_check_password", { password });
-            if (res.success) {
-                onLogin();
-            } else {
-                setError("Password verification failed.");
-            }
-        } catch (err: unknown) {
-            setError(err instanceof Error ? err.message : String(err));
-        } finally {
-            setLoading(false);
-        }
+            if (res.success) { onLogin(); } else { setError("Password verification failed."); }
+        } catch (err: unknown) { setError(err instanceof Error ? err.message : String(err)); }
+        finally { setLoading(false); }
     };
 
     return (
-        <div className="h-full w-full auth-gradient flex items-center justify-center p-6 relative">
+        <div className="auth-gradient h-screen w-screen relative overflow-hidden">
             <AuthThemeToggle />
 
-            <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="auth-glass p-8 rounded-3xl shadow-2xl w-full max-w-md"
-            >
-                <div className="text-center mb-8">
-                    <div className="w-20 h-20 mb-6 mx-auto flex items-center justify-center filter drop-shadow-lg">
-                        <img src="/logo.png" alt="Logo" className="w-full h-full" />
-                    </div>
-                    <h1 className="text-2xl font-bold text-white mb-1 tracking-tight">NoBuf</h1>
-                    <p className="text-sm text-white/60 font-medium">Self-Hosted Secure Storage</p>
+            {/* Decorative blur orbs — premium layered depth */}
+            <div className="fixed top-[-15%] left-[-8%] w-[600px] h-[600px] bg-nobuf-spring-green/10 rounded-full blur-[140px] pointer-events-none -z-10" />
+            <div className="fixed bottom-[-15%] right-[-5%] w-[500px] h-[500px] bg-nobuf-ocean-green/12 rounded-full blur-[120px] pointer-events-none -z-10" />
+            <div className="fixed top-[40%] right-[30%] w-[300px] h-[300px] bg-nobuf-charlotte/8 rounded-full blur-[100px] pointer-events-none -z-10" />
+
+            {/* Logo banner — centered at top, spans both columns */}
+            <div className="flex items-center justify-center gap-4 pt-10 pb-6 px-6">
+                <div className="w-14 h-14 flex items-center justify-center filter drop-shadow-lg">
+                    <img src="/logo.png" alt="NoBuf Logo" className="w-full h-full" />
                 </div>
+                <div>
+                    <h1 className="text-3xl font-bold text-nobuf-text tracking-tight">NoBuf</h1>
+                </div>
+            </div>
 
-                <AnimatePresence mode="wait">
-                    {floodWait ? (
-                        <motion.div
-                            key="flood"
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            className="text-center space-y-6"
-                        >
-                            <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto animate-pulse">
-                                <span className="text-2xl">⏳</span>
-                            </div>
-                            <div>
-                                <h2 className="text-xl font-bold text-white mb-2">Too Many Requests</h2>
-                                <p className="text-sm text-gray-400">Telegram has temporarily limited your actions.</p>
-                                <p className="text-sm text-gray-400">Please wait before trying again.</p>
-                            </div>
-
-                            <div className="text-5xl font-mono items-center justify-center flex text-blue-400 font-bold">
-                                {Math.floor(floodWait / 60)}:{(floodWait % 60).toString().padStart(2, '0')}
-                            </div>
-
-                            <p className="text-xs text-red-400/60 mt-4">
-                                Do not restart the app. The timer will reset if you do.
-                            </p>
-                        </motion.div>
-                    ) : (
+            {/* Split layout: Left = form, Right = contextual guide */}
+            <div className="grid grid-cols-2 gap-0 px-6 pb-6" style={{ height: 'calc(100vh - 120px)' }}>
+                {/* ── LEFT PANEL ── */}
+                <div className="auth-glass p-8 rounded-2xl shadow-2xl flex flex-col overflow-y-auto">
+                    <AnimatePresence mode="wait">
+                        {floodWait ? (
+                            <motion.div
+                                key="flood"
+                                initial={{ opacity: 0 }}
+                                animate={{ opacity: 1 }}
+                                className="flex-1 flex flex-col items-center justify-center text-center space-y-6"
+                            >
+                                <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto animate-pulse">
+                                    <span className="text-2xl">⏳</span>
+                                </div>
+                                <div>
+                                    <h2 className="text-xl font-bold text-nobuf-text mb-2">Too Many Requests</h2>
+                                    <p className="text-sm text-nobuf-subtext">Telegram has temporarily limited your actions.</p>
+                                    <p className="text-sm text-nobuf-subtext">Please wait before trying again.</p>
+                                </div>
+                                <div className="text-5xl font-mono items-center justify-center flex text-nobuf-primary font-bold">
+                                    {Math.floor(floodWait / 60)}:{(floodWait % 60).toString().padStart(2, '0')}
+                                </div>
+                                <p className="text-xs text-red-400/60">
+                                    Do not restart the app. The timer will reset if you do.
+                                </p>
+                            </motion.div>
+                        ) : (
                         <>
-
-
                             {step === "setup" && (
                                 <motion.form
                                     key="setup"
@@ -309,11 +466,12 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                     animate={{ x: 0, opacity: 1 }}
                                     exit={{ x: -20, opacity: 0 }}
                                     onSubmit={handleSetupSubmit}
-                                    className="space-y-5"
+                                    className="flex-1 flex flex-col items-center justify-center space-y-5"
                                 >
-                                    <div className="space-y-4">
+                                    <h2 className="text-lg font-semibold text-nobuf-text mb-2">Configure Your Credentials</h2>
+                                    <div className="w-full max-w-sm space-y-4">
                                         <div>
-                                            <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">API ID</label>
+                                            <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider mb-2">API ID</label>
                                             <div className="relative">
                                                 <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
                                                 <input
@@ -321,12 +479,12 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                     value={apiId}
                                                     onChange={(e) => setApiId(e.target.value)}
                                                     placeholder="12345678"
-                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-3.5 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-all font-mono text-sm"
+                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-3.5 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all font-mono text-sm"
                                                 />
                                             </div>
                                         </div>
                                         <div>
-                                            <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">API Hash</label>
+                                            <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider mb-2">API Hash</label>
                                             <div className="relative">
                                                 <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
                                                 <input
@@ -334,7 +492,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                     value={apiHash}
                                                     onChange={(e) => setApiHash(e.target.value)}
                                                     placeholder="abcdef123456..."
-                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-3.5 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-all font-mono text-sm"
+                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-3.5 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all font-mono text-sm"
                                                 />
                                             </div>
                                         </div>
@@ -342,25 +500,16 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
                                     <button
                                         type="submit"
-                                        className="w-full bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/20 active:scale-[0.98]"
+                                        className="auth-btn-shine w-full max-w-sm bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-nobuf-primary/20 active:scale-[0.98]"
                                     >
                                         Configure <Settings className="w-4 h-4" />
-                                    </button>
-
-                                    <button
-                                        type="button"
-                                        onClick={() => setShowHelp(true)}
-                                        className="w-full text-xs text-blue-300 hover:text-white transition-colors flex items-center justify-center gap-1.5 py-1"
-                                    >
-                                        <HelpCircle className="w-3 h-3" />
-                                        How do I get my API credentials?
                                     </button>
 
                                     {import.meta.env.DEV && (
                                         <button
                                             type="button"
                                             onClick={() => onLogin()}
-                                            className="w-full text-xs text-red-400/60 hover:text-red-300 transition-colors py-1"
+                                            className="w-full max-w-sm text-xs text-red-400/60 hover:text-red-300 transition-colors py-1"
                                         >
                                             Dev Mode
                                         </button>
@@ -368,115 +517,64 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                 </motion.form>
                             )}
 
-
                             {step === "phone" && (
                                 <motion.div
                                     key="phone"
                                     initial={{ x: 20, opacity: 0 }}
                                     animate={{ x: 0, opacity: 1 }}
                                     exit={{ x: -20, opacity: 0 }}
-                                    className="space-y-6"
+                                    className="flex-1 flex flex-col items-center justify-center space-y-5"
                                 >
-                                    {/* Phone / QR Toggle */}
-                                    <div className="flex rounded-xl overflow-hidden border border-white/10">
-                                        <button
-                                            type="button"
-                                            onClick={() => { setLoginMethod('phone'); setQrUrl(null); setQrPolling(false); setError(null); }}
-                                            className={`flex-1 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-all ${
-                                                loginMethod === 'phone'
-                                                    ? 'bg-white/15 text-white'
-                                                    : 'text-white/50 hover:text-white/70'
-                                            }`}
-                                        >
-                                            <Phone className="w-4 h-4" /> Phone Number
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => { setLoginMethod('qr'); setError(null); handleQrLogin(); }}
-                                            className={`flex-1 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-all ${
-                                                loginMethod === 'qr'
-                                                    ? 'bg-white/15 text-white'
-                                                    : 'text-white/50 hover:text-white/70'
-                                            }`}
-                                        >
-                                            <QrCode className="w-4 h-4" /> QR Code
-                                        </button>
-                                    </div>
+                                    <div className="w-full max-w-sm space-y-6">
+                                        <PhoneQrToggle
+                                            loginMethod={loginMethod}
+                                            setLoginMethod={setLoginMethod}
+                                            setQrUrl={setQrUrl}
+                                            setQrPolling={setQrPolling}
+                                            setError={setError}
+                                            handleQrLogin={handleQrLogin}
+                                        />
 
-                                    {loginMethod === 'phone' ? (
-                                        <form onSubmit={handlePhoneSubmit} className="space-y-6">
-                                            <div className="space-y-2">
-                                                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider">Phone Number</label>
-                                                <div className="relative">
-                                                    <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
-                                                    <input
-                                                        type="tel"
-                                                        value={phone}
-                                                        onChange={(e) => setPhone(e.target.value)}
-                                                        placeholder="+1 234 567 8900"
-                                                        className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-all text-lg tracking-wide"
-                                                    />
-                                                </div>
-                                            </div>
-
-                                            <div className="flex flex-col gap-3">
-                                                <button
-                                                    type="submit"
-                                                    disabled={loading}
-                                                    className="w-full bg-white text-black hover:bg-gray-100 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
-                                                >
-                                                    {loading ? "Connecting..." : <>Continue <ArrowRight className="w-5 h-5" /></>}
-                                                </button>
-                                                <button type="button" onClick={() => setStep("setup")} className="text-xs text-gray-500 hover:text-white transition-colors py-2">
-                                                    Back to Configuration
-                                                </button>
-                                            </div>
-                                        </form>
-                                    ) : (
-                                        <div className="flex flex-col items-center gap-5">
-                                            {loading && !qrUrl && (
-                                                <div className="w-52 h-52 rounded-2xl bg-white/5 flex items-center justify-center">
-                                                    <div className="w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                                                </div>
-                                            )}
-                                            {qrUrl && (
-                                                <>
-                                                    <div className="p-4 bg-white rounded-2xl shadow-xl">
-                                                        <QRCodeSVG
-                                                            value={qrUrl}
-                                                            size={200}
-                                                            level="M"
-                                                            bgColor="#ffffff"
-                                                            fgColor="#000000"
+                                        {loginMethod === 'phone' ? (
+                                            <form onSubmit={handlePhoneSubmit} className="space-y-5">
+                                                <div className="space-y-2">
+                                                    <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider">Phone Number</label>
+                                                    <div className="relative">
+                                                        <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
+                                                        <input
+                                                            type="tel"
+                                                            value={phone}
+                                                            onChange={(e) => setPhone(e.target.value)}
+                                                            placeholder="+1 234 567 8900"
+                                                            className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all text-lg tracking-wide"
                                                         />
                                                     </div>
-                                                    <div className="text-center space-y-1">
-                                                        <p className="text-sm text-white/80">Scan with your Telegram app</p>
-                                                        <p className="text-xs text-white/40">Settings &gt; Devices &gt; Link Desktop Device</p>
-                                                    </div>
-                                                    {qrPolling && (
-                                                        <div className="flex items-center gap-2 text-xs text-blue-300">
-                                                            <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                                                            Waiting for scan...
-                                                        </div>
-                                                    )}
+                                                </div>
+                                                <div className="flex flex-col gap-3">
                                                     <button
-                                                        type="button"
-                                                        onClick={handleQrLogin}
-                                                        className="text-xs text-white/50 hover:text-white transition-colors"
+                                                        type="submit"
+                                                        disabled={loading}
+                                                        className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
                                                     >
-                                                        Refresh QR Code
+                                                        {loading ? "Connecting..." : <>Continue <ArrowRight className="w-5 h-5" /></>}
                                                     </button>
-                                                </>
-                                            )}
-                                            <button type="button" onClick={() => { setStep("setup"); setQrPolling(false); }} className="text-xs text-gray-500 hover:text-white transition-colors py-2">
-                                                Back to Configuration
-                                            </button>
-                                        </div>
-                                    )}
+                                                    <button type="button" onClick={() => setStep("setup")} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
+                                                        Back to Configuration
+                                                    </button>
+                                                </div>
+                                            </form>
+                                        ) : (
+                                            <QrLoginPanel
+                                                loading={loading}
+                                                qrUrl={qrUrl}
+                                                qrPolling={qrPolling}
+                                                onRefresh={handleQrLogin}
+                                                onBack={() => { setStep("setup"); setQrPolling(false); }}
+                                            />
+                                        )}
+                                    </div>
                                 </motion.div>
                             )}
-
 
                             {step === "code" && (
                                 <motion.form
@@ -485,37 +583,38 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                     animate={{ x: 0, opacity: 1 }}
                                     exit={{ x: -20, opacity: 0 }}
                                     onSubmit={handleCodeSubmit}
-                                    className="space-y-6"
+                                    className="flex-1 flex flex-col items-center justify-center space-y-5"
                                 >
-                                    <div className="space-y-2">
-                                        <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider">Telegram Code</label>
-                                        <div className="relative">
-                                            <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
-                                            <input
-                                                type="text"
-                                                value={code}
-                                                onChange={(e) => setCode(e.target.value)}
-                                                placeholder="1 2 3 4 5"
-                                                className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-all text-2xl tracking-[0.5em] font-mono text-center"
-                                            />
+                                    <h2 className="text-lg font-semibold text-nobuf-text">Enter the Code</h2>
+                                    <div className="w-full max-w-sm space-y-5">
+                                        <div className="space-y-2">
+                                            <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider">Telegram Code</label>
+                                            <div className="relative">
+                                                <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
+                                                <input
+                                                    type="text"
+                                                    value={code}
+                                                    onChange={(e) => setCode(e.target.value)}
+                                                    placeholder="1 2 3 4 5"
+                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all text-2xl tracking-[0.5em] font-mono text-center"
+                                                />
+                                            </div>
                                         </div>
-                                    </div>
-
-                                    <div className="flex flex-col gap-3">
-                                        <button
-                                            type="submit"
-                                            disabled={loading}
-                                            className="w-full bg-white text-black hover:bg-gray-100 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98]"
-                                        >
-                                            {loading ? "Verifying..." : "Sign In"}
-                                        </button>
-                                        <button type="button" onClick={() => setStep("phone")} className="text-xs text-gray-500 hover:text-white transition-colors py-2">
-                                            Change Phone Number
-                                        </button>
+                                        <div className="flex flex-col gap-3">
+                                            <button
+                                                type="submit"
+                                                disabled={loading}
+                                                className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                {loading ? "Verifying..." : "Sign In"}
+                                            </button>
+                                            <button type="button" onClick={() => setStep("phone")} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
+                                                Change Phone Number
+                                            </button>
+                                        </div>
                                     </div>
                                 </motion.form>
                             )}
-
 
                             {step === "password" && (
                                 <motion.form
@@ -524,182 +623,171 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                     animate={{ x: 0, opacity: 1 }}
                                     exit={{ x: -20, opacity: 0 }}
                                     onSubmit={handlePasswordSubmit}
-                                    className="space-y-6"
+                                    className="flex-1 flex flex-col items-center justify-center space-y-5"
                                 >
-                                    <div className="space-y-2">
-                                        <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl mb-4">
-                                            <p className="text-xs text-blue-300 text-center">
-                                                Your account has Two-Factor Authentication enabled.
-                                                Please enter your cloud password to continue.
-                                            </p>
+                                    <h2 className="text-lg font-semibold text-nobuf-text">Enter Cloud Password</h2>
+                                    <div className="w-full max-w-sm space-y-5">
+                                        <div className="space-y-2">
+                                            <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider">Cloud Password</label>
+                                            <div className="relative">
+                                                <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
+                                                <input
+                                                    type="password"
+                                                    value={password}
+                                                    onChange={(e) => setPassword(e.target.value)}
+                                                    placeholder="Enter your password"
+                                                    className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all text-lg"
+                                                    autoFocus
+                                                />
+                                            </div>
                                         </div>
-                                        <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider">Cloud Password</label>
-                                        <div className="relative">
-                                            <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
-                                            <input
-                                                type="password"
-                                                value={password}
-                                                onChange={(e) => setPassword(e.target.value)}
-                                                placeholder="Enter your password"
-                                                className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-all text-lg"
-                                                autoFocus
-                                            />
+                                        <div className="flex flex-col gap-3">
+                                            <button
+                                                type="submit"
+                                                disabled={loading || !password}
+                                                className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                {loading ? "Verifying..." : "Unlock"}
+                                            </button>
+                                            <button type="button" onClick={() => { setStep("code"); setPassword(""); setError(null); }} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
+                                                Back to Code Entry
+                                            </button>
                                         </div>
-                                    </div>
-
-                                    <div className="flex flex-col gap-3">
-                                        <button
-                                            type="submit"
-                                            disabled={loading || !password}
-                                            className="w-full bg-white text-black hover:bg-gray-100 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
-                                        >
-                                            {loading ? "Verifying..." : "Unlock"}
-                                        </button>
-                                        <button type="button" onClick={() => { setStep("code"); setPassword(""); setError(null); }} className="text-xs text-gray-500 hover:text-white transition-colors py-2">
-                                            Back to Code Entry
-                                        </button>
                                     </div>
                                 </motion.form>
                             )}
                         </>
-                    )}
-                </AnimatePresence>
+                        )}
+                    </AnimatePresence>
 
-                {error && (
-                    <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="mt-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3"
-                    >
-                        <div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-2 shrink-0" />
-                        <p className="text-red-400 text-sm leading-snug">{error}</p>
-                    </motion.div>
-                )}
-
-                <div className="mt-8 pt-4 border-t border-white/5 text-center">
-                    <button
-                        onClick={() => setShowDonate(true)}
-                        className="text-xs text-telegram-subtext hover:text-telegram-text transition-colors flex items-center justify-center gap-1.5 mx-auto"
-                    >
-                        <Heart className="w-3.5 h-3.5 text-red-500/80" />
-                        Donate
-                    </button>
-                </div>
-            </motion.div>
-
-
-            <AnimatePresence>
-                {showHelp && (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
-                        onClick={() => setShowHelp(false)}
-                    >
+                    {error && (
                         <motion.div
-                            initial={{ scale: 0.95, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0.95, opacity: 0 }}
-                            className="glass bg-telegram-surface border border-telegram-border rounded-2xl p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto shadow-2xl"
-                            onClick={(e) => e.stopPropagation()}
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="mt-4 p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3"
                         >
-                            <div className="flex items-center justify-between mb-6">
-                                <h2 className="text-xl font-bold text-telegram-text">Getting Started</h2>
-                                <button onClick={() => setShowHelp(false)} className="p-2 hover:bg-telegram-hover rounded-lg transition-colors">
-                                    <X className="w-5 h-5 text-telegram-subtext" />
-                                </button>
-                            </div>
-
-                            <div className="space-y-6 text-telegram-text">
-                                <div className="p-4 bg-telegram-primary/10 border border-telegram-primary/20 rounded-xl">
-                                    <p className="text-sm text-telegram-subtext">
-                                        <strong className="text-telegram-primary">NoBuf</strong> uses your Telegram account as secure cloud storage. You'll need a Telegram account and API credentials to get started.
-                                    </p>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <h3 className="font-semibold flex items-center gap-2">
-                                        <span className="w-6 h-6 bg-telegram-primary text-white text-xs font-bold rounded-full flex items-center justify-center">1</span>
-                                        Go to Telegram's Developer Portal
-                                    </h3>
-                                    <p className="text-sm text-telegram-subtext ml-8">
-                                        Visit <button type="button" onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }} className="text-telegram-primary underline hover:text-telegram-text cursor-pointer">my.telegram.org</button> and log in with your phone number.
-                                    </p>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <h3 className="font-semibold flex items-center gap-2">
-                                        <span className="w-6 h-6 bg-telegram-primary text-white text-xs font-bold rounded-full flex items-center justify-center">2</span>
-                                        Create a New Application
-                                    </h3>
-                                    <p className="text-sm text-telegram-subtext ml-8">
-                                        Click on <strong>"API development tools"</strong> and create a new application. Use any name and description you like.
-                                    </p>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <h3 className="font-semibold flex items-center gap-2">
-                                        <span className="w-6 h-6 bg-telegram-primary text-white text-xs font-bold rounded-full flex items-center justify-center">3</span>
-                                        Copy Your Credentials
-                                    </h3>
-                                    <p className="text-sm text-telegram-subtext ml-8">
-                                        After creating the app, you'll see your <strong>API ID</strong> (a number) and <strong>API Hash</strong> (a string). Copy both and paste them into the fields on the previous screen.
-                                    </p>
-                                </div>
-
-                                <div className="p-4 bg-telegram-hover rounded-xl border border-telegram-border">
-                                    <p className="text-xs text-telegram-subtext">
-                                        <strong>🔒 Privacy:</strong> Your credentials are stored locally on your device and are never sent to any third-party servers. All data goes directly between you and Telegram.
-                                    </p>
-                                </div>
-
-                                <button
-                                    type="button"
-                                    onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }}
-                                    className="w-full bg-telegram-primary text-white font-semibold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-telegram-primary/90 transition-colors"
-                                >
-                                    <ExternalLink className="w-4 h-4" />
-                                    Open my.telegram.org
-                                </button>
-                            </div>
+                            <div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-2 shrink-0" />
+                            <p className="text-red-400 text-sm leading-snug">{error}</p>
                         </motion.div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
+                    )}
+                </div>
 
-            <AnimatePresence>
-                {showDonate && (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
-                        onClick={() => setShowDonate(false)}
-                    >
-                        <motion.div
-                            initial={{ scale: 0.95, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0.95, opacity: 0 }}
-                            className="glass bg-telegram-surface border border-telegram-border rounded-2xl p-6 max-w-sm w-full shadow-2xl"
-                            onClick={(e) => e.stopPropagation()}
-                        >
-                            <div className="relative flex items-center justify-center mb-6">
-                                <h2 className="text-xl font-bold text-telegram-text text-center">
-                                    Support the Project
-                                </h2>
-                                <button onClick={() => setShowDonate(false)} className="absolute right-0 p-2 hover:bg-telegram-hover rounded-lg transition-colors">
-                                    <X className="w-5 h-5 text-telegram-subtext" />
-                                </button>
-                            </div>
+                {/* ── RIGHT PANEL ── */}
+                <div className="auth-split-right p-8 rounded-2xl shadow-2xl overflow-y-auto">
+                    <AnimatePresence mode="wait">
+                        {floodWait ? (
+                            <motion.div key="flood-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                                <FloodWaitContext />
+                            </motion.div>
+                        ) : (
+                        <>
+                            {step === "setup" && (
+                                <motion.div key="setup-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                                    <p className="text-nobuf-subtext text-sm font-medium mb-6">
+                                        Your Telegram-powered cloud drive with zero-buffer streaming
+                                    </p>
+                                    <SetupGuide />
+                                </motion.div>
+                            )}
+                            {step === "phone" && (
+                                <motion.div key="phone-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                                    <PhoneContext />
+                                </motion.div>
+                            )}
+                            {step === "code" && (
+                                <motion.div key="code-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                                    <CodeContext phone={phone} />
+                                </motion.div>
+                            )}
+                            {step === "password" && (
+                                <motion.div key="password-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                                    <PasswordContext />
+                                </motion.div>
+                            )}
+                        </>
+                        )}
+                    </AnimatePresence>
+                </div>
+            </div>
+        </div>
+    );
+}
 
-                    </motion.div>
-                </motion.div>
+/* ── Sub-components ──────────────────────────── */
+
+function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, setError, handleQrLogin }: {
+    loginMethod: 'phone' | 'qr';
+    setLoginMethod: (m: 'phone' | 'qr') => void;
+    setQrUrl: (u: string | null) => void;
+    setQrPolling: (p: boolean) => void;
+    setError: (e: string | null) => void;
+    handleQrLogin: () => void;
+}) {
+    return (
+        <div className="flex rounded-xl overflow-hidden border border-nobuf-border">
+            <button
+                type="button"
+                onClick={() => { setLoginMethod('phone'); setQrUrl(null); setQrPolling(false); setError(null); }}
+                className={`flex-1 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-all ${
+                    loginMethod === 'phone'
+                        ? 'bg-nobuf-primary/15 text-nobuf-text'
+                        : 'text-nobuf-subtext hover:text-nobuf-text'
+                }`}
+            >
+                <Phone className="w-4 h-4" /> Phone Number
+            </button>
+            <button
+                type="button"
+                onClick={() => { setLoginMethod('qr'); setError(null); handleQrLogin(); }}
+                className={`flex-1 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-all ${
+                    loginMethod === 'qr'
+                        ? 'bg-nobuf-primary/15 text-nobuf-text'
+                        : 'text-nobuf-subtext hover:text-nobuf-text'
+                }`}
+            >
+                <QrCode className="w-4 h-4" /> QR Code
+            </button>
+        </div>
+    );
+}
+
+function QrLoginPanel({ loading, qrUrl, qrPolling, onRefresh, onBack }: {
+    loading: boolean;
+    qrUrl: string | null;
+    qrPolling: boolean;
+    onRefresh: () => void;
+    onBack: () => void;
+}) {
+    return (
+        <div className="flex flex-col items-center gap-5">
+            {loading && !qrUrl && (
+                <div className="w-52 h-52 rounded-2xl bg-nobuf-primary/5 flex items-center justify-center">
+                    <div className="w-8 h-8 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                </div>
             )}
-        </AnimatePresence>
-
-        <div className="fixed top-[-20%] left-[-10%] w-[500px] h-[500px] bg-blue-600/20 rounded-full blur-[120px] pointer-events-none -z-10" />
-        <div className="fixed bottom-[-10%] right-[-10%] w-[400px] h-[400px] bg-purple-600/10 rounded-full blur-[100px] pointer-events-none -z-10" />
-    </div>
+            {qrUrl && (
+                <>
+                    <div className="p-4 bg-white rounded-2xl shadow-xl">
+                        <QRCodeSVG value={qrUrl} size={200} level="M" bgColor="#ffffff" fgColor="#013718" />
+                    </div>
+                    <div className="text-center space-y-1">
+                        <p className="text-sm text-nobuf-text">Scan with your Telegram app</p>
+                        <p className="text-xs text-nobuf-subtext">Settings &gt; Devices &gt; Link Desktop Device</p>
+                    </div>
+                    {qrPolling && (
+                        <div className="flex items-center gap-2 text-xs text-nobuf-primary">
+                            <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                            Waiting for scan...
+                        </div>
+                    )}
+                    <button type="button" onClick={onRefresh} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors">
+                        Refresh QR Code
+                    </button>
+                </>
+            )}
+            <button type="button" onClick={onBack} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
+                Back to Configuration
+            </button>
+        </div>
     );
 }

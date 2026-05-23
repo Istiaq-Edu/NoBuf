@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, ReactNode } from 'react';
+﻿import { createContext, useContext, useState, ReactNode } from 'react';
 
 interface ConfirmOptions {
     title: string;
@@ -44,14 +44,14 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
                 <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 backdrop-blur-sm">
                     <div className="bg-[#1c1c1c] border border-white/10 rounded-xl p-6 w-96 shadow-2xl animate-in zoom-in-95" onClick={e => e.stopPropagation()}>
                         <h3 className="text-lg font-medium text-white mb-2">{options.title}</h3>
-                        <p className="text-telegram-subtext text-sm mb-6 whitespace-pre-line">{options.message}</p>
+                        <p className="text-nobuf-subtext text-sm mb-6 whitespace-pre-line">{options.message}</p>
                         <div className="flex justify-end gap-3">
-                            <button onClick={handleCancel} className="px-4 py-2 rounded-lg text-sm font-medium hover:bg-white/5 text-telegram-subtext transition">
+                            <button onClick={handleCancel} className="px-4 py-2 rounded-lg text-sm font-medium hover:bg-white/5 text-nobuf-subtext transition">
                                 {options.cancelText || 'Cancel'}
                             </button>
                             <button
                                 onClick={handleConfirm}
-                                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${options.variant === 'danger' ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'bg-telegram-primary text-white hover:bg-telegram-primary/90'}`}
+                                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${options.variant === 'danger' ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'bg-nobuf-primary text-white hover:bg-nobuf-primary/90'}`}
                             >
                                 {options.confirmText || 'Confirm'}
                             </button>

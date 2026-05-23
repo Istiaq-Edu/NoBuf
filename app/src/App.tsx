@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,7 +75,7 @@ function AppContent() {
   // Styled splash screen while verifying the session
   if (authStatus === "loading") {
     return (
-      <main className="h-screen w-screen flex items-center justify-center bg-telegram-bg">
+      <main className="h-screen w-screen flex items-center justify-center bg-nobuf-bg">
         <div className="flex flex-col items-center gap-4 animate-pulse">
           <div className="w-14 h-14 rounded-2xl bg-white/10 flex items-center justify-center">
             <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-white/60">
@@ -84,14 +84,14 @@ function AppContent() {
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
           </div>
-          <p className="text-sm text-telegram-subtext tracking-wide">Restoring session...</p>
+          <p className="text-sm text-nobuf-subtext tracking-wide">Restoring session...</p>
         </div>
       </main>
     );
   }
 
   return (
-    <main className="h-screen w-screen text-telegram-text overflow-hidden selection:bg-telegram-primary/30 relative">
+    <main className="h-screen w-screen text-nobuf-text overflow-hidden selection:bg-nobuf-primary/30 relative">
       <UpdateBanner
         available={available}
         version={version}
