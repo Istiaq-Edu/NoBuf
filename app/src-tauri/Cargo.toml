@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "1.4.0"
+version = "0.1.0"
 description = "nobuff — an open-source desktop app built with Tauri, Rust, and React."
 authors = []
 edition = "2021"
