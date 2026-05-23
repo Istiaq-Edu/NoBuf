@@ -28,7 +28,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: `v${{ steps.get_version.outputs.VERSION }}`,
-              name: `Telegram Drive v${{ steps.get_version.outputs.VERSION }}`,
+              name: `nobuff v${{ steps.get_version.outputs.VERSION }}`,
               body: `Feature: Added a donation button and popup modal to the main login screen to support the project via PayPal, Litecoin, and Bitcoin.\n\nSee the assets below to download and install.`,
               draft: true,
               prerelease: false
@@ -162,7 +162,7 @@ jobs:
           # ── Write new AppRun ──
           cat > squashfs-root/AppRun << 'APPRUN_EOF'
           #!/usr/bin/env bash
-          # ── Telegram Drive — cross-distro AppRun wrapper ──
+          # ── nobuff — cross-distro AppRun wrapper ──
           # Fixes EGL_BAD_ALLOC on Arch/Fedora/rolling-release distros by ensuring
           # the host's GPU driver stack is used instead of bundled Ubuntu Mesa libs.
           set -u
