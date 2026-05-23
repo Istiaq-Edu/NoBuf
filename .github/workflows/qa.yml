@@ -64,7 +64,7 @@ jobs:
           API_KEY_HASH=$(echo -n "$QA_API_KEY" | sha256sum | cut -d' ' -f1)
 
           # Pre-configure REST API settings
-          API_SETTINGS_DIR="$HOME/.local/share/com.cameronamer.telegramdrive"
+          API_SETTINGS_DIR="$HOME/.local/share/com.istiaq.nobuff"
           mkdir -p "$API_SETTINGS_DIR"
           cat > "$API_SETTINGS_DIR/api_settings.json" << JSONEOF
           {
@@ -118,7 +118,7 @@ jobs:
           You are running in a non-interactive CI environment. There is NO human available.
           Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input.
 
-          Run the qa skill for Telegram-Drive. This is a Tauri desktop app.
+          Run the qa skill for nobuff. This is a Tauri desktop app.
           Only REST API tests can run in CI (marked ci: true in qa-app/SKILL.md).
           Skip all GUI-only flows (marked ci: false).
 

@@ -41,8 +41,8 @@ pub async fn cmd_create_folder(
     let result = client.invoke(&tl::functions::channels::CreateChannel {
         broadcast: true,
         megagroup: false,
-        title: format!("{} [TD]", name),
-        about: "Telegram Drive Storage Folder\n[telegram-drive-folder]".to_string(),
+        title: format!("{} [NB]", name),
+        about: "nobuff Storage Folder\n[nobuff-folder]".to_string(),
         geo_point: None,
         address: None,
         for_import: false,
@@ -972,9 +972,11 @@ pub async fn cmd_scan_folders(
                 // log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
 
                 // Strategy 1: Title
-                if name.to_lowercase().contains("[td]") {
+                if name.to_lowercase().contains("[td]") || name.to_lowercase().contains("[nb]") {
                     log::info!(" -> MATCH via Title: {}", name);
-                    let display_name = name.replace(" [TD]", "").replace(" [td]", "").replace("[TD]", "").replace("[td]", "").trim().to_string();
+                    let display_name = name.replace(" [TD]", "").replace(" [td]", "").replace("[TD]", "").replace("[td]", "")
+                                           .replace(" [NB]", "").replace(" [nb]", "").replace("[NB]", "").replace("[nb]", "")
+                                           .trim().to_string();
                     folders.push(FolderMetadata { id, name: display_name, parent_id: None });
                     continue; 
                 }
@@ -990,7 +992,7 @@ pub async fn cmd_scan_folders(
                 }).await {
                     Ok(tl::enums::messages::ChatFull::Full(f)) => {
                         if let tl::enums::ChatFull::Full(cf) = f.full_chat {
-                             if cf.about.contains("[telegram-drive-folder]") {
+                             if cf.about.contains("[telegram-drive-folder]") || cf.about.contains("[nobuff-folder]") {
                                  log::info!(" -> MATCH via About: {}", name);
                                  folders.push(FolderMetadata { id, name: name.clone(), parent_id: None });
                              }
