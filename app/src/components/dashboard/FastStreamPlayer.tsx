@@ -833,7 +833,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           <div className="text-center px-8">
             <div className="text-red-400 text-lg mb-2">{err}</div>
             <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
-            <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded">Close</button>
+            <button onClick={handleClose} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Close</button>
           </div>
         ) : (
           <video
@@ -1089,7 +1089,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               )}
             </button>
             {/* Close */}
-            <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-white" title="Close (Esc)">
+            <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close (Esc)">
               <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
             {/* Fullscreen */}
@@ -1115,7 +1115,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           {/* Header */}
           <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
             <span className="text-white text-sm font-semibold">Settings</span>
-            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded text-white/60 hover:text-white transition-colors" title="Close settings">
+            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close settings">
               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
           </div>
@@ -1441,7 +1441,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 style={{ width: `${dlOverlay.percent}%` }}
               />
             </div>
-            <span className="text-white/90 text-xs font-mono whitespace-nowrap">
+            <span className="text-nobuf-text text-xs font-mono whitespace-nowrap">
               {dlOverlay.completed
                 ? 'Completed'
                 : dlOverlay.fromCache
@@ -1453,7 +1453,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             </span>
             <button
               onClick={(e) => { e.stopPropagation(); handleCancelDownload(); }}
-              className={`p-1 hover:bg-white/10 rounded transition-colors flex-shrink-0 ${dlOverlay.completed ? 'text-white/60 hover:text-white' : 'text-white/60 hover:text-red-400'}`}
+              className={`p-1 hover:bg-white/10 rounded transition-colors flex-shrink-0 ${dlOverlay.completed ? 'text-nobuf-subtext/60 hover:text-nobuf-primary' : 'text-nobuf-subtext/60 hover:text-red-400'}`}
               title={dlOverlay.completed ? 'Close' : 'Cancel download'}
             >
               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
