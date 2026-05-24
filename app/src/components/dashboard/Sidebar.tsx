@@ -1,4 +1,4 @@
-﻿import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { HardDrive, Folder, Plus, RefreshCw, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
@@ -11,9 +11,10 @@ interface SidebarProps {
     onDrop: (e: React.DragEvent, folderId: number | null) => void;
     onDelete: (id: number, name: string) => void;
     onRename: (id: number, newName: string) => void;
+    onReorder: (reordered: TelegramFolder[]) => void;
     onCreate: (name: string) => Promise<void>;
     isSyncing: boolean;
- isConnected: boolean;
+    isConnected: boolean;
     onSync: () => void;
     onLogout: () => void;
     bandwidth: BandwidthStats | null;
@@ -21,12 +22,24 @@ interface SidebarProps {
     onToggleCollapse: () => void;
 }
 
+/**
+ * Drag data type constants to distinguish between file-drop and folder-reorder.
+ * File drops use "application/x-telegram-file-id" (existing mechanism).
+ * Folder reorder uses "application/x-nobuf-folder-reorder" (new).
+ */
+const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
+
 export function Sidebar({
-    folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onCreate,
+    folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
+
+    // Reorder drag state: tracks which folder is being dragged and
+    // where it would be inserted (the index of the drop target).
+    const [dragOverFolderId, setDragOverFolderId] = useState<number | null>(null);
+    const [dragOverPosition, setDragOverPosition] = useState<'above' | 'below' | null>(null);
 
     const submitCreate = async () => {
         if (!newFolderName.trim()) return;
@@ -38,6 +51,85 @@ export function Sidebar({
             // handled by parent
         }
     }
+
+    // Compute reorder: move dragged folder to the position indicated by dragOver.
+    const handleReorderDrop = useCallback((draggedFolderId: number) => {
+        if (dragOverFolderId === null || dragOverPosition === null) return;
+        if (draggedFolderId === dragOverFolderId) return; // no-op
+
+        const draggedIndex = folders.findIndex(f => f.id === draggedFolderId);
+        if (draggedIndex === -1) return;
+
+        const targetIndex = folders.findIndex(f => f.id === dragOverFolderId);
+        if (targetIndex === -1) return;
+
+        // Compute the actual insertion index.
+        // If dragging above target, insert before it. If below, insert after it.
+        // But need to account for the dragged item being removed first.
+        const reordered = [...folders];
+        const [draggedItem] = reordered.splice(draggedIndex, 1);
+
+        // After removing dragged item, find the target's new index
+        const newTargetIndex = reordered.findIndex(f => f.id === dragOverFolderId);
+        const insertIndex = dragOverPosition === 'above' ? newTargetIndex : newTargetIndex + 1;
+
+        reordered.splice(insertIndex, 0, draggedItem);
+        onReorder(reordered);
+
+        // Clear drag state
+        setDragOverFolderId(null);
+        setDragOverPosition(null);
+    }, [folders, dragOverFolderId, dragOverPosition, onReorder]);
+
+    // Folder reorder drag handlers — called from SidebarItem
+    const handleFolderDragStart = useCallback((e: React.DragEvent, folderId: number) => {
+        e.dataTransfer.setData(FOLDER_REORDER_MIME, String(folderId));
+        e.dataTransfer.effectAllowed = 'move';
+        // Also set a small drag image so it looks right
+    }, []);
+
+    const handleFolderDragOver = useCallback((e: React.DragEvent, folderId: number) => {
+        // Only respond if this is a folder reorder drag (not a file drag)
+        if (!e.dataTransfer.types.includes(FOLDER_REORDER_MIME)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+
+        // Determine position: above or below the target based on mouse Y
+        const rect = e.currentTarget.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        const position = e.clientY < midY ? 'above' : 'below';
+
+        setDragOverFolderId(folderId);
+        setDragOverPosition(position);
+    }, []);
+
+    const handleFolderDragLeave = useCallback((e: React.DragEvent) => {
+        // Only clear if actually leaving the element (not entering a child)
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX;
+        const y = e.clientY;
+        if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+            setDragOverFolderId(null);
+            setDragOverPosition(null);
+        }
+    }, []);
+
+    const handleFolderDrop = useCallback((e: React.DragEvent) => {
+        const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
+        if (reorderData) {
+            e.preventDefault();
+            e.stopPropagation();
+            handleReorderDrop(Number(reorderData));
+            return;
+        }
+        // If not a reorder drop, fall through to file drop
+    }, [handleReorderDrop]);
+
+    const handleDragEnd = useCallback(() => {
+        setDragOverFolderId(null);
+        setDragOverPosition(null);
+    }, []);
 
     return (
         <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-nobuf-surface border-r border-nobuf-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0`} onClick={e => e.stopPropagation()}>
@@ -57,7 +149,7 @@ export function Sidebar({
             </div>
 
             {/* Scrollable folder list */}
-            <nav className="flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0">
+            <nav className="flex-1 px-2 py-2 overflow-y-auto min-h-0" style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                 <SidebarItem
                     icon={HardDrive}
                     label="Saved Messages"
@@ -67,16 +159,32 @@ export function Sidebar({
                     folderId={null}
                     collapsed={collapsed}
                 />
-                {folders.map(folder => (
+                {folders.map((folder, index) => (
                     <SidebarItem
                         key={folder.id}
                         icon={Folder}
                         label={folder.name}
                         active={activeFolderId === folder.id}
                         onClick={() => setActiveFolderId(folder.id)}
-                        onDrop={(e: React.DragEvent) => onDrop(e, folder.id)}
+                        onDrop={(e: React.DragEvent) => {
+                            // Check if it's a reorder drop first
+                            const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
+                            if (reorderData) {
+                                handleReorderDrop(Number(reorderData));
+                                return;
+                            }
+                            onDrop(e, folder.id);
+                        }}
                         onDelete={() => onDelete(folder.id, folder.name)}
                         onRename={(newName: string) => onRename(folder.id, newName)}
+                        onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
+                        onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
+                        onFolderDragLeave={handleFolderDragLeave}
+                        onFolderDrop={(e: React.DragEvent) => handleFolderDrop(e)}
+                        onFolderDragEnd={handleDragEnd}
+                        reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
+                        isFirst={index === 0}
+                        isLast={index === folders.length - 1}
                         folderId={folder.id}
                         collapsed={collapsed}
                     />

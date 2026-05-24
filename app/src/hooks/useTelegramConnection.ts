@@ -269,6 +269,15 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     };
 
+    // Reorder folders — persists new order to store
+    const handleFolderReorder = useCallback(async (reordered: TelegramFolder[]) => {
+        setFolders(reordered);
+        if (store) {
+            await store.set('folders', reordered);
+            await store.save();
+        }
+    }, [store]);
+
     const handleSetActiveFolderId = async (id: number | null) => {
         setActiveFolderId(id);
         if (store) {
@@ -289,6 +298,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         handleCreateFolder,
         handleFolderRename,
         handleFolderDelete,
+        handleFolderReorder,
         isNetworkError,
         forceLogout
     };
