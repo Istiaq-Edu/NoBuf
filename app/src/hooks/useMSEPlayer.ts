@@ -515,8 +515,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   };
 
   const fetchMoreData = async (url: string, mp4box: MP4BoxFile) => {
-    const MAX_PREFETCH = 10 * 1024 * 1024; // 10MB max to find moov
+    const MAX_PREFETCH = 10 * 1024 * 1024; // 10MB max forward scan for moov
 
+    // Phase 1: Forward scan from byte 0 (works for faststarted MP4s)
     while (!cancelledRef.current && !state.current.initialized &&
            state.current.currentOffset < state.current.fileLength &&
            state.current.currentOffset < MAX_PREFETCH) {
@@ -546,6 +547,48 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         trackDownloadedRange(offset, offset + data.byteLength - 1);
       } catch (e) {
         break;
+      }
+    }
+
+    // Phase 2: If moov still not found, fetch the last 5MB of the file.
+    // Non-faststarted MP4s place the moov atom at the end — mp4box can
+    // parse it from there and fire onReady, then we seek back to byte 0
+    // for playback.
+    const TAIL_FETCH_SIZE = 5 * 1024 * 1024; // 5MB from end
+    if (!state.current.initialized && !cancelledRef.current && state.current.fileLength > MAX_PREFETCH) {
+      const tailStart = Math.max(0, state.current.fileLength - TAIL_FETCH_SIZE);
+      const tailEnd = state.current.fileLength - 1;
+
+      // Don't re-fetch bytes we already have from the forward scan
+      if (tailStart >= state.current.currentOffset) {
+        try {
+          console.log(`[MSE] moov not found in first ${formatBytes(state.current.currentOffset)} — fetching tail: bytes ${tailStart}-${tailEnd}`);
+          const response = await fetch(url, {
+            headers: { Range: `bytes=${tailStart}-${tailEnd}` },
+          });
+
+          if (cancelledRef.current) return;
+          if (response.ok || response.status === 206) {
+            const data = await response.arrayBuffer();
+            if (cancelledRef.current) return;
+
+            const buffer = data as any;
+            buffer.fileStart = tailStart;
+            mp4box.appendBuffer(buffer);
+            mp4box.flush();
+
+            reportRangesToBackend(tailStart, tailStart + data.byteLength - 1);
+            trackDownloadedRange(tailStart, tailStart + data.byteLength - 1);
+
+            if (state.current.initialized) {
+              console.log('[MSE] moov found in tail — resetting offset to byte 0 for playback');
+              state.current.currentOffset = 0;
+              setPrefetchedBytes(0);
+            }
+          }
+        } catch (e) {
+          console.error('[MSE] Tail fetch failed:', e);
+        }
       }
     }
 
