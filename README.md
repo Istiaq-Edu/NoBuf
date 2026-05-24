@@ -128,7 +128,9 @@ Your Telegram channels become a video library. Your Saved Messages become a quic
 
 **File Management**
 
-- 📁 **Folder System** — Telegram channels as folders. Create, rename, delete, drag-and-drop. To add an existing channel to NoBuf, just append **`[NB]`** to the channel name.
+- 📁 **Folder System** — Telegram channels as folders. Create, rename, delete, drag-and-drop.
+  > [!TIP]
+  > **Add an existing channel to NoBuf:** Just append **`[NB]`** to the channel name in Telegram — NoBuf will detect it automatically.
 - 📂 **File Explorer** — Grid and list views with virtual scrolling for thousands of files.
 - 📤 **Drag & Drop Upload** — Upload queue with progress, speed tracking, and cancellation.
 - 📥 **Parallel Downloads** — 3 concurrent TCP connections per file. ~3× faster than single-threaded.

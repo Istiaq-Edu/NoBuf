@@ -116,13 +116,16 @@ jobs:
         working-directory: app
         run: |
           VERSION="${{ needs.create-release.outputs.version }}"
-          # Update tauri.conf.json — perl is portable across macOS/Linux/Windows
-          perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
-          # Update package.json
+          # MSI/WiX requires numeric-only versions (no -beta etc.)
+          # Strip pre-release suffix for tauri.conf.json only
+          MSI_VERSION="${VERSION%%-*}"
+          # Update tauri.conf.json — numeric version for MSI compatibility
+          perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$MSI_VERSION\"/" src-tauri/tauri.conf.json
+          # Update package.json — full semver
           perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
-          # Update Cargo.toml
+          # Update Cargo.toml — full semver
           perl -pi -e "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
-          echo "--- Version set to $VERSION in all config files ---"
+          echo "--- Version set: tauri.conf.json=$MSI_VERSION, package.json=$VERSION, Cargo.toml=$VERSION ---"
 
       - name: Install frontend dependencies
         working-directory: app
