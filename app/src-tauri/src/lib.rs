@@ -5,12 +5,30 @@ pub mod stream_cache;
 pub mod bandwidth;
 
 use tauri::Manager;
+use tauri::webview::WebviewWindowBuilder;
+use tauri::WebviewUrl;
+use url::Url;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use commands::TelegramState;
 use commands::streaming::StreamConfig;
 use rand::Rng;
+
+/// Port for the localhost plugin that serves frontend assets in production.
+/// This makes the document origin http://localhost:LOCALHOST_PORT, which
+/// passes WebView2's URL safety check for media loading from
+/// http://localhost:14201 (the Actix streaming server).
+/// Without this, WebView2 blocks <video> src URLs on localhost when
+/// the page is served from a different origin (tauri://localhost).
+const LOCALHOST_PORT: u16 = 9527;
+
+/// Frontend URL: Vite dev server in debug builds, localhost plugin in release.
+#[cfg(debug_assertions)]
+const FRONTEND_URL: &str = "http://localhost:1420";
+
+#[cfg(not(debug_assertions))]
+const FRONTEND_URL: &str = "http://localhost:9527";
 
 pub mod server;
 pub mod api_routes;
@@ -118,6 +136,7 @@ pub fn run() {
     let server_handle_for_setup = server_handle.clone();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PORT).build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
@@ -127,6 +146,19 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(move |app| {
+            // Create main window programmatically with localhost URL.
+            // This is required for WebView2's URL safety check to allow
+            // media loading from http://localhost:14201 (Actix streaming).
+            // In dev: Vite dev server (http://localhost:1420).
+            // In prod: localhost plugin (http://localhost:9527).
+            let frontend_url = WebviewUrl::External(Url::parse(FRONTEND_URL).unwrap());
+            WebviewWindowBuilder::new(app, "main", frontend_url)
+                .title("NoBuf")
+                .inner_size(1200.0, 800.0)
+                .min_inner_size(1000.0, 700.0)
+                .disable_drag_drop_handler()
+                .build()?;
+
             app.manage(TelegramState {
                 client: Arc::new(Mutex::new(None)),
                 login_token: Arc::new(Mutex::new(None)),
