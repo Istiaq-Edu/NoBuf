@@ -491,20 +491,38 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return;
       }
 
-      // Feed to mp4box
-      const buffer = data as any;
-      buffer.fileStart = 0;
-      mp4box.appendBuffer(buffer);
-
-      state.current.currentOffset = firstChunkSize;
-      setPrefetchedBytes(firstChunkSize);
-
-      // Report initial chunk range to cache backend
+      // Report initial chunk range to cache backend (even if we don't feed to mp4box yet)
       reportRangesToBackend(0, firstChunkSize - 1);
 
-      // If onReady hasn't fired yet, keep fetching more data (moov may be beyond 1MB)
-      if (!state.current.initialized && state.current.fileLength > 0) {
-        await fetchMoreData(url, mp4box);
+      // Scan the first chunk for moov atom. In MP4 format, each box has:
+      // [4 bytes size][4 bytes type][payload]. We scan for boxes with type "moov".
+      const moovInFirstChunk = scanForMoovBox(data);
+
+      if (moovInFirstChunk) {
+        // Faststarted MP4: moov is near the beginning. Feed the first chunk
+        // to mp4box — moov will be found and onReady will fire immediately.
+        console.log('[MSE] moov found in first chunk — faststarted MP4');
+        const buffer = data as any;
+        buffer.fileStart = 0;
+        mp4box.appendBuffer(buffer);
+
+        state.current.currentOffset = firstChunkSize;
+        setPrefetchedBytes(firstChunkSize);
+
+        // If onReady hasn't fired yet (moov box might extend beyond 512KB),
+        // forward scan up to 10MB to find the complete moov atom.
+        if (!state.current.initialized && state.current.fileLength > 0) {
+          await fetchMoreDataForwardScan(url, mp4box);
+        }
+      } else {
+        // Non-faststarted MP4: moov is at the END of the file. MSE/mp4box.js
+        // fundamentally cannot produce valid segments for moov-at-end progressive
+        // MP4s — even if we fetch moov from the tail first, mp4box's segmentation
+        // engine produces segments that MSE can't decode because the data was
+        // received out-of-order. The browser's native <video> decoder handles
+        // moov-at-end files perfectly via HTTP range requests, so fall back.
+        console.log('[MSE] moov NOT in first chunk — non-faststarted MP4, falling back to native playback');
+        setUseNative(true);
       }
     } catch (e: any) {
       console.error('[MSE] Setup failed:', e);
@@ -514,16 +532,53 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
   };
 
-  const fetchMoreData = async (url: string, mp4box: MP4BoxFile) => {
-    const MAX_PREFETCH = 10 * 1024 * 1024; // 10MB max forward scan for moov
+  /** Scan an ArrayBuffer for an MP4 box with type "moov".
+   *  MP4 boxes are: [4 bytes size][4 bytes type][payload].
+   *  Returns true if a moov box is found in the data. */
+  const scanForMoovBox = (data: ArrayBuffer): boolean => {
+    const view = new DataView(data);
+    const len = data.byteLength;
+    let offset = 0;
 
-    // Phase 1: Forward scan from byte 0 (works for faststarted MP4s)
+    while (offset + 8 <= len) {
+      const size = view.getUint32(offset);
+      const type = String.fromCharCode(
+        view.getUint8(offset + 4),
+        view.getUint8(offset + 5),
+        view.getUint8(offset + 6),
+        view.getUint8(offset + 7),
+      );
+
+      if (type === 'moov') return true;
+
+      // Advance to next box. Size=0 means box extends to end of file.
+      // Size=1 means 64-bit extended size (next 8 bytes are the real size).
+      if (size === 0) break;
+      if (size === 1) {
+        if (offset + 16 > len) break;
+        offset += 16; // Skip extended size header (approximate — large boxes)
+      } else {
+        offset += size;
+      }
+
+      if (offset > len) break;
+    }
+
+    return false;
+  };
+
+  /** Forward scan from currentOffset up to MAX_PREFETCH to find moov.
+   *  Used when moov extends beyond the first 512KB chunk (faststarted MP4s
+   *  where moov is near the beginning but larger than 512KB). */
+  const fetchMoreDataForwardScan = async (url: string, mp4box: MP4BoxFile) => {
+    const MAX_PREFETCH = 10 * 1024 * 1024;
+
     while (!cancelledRef.current && !state.current.initialized &&
            state.current.currentOffset < state.current.fileLength &&
            state.current.currentOffset < MAX_PREFETCH) {
 
       const offset = state.current.currentOffset;
-      const chunkSize = FRAGMENT_SIZES[0]; // 512KB for moov discovery
+      const chunkSize = FRAGMENT_SIZES[0];
       const end = Math.min(offset + chunkSize - 1, state.current.fileLength - 1);
 
       try {
@@ -550,49 +605,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
     }
 
-    // Phase 2: If moov still not found, fetch the last 5MB of the file.
-    // Non-faststarted MP4s place the moov atom at the end — mp4box can
-    // parse it from there and fire onReady, then we seek back to byte 0
-    // for playback.
-    const TAIL_FETCH_SIZE = 5 * 1024 * 1024; // 5MB from end
-    if (!state.current.initialized && !cancelledRef.current && state.current.fileLength > MAX_PREFETCH) {
-      const tailStart = Math.max(0, state.current.fileLength - TAIL_FETCH_SIZE);
-      const tailEnd = state.current.fileLength - 1;
-
-      // Don't re-fetch bytes we already have from the forward scan
-      if (tailStart >= state.current.currentOffset) {
-        try {
-          console.log(`[MSE] moov not found in first ${formatBytes(state.current.currentOffset)} — fetching tail: bytes ${tailStart}-${tailEnd}`);
-          const response = await fetch(url, {
-            headers: { Range: `bytes=${tailStart}-${tailEnd}` },
-          });
-
-          if (cancelledRef.current) return;
-          if (response.ok || response.status === 206) {
-            const data = await response.arrayBuffer();
-            if (cancelledRef.current) return;
-
-            const buffer = data as any;
-            buffer.fileStart = tailStart;
-            mp4box.appendBuffer(buffer);
-            mp4box.flush();
-
-            reportRangesToBackend(tailStart, tailStart + data.byteLength - 1);
-            trackDownloadedRange(tailStart, tailStart + data.byteLength - 1);
-
-            if (state.current.initialized) {
-              console.log('[MSE] moov found in tail — resetting offset to byte 0 for playback');
-              state.current.currentOffset = 0;
-              setPrefetchedBytes(0);
-            }
-          }
-        } catch (e) {
-          console.error('[MSE] Tail fetch failed:', e);
-        }
-      }
-    }
-
     if (!state.current.initialized && !cancelledRef.current) {
+      console.error('[MSE] moov not found after forward scan — falling back to native playback');
       setUseNative(true);
     }
   };
@@ -740,7 +754,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Start mp4box segment generation
       mp4box.start();
 
-      // Start downloading and appending
+      // Start downloading and appending (faststarted MP4 — normal path)
       downloadLoop(url);
     } catch (e: any) {
       if (!cancelledRef.current) {

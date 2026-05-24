@@ -9,18 +9,28 @@ interface SidebarItemProps {
     onDrop: (e: React.DragEvent) => void;
     onDelete?: () => void;
     onRename?: (newName: string) => void;
+    /** Folder reorder drag — only for folders (folderId !== null). */
+    onFolderDragStart?: (e: React.DragEvent) => void;
+    onFolderDragOver?: (e: React.DragEvent) => void;
+    onFolderDragLeave?: (e: React.DragEvent) => void;
+    onFolderDrop?: (e: React.DragEvent) => void;
+    onFolderDragEnd?: () => void;
+    /** Visual indicator for reorder drop target: 'above' shows a line above, 'below' below. */
+    reorderIndicator?: 'above' | 'below' | null;
+    /** Edge-case flags for reorder: prevent dropping above the first item or below the last. */
+    isFirst?: boolean;
+    isLast?: boolean;
     folderId: number | null;
     collapsed?: boolean;
 }
 
-/**
- * SidebarItem - Pure DOM event-based drop handling
- *
- * With Tauri's dragDropEnabled: false, DOM events work reliably.
- * This component handles internal file moves via standard React drag events.
- * Supports inline rename (double-click) and context menu with rename/delete.
- */
-export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename, folderId, collapsed }: SidebarItemProps) {
+const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
+
+export function SidebarItem({
+    icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename,
+    onFolderDragStart, onFolderDragOver, onFolderDragLeave, onFolderDrop, onFolderDragEnd,
+    reorderIndicator, isFirst, isLast, folderId, collapsed
+}: SidebarItemProps) {
     const [isOver, setIsOver] = useState(false);
     const [isRenaming, setIsRenaming] = useState(false);
     const [renameValue, setRenameValue] = useState(label);
@@ -29,6 +39,8 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
     const inputRef = useRef<HTMLInputElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
 
+    const isFolder = folderId !== null;
+
     useEffect(() => {
         if (isRenaming && inputRef.current) {
             inputRef.current.focus();
@@ -36,7 +48,6 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
         }
     }, [isRenaming]);
 
-    // Close context menu on outside click
     useEffect(() => {
         if (!showContextMenu) return;
         const handler = (e: MouseEvent) => {
@@ -69,27 +80,51 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
         setIsRenaming(true);
     };
 
-    // Only show rename/delete for actual folders (folderId !== null)
-    const isFolder = folderId !== null;
+    // Determine if a drag event is a folder reorder (vs file drop)
+    const isReorderDrag = (e: React.DragEvent) => e.dataTransfer.types.includes(FOLDER_REORDER_MIME);
 
     return (
         <>
+            {/* Reorder drop indicator line — rendered as a separate element above/below the button */}
+            {reorderIndicator === 'above' && !(isFirst) && (
+                <div className="h-0.5 bg-nobuf-primary rounded-full mx-2 shrink-0" />
+            )}
+
             <button
+                // CRITICAL: <button> elements are NOT draggable by default in HTML.
+                // Without draggable="true", onDragStart never fires.
+                draggable={isFolder && !isRenaming && !collapsed ? true : false}
                 onClick={onClick}
                 onDoubleClick={() => {
                     if (isFolder && onRename && !isRenaming) {
                         startRename();
                     }
                 }}
+                // Folder reorder: start drag on a folder item (not during rename, not when collapsed)
+                onDragStart={(e) => {
+                    if (!isFolder || isRenaming || collapsed) {
+                        e.preventDefault();
+                        return;
+                    }
+                    if (onFolderDragStart) onFolderDragStart(e);
+                }}
                 onDragEnter={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    setIsOver(true);
+                    // Only highlight for file drops (not reorder — reorder has its own indicator)
+                    if (!isReorderDrag(e)) {
+                        setIsOver(true);
+                    }
                 }}
                 onDragOver={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    e.dataTransfer.dropEffect = 'move';
+                    if (isReorderDrag(e)) {
+                        e.dataTransfer.dropEffect = 'move';
+                        if (onFolderDragOver) onFolderDragOver(e);
+                    } else {
+                        e.dataTransfer.dropEffect = 'move';
+                    }
                 }}
                 onDragLeave={(e) => {
                     e.preventDefault();
@@ -99,13 +134,26 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
                     const y = e.clientY;
                     if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
                         setIsOver(false);
+                        if (onFolderDragLeave) onFolderDragLeave(e);
                     }
                 }}
                 onDrop={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
                     setIsOver(false);
+
+                    // Priority 1: folder reorder drop
+                    if (isReorderDrag(e) && onFolderDrop) {
+                        onFolderDrop(e);
+                        return;
+                    }
+
+                    // Priority 2: file drop into folder
                     if (onDrop) onDrop(e);
+                }}
+                onDragEnd={() => {
+                    setIsOver(false);
+                    if (onFolderDragEnd) onFolderDragEnd();
                 }}
                 onContextMenu={(e) => {
                     if (isFolder) {
@@ -115,12 +163,13 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
                     }
                 }}
                 title={collapsed ? label : undefined}
+                // When this item is the reorder drop target, add a subtle shift animation
                 className={`group w-full flex items-center rounded-lg text-sm font-medium transition-all duration-150 overflow-hidden ${collapsed ? 'relative justify-center py-2' : 'px-3 py-2 gap-3'} ${active
                     ? 'bg-nobuf-primary/10 text-nobuf-primary'
                     : isOver
                         ? 'bg-nobuf-primary/30 text-nobuf-text ring-2 ring-nobuf-primary scale-[1.02] shadow-lg'
                         : 'text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text'
-                    }`}
+                    } ${isFolder && !isRenaming && !collapsed ? 'cursor-grab active:cursor-grabbing' : ''}`}
             >
                 <Icon className={`w-4 h-4 shrink-0 ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-nobuf-primary' : ''}`} />
                 {isRenaming ? (
@@ -153,6 +202,11 @@ export function SidebarItem({ icon: Icon, label, active = false, onClick, onDrop
                     </div>
                 )}
             </button>
+
+            {/* Reorder drop indicator line below */}
+            {reorderIndicator === 'below' && !(isLast) && (
+                <div className="h-0.5 bg-nobuf-primary rounded-full mx-2 shrink-0" />
+            )}
 
             {/* Context menu for folders */}
             {showContextMenu && isFolder && (

@@ -36,7 +36,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const {
         store, folders, activeFolderId, setActiveFolderId, isSyncing, isConnected,
-        handleLogout, handleSyncFolders, handleCreateFolder, handleFolderRename, handleFolderDelete
+        handleLogout, handleSyncFolders, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
     } = useTelegramConnection(onLogout);
 
 
@@ -483,6 +483,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onDrop={handleDropOnFolder}
                 onDelete={handleFolderDelete}
                 onRename={handleFolderRename}
+                onReorder={handleFolderReorder}
                 onCreate={handleCreateFolder}
                 isSyncing={isSyncing}
                 isConnected={isConnected}
