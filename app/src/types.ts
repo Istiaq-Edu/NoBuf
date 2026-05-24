@@ -14,6 +14,12 @@ export interface TelegramFolder {
     parent_id?: number;
 }
 
+export interface ScanResult {
+    added: TelegramFolder[];
+    updated: TelegramFolder[];
+    removed: number[];
+}
+
 export interface QueueItem {
     id: string;
     path: string;

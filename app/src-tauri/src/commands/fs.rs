@@ -2,8 +2,9 @@
 use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
+use std::collections::HashMap;
 use crate::TelegramState;
-use crate::models::{FolderMetadata, FileMetadata};
+use crate::models::{FolderMetadata, FileMetadata, ScanResult};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta};
@@ -14,6 +15,69 @@ use std::io::{Read, Seek, SeekFrom, Write};
 /// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
+
+/// Rename a NoBuf folder (channel). Updates the Telegram channel title
+/// and appends the [NB] tag if missing. Updates peer cache.
+#[tauri::command]
+pub async fn cmd_rename_folder(
+    folder_id: i64,
+    new_name: String,
+    state: State<'_, TelegramState>,
+) -> Result<FolderMetadata, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        log::info!("[MOCK] Renamed folder {} to '{}'", folder_id, new_name);
+        return Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None });
+    }
+    let client = client_opt.unwrap();
+
+    let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
+
+    let input_channel = match peer {
+        Peer::Channel(c) => {
+            tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: c.raw.id,
+                access_hash: c.raw.access_hash.ok_or("No access hash for channel")?,
+            })
+        },
+        _ => return Err("Only channels (folders) can be renamed.".to_string()),
+    };
+
+    // Ensure [NB] tag is present in the new title
+    let tagged_name = if new_name.to_lowercase().contains("[nb]") {
+        new_name.clone()
+    } else {
+        format!("{} [NB]", new_name)
+    };
+
+    client.invoke(&tl::functions::channels::EditTitle {
+        channel: input_channel,
+        title: tagged_name.clone(),
+    }).await.map_err(|e| format!("Failed to rename channel: {}", e))?;
+
+    // Update peer cache with the new name
+    {
+        let mut cache = state.peer_cache.write().await;
+        if let Some(existing_peer) = cache.get(&folder_id).cloned() {
+            if let Peer::Channel(mut c) = existing_peer {
+                c.raw.title = tagged_name.clone();
+                cache.insert(folder_id, Peer::Channel(c));
+            }
+        }
+    }
+
+    Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None })
+}
+
+/// Trigger an automatic sync on startup. This runs the same reconciliation
+/// as cmd_scan_folders but is triggered programmatically after the dashboard loads.
+#[tauri::command]
+pub async fn cmd_start_auto_sync(
+    local_folders: Vec<FolderMetadata>,
+    state: State<'_, TelegramState>,
+) -> Result<ScanResult, String> {
+    cmd_scan_folders(local_folders, state).await
+}
 
 #[tauri::command]
 pub async fn cmd_create_folder(
@@ -42,12 +106,12 @@ pub async fn cmd_create_folder(
         broadcast: true,
         megagroup: false,
         title: format!("{} [NB]", name),
-        about: "NoBuf Storage Folder\n[NoBuf-folder]".to_string(),
+        about: "".to_string(),
         geo_point: None,
         address: None,
         for_import: false,
         forum: false,
-        ttl_period: None, // Initial creation TTL
+        ttl_period: None,
     }).await.map_err(map_error)?;
     
     let (chat_id, access_hash) = match result {
@@ -79,6 +143,7 @@ pub async fn cmd_create_folder(
     })
 }
 
+/// Delete a NoBuf folder (channel) from Telegram. Also cleans peer cache.
 #[tauri::command]
 pub async fn cmd_delete_folder(
     folder_id: i64,
@@ -90,6 +155,8 @@ pub async fn cmd_delete_folder(
     
     if client_opt.is_none() {
         log::info!("[MOCK] Deleted folder ID {}", folder_id);
+        // Clean peer cache
+        state.peer_cache.write().await.remove(&folder_id);
         return Ok(true);
     }
     let client = client_opt.unwrap();
@@ -111,6 +178,9 @@ pub async fn cmd_delete_folder(
     client.invoke(&tl::functions::channels::DeleteChannel {
         channel: input_channel,
     }).await.map_err(|e| format!("Failed to delete channel: {}", e))?;
+
+    // Clean peer cache
+    state.peer_cache.write().await.remove(&folder_id);
     
     Ok(true)
 }
@@ -941,76 +1011,91 @@ pub async fn cmd_search_global(
     Ok(files)
 }
 
+/// Full reconciliation sync: scans all Telegram dialogs for NoBuf-tagged channels,
+/// computes diff against the local folder list, and returns added/updated/removed.
+///
+/// Matching strategy: [NB] in channel title only. No about/description check.
+/// Display name strips the [NB] tag for clean UI.
 #[tauri::command]
 pub async fn cmd_scan_folders(
+    local_folders: Vec<FolderMetadata>,
     state: State<'_, TelegramState>,
-) -> Result<Vec<FolderMetadata>, String> {
+) -> Result<ScanResult, String> {
     let client_opt = { state.client.lock().await.clone() };
-    if client_opt.is_none() { 
-        return Ok(Vec::new());
+    if client_opt.is_none() {
+        return Ok(ScanResult { added: Vec::new(), updated: Vec::new(), removed: Vec::new(), current: Vec::new() });
     }
     let client = client_opt.unwrap();
-    
-    let mut folders = Vec::new();
+
+    let mut found_folders: Vec<FolderMetadata> = Vec::new();
     let mut dialogs = client.iter_dialogs();
-    
-    log::info!("Starting Folder Scan...");
+
+    log::info!("Starting Folder Scan (full reconciliation)...");
 
     // Acquire write lock once for the entire scan to populate the peer cache
     let mut peer_cache = state.peer_cache.write().await;
 
     while let Some(dialog) = dialogs.next().await.map_err(|e| e.to_string())? {
-        // Populate peer cache for every dialog we encounter (free priming)
         match &dialog.peer {
             Peer::Channel(c) => {
                 let id = c.raw.id;
                 peer_cache.insert(id, dialog.peer.clone());
 
-                let name = c.raw.title.clone();
-                let access_hash = c.raw.access_hash.unwrap_or(0);
-                
-                // log::debug!("[SCAN] Processing Channel: '{}' (ID: {})", name, id);
-
-                // Strategy 1: Title
-                if name.to_lowercase().contains("[td]") || name.to_lowercase().contains("[nb]") {
-                    log::info!(" -> MATCH via Title: {}", name);
-                    let display_name = name.replace(" [TD]", "").replace(" [td]", "").replace("[TD]", "").replace("[td]", "")
-                                           .replace(" [NB]", "").replace(" [nb]", "").replace("[NB]", "").replace("[nb]", "")
-                                           .trim().to_string();
-                    folders.push(FolderMetadata { id, name: display_name, parent_id: None });
-                    continue; 
-                }
-
-                // Strategy 2: About
-                let input_chan = tl::enums::InputChannel::Channel(tl::types::InputChannel {
-                    channel_id: c.raw.id,
-                    access_hash,
-                });
-                
-                match client.invoke(&tl::functions::channels::GetFullChannel {
-                    channel: input_chan,
-                }).await {
-                    Ok(tl::enums::messages::ChatFull::Full(f)) => {
-                        if let tl::enums::ChatFull::Full(cf) = f.full_chat {
-                             if cf.about.contains("[telegram-drive-folder]") || cf.about.contains("[NoBuf-folder]") {
-                                 log::info!(" -> MATCH via About: {}", name);
-                                 folders.push(FolderMetadata { id, name: name.clone(), parent_id: None });
-                             }
-                        }
-                    },
-                    Err(e) => log::warn!(" -> Failed to get full info: {}", e),
+                let title = c.raw.title.clone();
+                // Match only by [NB] in title (case-insensitive)
+                if title.to_lowercase().contains("[nb]") {
+                    let display_name = title
+                        .replace(" [NB]", "").replace(" [nb]", "")
+                        .replace("[NB]", "").replace("[nb]", "")
+                        .trim()
+                        .to_string();
+                    log::info!(" -> MATCH: '{}' (ID: {})", display_name, id);
+                    found_folders.push(FolderMetadata { id, name: display_name, parent_id: None });
                 }
             },
             Peer::User(u) => {
                 peer_cache.insert(u.raw.id(), dialog.peer.clone());
-                // log::debug!("[SCAN] Cached User Peer: {}", u.raw.id());
             },
-            _peer => {
-                // log::debug!("[SCAN] Skipped Peer: {:?}", peer);
+            _peer => {}
+        }
+    }
+
+    log::info!("Scan found {} NoBuf folders. Peer cache size: {}.", found_folders.len(), peer_cache.len());
+
+    // Build lookup: found folder ID -> FolderMetadata
+    let found_map: HashMap<i64, &FolderMetadata> = found_folders.iter().map(|f| (f.id, f)).collect();
+    let local_map: HashMap<i64, &FolderMetadata> = local_folders.iter().map(|f| (f.id, f)).collect();
+
+    let mut added: Vec<FolderMetadata> = Vec::new();
+    let mut updated: Vec<FolderMetadata> = Vec::new();
+    let mut removed: Vec<i64> = Vec::new();
+    let current: Vec<FolderMetadata> = found_folders.clone();
+
+    // New folders: in Telegram but not in local
+    for f in &found_folders {
+        if !local_map.contains_key(&f.id) {
+            added.push(f.clone());
+        }
+    }
+
+    // Updated folders: in both but name differs
+    for f in &found_folders {
+        if let Some(local) = local_map.get(&f.id) {
+            if local.name != f.name {
+                updated.push(f.clone());
             }
         }
     }
-    
-    log::info!("Scan complete. Found {} folders. Peer cache size: {}.", folders.len(), peer_cache.len());
-    Ok(folders)
+
+    // Removed folders: in local but not in Telegram scan results
+    // (deleted, left, kicked, or [NB] tag removed from title)
+    for f in &local_folders {
+        if !found_map.contains_key(&f.id) {
+            removed.push(f.id);
+        }
+    }
+
+    log::info!("Reconciliation: +{} ~{} -{}", added.len(), updated.len(), removed.len());
+
+    Ok(ScanResult { added, updated, removed, current })
 }

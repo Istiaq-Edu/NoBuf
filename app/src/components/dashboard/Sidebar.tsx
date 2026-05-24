@@ -10,9 +10,10 @@ interface SidebarProps {
     setActiveFolderId: (id: number | null) => void;
     onDrop: (e: React.DragEvent, folderId: number | null) => void;
     onDelete: (id: number, name: string) => void;
+    onRename: (id: number, newName: string) => void;
     onCreate: (name: string) => Promise<void>;
     isSyncing: boolean;
-    isConnected: boolean;
+ isConnected: boolean;
     onSync: () => void;
     onLogout: () => void;
     bandwidth: BandwidthStats | null;
@@ -21,7 +22,7 @@ interface SidebarProps {
 }
 
 export function Sidebar({
-    folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onCreate,
+    folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onCreate,
     isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
@@ -75,6 +76,7 @@ export function Sidebar({
                         onClick={() => setActiveFolderId(folder.id)}
                         onDrop={(e: React.DragEvent) => onDrop(e, folder.id)}
                         onDelete={() => onDelete(folder.id, folder.name)}
+                        onRename={(newName: string) => onRename(folder.id, newName)}
                         folderId={folder.id}
                         collapsed={collapsed}
                     />

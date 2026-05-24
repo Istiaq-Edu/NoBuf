@@ -18,7 +18,16 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [],
+    "windows": [
+      {
+        "title": "NoBuf",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 1000,
+        "minHeight": 700,
+        "dragDropEnabled": false
+      }
+    ],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' http://localhost:14201; media-src 'self' http://localhost:14201; img-src 'self' data: blob: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:;",
       "capabilities": ["default"]
