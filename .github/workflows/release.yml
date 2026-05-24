@@ -116,12 +116,12 @@ jobs:
         working-directory: app
         run: |
           VERSION="${{ needs.create-release.outputs.version }}"
-          # Update tauri.conf.json
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+          # Update tauri.conf.json — perl is portable across macOS/Linux/Windows
+          perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
           # Update package.json
-          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
+          perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" package.json
           # Update Cargo.toml
-          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          perl -pi -e "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
           echo "--- Version set to $VERSION in all config files ---"
 
       - name: Install frontend dependencies
