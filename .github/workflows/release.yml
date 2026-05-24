@@ -15,6 +15,7 @@ jobs:
       release_id: ${{ steps.create-release.outputs.result }}
       prerelease: ${{ steps.get_version.outputs.PRERELEASE }}
       version: ${{ steps.get_version.outputs.VERSION }}
+      changelog: ${{ steps.generate-changelog.outputs.changelog }}
     permissions:
       contents: write
     steps:
@@ -35,6 +36,31 @@ jobs:
             echo "PRERELEASE=false" >> $GITHUB_OUTPUT
           fi
       
+      - name: Install git-cliff
+        run: |
+          CLIFF_URL=$(curl -sL https://api.github.com/repos/orhun/git-cliff/releases/latest | grep "browser_download_url.*linux-x86_64.*tar.gz" | head -1 | cut -d '"' -f 4)
+          curl -fsSL "$CLIFF_URL" | tar xzf - --strip-components=1 git-cliff
+          chmod +x git-cliff
+          sudo mv git-cliff /usr/local/bin/
+      
+      - name: Generate changelog
+        id: generate-changelog
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          # Generate changelog for this release only
+          CHANGELOG=$(git-cliff --current --tag "v${VERSION}" --strip-header --unreleased 2>/dev/null || echo "")
+          # If git-cliff produced nothing (e.g. no conventional commits), use a fallback
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="See commit history for changes in this release."
+          fi
+          # Save to file for multiline output
+          echo "$CHANGELOG" > /tmp/changelog.txt
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            cat /tmp/changelog.txt
+            echo "CHANGELOG_EOF"
+          } >> $GITHUB_OUTPUT
+      
       - name: Create Release
         id: create-release
         uses: actions/github-script@v7
@@ -42,7 +68,10 @@ jobs:
           script: |
             const version = `${{ steps.get_version.outputs.VERSION }}`;
             const isBeta = version.includes('beta') || version.includes('alpha');
-            const body = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\nNoBuf is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux\n\nSee the assets below to download and install.`;
+            const changelog = `${{ steps.generate-changelog.outputs.changelog }}`;
+            const intro = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\nNoBuf is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}`;
+            const highlights = `\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux`;
+            const body = `${intro}${highlights}\n\n---\n\n## What Changed\n\n${changelog}\n\nSee the assets below to download and install.`;
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -304,3 +333,34 @@ jobs:
               draft: false,
               prerelease: process.env.prerelease === 'true'
             })
+
+  update-changelog:
+    needs: [create-release, publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install git-cliff
+        run: |
+          CLIFF_URL=$(curl -sL https://api.github.com/repos/orhun/git-cliff/releases/latest | grep "browser_download_url.*linux-x86_64.*tar.gz" | head -1 | cut -d '"' -f 4)
+          curl -fsSL "$CLIFF_URL" | tar xzf - --strip-components=1 git-cliff
+          chmod +x git-cliff
+          sudo mv git-cliff /usr/local/bin/
+
+      - name: Update CHANGELOG.md
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          git-cliff --tag "v${VERSION}" -o CHANGELOG.md
+
+      - name: Commit and push CHANGELOG.md
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet && echo "No changelog changes to commit" && exit 0
+          git commit -m "docs: update CHANGELOG.md for v${{ needs.create-release.outputs.version }}"
+          git push
