@@ -37,11 +37,11 @@ jobs:
           fi
       
       - name: Install git-cliff
-        run: |
-          CLIFF_URL=$(curl -sL https://api.github.com/repos/orhun/git-cliff/releases/latest | grep "browser_download_url.*linux-x86_64.*tar.gz" | head -1 | cut -d '"' -f 4)
-          curl -fsSL "$CLIFF_URL" | tar xzf - --strip-components=1 git-cliff
-          chmod +x git-cliff
-          sudo mv git-cliff /usr/local/bin/
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Generate changelog
         id: generate-changelog
@@ -345,11 +345,11 @@ jobs:
           ref: main
 
       - name: Install git-cliff
-        run: |
-          CLIFF_URL=$(curl -sL https://api.github.com/repos/orhun/git-cliff/releases/latest | grep "browser_download_url.*linux-x86_64.*tar.gz" | head -1 | cut -d '"' -f 4)
-          curl -fsSL "$CLIFF_URL" | tar xzf - --strip-components=1 git-cliff
-          chmod +x git-cliff
-          sudo mv git-cliff /usr/local/bin/
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update CHANGELOG.md
         run: |
