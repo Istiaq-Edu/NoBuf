@@ -37,11 +37,9 @@ jobs:
           fi
       
       - name: Install git-cliff
-        uses: orhun/git-cliff-action@v4
+        uses: taiki-e/install-action@v2
         with:
-          args: --version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tool: git-cliff
       
       - name: Generate changelog
         id: generate-changelog
@@ -345,11 +343,9 @@ jobs:
           ref: main
 
       - name: Install git-cliff
-        uses: orhun/git-cliff-action@v4
+        uses: taiki-e/install-action@v2
         with:
-          args: --version
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tool: git-cliff
 
       - name: Update CHANGELOG.md
         run: |
