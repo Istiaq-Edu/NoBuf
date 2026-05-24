@@ -106,6 +106,51 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // MSE is ready once loadedmetadata fires (duration is set)
   const mseReady = dur > 0;
 
+  // Native fallback Blob URL — WebView2 blocks media loading from localhost
+  // URLs when the page is served from a different origin (tauri://localhost).
+  // When MSE fails (useNative=true), we fetch the entire video as a Blob and
+  // create a same-origin URL that bypasses WebView2's URL safety check.
+  const [nativeBlobUrl, setNativeBlobUrl] = useState<string | null>(null);
+  const nativeBlobRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!useNative || !streamUrl) {
+      if (nativeBlobRef.current) {
+        URL.revokeObjectURL(nativeBlobRef.current);
+        nativeBlobRef.current = null;
+      }
+      setNativeBlobUrl(null);
+      return;
+    }
+    setLoad(true);
+    let cancelled = false;
+    fetch(streamUrl)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.blob();
+      })
+      .then(blob => {
+        if (cancelled) return;
+        if (nativeBlobRef.current) URL.revokeObjectURL(nativeBlobRef.current);
+        const url = URL.createObjectURL(blob);
+        nativeBlobRef.current = url;
+        setNativeBlobUrl(url);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        console.error('[Player] Native blob fetch failed:', err);
+        setErr(`Failed to load video: ${err.message}`);
+        setLoad(false);
+      });
+    return () => { cancelled = true; };
+  }, [useNative, streamUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (nativeBlobRef.current) URL.revokeObjectURL(nativeBlobRef.current);
+    };
+  }, []);
+
   // Thumbnail extractor — ref-based hover processor + synchronous cache check
   const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -390,8 +435,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // Pass video element to MSE hook for seek currentTime setting
     setVideoRef(v);
 
-    // Use MSE URL if available, otherwise use streamUrl directly
-    const videoUrl = useNative ? streamUrl : (mseUrl || streamUrl);
+    // Use Blob URLs only — never set video.src to the localhost stream URL
+    // directly, because WebView2's URL safety check blocks cross-origin
+    // localhost media URLs when the page is served from tauri://localhost.
+    const videoUrl = useNative ? nativeBlobUrl : mseUrl;
     if (!videoUrl) return;
 
     console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
@@ -493,7 +540,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
     };
-  }, [streamUrl, mseUrl, useNative, setVideoRef]);
+  }, [streamUrl, mseUrl, useNative, nativeBlobUrl, setVideoRef]);
 
 
   // Buffer state is already updated by timeupdate and progress events above

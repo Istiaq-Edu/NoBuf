@@ -35,6 +35,22 @@ pub struct FolderMetadata {
     pub name: String,
 }
 
+/// Result of a full reconciliation sync between local state and Telegram.
+/// The backend scans all Telegram dialogs, finds NoBuf-tagged channels,
+/// and computes the diff against the local folder list passed from the frontend.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScanResult {
+    /// New folders found on Telegram that aren't in the local list.
+    pub added: Vec<FolderMetadata>,
+    /// Existing folders whose name changed on Telegram.
+    pub updated: Vec<FolderMetadata>,
+    /// Local folder IDs that no longer appear as NoBuf channels on Telegram
+    /// (deleted, left, kicked, or tag removed from title).
+    pub removed: Vec<i64>,
+    /// All currently-valid NoBuf folders found on Telegram (for full state replacement).
+    pub current: Vec<FolderMetadata>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Drive {
     pub chat_id: i64,

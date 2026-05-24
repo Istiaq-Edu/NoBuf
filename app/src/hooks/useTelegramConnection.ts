@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Store } from '@tauri-apps/plugin-store';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
-import { TelegramFolder } from '../types';
+import { TelegramFolder, ScanResult } from '../types';
 import { useNetworkStatus } from './useNetworkStatus';
 
 export function useTelegramConnection(onLogoutParent: () => void) {
@@ -16,15 +16,11 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const [store, setStore] = useState<Store | null>(null);
     const [isSyncing, setIsSyncing] = useState(false);
     const [isConnected, setIsConnected] = useState(true);
-
+    const autoSyncDone = useRef(false);
 
     const networkIsOnline = useNetworkStatus();
 
-
     // Load persisted store and restore saved folders.
-    // NOTE: The Telegram connection is already established by App.tsx before
-    // Dashboard mounts, so we do NOT call cmd_connect here. This prevents
-    // duplicate network runners and race conditions in the Rust backend.
     useEffect(() => {
         const initStore = async () => {
             try {
@@ -41,7 +37,6 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 const savedActiveFolderId = await _store.get<number | null>('activeFolderId');
                 if (savedActiveFolderId !== undefined) setActiveFolderId(savedActiveFolderId);
 
-                // Connection is already live — just mark connected and refresh files
                 setIsConnected(true);
                 queryClient.invalidateQueries({ queryKey: ['files'] });
             } catch {
@@ -51,11 +46,84 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         initStore();
     }, [queryClient]);
 
+    // Startup auto-sync: run once after dashboard loads and connection is live
+    useEffect(() => {
+        if (!store || autoSyncDone.current || !isConnected) return;
+        autoSyncDone.current = true;
+
+        const doAutoSync = async () => {
+            setIsSyncing(true);
+            try {
+                const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
+                applySyncResult(result);
+                if (result.added.length > 0 || result.updated.length > 0 || result.removed.length > 0) {
+                    showSyncSummary(result);
+                }
+            } catch {
+                // Silent failure for auto-sync — don't disrupt user
+            } finally {
+                setIsSyncing(false);
+            }
+        };
+        doAutoSync();
+    }, [store, isConnected]);
 
     useEffect(() => {
         setIsConnected(networkIsOnline);
     }, [networkIsOnline]);
 
+    // Apply a ScanResult to the local folder state and persist to store
+    const applySyncResult = useCallback((result: ScanResult) => {
+        setFolders(prev => {
+            let updated = [...prev];
+
+            // Add new folders
+            for (const f of result.added) {
+                if (!updated.find(existing => existing.id === f.id)) {
+                    updated.push(f);
+                }
+            }
+
+            // Update names for changed folders
+            for (const f of result.updated) {
+                const idx = updated.findIndex(existing => existing.id === f.id);
+                if (idx !== -1) {
+                    updated[idx] = { ...updated[idx], name: f.name };
+                }
+            }
+
+            // Remove stale folders
+            updated = updated.filter(f => !result.removed.includes(f.id));
+
+            // Persist
+            if (store) {
+                store.set('folders', updated).then(() => store.save());
+            }
+
+            // Handle active folder removal
+            if (result.removed.length > 0) {
+                const currentActive = activeFolderId;
+                if (currentActive !== null && result.removed.includes(currentActive)) {
+                    setActiveFolderId(null);
+                    if (store) {
+                        store.set('activeFolderId', null).then(() => store.save());
+                    }
+                    toast.info("Current folder was removed on Telegram — redirected to Saved Messages.");
+                }
+            }
+
+            return updated;
+        });
+    }, [store, activeFolderId]);
+
+    // Show detailed sync summary toast
+    const showSyncSummary = useCallback((result: ScanResult) => {
+        const parts: string[] = [];
+        if (result.added.length > 0) parts.push(`${result.added.length} new folder(s)`);
+        if (result.updated.length > 0) parts.push(`${result.updated.length} name updated`);
+        if (result.removed.length > 0) parts.push(`${result.removed.length} removed`);
+        toast.success(`Sync complete: ${parts.join(', ')}`);
+    }, []);
 
     const isNetworkError = (error: string): boolean => {
         const keywords = ['timeout', 'connection', 'network', 'socket', 'disconnected', 'EOF', 'ECONNREFUSED', 'overflow'];
@@ -79,7 +147,6 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         onLogoutParent();
     };
 
-
     const handleLogout = async () => {
         if (!await confirm({ title: "Sign Out", message: "Are you sure you want to sign out? This will disconnect your active session.", confirmText: "Sign Out", variant: 'danger' })) return;
 
@@ -99,27 +166,14 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     };
 
+    // Full reconciliation sync (manual button)
     const handleSyncFolders = async () => {
         if (!store) return;
         setIsSyncing(true);
         try {
-            const foundFolders = await invoke<TelegramFolder[]>('cmd_scan_folders');
-            const merged = [...folders];
-            let added = 0;
-            for (const f of foundFolders) {
-                if (!merged.find(existing => existing.id === f.id)) {
-                    merged.push(f);
-                    added++;
-                }
-            }
-            if (added > 0) {
-                setFolders(merged);
-                await store.set('folders', merged);
-                await store.save();
-                toast.success(`Scan complete. Found ${added} new folders.`);
-            } else {
-                toast.info("Scan complete. No new folders found.");
-            }
+            const result = await invoke<ScanResult>('cmd_scan_folders', { localFolders: folders });
+            applySyncResult(result);
+            showSyncSummary(result);
         } catch {
             toast.error("Sync failed");
         } finally {
@@ -142,10 +196,29 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     };
 
+    // Rename folder — updates Telegram and local state
+    const handleFolderRename = async (folderId: number, newName: string) => {
+        if (!store) return;
+        try {
+            const updatedFolder = await invoke<TelegramFolder>('cmd_rename_folder', { folderId, newName });
+            setFolders(prev => {
+                const updated = prev.map(f =>
+                    f.id === folderId ? { ...f, name: updatedFolder.name } : f
+                );
+                store.set('folders', updated).then(() => store.save());
+                return updated;
+            });
+            toast.success(`Folder renamed to "${updatedFolder.name}".`);
+        } catch (e) {
+            toast.error("Failed to rename folder: " + e);
+        }
+    };
+
+    // Delete folder — with warning about Telegram deletion
     const handleFolderDelete = async (folderId: number, folderName: string) => {
         if (!await confirm({
             title: "Delete Folder",
-            message: `Are you sure you want to delete "${folderName}"?\nThis will delete the channel on Telegram.`,
+            message: `Are you sure you want to delete "${folderName}"?\nThis will permanently delete the channel on Telegram and all its files.`,
             confirmText: "Delete",
             variant: 'danger'
         })) return;
@@ -158,14 +231,21 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 await store.set('folders', updated);
                 await store.save();
             }
-            if (activeFolderId === folderId) setActiveFolderId(null);
+            if (activeFolderId === folderId) {
+                setActiveFolderId(null);
+                if (store) {
+                    await store.set('activeFolderId', null);
+                    await store.save();
+                }
+            }
             toast.success(`Folder "${folderName}" deleted.`);
         } catch (e: unknown) {
             const errStr = String(e);
-            if (errStr.includes("not found")) {
+            if (errStr.includes("not found") || errStr.includes("No access hash") || errStr.includes("CHANNEL_PRIVATE")) {
+                // Channel already gone on Telegram — just remove locally
                 if (await confirm({
                     title: "Folder Not Found",
-                    message: `Folder "${folderName}" not found on Telegram (it may have been deleted externally).\nRemove from this app?`,
+                    message: `"${folderName}" no longer exists on Telegram (may have been deleted externally).\nRemove from this app?`,
                     confirmText: "Remove",
                     variant: 'info'
                 })) {
@@ -175,14 +255,19 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                         await store.set('folders', updated);
                         await store.save();
                     }
-                    if (activeFolderId === folderId) setActiveFolderId(null);
+                    if (activeFolderId === folderId) {
+                        setActiveFolderId(null);
+                        if (store) {
+                            await store.set('activeFolderId', null);
+                            await store.save();
+                        }
+                    }
                 }
             } else {
                 toast.error(`Failed to delete folder: ${e}`);
             }
         }
     };
-
 
     const handleSetActiveFolderId = async (id: number | null) => {
         setActiveFolderId(id);
@@ -202,6 +287,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         handleLogout,
         handleSyncFolders,
         handleCreateFolder,
+        handleFolderRename,
         handleFolderDelete,
         isNetworkError,
         forceLogout
