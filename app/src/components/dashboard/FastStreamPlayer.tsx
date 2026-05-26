@@ -526,7 +526,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
     };
-  }, [streamUrl, mseUrl, useNative, setVideoRef]);
+  }, [streamUrl, mseUrl, videoStreamUrl, useNative, setVideoRef]);
 
 
   // Buffer state is already updated by timeupdate and progress events above

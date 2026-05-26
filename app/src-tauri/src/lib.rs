@@ -133,22 +133,17 @@ fn handle_nobuf_stream_protocol(
 
     let target_url = format!("http://127.0.0.1:{}{}", STREAM_PORT, path_and_query);
     let method = request.method().as_str();
-    let has_range = request.headers().get("range").or_else(|| request.headers().get("Range")).is_some();
-
-    // For non-Range GET requests (initial browser probe), use HEAD to avoid
-    // buffering the entire file body. Chromium aborts the connection once it
-    // reads the Accept-Ranges header from the response.
-    // For Range GET requests and HEAD requests, proxy normally.
-    let ureq_resp = if has_range || method == "HEAD" {
-        ureq::request(method, &target_url)
-            .timeout(std::time::Duration::from_secs(120))
-            .call()
-    } else {
-        // Initial GET probe without Range — proxy as HEAD to get headers only
-        ureq::head(&target_url)
-            .timeout(std::time::Duration::from_secs(30))
-            .call()
-    };
+    // Proxy ALL requests using their original method (GET, HEAD, etc).
+    // Previously, non-Range GET requests were proxied as HEAD to avoid buffering
+    // the full file body. However, this returns a HEAD-like response (headers but
+    // no body) for a GET request, which is invalid - Content-Length indicates the
+    // full file size but the body is empty. WebView2/Chromium sees a truncated
+    // response and may error out. Since Chromium almost always sends Range requests
+    // for <video> src, non-Range GET probes are rare in practice, so buffering
+    // the full body for them is acceptable.
+    let ureq_resp = ureq::request(method, &target_url)
+        .timeout(std::time::Duration::from_secs(120))
+        .call();
 
     match ureq_resp {
         Ok(response) => {
@@ -169,11 +164,10 @@ fn handle_nobuf_stream_protocol(
                 }
             }
 
-            // Read body (bounded for Range responses, empty for HEAD/probe)
+            // Read body for all responses (empty for HEAD, partial for Range,
+            // full for non-Range GET). ureq returns no body for HEAD requests.
             let mut body = Vec::new();
-            if has_range {
-                let _ = response.into_reader().read_to_end(&mut body);
-            }
+            let _ = response.into_reader().read_to_end(&mut body);
 
             builder.body(body).unwrap_or_else(|_| {
                 http::Response::builder()
