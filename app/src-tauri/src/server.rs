@@ -295,7 +295,7 @@ const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 3;
 
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
-fn parse_range_header(range: &str, total_size: u64) -> Option<(u64, u64)> {
+pub(crate) fn parse_range_header(range: &str, total_size: u64) -> Option<(u64, u64)> {
     let range = range.trim().strip_prefix("bytes=")?;
     let parts: Vec<&str> = range.split('-').collect();
     if parts.len() != 2 {
@@ -324,7 +324,7 @@ fn parse_range_header(range: &str, total_size: u64) -> Option<(u64, u64)> {
 }
 
 /// Resolve the message ID to the actual Media object, handling folder routing.
-async fn resolve_media_from_path(
+pub(crate) async fn resolve_media_from_path(
     folder_id_str: &str,
     message_id: i32,
     data: &web::Data<Arc<TelegramState>>,
@@ -1245,6 +1245,7 @@ pub async fn start_streaming_server(
             .service(stream_media)
             .service(stream_media_head)
             .configure(hls::configure_hls)
+            .configure(crate::faststart::configure_faststart)
     })
     .bind(("127.0.0.1", port))?
     .run();
