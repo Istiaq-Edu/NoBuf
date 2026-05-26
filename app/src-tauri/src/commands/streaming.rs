@@ -18,7 +18,14 @@ pub struct StreamConfig {
 #[derive(serde::Serialize)]
 pub struct StreamInfo {
     pub token: String,
+    /// HTTP base URL for fetch-based streaming (MSE pipeline, thumbnail extraction).
+    /// Example: http://localhost:14201
     pub base_url: String,
+    /// Custom protocol base URL for <video> element src attribute.
+    /// Uses registered `nobuf-stream://` scheme to bypass WebView2 URL
+    /// safety checks that block cross-port localhost media in production.
+    /// Example: nobuf-stream://localhost
+    pub video_base_url: String,
 }
 
 /// Returns the streaming server's session token and base URL to the frontend.
@@ -29,6 +36,7 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
     StreamInfo {
         token: config.token.clone(),
         base_url: format!("http://localhost:{}", config.port),
+        video_base_url: "nobuf-stream://localhost".to_string(),
     }
 }
 

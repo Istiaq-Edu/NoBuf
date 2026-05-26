@@ -9,6 +9,7 @@ use tauri::webview::WebviewWindowBuilder;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use commands::TelegramState;
 use commands::streaming::StreamConfig;
 use rand::Rng;
@@ -117,6 +118,95 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
     });
 }
 
+
+/// Custom protocol handler for `nobuf-stream://` URL scheme.
+/// Proxies requests to the internal Actix streaming server on 127.0.0.1:14201.
+/// This bypasses WebView2 URL safety checks that block cross-port localhost
+/// media loading from <video> elements in production builds.
+fn handle_nobuf_stream_protocol(
+    request: http::Request<Vec<u8>>,
+) -> http::Response<Vec<u8>> {
+    let uri = request.uri();
+    let path_and_query = uri.path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    let target_url = format!("http://127.0.0.1:{}{}", STREAM_PORT, path_and_query);
+    let method = request.method().as_str();
+    let has_range = request.headers().get("range").or_else(|| request.headers().get("Range")).is_some();
+
+    // For non-Range GET requests (initial browser probe), use HEAD to avoid
+    // buffering the entire file body. Chromium aborts the connection once it
+    // reads the Accept-Ranges header from the response.
+    // For Range GET requests and HEAD requests, proxy normally.
+    let ureq_resp = if has_range || method == "HEAD" {
+        ureq::request(method, &target_url)
+            .timeout(std::time::Duration::from_secs(120))
+            .call()
+    } else {
+        // Initial GET probe without Range — proxy as HEAD to get headers only
+        ureq::head(&target_url)
+            .timeout(std::time::Duration::from_secs(30))
+            .call()
+    };
+
+    match ureq_resp {
+        Ok(response) => {
+            let status = response.status();
+            let mut builder = http::Response::builder().status(status);
+
+            // Forward essential response headers
+            for name in response.headers_names() {
+                let name_lower = name.to_lowercase();
+                if matches!(name_lower.as_str(),
+                    "content-type" | "content-length" | "content-range" |
+                    "accept-ranges" | "x-cache" | "x-download-mode" |
+                    "cache-control" | "connection"
+                ) {
+                    if let Some(value) = response.header(&name) {
+                        builder = builder.header(name.as_str(), value);
+                    }
+                }
+            }
+
+            // Read body (bounded for Range responses, empty for HEAD/probe)
+            let mut body = Vec::new();
+            if has_range {
+                let _ = response.into_reader().read_to_end(&mut body);
+            }
+
+            builder.body(body).unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(500)
+                    .body(b"Internal proxy error".to_vec())
+                    .unwrap()
+            })
+        }
+        Err(ureq::Error::Status(status_code, response)) => {
+            // Actix returned an error status — forward it
+            let mut builder = http::Response::builder().status(status_code);
+            if let Some(ct) = response.header("content-type") {
+                builder = builder.header("content-type", ct);
+            }
+            let mut body = Vec::new();
+            let _ = response.into_reader().read_to_end(&mut body);
+            builder.body(body).unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(500)
+                    .body(b"Internal proxy error".to_vec())
+                    .unwrap()
+            })
+        }
+        Err(e) => {
+            log::error!("[nobuf-stream] Proxy error for {} {}: {}", method, path_and_query, e);
+            http::Response::builder()
+                .status(502)
+                .body(format!("Proxy error: {}", e).into_bytes())
+                .unwrap()
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -131,7 +221,7 @@ pub fn run() {
     let app = {
         // In production: add the localhost plugin so the app runs from
         // http://localhost:14200 (same-origin with the streaming server).
-        // In dev mode: no plugin needed — Vite dev server is already on localhost.
+        // In dev mode: no plugin needed â€” Vite dev server is already on localhost.
         #[cfg(not(debug_assertions))]
         let builder = tauri::Builder::default()
             .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
@@ -172,7 +262,7 @@ pub fn run() {
             // Initialize stream cache manager
             // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
             // subject to automatic cleanup by Storage Sense, Disk Cleanup,
-            // and antivirus — which can delete .dat and .meta files mid-stream
+            // and antivirus â€” which can delete .dat and .meta files mid-stream
             // causing catastrophic cached-range loss.
             let cache_dir = app.path().app_data_dir()
                 .map_err(|e| format!("app_data_dir: {}", e))
@@ -201,7 +291,7 @@ pub fn run() {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap() = Some(streaming_server.handle());
-                            // Now await the server — blocks until stopped
+                            // Now await the server â€” blocks until stopped
                             streaming_server.await.ok();
                         }
                         Err(e) => log::error!("Streaming server failed: {}", e),
@@ -272,13 +362,17 @@ pub fn run() {
             commands::cmd_rename_folder,
             commands::cmd_start_auto_sync,
         ])
+        .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
+            responder.respond(handle_nobuf_stream_protocol(request));
+        })
+
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
     };
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            log::info!("Application exiting — shutting down background services...");
+            log::info!("Application exiting â€” shutting down background services...");
 
             // 1. Shutdown the grammers network runner
             let shutdown_arc = app_handle.state::<TelegramState>().runner_shutdown.clone();
@@ -295,7 +389,7 @@ pub fn run() {
                 log::info!("Stopping Actix streaming server...");
                 drop(handle.stop(true));
                 // Give the server time to finish in-flight streaming requests
-                // before we clear the cache — prevents concurrent writes during
+                // before we clear the cache â€” prevents concurrent writes during
                 // cache deletion which can cause meta corruption on Windows.
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
