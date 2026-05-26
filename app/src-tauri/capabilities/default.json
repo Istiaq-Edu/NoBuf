@@ -4,7 +4,7 @@
     "main"
   ],
   "remote": {
-    "urls": ["http://localhost:1420", "http://localhost:14200"]
+    "urls": ["http://localhost:1420/*", "http://localhost:14200/*"]
   },
   "permissions": [
     "core:default",
