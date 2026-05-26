@@ -63,6 +63,12 @@ impl Drop for DownloadGuard {
 /// ends due to client disconnect. This keeps the Telegram download going so
 /// subsequent overlapping range requests find cached data instead of starting
 /// new downloads (fixes native video player backend overload).
+///
+/// Key design: continuation tasks are NOT registered with the coordinator.
+/// They write to cache silently — new requests find their data via the
+/// fast-path cache check, not via coordinator subscription. This prevents
+/// the "subscribing to slow background task" problem where new requests
+/// wait for continuations that are throttled and slow.
 struct ContinuationGuard {
     cache_mgr: Option<StreamCacheManager>,
     message_id: i32,
@@ -84,99 +90,132 @@ impl Drop for ContinuationGuard {
         if let Some(ref cm) = self.cache_mgr {
             let sent = self.bytes_sent.load(Ordering::Relaxed);
             let remaining = (self.end_byte - self.start_byte + 1) - sent;
-            // Only continue if there's meaningful data left (more than 1 chunk)
-            // and the download wasn't complete
-            if remaining > TELEGRAM_CHUNK_SIZE as u64 && sent > 0 {
-                let current_offset = self.start_byte + sent;
-                let end_byte = self.end_byte;
-                let msg_id = self.message_id;
-                let cache_mgr_clone = cm.clone();
-                let client_opt = self.client.take();
-                let media_clone = self.media.clone();
-                let folder_id = self.cache_folder_id;
-                let filename = self.cache_filename.clone();
-                let mime = self.mime_stream.clone();
-                let semaphore = self.download_semaphore.clone();
-                let limit_kb = self.speed_limit_kb;
-                let total_size = self.end_byte + 1;
+            // Only continue if there's meaningful data left (>2MB) and
+            // the download wasn't complete. Small remaining data (<2MB)
+            // doesn't warrant a background task — it will be requested
+            // again quickly if needed, and spawning a task for <2MB
+            // creates coordinator noise without meaningful benefit.
+            if remaining < 2 * 1024 * 1024 || sent == 0 {
+                return;
+            }
 
-                log::info!(
-                    "[CONTINUATION] Spawning background download for msg {} range {}-{} (sent {}, remaining {})",
-                    msg_id, current_offset, end_byte, sent, remaining
-                );
+            let current_offset = self.start_byte + sent;
+            let end_byte = self.end_byte;
+            let msg_id = self.message_id;
+            let cache_mgr_clone = cm.clone();
+            let client_opt = self.client.take();
+            let media_clone = self.media.clone();
+            let folder_id = self.cache_folder_id;
+            let filename = self.cache_filename.clone();
+            let mime = self.mime_stream.clone();
+            let semaphore = self.download_semaphore.clone();
+            let limit_kb = self.speed_limit_kb;
+            let total_size = self.end_byte + 1;
 
-                tokio::spawn(async move {
-                    let client = match client_opt {
-                        Some(c) => c,
-                        None => {
-                            log::warn!("[CONTINUATION] No client available for msg {}", msg_id);
-                            return;
-                        }
-                    };
+            log::info!(
+                "[CONTINUATION] Evaluating background download for msg {} range {}-{} (sent {}, remaining {})",
+                msg_id, current_offset, end_byte, sent, remaining
+            );
 
-                    // Register as a background download so overlapping requests can subscribe
-                    let _registered = cache_mgr_clone.register_download(msg_id, current_offset, end_byte).await.is_some();
-                    let _unregister_guard = if _registered {
-                        Some(DownloadGuard {
-                            cache_mgr: Some(cache_mgr_clone.clone()),
-                            message_id: msg_id,
-                            start_byte: current_offset,
-                            end_byte: end_byte,
-                        })
-                    } else {
-                        None
-                    };
+            tokio::spawn(async move {
+                // CRITICAL: Check if there's a covering download already active.
+                // If another SEQUENTIAL download covers our remaining range, it
+                // will cache the data anyway — no need for a wasteful duplicate.
+                if cache_mgr_clone.find_best_covering_download(msg_id, current_offset, end_byte).await.is_some() {
+                    log::info!(
+                        "[CONTINUATION] Skipping for msg {} — covering download exists, it will cache the data",
+                        msg_id
+                    );
+                    return;
+                }
 
-                    let chunks_to_skip = (current_offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
-                    let bytes_to_discard = current_offset % TELEGRAM_CHUNK_SIZE as u64;
+                let client = match client_opt {
+                    Some(c) => c,
+                    None => {
+                        log::warn!("[CONTINUATION] No client available for msg {}", msg_id);
+                        return;
+                    }
+                };
 
-                    let download_iter = client.iter_download(&media_clone)
-                        .chunk_size(TELEGRAM_CHUNK_SIZE)
-                        .skip_chunks(chunks_to_skip);
+                // Continuation is NOT registered with the coordinator.
+                // It writes to cache silently — new requests find data via
+                // fast-path cache check, not coordinator subscription.
+                // This prevents "subscribing to slow background task" problem.
 
-                    // Open cache file for writing
-                    let mut cache_file = match cache_mgr_clone.open_data_file_write(msg_id) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::error!("[CONTINUATION] Failed to open cache file for msg {}: {}", msg_id, e);
-                            return;
-                        }
-                    };
+                let chunks_to_skip = (current_offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
+                let bytes_to_discard = current_offset % TELEGRAM_CHUNK_SIZE as u64;
 
-                    let mut offset = current_offset;
-                    let mut first_chunk = true;
-                    let mut bytes_total: u64 = 0;
-                    let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                    let mut iter = download_iter;
+                let download_iter = client.iter_download(&media_clone)
+                    .chunk_size(TELEGRAM_CHUNK_SIZE)
+                    .skip_chunks(chunks_to_skip);
 
-                    loop {
-                        // Check timeout — stop after 120 seconds regardless
-                        if tokio::time::Instant::now() >= timeout {
-                            log::info!("[CONTINUATION] Timeout reached for msg {}, stopping at offset {}", msg_id, offset);
+                // Open cache file for writing
+                let mut cache_file = match cache_mgr_clone.open_data_file_write(msg_id) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::error!("[CONTINUATION] Failed to open cache file for msg {}: {}", msg_id, e);
+                        return;
+                    }
+                };
+
+                let mut offset = current_offset;
+                let mut first_chunk = true;
+                let mut bytes_total: u64 = 0;
+                let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                let mut iter = download_iter;
+
+                loop {
+                    // Check timeout — stop after 120 seconds regardless
+                    if tokio::time::Instant::now() >= timeout {
+                        log::info!("[CONTINUATION] Timeout reached for msg {}, stopping at offset {}", msg_id, offset);
+                        break;
+                    }
+
+                    // Re-check covering download periodically — if a player-facing
+                    // SEQUENTIAL download started and covers our range, stop the
+                    // continuation (the player download will cache data faster).
+                    if bytes_total > 0 && bytes_total % (4 * 1024 * 1024) == 0 {
+                        if cache_mgr_clone.find_best_covering_download(msg_id, offset, end_byte).await.is_some() {
+                            log::info!(
+                                "[CONTINUATION] Stopping for msg {} — covering download appeared at offset {}",
+                                msg_id, offset
+                            );
                             break;
                         }
+                    }
 
-                        // Acquire semaphore before hitting Telegram API
-                        let _permit = semaphore.acquire().await.unwrap();
-                        match iter.next().await.transpose() {
-                            Some(Ok(bytes)) => {
-                                let mut chunk_data = bytes;
-                                if first_chunk && bytes_to_discard > 0 {
-                                    let discard = bytes_to_discard.min(chunk_data.len() as u64) as usize;
-                                    chunk_data = chunk_data[discard..].to_vec();
-                                    first_chunk = false;
-                                }
+                    // Acquire semaphore before hitting Telegram API
+                    let _permit = semaphore.acquire().await.unwrap();
+                    match iter.next().await.transpose() {
+                        Some(Ok(bytes)) => {
+                            let mut chunk_data = bytes;
+                            if first_chunk && bytes_to_discard > 0 {
+                                let discard = bytes_to_discard.min(chunk_data.len() as u64) as usize;
+                                chunk_data = chunk_data[discard..].to_vec();
+                                first_chunk = false;
+                            }
 
-                                let remaining_bytes = end_byte - offset + 1;
-                                let final_data = if chunk_data.len() as u64 > remaining_bytes {
-                                    chunk_data[..remaining_bytes as usize].to_vec()
-                                } else {
-                                    chunk_data
-                                };
+                            let remaining_bytes = end_byte - offset + 1;
+                            let final_data = if chunk_data.len() as u64 > remaining_bytes {
+                                chunk_data[..remaining_bytes as usize].to_vec()
+                            } else {
+                                chunk_data
+                            };
 
-                                let bytes_in_chunk = final_data.len() as u64;
-                                let chunk_range_end = offset + bytes_in_chunk - 1;
+                            let bytes_in_chunk = final_data.len() as u64;
+                            let chunk_range_end = offset + bytes_in_chunk - 1;
 
+                            // Cache-skip optimization: check if this range is already
+                            // cached (from a previous download or another continuation).
+                            // If cached, skip writing to avoid duplicate meta entries.
+                            let _lock = cache_mgr_clone.lock_meta(msg_id).await;
+                            let meta = cache_mgr_clone.load_meta(msg_id);
+                            let already_cached = meta.as_ref()
+                                .map(|m| is_range_cached(&m.cached_ranges, offset, chunk_range_end))
+                                .unwrap_or(false);
+                            drop(_lock);
+
+                            if !already_cached {
                                 // Write to cache file
                                 let _ = cache_file.seek(SeekFrom::Start(offset));
                                 let _ = cache_file.write_all(&final_data);
@@ -203,41 +242,37 @@ impl Drop for ContinuationGuard {
                                     log::warn!("[CONTINUATION] Failed to save meta for msg {}: {}", msg_id, e);
                                 }
                                 drop(_lock);
-
-                                // Broadcast progress to subscribers
-                                if _registered {
-                                    cache_mgr_clone.update_download_progress(msg_id, current_offset, chunk_range_end).await;
-                                }
-
-                                offset += bytes_in_chunk;
-                                bytes_total += bytes_in_chunk;
-
-                                // Throttle
-                                if limit_kb > 0 {
-                                    let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
-                                    let sleep_ms = sleep_ms.min(2000);
-                                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                                }
-
-                                if chunk_range_end >= end_byte {
-                                    log::info!("[CONTINUATION] Completed background download for msg {} up to offset {}", msg_id, offset);
-                                    break;
-                                }
+                            } else {
+                                log::debug!("[CONTINUATION] Skipping cached range {}-{} for msg {}", offset, chunk_range_end, msg_id);
                             }
-                            None => {
-                                log::info!("[CONTINUATION] Download iterator exhausted for msg {}", msg_id);
-                                break;
+
+                            offset += bytes_in_chunk;
+                            bytes_total += bytes_in_chunk;
+
+                            // Throttle
+                            if limit_kb > 0 {
+                                let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
+                                let sleep_ms = sleep_ms.min(2000);
+                                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                             }
-                            Some(Err(e)) => {
-                                log::error!("[CONTINUATION] Download error for msg {}: {}", msg_id, e);
+
+                            if chunk_range_end >= end_byte {
+                                log::info!("[CONTINUATION] Completed background download for msg {} up to offset {}", msg_id, offset);
                                 break;
                             }
                         }
+                        None => {
+                            log::info!("[CONTINUATION] Download iterator exhausted for msg {}", msg_id);
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            log::error!("[CONTINUATION] Download error for msg {}: {}", msg_id, e);
+                            break;
+                        }
                     }
-                    log::info!("[CONTINUATION] Background task ended for msg {}, downloaded {} bytes, final offset {}", msg_id, bytes_total, offset);
-                    // _unregister_guard drops here, automatically unregistering the download
-                });
-            }
+                }
+                log::info!("[CONTINUATION] Background task ended for msg {}, downloaded {} bytes, final offset {}", msg_id, bytes_total, offset);
+            });
         }
     }
 }
@@ -256,6 +291,7 @@ pub(crate) struct StreamQuery {
 /// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
+const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 3;
 
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
@@ -528,19 +564,20 @@ async fn stream_media(
 
     // === COORDINATOR: Check if an active SEQUENTIAL download already covers our range ===
     // Bug #6 fix: overlapping range requests subscribe to existing downloads instead of
-    // spawning duplicates. This eliminates the 15+ concurrent overlapping SEQUENTIAL
-    // downloads observed in 3rd terminal logs (633MB-1.4GB, 634MB-1.4GB, etc.).
+    // spawning duplicates.
     //
-    // IMPORTANT: Only subscribe if the active download's progress is CLOSE to our
-    // needed offset (within 2MB). If the progress is far away (e.g., continuation
-    // at 1.5MB while we need data at 287MB for the moov atom), subscribing would
-    // take 30+ seconds. Instead, start a fast SEQUENTIAL download for urgent ranges.
+    // Strategy: Subscribe if the active download's progress is CLOSE to our
+    // needed offset. If far away (>2MB distance), we have two options:
+    // 1. If max concurrent downloads NOT reached → start a new targeted SEQUENTIAL download
+    // 2. If max concurrent downloads reached → return HTTP 503 Retry-After, forcing the
+    //    browser to retry later (by then the data should be cached or closer to our offset).
+    //    This eliminates the "proceed unregistered" cascade that wastes bandwidth.
     if let Some(ref cache_mgr) = **cache {
-        let dl_info = cache_mgr.find_covering_download(message_id, start_byte, end_byte).await;
+        let dl_info = cache_mgr.find_best_covering_download(message_id, start_byte, end_byte).await;
         if let Some(dl) = dl_info {
             let current_progress = *dl.progress_rx.borrow();
-            let distance = start_byte.saturating_sub(current_progress);
-            const MAX_SUBSCRIBE_DISTANCE: u64 = 2 * 1024 * 1024; // 2MB — subscribe only if within 2MB
+            let distance = start_byte.saturating_sub(current_progress.max(dl.start_byte));
+            const MAX_SUBSCRIBE_DISTANCE: u64 = 10 * 1024 * 1024; // 10MB — subscribe if download will reach our offset within ~5 seconds at 2MB/s
 
             if distance <= MAX_SUBSCRIBE_DISTANCE {
                 log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} subscribing to active download {}-{} (progress={}, distance={})",
@@ -724,184 +761,58 @@ async fn stream_media(
                     .streaming(subscriber_stream);
             }
             } else {
-                // Progress too far from needed offset — skip subscription,
-                // start a fast SEQUENTIAL download for this range instead
-                log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription to {}-{} (progress={}, distance={} > 2MB), starting SEQUENTIAL download",
+                // Progress too far from needed offset — skip subscription.
+                // Check if we can start a new targeted download. If max concurrent
+                // is already reached, return 503 Retry-After instead of "proceeding
+                // unregistered" — this prevents the download cascade where unregistered
+                // downloads waste bandwidth without coordinator visibility.
+                let active_count = cache_mgr.active_download_count(message_id).await;
+                if active_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
+                    let retry_seconds = (distance / (500 * 1024)).max(2).min(30); // Estimate: 500KB/s download speed
+                    log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription (distance={} > 10MB), max concurrent ({}) reached, returning 503 Retry-After:{}s",
+                        message_id, start_byte, end_byte, distance, active_count, retry_seconds);
+                    return HttpResponse::ServiceUnavailable()
+                        .insert_header(("Retry-After", retry_seconds.to_string()))
+                        .insert_header(("X-Reason", "download-busy"))
+                        .body("Max concurrent downloads reached for this file — retry after data is cached");
+                }
+                log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription to {}-{} (progress={}, distance={} > 10MB), starting targeted SEQUENTIAL download",
                     message_id, start_byte, end_byte, dl.start_byte, dl.end_byte, current_progress, distance);
                 // Fall through to SEQUENTIAL download section below
             }
         }
     }
 
-    // No active download covers our range — check if we can start a new one
-    // Bug #15 fix: When MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE is reached,
-    // subscribe to the nearest existing download instead of spawning a new one.
-    // This prevents FLOOD_PREMIUM_WAIT bombardment from 10+ simultaneous
-    // Telegram API calls (observed in 7th terminal logs).
+    // No covering download found AND max concurrent downloads reached —
+    // return HTTP 503 Retry-After. This eliminates the "proceed unregistered"
+    // cascade where downloads waste bandwidth without coordinator visibility.
+    // The browser will retry the request after the specified delay, and by then
+    // the data should be cached (the active downloads will have progressed).
     if let Some(ref cache_mgr) = **cache {
-        const MAX_SUBSCRIBE_DISTANCE_LIMIT: u64 = 2 * 1024 * 1024; // 2MB — subscribe only if within 2MB
         let active_count = cache_mgr.active_download_count(message_id).await;
-        if active_count >= 3 { // MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE
-            log::warn!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} max concurrent downloads ({}) reached",
-                message_id, start_byte, end_byte, active_count);
-            // Try to subscribe to the nearest existing download
-            if let Some(nearest) = cache_mgr.find_nearest_download(message_id, start_byte).await {
-                // Check progress distance — if the nearest download's progress is
-                // too far from our needed offset, subscribing would take too long.
-                // Fall through to SEQUENTIAL download instead.
-                let current_progress = *nearest.progress_rx.borrow();
-                let distance = start_byte.saturating_sub(current_progress);
-                if distance <= MAX_SUBSCRIBE_DISTANCE_LIMIT {
-                    log::info!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} subscribing to nearest download {}-{} (progress={}, distance={})",
-                        message_id, start_byte, end_byte, nearest.start_byte, nearest.end_byte, current_progress, distance);
-                // Re-use the subscriber stream logic from above — create a
-                // subscriber response that reads from cache as nearest download progresses
-                let dl_info = nearest;
-                let cache_mgr_clone = cache_mgr.clone();
-                let data_path = cache_mgr.data_path(message_id);
-                let subscriber_content_length = content_length;
-                let subscriber_start = start_byte;
-                let subscriber_end = end_byte;
-                let subscriber_mime = mime.clone();
-                let subscriber_size = size;
-                let subscriber_msg = message_id;
-                let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+        if active_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
+            // Estimate retry time based on download progress distance.
+            // If a covering/nearest download exists, calculate how long until it reaches our offset.
+            // Conservative estimate: 500KB/s Telegram download speed.
+            let retry_seconds = if let Some(nearest) = cache_mgr.find_nearest_download(message_id, start_byte).await {
+                let progress = *nearest.progress_rx.borrow();
+                let distance = start_byte.saturating_sub(progress);
+                (distance / (500 * 1024)).max(2).min(30)
+            } else {
+                5 // No download found — give it 5 seconds for one to start
+            };
 
-                let subscriber_stream = async_stream::stream! {
-                    let _subscriber_stream_guard = {
-                        cache_mgr_clone.track_streaming(subscriber_msg);
-                        StreamingGuard {
-                            cache_mgr: Some(cache_mgr_clone.clone()),
-                            message_id: subscriber_msg,
-                        }
-                    };
-
-                    let mut progress_rx = dl_info.progress_rx;
-                    let mut read_offset = subscriber_start;
-                    let mut bytes_remaining = subscriber_content_length;
-
-                    let mut read_file = match std::fs::File::open(&data_path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::error!("[PREBUFFER] COORDINATOR_LIMIT: Failed to open cache file for reading msg {}: {}", subscriber_msg, e);
-                            return;
-                        }
-                    };
-
-                    loop {
-                        let current_progress = *progress_rx.borrow();
-                        if current_progress >= read_offset {
-                            // Data available at read_offset
-                        } else {
-                            match progress_rx.changed().await {
-                                Ok(()) => {
-                                    if *progress_rx.borrow() < read_offset { continue; }
-                                }
-                                Err(_) => {
-                                    // Download ended — deliver all available cached data
-                                    let _lock = cache_mgr_clone.lock_meta(subscriber_msg).await;
-                                    let meta = cache_mgr_clone.load_meta(subscriber_msg);
-                                    drop(_lock);
-                                    if let Some(meta) = meta {
-                                        let max_cached_end = meta.cached_ranges.iter()
-                                            .filter(|&(s, _)| *s <= read_offset)
-                                            .map(|&(_, e)| e)
-                                            .max()
-                                            .unwrap_or(0);
-                                        if max_cached_end >= read_offset {
-                                            let available_end = max_cached_end.min(subscriber_end);
-                                            let read_len = (available_end - read_offset + 1) as usize;
-                                            use std::io::Read;
-                                            read_file.seek(SeekFrom::Start(read_offset)).ok();
-                                            let mut buf = vec![0u8; read_len];
-                                            match read_file.read_exact(&mut buf) {
-                                                Ok(()) => {
-                                                    bytes_remaining -= read_len as u64;
-                                                    read_offset += read_len as u64;
-                                                    yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
-                                                }
-                                                Err(e) => {
-                                                    log::error!("[PREBUFFER] COORDINATOR_LIMIT: Cache read failed for msg {} at offset {}: {}", subscriber_msg, read_offset, e);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    log::warn!("[PREBUFFER] COORDINATOR_LIMIT: Active download ended before covering full range for msg {} (need {}-{}, delivered up to {})",
-                                        subscriber_msg, subscriber_start, subscriber_end, read_offset);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Read available data from cache
-                        let max_cached_end = *progress_rx.borrow();
-                        let available_end = max_cached_end.min(subscriber_end);
-                        let readable = (available_end - read_offset + 1) as usize;
-                        let chunk_size = readable
-                            .min(TELEGRAM_CHUNK_SIZE as usize)
-                            .min(bytes_remaining as usize);
-
-                        if chunk_size == 0 {
-                            if bytes_remaining == 0 { break; }
-                            continue;
-                        }
-
-                        use std::io::Read;
-                        read_file.seek(SeekFrom::Start(read_offset)).ok();
-                        let mut buf = vec![0u8; chunk_size];
-                        match read_file.read_exact(&mut buf) {
-                            Ok(()) => {
-                                bytes_remaining -= chunk_size as u64;
-                                read_offset += chunk_size as u64;
-                                yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
-                            }
-                            Err(e) => {
-                                log::error!("[PREBUFFER] COORDINATOR_LIMIT: Cache read failed for msg {} at offset {}: {}", subscriber_msg, read_offset, e);
-                                break;
-                            }
-                        }
-
-                        if limit_kb > 0 {
-                            let sleep_ms = (chunk_size as u64 * 1000) / (limit_kb * 1024);
-                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms.min(2000))).await;
-                        }
-                        if bytes_remaining == 0 { break; }
-                    }
-                    log::info!("[PREBUFFER] COORDINATOR_LIMIT: Subscriber for msg {} range {}-{} completed (bytes_remaining={})",
-                        subscriber_msg, subscriber_start, subscriber_end, bytes_remaining);
-                };
-
-                if is_partial {
-                    return HttpResponse::PartialContent()
-                        .insert_header(("Content-Type", subscriber_mime))
-                        .insert_header(("Content-Range", format!("bytes {}-{}/{}", subscriber_start, subscriber_end, subscriber_size)))
-                        .insert_header(("Accept-Ranges", "bytes"))
-                        .insert_header(("Connection", "keep-alive"))
-                        .insert_header(("X-Download-Mode", "subscriber-limit"))
-                        .streaming(subscriber_stream);
-                } else {
-                    return HttpResponse::Ok()
-                        .insert_header(("Content-Type", subscriber_mime))
-                        .insert_header(("Accept-Ranges", "bytes"))
-                        .insert_header(("X-Download-Mode", "subscriber-limit"))
-                        .streaming(subscriber_stream);
-                }
-                } else {
-                    // Progress too far from needed offset — skip subscription,
-                    // fall through to SEQUENTIAL download for this range instead
-                    log::info!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} skipping subscription to nearest download {}-{} (progress={}, distance={} > 2MB), starting SEQUENTIAL download",
-                        message_id, start_byte, end_byte, nearest.start_byte, nearest.end_byte, current_progress, distance);
-                    // Fall through to SEQUENTIAL download section below
-                }
-            }
-            // No nearest download found either — proceed unregistered
-            log::warn!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} no nearest download found, proceeding unregistered",
-                message_id, start_byte, end_byte);
+            log::info!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} max concurrent ({}) reached, returning 503 Retry-After:{}s",
+                message_id, start_byte, end_byte, active_count, retry_seconds);
+            return HttpResponse::ServiceUnavailable()
+                .insert_header(("Retry-After", retry_seconds.to_string()))
+                .insert_header(("X-Reason", "download-busy"))
+                .body("Max concurrent downloads reached — retry after data is cached");
         }
     }
 
     // No active download covers our range — proceed with new SEQUENTIAL download
+                // No active download covers our range — proceed with new SEQUENTIAL download
 
     let client_guard = { data.client.lock().await.clone() };
     let client = match client_guard {

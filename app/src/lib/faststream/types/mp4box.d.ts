@@ -18,12 +18,17 @@ declare module 'mp4box' {
   }
 
   interface MP4BoxFile {
-    appendBuffer(buffer: ArrayBuffer & { fileStart: number }): void;
+    appendBuffer(buffer: ArrayBuffer & { fileStart: number }): number | undefined;
     onReady: (info: MP4Info) => void;
     onError: (e: any) => void;
+    onSegment: ((trackId: number, user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => void) | null;
     start(): void;
     stop(): void;
     flush(): void;
+    seek(time: number, useRap: boolean): { offset: number; time: number } | null;
+    setSegmentOptions(trackId: number, user: any, options: { nbSamples: number }): void;
+    initializeSegmentation(): Array<{ id: number; buffer: ArrayBuffer }> | null;
+    getTrackSamplesInfo(trackId: number): MP4BoxSample[] | undefined;
     moov?: MP4BoxMoov;
   }
 

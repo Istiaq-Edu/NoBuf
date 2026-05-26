@@ -46,4 +46,5 @@ rand = "0.8"
 sha2 = "0.10"
 mp4parse = "0.17"
 ffmpeg-sidecar = "2.5"
+tauri-plugin-localhost = "2"
 
