@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -14,6 +14,7 @@ import { VideoCacheDialog } from './VideoCacheDialog';
 interface FastStreamPlayerProps {
   file: TelegramFile;
   streamUrl: string;
+  videoStreamUrl?: string | null;
   onClose: () => void;
   onNext?: () => void;
   onPrev?: () => void;
@@ -24,7 +25,7 @@ interface FastStreamPlayerProps {
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -421,7 +422,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // files via Range requests naturally (browser requests moov from tail first).
     // Works in both dev and production thanks to tauri-plugin-localhost
     // (app runs from http://localhost, same-origin with the streaming server).
-    const videoUrl = useNative ? streamUrl : mseUrl;
+        // Use custom protocol URL (nobuf-stream://) for native <video> src to bypass WebView2 URL safety checks.
+    // Falls back to streamUrl if videoStreamUrl is not provided (dev mode compatibility).
+    const videoUrl = useNative ? (videoStreamUrl || streamUrl) : mseUrl;
     if (!videoUrl) return;
 
     console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
