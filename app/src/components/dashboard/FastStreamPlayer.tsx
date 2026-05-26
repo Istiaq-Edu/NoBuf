@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState, useCallback } from 'react';
+﻿import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -89,6 +89,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     mseUrl,
     error: mseError,
     useNative,
+    unsupportedCodec,
     prefetchedBytes,
     totalBytes,
     isPrefetching,
@@ -102,24 +103,37 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
     setSuppressBackendReports,
+    getMoovBuffer,
+    getFirstChunk,
+    getInitSegments,
+    getVideoTrackInfo,
+    getMP4BoxClass,
+    getFileLength,
+    thumbnailDataReady,
+    moovBufferReady,
   } = useMSEPlayer(streamUrl, file, activeFolderId);
-  // MSE is ready once loadedmetadata fires (duration is set)
-  const mseReady = dur > 0;
 
-  // In production (tauri://localhost), WebView2 blocks cross-origin localhost
-  // media URLs via URL safety check, and fetch() to the stream server also
-  // fails with 403. So native playback only works in dev mode (localhost origin).
-  // When MSE fails in production, we show an error. In dev mode, native playback
-  // can still work since both page and stream are on localhost.
+  // Native playback fallback: when MSE fails (e.g., codec not supported),
+  // the player falls back to native <video> using streamUrl directly.
+  // Only show error if there's an actual error from the MSE player, not just
+  // because native mode is active.
   useEffect(() => {
-    if (useNative && !mseUrl) {
-      setErr(mseError || 'This video format cannot be streamed in the current environment. Please download the file to watch it.');
+    if (unsupportedCodec) {
+      setErr(unsupportedCodec);
+      setLoad(false);
+    } else if (useNative && mseError && !mseUrl) {
+      setErr(mseError);
       setLoad(false);
     }
-  }, [useNative, mseUrl, mseError]);
+  }, [useNative, mseUrl, mseError, unsupportedCodec]);
 
   // Thumbnail extractor — ref-based hover processor + synchronous cache check
-  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, mseReady);
+  // useMemo stabilizes mseGetters so the effect in useThumbnailExtractor doesn't re-run on every render
+  const mseGetters = useMemo(() => ({
+    getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength,
+  }), [getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength]);
+
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
@@ -402,11 +416,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // Pass video element to MSE hook for seek currentTime setting
     setVideoRef(v);
 
-    // MSE Blob URL bypasses WebView2's URL safety check (same-origin).
-    // For native fallback (useNative=true), try streamUrl directly — this
-    // works in dev (localhost origin) but will be blocked in production.
-    // The error handler will catch the URL safety check failure and show
-    // the MSE fallback error message instead.
+    // MSE mode uses a Blob URL (same-origin, bypasses WebView2 restrictions).
+    // Native fallback uses streamUrl directly — native <video> handles moov-at-end
+    // files via Range requests naturally (browser requests moov from tail first).
+    // Works in both dev and production thanks to tauri-plugin-localhost
+    // (app runs from http://localhost, same-origin with the streaming server).
     const videoUrl = useNative ? streamUrl : mseUrl;
     if (!videoUrl) return;
 
@@ -800,9 +814,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
         {err ? (
           <div className="text-center px-8">
-            <div className="text-red-400 text-lg mb-2">{err}</div>
-            <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
-            <button onClick={handleClose} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Close</button>
+            <div className="text-amber-400 text-lg mb-2">{err}</div>
+            {unsupportedCodec ? (
+              <div className="flex gap-3 justify-center">
+                <button onClick={handleDownload} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Download Video</button>
+                <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-nobuf-subtext rounded-lg transition-colors">Close</button>
+              </div>
+            ) : (
+              <>
+                <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
+                <button onClick={handleClose} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Close</button>
+              </>
+            )}
           </div>
         ) : (
           <video
