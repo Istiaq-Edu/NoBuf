@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-download-file"
+description = "Enables the cmd_download_file command without any pre-configured scope."
+commands.allow = ["cmd_download_file"]
+
+[[permission]]
+identifier = "deny-cmd-download-file"
+description = "Denies the cmd_download_file command without any pre-configured scope."
+commands.deny = ["cmd_download_file"]

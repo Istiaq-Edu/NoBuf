@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-upload-file"
+description = "Enables the cmd_upload_file command without any pre-configured scope."
+commands.allow = ["cmd_upload_file"]
+
+[[permission]]
+identifier = "deny-cmd-upload-file"
+description = "Denies the cmd_upload_file command without any pre-configured scope."
+commands.deny = ["cmd_upload_file"]

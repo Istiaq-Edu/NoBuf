@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-bandwidth"
+description = "Enables the cmd_get_bandwidth command without any pre-configured scope."
+commands.allow = ["cmd_get_bandwidth"]
+
+[[permission]]
+identifier = "deny-cmd-get-bandwidth"
+description = "Denies the cmd_get_bandwidth command without any pre-configured scope."
+commands.deny = ["cmd_get_bandwidth"]
