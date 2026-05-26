@@ -134,7 +134,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
     getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength,
   }), [getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength]);
 
-  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, videoStreamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);

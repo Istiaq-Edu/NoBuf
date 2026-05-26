@@ -500,6 +500,7 @@ class ThumbnailPipeline {
 export function useThumbnailExtractor(
   mainVideoRef: React.RefObject<HTMLVideoElement | null>,
   streamUrl: string | null,
+  videoStreamUrl?: string | null,
   useNative: boolean = true,
   mseGetters?: MSEGetters,
   thumbnailDataReady?: boolean,
@@ -667,7 +668,7 @@ export function useThumbnailExtractor(
     canvas.height = THUMBNAIL_HEIGHT;
     canvasRef.current = canvas;
 
-    video.src = streamUrl;
+    video.src = videoStreamUrl || streamUrl;
 
     video.addEventListener('loadedmetadata', () => {
       durationRef.current = video.duration;
@@ -694,7 +695,7 @@ export function useThumbnailExtractor(
       desiredHoverTimeRef.current = -1;
       hoverActiveRef.current = false;
     };
-  }, [streamUrl, useNative]);
+  }, [streamUrl, videoStreamUrl, useNative]);
 
   // ─── Main Video Duration Tracking ────────────────────────────────────
 
