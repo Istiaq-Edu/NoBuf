@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-generate-sprite-sheet"
+description = "Enables the cmd_generate_sprite_sheet command without any pre-configured scope."
+commands.allow = ["cmd_generate_sprite_sheet"]
+
+[[permission]]
+identifier = "deny-cmd-generate-sprite-sheet"
+description = "Denies the cmd_generate_sprite_sheet command without any pre-configured scope."
+commands.deny = ["cmd_generate_sprite_sheet"]

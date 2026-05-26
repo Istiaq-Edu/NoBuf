@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-connect"
+description = "Enables the cmd_connect command without any pre-configured scope."
+commands.allow = ["cmd_connect"]
+
+[[permission]]
+identifier = "deny-cmd-connect"
+description = "Denies the cmd_connect command without any pre-configured scope."
+commands.deny = ["cmd_connect"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-cache-status"
+description = "Enables the cmd_get_cache_status command without any pre-configured scope."
+commands.allow = ["cmd_get_cache_status"]
+
+[[permission]]
+identifier = "deny-cmd-get-cache-status"
+description = "Denies the cmd_get_cache_status command without any pre-configured scope."
+commands.deny = ["cmd_get_cache_status"]

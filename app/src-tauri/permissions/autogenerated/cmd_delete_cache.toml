@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-delete-cache"
+description = "Enables the cmd_delete_cache command without any pre-configured scope."
+commands.allow = ["cmd_delete_cache"]
+
+[[permission]]
+identifier = "deny-cmd-delete-cache"
+description = "Denies the cmd_delete_cache command without any pre-configured scope."
+commands.deny = ["cmd_delete_cache"]

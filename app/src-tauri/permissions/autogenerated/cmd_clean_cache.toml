@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-clean-cache"
+description = "Enables the cmd_clean_cache command without any pre-configured scope."
+commands.allow = ["cmd_clean_cache"]
+
+[[permission]]
+identifier = "deny-cmd-clean-cache"
+description = "Denies the cmd_clean_cache command without any pre-configured scope."
+commands.deny = ["cmd_clean_cache"]
