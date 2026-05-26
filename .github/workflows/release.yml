@@ -103,12 +103,12 @@ jobs:
             
           # macOS Intel
           - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin --bundles app'
             target: 'x86_64-apple-darwin'
           
           # macOS Apple Silicon
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin --bundles app'
             target: 'aarch64-apple-darwin'
 
     runs-on: ${{ matrix.platform }}
