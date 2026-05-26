@@ -271,6 +271,11 @@ All notable changes to NoBuf will be documented in this file.
 - Add x86_64 Mac Support (macos-13 runner) & Set Deployment Target to 10.13
 
 ## [app-v0.2.0] - 2026-01-25
+## [0.4.1] - 2026-05-26
+
+### Documentation
+
+- Update CHANGELOG.md for v0.4.0
 
 ### Bug Fixes
 
