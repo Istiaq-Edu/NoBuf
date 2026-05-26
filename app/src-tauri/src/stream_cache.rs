@@ -127,6 +127,13 @@ pub struct ActiveDownload {
     /// to know when data they need is available). Sender is dropped when
     /// the download completes, which signals subscribers via changed() → Err.
     pub progress_tx: watch::Sender<u64>,
+    /// Last broadcasted progress value (mirrors progress_tx's current value).
+    /// Used by find_best_covering_download to calculate distance without
+    /// needing to subscribe to the watch channel. Initialized to start_byte
+    /// so that newly registered downloads have an accurate distance estimate
+    /// (a download starting at 287MB is "closer" to offset 287.5MB than
+    /// one starting at 0, even before any chunks are downloaded).
+    pub last_progress: u64,
 }
 
 /// Information returned to a subscriber (read-only snapshot of an ActiveDownload)
@@ -387,6 +394,48 @@ impl StreamCacheManager {
         None
     }
 
+    /// Find the BEST covering download for a message — the one whose
+    /// progress is closest to the requested start_byte. This is crucial
+    /// for non-faststarted MP4s where two concurrent downloads exist:
+    /// one from the beginning (0-end) and one from the moov atom offset.
+    /// Without this, a request near the moov would subscribe to the
+    /// front download (distance ~287MB) instead of the moov download
+    /// (distance ~0MB), causing excessive waiting.
+    ///
+    /// Uses last_progress (initialized to start_byte) for distance
+    /// calculation, giving accurate estimates even before any chunks
+    /// are downloaded.
+    pub async fn find_best_covering_download(&self, message_id: i32, start_byte: u64, _end_byte: u64) -> Option<ActiveDownloadInfo> {
+        let downloads = self.active_downloads.lock().await;
+        let dls = downloads.get(&message_id)?;
+
+        let mut best: Option<&ActiveDownload> = None;
+        let mut best_distance: u64 = u64::MAX;
+
+        for dl in dls.iter() {
+            // A download "covers" our start_byte if it starts before our
+            // offset and extends past it (it will eventually reach us).
+            if dl.start_byte <= start_byte && dl.end_byte >= start_byte {
+                // Distance = how far the download's effective progress is
+                // from our start_byte. Use max(start_byte, last_progress)
+                // as effective progress — start_byte is the minimum since
+                // the download will begin there.
+                let effective_progress = dl.last_progress.max(dl.start_byte);
+                let distance = start_byte.saturating_sub(effective_progress);
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = Some(dl);
+                }
+            }
+        }
+
+        best.map(|dl| ActiveDownloadInfo {
+            start_byte: dl.start_byte,
+            end_byte: dl.end_byte,
+            progress_rx: dl.progress_tx.subscribe(),
+        })
+    }
+
     /// Find the nearest active download for a message (closest start_byte
     /// to the requested range). Used when MAX_CONCURRENT_DOWNLOADS limit
     /// is reached — new requests subscribe to the closest download instead
@@ -430,11 +479,12 @@ impl StreamCacheManager {
                 MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE, message_id, start_byte, end_byte);
             return None;
         }
-        let (progress_tx, progress_rx) = watch::channel(0u64);
+        let (progress_tx, progress_rx) = watch::channel(start_byte);
         let dl = ActiveDownload {
             start_byte,
             end_byte,
             progress_tx,
+            last_progress: start_byte,
         };
         downloads.entry(message_id)
             .or_insert_with(Vec::new)
@@ -451,13 +501,14 @@ impl StreamCacheManager {
     /// Bug #13 fix: Searches Vec<ActiveDownload> to find the download
     /// that matches the exact range, not just any download for the message.
     pub async fn update_download_progress(&self, message_id: i32, start_byte: u64, last_cached_byte: u64) {
-        let downloads = self.active_downloads.lock().await;
-        if let Some(dls) = downloads.get(&message_id) {
+        let mut downloads = self.active_downloads.lock().await;
+        if let Some(dls) = downloads.get_mut(&message_id) {
             // Find the download that started at start_byte (the download that
             // called this method). This avoids updating the wrong download's
             // progress when multiple concurrent downloads exist for the same message.
-            for dl in dls.iter() {
+            for dl in dls.iter_mut() {
                 if dl.start_byte == start_byte {
+                    dl.last_progress = last_cached_byte;
                     let _ = dl.progress_tx.send(last_cached_byte);
                     return;
                 }
@@ -465,8 +516,9 @@ impl StreamCacheManager {
             // Fallback: if we can't find the exact download by start_byte,
             // update any download whose range includes last_cached_byte.
             // This handles edge cases where the download's start_byte changed.
-            for dl in dls.iter() {
+            for dl in dls.iter_mut() {
                 if dl.start_byte <= last_cached_byte && dl.end_byte >= last_cached_byte {
+                    dl.last_progress = last_cached_byte;
                     let _ = dl.progress_tx.send(last_cached_byte);
                     return;
                 }
