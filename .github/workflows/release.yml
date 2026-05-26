@@ -15,7 +15,7 @@ jobs:
       release_id: ${{ steps.create-release.outputs.result }}
       prerelease: ${{ steps.get_version.outputs.PRERELEASE }}
       version: ${{ steps.get_version.outputs.VERSION }}
-      changelog: ${{ steps.generate-changelog.outputs.changelog }}
+      changelog: ${{ steps.git-cliff.outputs.content }}
     permissions:
       contents: write
     steps:
@@ -38,28 +38,18 @@ jobs:
             echo "PRERELEASE=false" >> $GITHUB_OUTPUT
           fi
       
-      - name: Install git-cliff
-        uses: taiki-e/install-action@v2
-        with:
-          tool: git-cliff
+      - name: Create local tag for git-cliff
+        run: git tag "v${{ steps.get_version.outputs.VERSION }}"
       
       - name: Generate changelog
-        id: generate-changelog
-        run: |
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
-          # Generate changelog for this release only
-          CHANGELOG=$(git-cliff --current --tag "v${VERSION}" --strip-header --unreleased 2>/dev/null || echo "")
-          # If git-cliff produced nothing (e.g. no conventional commits), use a fallback
-          if [ -z "$CHANGELOG" ]; then
-            CHANGELOG="See commit history for changes in this release."
-          fi
-          # Save to file for multiline output
-          echo "$CHANGELOG" > /tmp/changelog.txt
-          {
-            echo "changelog<<CHANGELOG_EOF"
-            cat /tmp/changelog.txt
-            echo "CHANGELOG_EOF"
-          } >> $GITHUB_OUTPUT
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip-header
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
       
       - name: Create Release
         id: create-release
@@ -68,7 +58,7 @@ jobs:
           script: |
             const version = `${{ steps.get_version.outputs.VERSION }}`;
             const isBeta = version.includes('beta') || version.includes('alpha');
-            const changelog = `${{ steps.generate-changelog.outputs.changelog }}`;
+            const changelog = `${{ steps.git-cliff.outputs.content }}` || 'See commit history for changes in this release.';
             const intro = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\nNoBuf is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}`;
             const highlights = `\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux`;
             const body = `${intro}${highlights}\n\n---\n\n## What Changed\n\n${changelog}\n\nSee the assets below to download and install.`;
@@ -346,17 +336,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           ref: main
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@v2
-        with:
-          tool: git-cliff
+      - name: Create local tag for git-cliff
+        run: git tag "v${{ needs.create-release.outputs.version }}"
 
-      - name: Update CHANGELOG.md
-        run: |
-          VERSION="${{ needs.create-release.outputs.version }}"
-          git-cliff --tag "v${VERSION}" -o CHANGELOG.md
+      - name: Generate full changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
 
       - name: Commit and push CHANGELOG.md
         run: |
