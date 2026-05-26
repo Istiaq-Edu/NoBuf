@@ -17,6 +17,7 @@ pub mod server;
 pub mod api_routes;
 pub mod hls;
 pub mod download_pool;
+pub mod faststart;
 
 /// Single source of truth for the Actix streaming server port.
 /// Referenced in lib.rs (server startup) and exposed to the frontend
