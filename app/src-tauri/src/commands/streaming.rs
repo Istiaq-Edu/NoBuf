@@ -24,19 +24,42 @@ pub struct StreamInfo {
     /// Custom protocol base URL for <video> element src attribute.
     /// Uses registered `nobuf-stream://` scheme to bypass WebView2 URL
     /// safety checks that block cross-port localhost media in production.
-    /// Example: nobuf-stream://localhost
+    /// On Windows, WebView2 maps custom schemes to http://SCHEME.localhost/
+    /// format (see wry webview2/mod.rs `work_around_uri_prefix`), so
+    /// `nobuf-stream://localhost` is never intercepted by
+    /// `WebResourceRequestedFilter` and fails `IsSafeToLoadURL`.
+    /// On macOS/Linux, the native scheme format works correctly.
+    /// Example (Windows): http://nobuf-stream.localhost
+    /// Example (macOS/Linux): nobuf-stream://localhost
     pub video_base_url: String,
 }
 
 /// Returns the streaming server's session token and base URL to the frontend.
 /// The frontend must use the returned base_url to construct stream URLs,
 /// never hardcoding the port.
+///
+/// On Windows, `video_base_url` uses the `http://SCHEME.localhost` format
+/// because WebView2 maps custom schemes to HTTP subdomains of `.localhost`
+/// (wry's `work_around_uri_prefix`). The `nobuf-stream://localhost` format
+/// is NOT intercepted by `AddWebResourceRequestedFilter` on Windows and
+/// fails `IsSafeToLoadURL`, causing `MEDIA_ELEMENT_ERROR`.
+/// On macOS/Linux, the native `SCHEME://localhost` format works correctly.
 #[tauri::command]
 pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
+    // On Windows, WebView2 requires custom protocol URLs in http://SCHEME.localhost format.
+    // See: wry src/webview2/mod.rs `attach_custom_protocol_handler`, `work_around_uri_prefix`,
+    // and `is_work_around_uri`. The `AddWebResourceRequestedFilter` only intercepts
+    // `http://nobuf-stream.localhost/*` — `nobuf-stream://localhost/*` is never matched.
+    let video_base_url = if cfg!(windows) {
+        "http://nobuf-stream.localhost".to_string()
+    } else {
+        "nobuf-stream://localhost".to_string()
+    };
+
     StreamInfo {
         token: config.token.clone(),
         base_url: format!("http://localhost:{}", config.port),
-        video_base_url: "nobuf-stream://localhost".to_string(),
+        video_base_url,
     }
 }
 
