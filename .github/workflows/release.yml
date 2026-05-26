@@ -158,6 +158,10 @@ jobs:
         working-directory: app
         run: npm install
 
+      - name: Run frontend tests
+        working-directory: app
+        run: npm test
+
       - name: Build the app
         uses: tauri-apps/tauri-action@v0
         env:
