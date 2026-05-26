@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-regenerate-api-key"
+description = "Enables the cmd_regenerate_api_key command without any pre-configured scope."
+commands.allow = ["cmd_regenerate_api_key"]
+
+[[permission]]
+identifier = "deny-cmd-regenerate-api-key"
+description = "Denies the cmd_regenerate_api_key command without any pre-configured scope."
+commands.deny = ["cmd_regenerate_api_key"]

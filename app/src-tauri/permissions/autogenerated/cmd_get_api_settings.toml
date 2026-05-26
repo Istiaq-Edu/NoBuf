@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-api-settings"
+description = "Enables the cmd_get_api_settings command without any pre-configured scope."
+commands.allow = ["cmd_get_api_settings"]
+
+[[permission]]
+identifier = "deny-cmd-get-api-settings"
+description = "Denies the cmd_get_api_settings command without any pre-configured scope."
+commands.deny = ["cmd_get_api_settings"]

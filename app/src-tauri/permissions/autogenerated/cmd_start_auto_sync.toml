@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-start-auto-sync"
+description = "Enables the cmd_start_auto_sync command without any pre-configured scope."
+commands.allow = ["cmd_start_auto_sync"]
+
+[[permission]]
+identifier = "deny-cmd-start-auto-sync"
+description = "Denies the cmd_start_auto_sync command without any pre-configured scope."
+commands.deny = ["cmd_start_auto_sync"]

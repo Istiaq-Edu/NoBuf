@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-check-connection"
+description = "Enables the cmd_check_connection command without any pre-configured scope."
+commands.allow = ["cmd_check_connection"]
+
+[[permission]]
+identifier = "deny-cmd-check-connection"
+description = "Denies the cmd_check_connection command without any pre-configured scope."
+commands.deny = ["cmd_check_connection"]

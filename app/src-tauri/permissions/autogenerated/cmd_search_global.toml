@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-search-global"
+description = "Enables the cmd_search_global command without any pre-configured scope."
+commands.allow = ["cmd_search_global"]
+
+[[permission]]
+identifier = "deny-cmd-search-global"
+description = "Denies the cmd_search_global command without any pre-configured scope."
+commands.deny = ["cmd_search_global"]
