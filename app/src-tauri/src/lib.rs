@@ -5,6 +5,7 @@ pub mod stream_cache;
 pub mod bandwidth;
 
 use tauri::Manager;
+use tauri::webview::WebviewWindowBuilder;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,15 @@ pub mod download_pool;
 /// Referenced in lib.rs (server startup) and exposed to the frontend
 /// via cmd_get_stream_info so no component ever hardcodes the port.
 pub const STREAM_PORT: u16 = 14201;
+
+/// Port for the localhost plugin in production builds.
+/// In dev mode, the app already runs from http://localhost:1420 (Vite dev server).
+/// In production, tauri-plugin-localhost serves the frontend assets from this port,
+/// making the app same-origin with the streaming server on localhost:14201.
+/// This avoids WebView2's mixed-content / URL-safety-check block that prevents
+/// <video> from loading http://localhost media from https://tauri.localhost.
+#[cfg(not(debug_assertions))]
+const LOCALHOST_PLUGIN_PORT: u16 = 14200;
 
 /// Generate a random 32-character hex token for streaming server auth
 fn generate_stream_token() -> String {
@@ -117,7 +127,17 @@ pub fn run() {
         Arc::new(std::sync::Mutex::new(None));
     let server_handle_for_setup = server_handle.clone();
 
-    let app = tauri::Builder::default()
+    let app = {
+        // In production: add the localhost plugin so the app runs from
+        // http://localhost:14200 (same-origin with the streaming server).
+        // In dev mode: no plugin needed — Vite dev server is already on localhost.
+        #[cfg(not(debug_assertions))]
+        let builder = tauri::Builder::default()
+            .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
+        #[cfg(debug_assertions)]
+        let builder = tauri::Builder::default();
+
+        builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
@@ -190,7 +210,26 @@ pub fn run() {
 
             // Start API server if enabled in settings
             restart_api_server(app.handle());
-            
+
+            // Create the main window manually (removed from tauri.conf.json).
+            // In production: the localhost plugin serves assets from http://localhost:14200,
+            // so the window URL points there. This makes the app same-origin with the
+            // streaming server on http://localhost:14201, bypassing WebView2's
+            // mixed-content / URL-safety-check that blocks HTTP localhost media
+            // from https://tauri.localhost pages.
+            // In dev mode: the Vite dev server is already on http://localhost:1420.
+            #[cfg(not(debug_assertions))]
+            let window_url = tauri::WebviewUrl::External(format!("http://localhost:{}", LOCALHOST_PLUGIN_PORT).parse().unwrap());
+            #[cfg(debug_assertions)]
+            let window_url = tauri::WebviewUrl::External("http://localhost:1420".parse().unwrap());
+
+            WebviewWindowBuilder::new(app, "main", window_url)
+                .title("NoBuf")
+                .inner_size(1200.0, 800.0)
+                .min_inner_size(1000.0, 700.0)
+                .disable_drag_drop_handler()
+                .build()?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -233,7 +272,8 @@ pub fn run() {
             commands::cmd_start_auto_sync,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application");
+        .expect("error while building tauri application")
+    };
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
