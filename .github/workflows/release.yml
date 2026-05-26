@@ -39,7 +39,7 @@ jobs:
           fi
       
       - name: Create local tag for git-cliff
-        run: git tag "v${{ steps.get_version.outputs.VERSION }}"
+        run: git tag -f "v${{ steps.get_version.outputs.VERSION }}"
       
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
@@ -59,9 +59,8 @@ jobs:
             const version = `${{ steps.get_version.outputs.VERSION }}`;
             const isBeta = version.includes('beta') || version.includes('alpha');
             const changelog = `${{ steps.git-cliff.outputs.content }}` || 'See commit history for changes in this release.';
-            const intro = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\nNoBuf is a Telegram-based cloud storage desktop app. Store, browse, and manage your Telegram files like a cloud drive.\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}`;
-            const highlights = `\n\n## Highlights\n- Telegram-based cloud storage with unlimited space\n- File browser with thumbnails and metadata\n- Upload, download, and manage files seamlessly\n- Cross-platform: Windows, macOS (Intel & ARM), Linux`;
-            const body = `${intro}${highlights}\n\n---\n\n## What Changed\n\n${changelog}\n\nSee the assets below to download and install.`;
+            const intro = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}`;
+            const body = `${intro}\n\n---\n\n## What Changed\n\n${changelog}\n\nSee the assets below to download and install.`;
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -340,7 +339,7 @@ jobs:
           ref: main
 
       - name: Create local tag for git-cliff
-        run: git tag "v${{ needs.create-release.outputs.version }}"
+        run: git tag -f "v${{ needs.create-release.outputs.version }}"
 
       - name: Generate full changelog
         uses: orhun/git-cliff-action@v4
