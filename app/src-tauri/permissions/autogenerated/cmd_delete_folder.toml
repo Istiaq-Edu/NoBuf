@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-delete-folder"
+description = "Enables the cmd_delete_folder command without any pre-configured scope."
+commands.allow = ["cmd_delete_folder"]
+
+[[permission]]
+identifier = "deny-cmd-delete-folder"
+description = "Denies the cmd_delete_folder command without any pre-configured scope."
+commands.deny = ["cmd_delete_folder"]

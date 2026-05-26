@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-is-network-available"
+description = "Enables the cmd_is_network_available command without any pre-configured scope."
+commands.allow = ["cmd_is_network_available"]
+
+[[permission]]
+identifier = "deny-cmd-is-network-available"
+description = "Denies the cmd_is_network_available command without any pre-configured scope."
+commands.deny = ["cmd_is_network_available"]
