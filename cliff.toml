@@ -28,6 +28,7 @@ trim = true
 conventional_commits = true
 filter_unconventional = false
 commit_parsers = [
+    # Conventional commit format
     { message = "^feat", group = "Features" },
     { message = "^fix", group = "Bug Fixes" },
     { message = "^doc", group = "Documentation" },
@@ -41,7 +42,24 @@ commit_parsers = [
     { message = "^chore\\(release\\): prepare for", skip = true },
     { message = "^chore|^ci", group = "Miscellaneous Tasks" },
     { body = ".*security", group = "Security" },
+    # Skip noisy commits (must come BEFORE general verb patterns)
+    { message = "^Update.*README", skip = true },
+    { message = "^Update.*\\.(tsx|ts|jsx|js|css|html|rs|toml|yaml|json|md)$", group = "Enhancements" },
+    { message = "^Bump version", skip = true },
+    { message = "^Release v", skip = true },
+    { message = "^[Vv]\\d+\\.\\d+", skip = true },
+    { message = "^Merge (branch|pull request)", skip = true },
+    # Copilot / GitHub Desktop style patterns
+    { message = "^Add|^Create|^Implement|^Introduce", group = "Features" },
+    { message = "^Fix|^Resolve|^Repair|^Restore", group = "Bug Fixes" },
+    { message = "^Update|^Modify|^Change", group = "Enhancements" },
+    { message = "^Improve|^Optimize|^Enhance|^Refine|^Tweak", group = "Performance" },
+    { message = "^Remove|^Delete|^Drop|^Clean", group = "Removed" },
+    { message = "^Rename|^Move|^Reorder|^Reorganize", group = "Refactor" },
+    { message = "^Bump|^Release|^Prepare", group = "Miscellaneous Tasks" },
+    # Fallback for anything else
+    { message = ".*", group = "Other" },
 ]
-filter_commits = true
+filter_commits = false
 topo_order = false
 sort_commits = "oldest"
