@@ -421,19 +421,19 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
             <div className="fixed top-[40%] right-[30%] w-[300px] h-[300px] bg-nobuf-charlotte/8 rounded-full blur-[100px] pointer-events-none -z-10" />
 
             {/* Logo banner — centered at top, spans both columns */}
-            <div className="flex items-center justify-center gap-4 pt-10 pb-6 px-6">
+            <div className="flex items-center justify-center gap-4 pt-6 pb-4 md:pt-10 md:pb-6 px-6">
                 <div className="w-14 h-14 flex items-center justify-center filter drop-shadow-lg">
                     <img src="/logo.png" alt="NoBuf Logo" className="w-full h-full" />
                 </div>
                 <div>
-                    <h1 className="text-3xl font-bold text-nobuf-text tracking-tight">NoBuf</h1>
+                    <h1 className="text-2xl md:text-3xl font-bold text-nobuf-text tracking-tight">NoBuf</h1>
                 </div>
             </div>
 
             {/* Split layout: Left = form, Right = contextual guide */}
-            <div className="grid grid-cols-2 gap-0 px-6 pb-6" style={{ height: 'calc(100vh - 120px)' }}>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-0 px-6 pb-6" style={{ height: 'calc(100vh - 120px)' }}>
                 {/* ── LEFT PANEL ── */}
-                <div className="auth-glass p-8 rounded-2xl shadow-2xl flex flex-col overflow-y-auto">
+                <div className="auth-glass p-4 md:p-8 rounded-2xl shadow-2xl flex flex-col overflow-y-auto">
                     <AnimatePresence mode="wait">
                         {floodWait ? (
                             <motion.div
@@ -673,7 +673,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 </div>
 
                 {/* ── RIGHT PANEL ── */}
-                <div className="auth-split-right p-8 rounded-2xl shadow-2xl overflow-y-auto">
+                <div className="auth-split-right p-4 md:p-8 rounded-2xl shadow-2xl overflow-y-auto">
                     <AnimatePresence mode="wait">
                         {floodWait ? (
                             <motion.div key="flood-right" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>

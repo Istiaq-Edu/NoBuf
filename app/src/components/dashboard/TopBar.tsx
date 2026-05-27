@@ -1,4 +1,4 @@
-﻿import { LayoutGrid, Sun, Moon, Settings, ArrowLeftRight } from 'lucide-react';
+import { LayoutGrid, Sun, Moon, Settings, ArrowLeftRight, Menu } from 'lucide-react';
 import { useTheme } from '../../context/ThemeContext';
 
 interface TopBarProps {
@@ -19,6 +19,8 @@ interface TopBarProps {
     uploadFinishedCount?: number;
     downloadActiveCount?: number;
     downloadFinishedCount?: number;
+    onToggleMobileSidebar?: () => void;
+    isMobile?: boolean;
 }
 
 export function TopBar({
@@ -27,20 +29,30 @@ export function TopBar({
     onToggleTransfers, showTransferPanel,
     uploadActiveCount = 0, uploadFinishedCount = 0,
     downloadActiveCount = 0, downloadFinishedCount = 0,
+    onToggleMobileSidebar, isMobile,
 }: TopBarProps) {
     const { theme, toggleTheme } = useTheme();
 
     return (
         <header className="h-14 border-b border-nobuf-border flex items-center px-4 justify-between bg-nobuf-surface/80 backdrop-blur-md sticky top-0 z-10" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center gap-4">
-                <div className="flex items-center text-sm breadcrumbs text-nobuf-subtext select-none">
+            <div className="flex items-center gap-2">
+                {isMobile && (
+                    <button
+                        onClick={onToggleMobileSidebar}
+                        className="p-2 hover:bg-nobuf-hover rounded-md text-nobuf-subtext hover:text-nobuf-text transition mr-1"
+                        title="Menu"
+                    >
+                        <Menu className="w-5 h-5" />
+                    </button>
+                )}
+                <div className="hidden sm:flex items-center text-sm breadcrumbs text-nobuf-subtext select-none">
                     <span className="hover:text-nobuf-text cursor-pointer transition-colors">Start</span>
                     <span className="mx-2">/</span>
                     <span className="text-nobuf-text font-medium">{currentFolderName}</span>
                 </div>
             </div>
 
-            <div className="flex-1 max-w-md mx-4">
+            <div className="flex-1 max-w-md mx-2 sm:mx-4">
                 <input
                     type="text"
                     placeholder="Search files..."
@@ -52,11 +64,11 @@ export function TopBar({
 
             <div className="flex items-center gap-2">
                 {selectedIds.length > 0 && (
-                    <div className="flex items-center gap-2 mr-4 animate-in fade-in slide-in-from-top-2">
+                    <div className="flex items-center gap-1 sm:gap-2 mr-2 sm:mr-4 animate-in fade-in slide-in-from-top-2">
                         <span className="text-xs text-nobuf-subtext mr-2">{selectedIds.length} Selected</span>
-                        <button onClick={onSelectAll} className="px-3 py-1.5 bg-nobuf-hover hover:bg-nobuf-border rounded-md text-xs text-nobuf-text transition">Select All</button>
+                        <button onClick={onSelectAll} className="hidden sm:inline-flex px-3 py-1.5 bg-nobuf-hover hover:bg-nobuf-border rounded-md text-xs text-nobuf-text transition">Select All</button>
                         <button onClick={onShowMoveModal} className="px-3 py-1.5 bg-nobuf-primary/20 hover:bg-nobuf-primary/30 text-nobuf-primary rounded-md text-xs transition font-medium">Move to...</button>
-                        <button onClick={onBulkDownload} className="px-3 py-1.5 bg-nobuf-hover hover:bg-nobuf-border rounded-md text-xs text-nobuf-text transition">Download Selected</button>
+                        <button onClick={onBulkDownload} className="hidden sm:inline-flex px-3 py-1.5 bg-nobuf-hover hover:bg-nobuf-border rounded-md text-xs text-nobuf-text transition">Download Selected</button>
                         <button onClick={onBulkDelete} className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md text-xs transition">Delete</button>
                     </div>
                 )}

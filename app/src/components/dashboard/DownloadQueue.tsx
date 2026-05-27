@@ -24,7 +24,7 @@ export function DownloadQueue({ items, onClearFinished, onCancelAll, onCancelIte
     const completedCount = items.filter(i => i.status === 'success').length;
 
     return (
-        <div className="fixed bottom-4 right-4 w-80 bg-nobuf-surface border border-nobuf-border rounded-xl shadow-2xl overflow-hidden z-[100]">
+        <div className="fixed bottom-4 right-2 sm:right-4 w-[calc(100vw-1rem)] sm:w-80 max-w-80 bg-nobuf-surface border border-nobuf-border rounded-xl shadow-2xl overflow-hidden z-[100]">
             <div className="p-3 border-b border-nobuf-border bg-nobuf-hover flex justify-between items-center">
                 <div className="flex items-center gap-2">
                     <Download className="w-4 h-4 text-nobuf-secondary" />

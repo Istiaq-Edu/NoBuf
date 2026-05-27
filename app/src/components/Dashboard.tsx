@@ -28,10 +28,12 @@ import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
 import { useCacheSession } from '../context/CacheSessionContext';
+import { useResponsive } from '../hooks/useResponsive';
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const queryClient = useQueryClient();
     const cacheSession = useCacheSession();
+    const { isMobile } = useResponsive();
 
 
     const {
@@ -56,6 +58,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         try { return localStorage.getItem('sidebar-collapsed') === 'true'; }
         catch { return false; }
     });
+    // Auto-collapse sidebar on mobile
+    const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
     const toggleSidebar = useCallback(() => {
         setSidebarCollapsed(prev => {
             const next = !prev;
@@ -231,7 +235,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         setPdfFile(null);
         setPreviewContextFiles([]);
         setPreviewContextIndex(-1);
-    }, [activeFolderId]);
+        setMobileSidebarOpen(false);
+        }, [activeFolderId]);
 
 
     useEffect(() => {
@@ -476,6 +481,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {isDragging && internalDragFileId === null && <DragDropOverlay key="drag-drop-overlay" />}
             </AnimatePresence>
 
+            {isMobile && mobileSidebarOpen && (
+                <div className="fixed inset-0 z-30 bg-black/50" onClick={() => setMobileSidebarOpen(false)} />
+            )}
             <Sidebar
                 folders={folders}
                 activeFolderId={activeFolderId}
@@ -492,6 +500,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 bandwidth={bandwidth || null}
                 collapsed={sidebarCollapsed}
                 onToggleCollapse={toggleSidebar}
+                mobileOpen={mobileSidebarOpen}
+                onMobileClose={() => setMobileSidebarOpen(false)}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
@@ -513,6 +523,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     uploadFinishedCount={uploadFinishedCount}
                     downloadActiveCount={downloadActiveCount}
                     downloadFinishedCount={downloadFinishedCount}
+                    onToggleMobileSidebar={() => setMobileSidebarOpen(o => !o)}
+                    isMobile={isMobile}
                 />
                 {searchTerm.length > 2 && (
                     <div className="px-6 pt-4 pb-0">

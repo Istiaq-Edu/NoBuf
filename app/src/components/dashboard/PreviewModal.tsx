@@ -201,7 +201,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
 
                 <button
                     onClick={onClose}
-                    className="absolute -top-12 right-0 p-2 bg-black/60 hover:bg-black/80 rounded-full transition-colors"
+                    className="absolute top-2 right-2 md:-top-12 md:right-0 p-2 bg-black/60 hover:bg-black/80 rounded-full transition-colors"
                     style={{ color: '#ffffff' }}
                 >
                     <X className="w-6 h-6" />
@@ -253,7 +253,7 @@ export function PreviewModal({ file, onClose, onNext, onPrev, currentIndex, tota
                     </div>
                 )}
 
-                <div className="absolute bottom-[-3rem] text-white text-sm opacity-50">
+                <div className="absolute bottom-[-2rem] md:bottom-[-3rem] text-white text-sm opacity-50">
                     {file.name}
                     {typeof currentIndex === 'number' && typeof totalItems === 'number' && totalItems > 0 && (
                         <span className="ml-3">{currentIndex + 1}/{totalItems}</span>

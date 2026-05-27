@@ -60,7 +60,7 @@ export function TransferPanel({
                 />
             )}
             <div
-                className={`fixed right-0 top-14 bottom-0 w-[380px] bg-nobuf-surface border-l border-nobuf-border shadow-2xl z-40 flex flex-col transition-transform duration-300 ease-in-out ${
+                className={`fixed right-0 top-14 bottom-0 w-full sm:w-[380px] bg-nobuf-surface border-l border-nobuf-border shadow-2xl z-40 flex flex-col transition-transform duration-300 ease-in-out ${
                     isOpen ? 'translate-x-0' : 'translate-x-full'
                 }`}
             >
