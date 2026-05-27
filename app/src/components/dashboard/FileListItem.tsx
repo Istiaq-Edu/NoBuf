@@ -62,7 +62,7 @@ export function FileListItem({
                     onDrop(e, file.id);
                 }
             }}
-            className={`group grid grid-cols-[2.5rem_2fr_6rem_8rem] gap-4 items-center px-4 py-3 rounded-lg cursor-pointer border border-transparent transition-all hover:bg-nobuf-hover 
+            className={`group grid grid-cols-[2.5rem_1fr] sm:grid-cols-[2.5rem_2fr_6rem_8rem] gap-2 sm:gap-4 items-center px-2 sm:px-4 py-3 rounded-lg cursor-pointer border border-transparent transition-all hover:bg-nobuf-hover 
                 ${selectedIds.includes(file.id) ? 'bg-nobuf-primary/10 border-nobuf-primary/20' : ''}
                 ${isDragOver ? 'ring-2 ring-nobuf-primary bg-nobuf-primary/20' : ''}
             `}
@@ -104,8 +104,8 @@ export function FileListItem({
                     <button onClick={(e) => { e.stopPropagation(); onDelete(file.id) }} className="p-1 hover:text-red-400 text-nobuf-subtext" title="Delete"><Trash2 className="w-4 h-4" /></button>
                 </div>
             </div>
-            <div className="text-right text-xs text-nobuf-subtext truncate">{file.sizeStr}</div>
-            <div className="text-right text-xs text-nobuf-subtext font-mono opacity-50 truncate">{file.created_at || '-'}</div>
+            <div className="hidden sm:block text-right text-xs text-nobuf-subtext truncate">{file.sizeStr}</div>
+            <div className="hidden sm:block text-right text-xs text-nobuf-subtext font-mono opacity-50 truncate">{file.created_at || '-'}</div>
         </div>
     );
 }

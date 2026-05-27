@@ -11,7 +11,7 @@ interface MoveToFolderModalProps {
 export function MoveToFolderModal({ folders, onClose, onSelect, activeFolderId }: MoveToFolderModalProps) {
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
-            <div className="bg-nobuf-surface border border-nobuf-border rounded-xl w-80 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
+            <div className="bg-nobuf-surface border border-nobuf-border rounded-xl w-[calc(100vw-2rem)] max-w-80 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
                 <div className="p-4 border-b border-nobuf-border flex justify-between items-center">
                     <h3 className="text-nobuf-text font-medium">Move to Folder</h3>
                     <button onClick={onClose} className="text-nobuf-subtext hover:text-nobuf-text"><Plus className="w-5 h-5 rotate-45" /></button>

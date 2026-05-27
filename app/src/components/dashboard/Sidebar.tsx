@@ -20,6 +20,8 @@ interface SidebarProps {
     bandwidth: BandwidthStats | null;
     collapsed: boolean;
     onToggleCollapse: () => void;
+    mobileOpen?: boolean;
+    onMobileClose?: () => void;
 }
 
 /**
@@ -31,7 +33,8 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
-    isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse
+    isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse,
+    mobileOpen, onMobileClose: _onMobileClose
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
@@ -132,7 +135,7 @@ export function Sidebar({
     }, []);
 
     return (
-        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-nobuf-surface border-r border-nobuf-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0`} onClick={e => e.stopPropagation()}>
+        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-nobuf-surface border-r border-nobuf-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0 max-sm:fixed max-sm:inset-y-0 max-sm:left-0 max-sm:z-40 max-sm:shadow-2xl ${mobileOpen ? 'max-sm:translate-x-0' : 'max-sm:-translate-x-full'} max-sm:transition-transform max-sm:duration-300`} onClick={e => e.stopPropagation()}>
 
             {/* Toggle button — always in the same spot */}
             <div className="p-3 flex items-center">

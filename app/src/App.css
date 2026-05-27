@@ -978,3 +978,28 @@ body,
     background: var(--color-nobuf-hover);
     color: var(--color-nobuf-text);
 }
+
+/* ========================================
+   Responsive Breakpoints
+   ======================================== */
+
+/* Mobile: sidebar drawer overlay */
+@media (max-width: 639px) {
+    .settings-page-body {
+        padding: 16px;
+    }
+    .settings-page-header {
+        padding: 16px;
+    }
+    .settings-card {
+        padding: 12px;
+    }
+}
+
+/* Tablet adjustments */
+@media (max-width: 1023px) {
+    .settings-page-body {
+        max-width: 100%;
+        padding: 20px 24px 32px;
+    }
+}
