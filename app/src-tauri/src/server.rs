@@ -1235,6 +1235,7 @@ pub async fn start_streaming_server(
             .allow_any_method()
             .allow_any_header()
             .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .allow_private_network_access()
             .max_age(3600);
 
         App::new()
@@ -1263,4 +1264,134 @@ pub async fn start_server(
     _api_port: u16,
 ) -> std::io::Result<actix_web::dev::Server> {
     start_streaming_server(port, tg_state, token, cache_mgr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_cors::Cors;
+    use actix_web::{test, web, App, HttpResponse, http::Method, http::header as actix_header};
+
+    async fn test_handler() -> HttpResponse {
+        HttpResponse::Ok().body("test")
+    }
+
+    /// Verify CORS middleware includes Access-Control-Allow-Private-Network: true
+    /// when a preflight request contains Access-Control-Request-Private-Network: true.
+    /// This is the core fix for the WebView2 "Media load rejected by URL safety check"
+    /// error — Chromium's LNA/PNA restriction blocks cross-port localhost media
+    /// unless the server sends this header.
+    #[actix_rt::test]
+    async fn cors_preflight_includes_private_network_access() {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .allow_private_network_access()
+            .max_age(3600);
+
+        let app = test::init_service(
+            App::new()
+                .wrap(cors)
+                .route("/test", web::get().to(test_handler))
+        ).await;
+
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/test")
+            .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
+            .insert_header((actix_header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .insert_header(("Access-Control-Request-Private-Network", "true"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // The critical header: Access-Control-Allow-Private-Network: true
+        let pna_header = resp.headers().get("Access-Control-Allow-Private-Network");
+        assert!(pna_header.is_some(), "Access-Control-Allow-Private-Network header must be present");
+        assert_eq!(
+            pna_header.unwrap().to_str().unwrap(),
+            "true",
+            "Access-Control-Allow-Private-Network must be 'true'"
+        );
+
+        // Also verify standard CORS headers (use string names to avoid http crate version conflict)
+        assert!(resp.headers().get("Access-Control-Allow-Origin").is_some());
+        assert!(resp.headers().get("Access-Control-Allow-Methods").is_some());
+        assert!(resp.headers().get("Access-Control-Max-Age").is_some());
+    }
+
+    /// Verify CORS preflight WITHOUT PNA request header does NOT include
+    /// Access-Control-Allow-Private-Network (only sent when requested).
+    #[actix_rt::test]
+    async fn cors_preflight_without_pna_request_no_pna_response() {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .allow_private_network_access()
+            .max_age(3600);
+
+        let app = test::init_service(
+            App::new()
+                .wrap(cors)
+                .route("/test", web::get().to(test_handler))
+        ).await;
+
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/test")
+            .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
+            .insert_header((actix_header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        // PNA header should NOT be present when not requested
+        let pna_header = resp.headers().get("Access-Control-Allow-Private-Network");
+        assert!(pna_header.is_none(), "PNA header should not be sent when not requested");
+    }
+
+    /// Verify CORS exposes Content-Range header in actual responses (not preflight).
+    /// Access-Control-Expose-Headers is only present in actual responses, not preflight.
+    /// Needed for Range request video streaming — the browser must be able to read
+    /// Content-Range from the response.
+    #[actix_rt::test]
+    async fn cors_exposes_content_range_header() {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .allow_private_network_access()
+            .max_age(3600);
+
+        let app = test::init_service(
+            App::new()
+                .wrap(cors)
+                .route("/test", web::get().to(test_handler))
+        ).await;
+
+        // Use a regular GET request (not OPTIONS) — Expose-Headers only appears in actual responses
+        let req = test::TestRequest::default()
+            .method(Method::GET)
+            .uri("/test")
+            .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+
+        let expose_headers = resp.headers().get("Access-Control-Expose-Headers");
+        assert!(expose_headers.is_some(), "Access-Control-Expose-Headers must be present in actual response");
+        let expose_str = expose_headers.unwrap().to_str().unwrap();
+        // actix-cors lowercases header values — use case-insensitive checks
+        let lower = expose_str.to_lowercase();
+        assert!(lower.contains("content-range"), "Content-Range must be exposed");
+        assert!(lower.contains("content-length"), "Content-Length must be exposed");
+        assert!(lower.contains("accept-ranges"), "Accept-Ranges must be exposed");
+    }
 }

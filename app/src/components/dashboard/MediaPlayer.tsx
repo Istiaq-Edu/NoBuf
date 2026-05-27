@@ -32,10 +32,6 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
     const streamUrl = streamInfo
         ? `${streamInfo.base_url}/stream/${folderIdParam}/${file.id}?token=${streamInfo.token}`
         : null;
-    // Custom protocol URL for native <video> src — bypasses WebView2 URL safety checks
-    const videoStreamUrl = streamInfo
-        ? `${streamInfo.video_base_url}/stream/${folderIdParam}/${file.id}?token=${streamInfo.token}`
-        : null;
 
     useEffect(() => {
         console.log(`[MediaPlayer] Stream URL resolved: ${streamUrl}, fileId: ${file.id}`);
@@ -49,7 +45,6 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
         <FastStreamPlayer
             file={file}
             streamUrl={streamUrl}
-            videoStreamUrl={videoStreamUrl}
             onClose={onClose}
             onNext={onNext}
             onPrev={onPrev}

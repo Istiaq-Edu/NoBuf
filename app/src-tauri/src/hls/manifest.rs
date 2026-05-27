@@ -183,7 +183,7 @@ async fn hls_master(
     };
 
     let info = calculate_hls_info(size, &mime);
-    let hls_base_url = format!("http://localhost:{}/hls/{}/{}", 14201, folder_id_str, message_id);
+    let hls_base_url = format!("http://localhost:{}/hls/{}/{}", crate::STREAM_PORT, folder_id_str, message_id);
     let manifest = generate_master_playlist(&info, &hls_base_url, query.token.as_deref().unwrap_or(""));
 
     HttpResponse::Ok()
@@ -254,7 +254,7 @@ async fn hls_level(
     };
 
     // Use the main /stream/ endpoint as segment source (it supports Range requests)
-    let stream_url = format!("http://localhost:{}/stream/{}/{}", 14201, folder_id_str, message_id);
+    let stream_url = format!("http://localhost:{}/stream/{}/{}", crate::STREAM_PORT, folder_id_str, message_id);
     let info = calculate_hls_info(size, &mime);
     let manifest = generate_media_playlist(&info, &stream_url, query.token.as_deref().unwrap_or(""));
 
