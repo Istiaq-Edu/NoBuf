@@ -2,6 +2,16 @@
 
 All notable changes to NoBuf will be documented in this file.
 
+## [0.4.7] - 2026-05-27
+
+### Documentation
+
+- Update CHANGELOG.md for v0.4.6
+
+### Other
+
+- Enable PNA CORS and prefer HTTP base_url
+
 ## [0.4.6] - 2026-05-26
 
 ### Bug Fixes
