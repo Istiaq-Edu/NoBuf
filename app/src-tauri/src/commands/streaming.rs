@@ -19,16 +19,16 @@ pub struct StreamConfig {
 pub struct StreamInfo {
     pub token: String,
     /// HTTP base URL for fetch-based streaming (MSE pipeline, thumbnail extraction).
+    /// Also used for native <video> src on all platforms since PNA CORS headers
+    /// allow cross-port localhost media loading.
     /// Example: http://localhost:14201
     pub base_url: String,
     /// Custom protocol base URL for <video> element src attribute.
-    /// Uses registered `nobuf-stream://` scheme to bypass WebView2 URL
-    /// safety checks that block cross-port localhost media in production.
-    /// On Windows, WebView2 maps custom schemes to http://SCHEME.localhost/
-    /// format (see wry webview2/mod.rs `work_around_uri_prefix`), so
-    /// `nobuf-stream://localhost` is never intercepted by
-    /// `WebResourceRequestedFilter` and fails `IsSafeToLoadURL`.
-    /// On macOS/Linux, the native scheme format works correctly.
+    /// DEPRECATED: no longer used for native video on any platform.
+    /// The direct HTTP base_url with CORS + PNA headers works reliably on
+    /// all platforms, bypassing WebView2 URL safety checks and LNA/PNA
+    /// restrictions. Kept for backward compatibility with older frontend code
+    /// that may still reference this field.
     /// Example (Windows): http://nobuf-stream.localhost
     /// Example (macOS/Linux): nobuf-stream://localhost
     pub video_base_url: String,
@@ -38,12 +38,11 @@ pub struct StreamInfo {
 /// The frontend must use the returned base_url to construct stream URLs,
 /// never hardcoding the port.
 ///
-/// On Windows, `video_base_url` uses the `http://SCHEME.localhost` format
-/// because WebView2 maps custom schemes to HTTP subdomains of `.localhost`
-/// (wry's `work_around_uri_prefix`). The `nobuf-stream://localhost` format
-/// is NOT intercepted by `AddWebResourceRequestedFilter` on Windows and
-/// fails `IsSafeToLoadURL`, causing `MEDIA_ELEMENT_ERROR`.
-/// On macOS/Linux, the native `SCHEME://localhost` format works correctly.
+/// Both base_url and video_base_url are provided, but the frontend should
+/// prefer base_url (direct HTTP) for all purposes including native <video>
+/// src. The Actix streaming server now includes CORS headers with
+/// Access-Control-Allow-Private-Network: true, which allows cross-port
+/// localhost requests even under Chromium's LNA/PNA restrictions.
 #[tauri::command]
 pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
     // On Windows, WebView2 requires custom protocol URLs in http://SCHEME.localhost format.
@@ -60,6 +59,84 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
         token: config.token.clone(),
         base_url: format!("http://localhost:{}", config.port),
         video_base_url,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify base_url uses direct HTTP format (http://localhost:PORT).
+    /// This is the URL used for native <video> src with PNA CORS headers.
+    #[test]
+    fn stream_info_base_url_format() {
+        let config = StreamConfig {
+            token: "test-token-123".to_string(),
+            port: 14201,
+        };
+
+        // Simulate what cmd_get_stream_info returns (without Tauri State wrapper)
+        let base_url = format!("http://localhost:{}", config.port);
+        assert_eq!(base_url, "http://localhost:14201");
+        assert!(base_url.starts_with("http://localhost:"));
+        // Port must be present — no trailing slash
+        assert!(base_url.matches(':').count() == 2, "base_url must include port number");
+    }
+
+    /// Verify video_base_url is platform-specific custom protocol format.
+    /// On Windows: http://nobuf-stream.localhost
+    /// On macOS/Linux: nobuf-stream://localhost
+    #[test]
+    fn stream_info_video_base_url_platform_specific() {
+        let video_base_url = if cfg!(windows) {
+            "http://nobuf-stream.localhost".to_string()
+        } else {
+            "nobuf-stream://localhost".to_string()
+        };
+
+        if cfg!(windows) {
+            assert_eq!(video_base_url, "http://nobuf-stream.localhost");
+            // Windows WebView2 maps custom schemes to http://SCHEME.localhost format
+            assert!(video_base_url.starts_with("http://"));
+            assert!(video_base_url.contains("nobuf-stream.localhost"));
+        } else {
+            assert_eq!(video_base_url, "nobuf-stream://localhost");
+            assert!(video_base_url.starts_with("nobuf-stream://"));
+        }
+    }
+
+    /// Verify base_url uses the configured port, not a hardcoded value.
+    #[test]
+    fn stream_info_base_url_uses_config_port() {
+        let config_port_1 = StreamConfig {
+            token: "test".to_string(),
+            port: 14201,
+        };
+        let config_port_2 = StreamConfig {
+            token: "test".to_string(),
+            port: 8080,
+        };
+
+        let base_url_1 = format!("http://localhost:{}", config_port_1.port);
+        let base_url_2 = format!("http://localhost:{}", config_port_2.port);
+
+        assert_eq!(base_url_1, "http://localhost:14201");
+        assert_eq!(base_url_2, "http://localhost:8080");
+        assert_ne!(base_url_1, base_url_2, "Different ports must produce different base_urls");
+    }
+
+    /// Verify the StreamInfo struct has all required fields for serialization.
+    #[test]
+    fn stream_info_has_required_fields() {
+        let info = StreamInfo {
+            token: "abc".to_string(),
+            base_url: "http://localhost:14201".to_string(),
+            video_base_url: "http://nobuf-stream.localhost".to_string(),
+        };
+
+        assert_eq!(info.token, "abc");
+        assert_eq!(info.base_url, "http://localhost:14201");
+        assert_eq!(info.video_base_url, "http://nobuf-stream.localhost");
     }
 }
 

@@ -14,7 +14,6 @@ import { VideoCacheDialog } from './VideoCacheDialog';
 interface FastStreamPlayerProps {
   file: TelegramFile;
   streamUrl: string;
-  videoStreamUrl?: string | null;
   onClose: () => void;
   onNext?: () => void;
   onPrev?: () => void;
@@ -25,7 +24,7 @@ interface FastStreamPlayerProps {
 
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
+export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -43,6 +42,8 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
   const [buf, setBuf] = useState(0);
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  // Track the actual URL set as <video>.src for diagnostic display
+  const [lastVideoSrc, setLastVideoSrc] = useState<string | null>(null);
   const [vis, setVis] = useState(true);
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
@@ -134,7 +135,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
     getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength,
   }), [getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength]);
 
-  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, videoStreamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
@@ -418,17 +419,19 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
     setVideoRef(v);
 
     // MSE mode uses a Blob URL (same-origin, bypasses WebView2 restrictions).
-    // Native fallback uses streamUrl directly — native <video> handles moov-at-end
-    // files via Range requests naturally (browser requests moov from tail first).
-    // Works in both dev and production thanks to tauri-plugin-localhost
-    // (app runs from http://localhost, same-origin with the streaming server).
-        // Use custom protocol URL (nobuf-stream://) for native <video> src to bypass WebView2 URL safety checks.
-    // Falls back to streamUrl if videoStreamUrl is not provided (dev mode compatibility).
-    const videoUrl = useNative ? (videoStreamUrl || streamUrl) : mseUrl;
+    // Native fallback uses streamUrl directly — the Actix streaming server
+    // now includes CORS headers with Access-Control-Allow-Private-Network: true,
+    // allowing cross-port localhost requests under Chromium's LNA/PNA restrictions.
+    // Native <video> handles moov-at-end files via Range requests naturally
+    // (browser requests moov from tail first). Works in both dev and production
+    // thanks to tauri-plugin-localhost (app runs from http://localhost, same-origin
+    // with the streaming server).
+    const videoUrl = useNative ? streamUrl : mseUrl;
     if (!videoUrl) return;
 
     console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
     v.src = videoUrl;
+    setLastVideoSrc(videoUrl);
     v.autoplay = true;
 
     const onMeta = () => {
@@ -455,7 +458,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
     };
     const onErr = () => {
       const err = v.error;
-      console.error('[Player] video error:', err?.code, err?.message);
+      console.error('[Player] video error:', err?.code, err?.message, 'src:', v.src);
       setErr(mseError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
@@ -526,8 +529,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
     };
-  }, [streamUrl, mseUrl, videoStreamUrl, useNative, setVideoRef]);
-
+  }, [streamUrl, mseUrl, useNative, setVideoRef]);
 
   // Buffer state is already updated by timeupdate and progress events above
 
@@ -825,7 +827,7 @@ export function FastStreamPlayer({ file, streamUrl, videoStreamUrl, onClose, onN
               </div>
             ) : (
               <>
-                <div className="text-gray-500 text-xs break-all max-w-md mb-4">{streamUrl}</div>
+                <div className="text-gray-500 text-xs break-all max-w-md mb-4">{lastVideoSrc || streamUrl}</div>
                 <button onClick={handleClose} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Close</button>
               </>
             )}
