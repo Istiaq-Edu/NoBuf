@@ -11,8 +11,241 @@ use tokio::sync::Semaphore;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
+use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached, MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE};
 use std::io::{Write, Seek, SeekFrom};
+
+/// Detect TS packet size from cached file data.
+/// Standard TS = 188 bytes per packet, M2TS = 192 bytes per packet.
+/// Detection: check if byte at offset 192 is 0x47 (M2TS) or byte at offset 188 is 0x47 (standard TS).
+/// Returns (ts_packet_size, is_m2ts) or None if detection fails.
+fn detect_ts_packet_size(data_path: &std::path::Path) -> Option<(u64, bool)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(data_path).ok()?;
+    let mut buf = vec![0u8; 193];
+    let n = file.read(&mut buf).ok()?;
+    if n < 1 || buf[0] != 0x47 {
+        return None;
+    }
+    if n >= 193 && buf[192] == 0x47 {
+        return Some((192, true)); // M2TS
+    }
+    if n >= 189 && buf[188] == 0x47 {
+        return Some((188, false)); // Standard TS
+    }
+    // Default to standard TS if first byte is 0x47 but can't confirm packet size
+    Some((188, false))
+}
+
+/// Rewrite TS stream data in a buffer for mediabunny compatibility.
+/// Two types of rewriting:
+/// 1. Init-prefix overlap (bytes 0-375): replace with cached rewritten init_prefix
+///    (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x0F)
+/// 2. Inline PAT/PMT packets beyond the init_prefix: rewrite PID 0x0FFF→0x1000
+///    and stream_type 0x15→0x0F. Mediabunny may re-read inline PAT packets and
+///    would fail to find PMT on PID 0x0FFF (which is null stuffing in TS).
+///
+/// If init_prefix is not cached yet, attempts on-the-fly extraction from the
+/// data file, rewriting, and caching. This ensures init_prefix is available
+/// even without hls.js (MSE transmuxer mode).
+///
+/// Returns whether any rewriting was done.
+fn rewrite_ts_stream_in_buf(
+    buf: &mut [u8],
+    buf_start: u64,
+    cache_mgr: &StreamCacheManager,
+    message_id: i32,
+    data_path: Option<&std::path::Path>,
+) -> bool {
+    let mut did_rewrite = false;
+
+    // Step 1: Ensure init_prefix is cached and available
+    let init_prefix = cache_mgr.get_init_prefix(message_id);
+    let prefix: Vec<u8> = match init_prefix {
+        Some(ref p) if !p.is_empty() => p.clone(),
+        _ => {
+            // Init_prefix not cached — try on-the-fly extraction from data file
+            if let Some(path) = data_path {
+                if let Some((ts_packet_size, is_m2ts)) = detect_ts_packet_size(path) {
+                    let extracted = hls::manifest::ensure_init_prefix(cache_mgr, message_id, path, ts_packet_size, is_m2ts);
+                    if !extracted.is_empty() {
+                        log::info!("[PREBUFFER] On-the-fly init_prefix extraction for msg {}: {} bytes, ts_packet_size={}, is_m2ts={}",
+                            message_id, extracted.len(), ts_packet_size, is_m2ts);
+                        extracted
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false; // Can't detect TS packet size
+                }
+            } else {
+                return false; // No data path available
+            }
+        }
+    };
+
+    // Step 2: Rewrite init_prefix overlap (bytes 0-375)
+    let prefix_len = prefix.len() as u64;
+    if buf_start < prefix_len {
+        let overlap_start = buf_start as usize;
+        let overlap_end = (prefix_len.min(buf_start + buf.len() as u64)) as usize;
+        let copy_len = overlap_end - overlap_start;
+        if copy_len > 0 {
+            buf[0..copy_len].copy_from_slice(&prefix[overlap_start..overlap_start + copy_len]);
+            did_rewrite = true;
+        }
+    }
+
+    // Step 3: Rewrite inline PAT/PMT packets throughout the buffer (beyond init_prefix).
+    // Scan for TS sync bytes (0x47) at 188-byte-aligned positions relative to the
+    // file start. Skip packets within the init_prefix range (already rewritten in Step 2).
+    // For each PAT packet (PID 0x0000), rewrite PMT PID declaration 0x0FFF→0x1000.
+    // For each PMT packet (PID 0x0FFF), rewrite TS header PID 0x0FFF→0x1000 and
+    // stream_type 0x15→0x0F.
+    let ps: usize = 188;
+    let file_offset_mod = buf_start % ps as u64;
+    let first_pkt_offset = if file_offset_mod == 0 { 0 } else { ps - file_offset_mod as usize };
+    let init_prefix_end_pkt = (prefix_len as usize + ps - 1) / ps; // Packet index of init_prefix end
+
+    let mut pkt_offset = first_pkt_offset;
+    while pkt_offset + ps <= buf.len() {
+        if buf[pkt_offset] != 0x47 {
+            pkt_offset += ps;
+            
+            continue;
+        }
+
+        // Skip packets within init_prefix range (already rewritten in Step 2)
+        let file_pkt_idx = (buf_start as usize + pkt_offset) / ps;
+        if file_pkt_idx < init_prefix_end_pkt {
+            pkt_offset += ps;
+            
+            continue;
+        }
+
+        let pid = ((buf[pkt_offset + 1] as u16 & 0x1F) << 8) | buf[pkt_offset + 2] as u16;
+
+        if pid == 0x0000 {
+            // PAT packet — rewrite PMT PID declaration if it's 0x0FFF
+            let pusi = (buf[pkt_offset + 1] >> 6) & 0x01;
+            let afc = (buf[pkt_offset + 3] >> 4) & 0x03;
+            let mut payload_offset = pkt_offset + 4;
+            if afc & 0x02 != 0 {
+                let af_len = buf[payload_offset] as usize;
+                payload_offset += 1 + af_len;
+            }
+            if payload_offset >= pkt_offset + ps || pusi != 1 {
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            let pointer = buf[payload_offset] as usize;
+            let section_start = payload_offset + 1 + pointer;
+            if section_start + 8 >= pkt_offset + ps {
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            let table_id = buf[section_start];
+            if table_id != 0x00 {
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            let section_length = (((buf[section_start + 1] & 0x0F) as u16) << 8) | buf[section_start + 2] as u16;
+            let num_programs = ((section_length - 9) / 4) as usize;
+
+            let mut pat_rewritten = false;
+            for p in 0..num_programs {
+                let prog_offset = section_start + 8 + p * 4;
+                if prog_offset + 4 > pkt_offset + ps { break; }
+                let prog_num = ((buf[prog_offset] as u16) << 8) | buf[prog_offset + 1] as u16;
+                if prog_num == 0 { continue; }
+                let declared_pid = ((buf[prog_offset + 2] as u16 & 0x1F) << 8) | buf[prog_offset + 3] as u16;
+                if declared_pid == 0x0FFF {
+                    buf[prog_offset + 2] = (buf[prog_offset + 2] & 0xE0) | ((0x1000 >> 8) as u8 & 0x1F);
+                    buf[prog_offset + 3] = (0x1000 & 0xFF) as u8;
+                    pat_rewritten = true;
+                }
+            }
+
+            if pat_rewritten {
+                let section_end_with_crc = section_start + 3 + section_length as usize;
+                let crc_end = section_end_with_crc - 4;
+                if crc_end > section_start && crc_end <= pkt_offset + ps {
+                    let new_crc = hls::manifest::crc32_mpeg2(&buf[section_start..crc_end]);
+                    buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
+                    buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
+                    buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
+                    buf[crc_end + 3] = (new_crc & 0xFF) as u8;
+                    did_rewrite = true;
+                }
+            }
+        } else if pid == 0x0FFF {
+            // Potential PMT packet on null stuffing PID — check if it's actually PMT
+            let pusi = (buf[pkt_offset + 1] >> 6) & 0x01;
+            let afc = (buf[pkt_offset + 3] >> 4) & 0x03;
+            let mut payload_offset = pkt_offset + 4;
+            if afc & 0x02 != 0 {
+                let af_len = buf[payload_offset] as usize;
+                payload_offset += 1 + af_len;
+            }
+            if payload_offset >= pkt_offset + ps || pusi != 1 {
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            let pointer = buf[payload_offset] as usize;
+            let section_start = payload_offset + 1 + pointer;
+            if section_start >= pkt_offset + ps {
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            let table_id = buf[section_start];
+            if table_id != 0x02 {
+                // Not PMT — null stuffing or other section, skip
+                pkt_offset += ps;
+                
+                continue;
+            }
+
+            // This is a PMT on PID 0x0FFF — rewrite TS header PID: 0x0FFF → 0x1000
+            buf[pkt_offset + 1] = (buf[pkt_offset + 1] & 0xE0) | ((0x1000 >> 8) as u8 & 0x1F);
+            buf[pkt_offset + 2] = (0x1000 & 0xFF) as u8;
+
+            // Recalculate PMT CRC-32
+            let section_length = (((buf[section_start + 1] & 0x0F) as u16) << 8) | buf[section_start + 2] as u16;
+            let section_end_with_crc = section_start + 3 + section_length as usize;
+            let crc_end = section_end_with_crc - 4;
+            if crc_end > section_start && crc_end <= pkt_offset + ps {
+                let new_crc = hls::manifest::crc32_mpeg2(&buf[section_start..crc_end]);
+                buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
+                buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
+                buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
+                buf[crc_end + 3] = (new_crc & 0xFF) as u8;
+
+                // Rewrite stream_types 0x15→0x0F in PMT
+                hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_offset + ps);
+                did_rewrite = true;
+            }
+        }
+
+        pkt_offset += ps;
+        
+    }
+
+    if did_rewrite {
+        log::debug!("[PREBUFFER] TS stream rewrite: msg {} buf range {}-{}, init_prefix + inline PAT/PMT",
+            message_id, buf_start, buf_start + buf.len() as u64 - 1);
+    }
+
+    did_rewrite
+}
 
 /// Drop-guard that untracks streaming when the Actix response ends
 /// (including client disconnect). Prevents cmd_delete_cache from
@@ -64,16 +297,64 @@ impl Drop for DownloadGuard {
 /// subsequent overlapping range requests find cached data instead of starting
 /// new downloads (fixes native video player backend overload).
 ///
-/// Key design: continuation tasks are NOT registered with the coordinator.
-/// They write to cache silently — new requests find their data via the
-/// fast-path cache check, not via coordinator subscription. This prevents
-/// the "subscribing to slow background task" problem where new requests
-/// wait for continuations that are throttled and slow.
+/// Key design: continuation tasks ARE registered with the coordinator so new
+/// player requests can discover and subscribe to them. Progress is broadcast
+/// via the coordinator's watch channel so subscribers know when data is
+/// available in cache. This prevents duplicate downloads and allows the
+/// continuation to skip throttling when a player is actively subscribed.
+/// Decide whether a continuation background download should be spawned.
+/// Returns (should_continue, remaining_bytes, continuation_start_offset, file_end_byte).
+///
+/// This is the pure logic extracted from ContinuationGuard::drop for testability.
+/// The decision depends on:
+/// - `total_file_size`: full file size (not just the request range end)
+/// - `start_byte`: where the HTTP request range started
+/// - `bytes_sent`: how many bytes were actually streamed before the response ended
+///
+/// The continuation downloads from `start_byte + bytes_sent` to `total_file_size - 1`,
+/// not just to the request's `end_byte`. This is critical for pre-buffer requests:
+/// after serving a 5MB range, we must continue downloading to the full file end
+/// so segments beyond the pre-buffer range can be served from cache.
+fn continuation_should_run(total_file_size: u64, start_byte: u64, bytes_sent: u64) -> (bool, u64, u64, u64) {
+    // Defensive: bail out if we can't calculate remaining meaningfully.
+    // total_file_size == 0 means unknown file size. If start_byte >=
+    // total_file_size, the range was beyond the file — no continuation.
+    if total_file_size == 0 || start_byte >= total_file_size {
+        return (false, 0, 0, 0);
+    }
+
+    // Calculate remaining bytes in the FILE (not just the request range).
+    // sent is always <= total_file_size - start_byte because we only
+    // stream data within [start_byte, total_file_size-1], so no underflow.
+    let remaining = (total_file_size - start_byte) - bytes_sent;
+
+    // Only continue if there's meaningful data left (>2MB) and
+    // the download wasn't trivially short. Small remaining data (<2MB)
+    // doesn't warrant a background task — it will be requested
+    // again quickly if needed, and spawning a task for <2MB
+    // creates coordinator noise without meaningful benefit.
+    if remaining < 2 * 1024 * 1024 || bytes_sent == 0 {
+        return (false, remaining, start_byte + bytes_sent, total_file_size - 1);
+    }
+
+    let current_offset = start_byte + bytes_sent;
+    let file_end = total_file_size - 1;
+    (true, remaining, current_offset, file_end)
+}
+
 struct ContinuationGuard {
     cache_mgr: Option<StreamCacheManager>,
     message_id: i32,
     start_byte: u64,
-    end_byte: u64,
+    /// End byte of the HTTP request range (e.g., 5242880 for a 5MB pre-buffer).
+    /// Used for coordinator registration matching.
+    request_end_byte: u64,
+    /// Total file size — the continuation downloads to this boundary,
+    /// not just to the request's end_byte. This is critical for
+    /// pre-buffer requests: after serving a 5MB range, we must
+    /// continue downloading to the full file end so segments beyond
+    /// the pre-buffer range can be served from cache.
+    total_file_size: u64,
     bytes_sent: Arc<AtomicU64>,
     /// Data needed to create a new iter_download for the continuation
     client: Option<Client>,
@@ -89,18 +370,13 @@ impl Drop for ContinuationGuard {
     fn drop(&mut self) {
         if let Some(ref cm) = self.cache_mgr {
             let sent = self.bytes_sent.load(Ordering::Relaxed);
-            let remaining = (self.end_byte - self.start_byte + 1) - sent;
-            // Only continue if there's meaningful data left (>2MB) and
-            // the download wasn't complete. Small remaining data (<2MB)
-            // doesn't warrant a background task — it will be requested
-            // again quickly if needed, and spawning a task for <2MB
-            // creates coordinator noise without meaningful benefit.
-            if remaining < 2 * 1024 * 1024 || sent == 0 {
+            let (should_continue, remaining, current_offset, file_end) =
+                continuation_should_run(self.total_file_size, self.start_byte, sent);
+
+            if !should_continue {
                 return;
             }
 
-            let current_offset = self.start_byte + sent;
-            let end_byte = self.end_byte;
             let msg_id = self.message_id;
             let cache_mgr_clone = cm.clone();
             let client_opt = self.client.take();
@@ -110,24 +386,45 @@ impl Drop for ContinuationGuard {
             let mime = self.mime_stream.clone();
             let semaphore = self.download_semaphore.clone();
             let limit_kb = self.speed_limit_kb;
-            let total_size = self.end_byte + 1;
+            let total_size = self.total_file_size; // For CacheMeta recovery
 
             log::info!(
-                "[CONTINUATION] Evaluating background download for msg {} range {}-{} (sent {}, remaining {})",
-                msg_id, current_offset, end_byte, sent, remaining
+                "[CONTINUATION] Evaluating background download for msg {} range {}-{} (request was {}-{}, sent {}, remaining {})",
+                msg_id, current_offset, file_end, self.start_byte, self.request_end_byte, sent, remaining
             );
 
             tokio::spawn(async move {
                 // CRITICAL: Check if there's a covering download already active.
-                // If another SEQUENTIAL download covers our remaining range, it
-                // will cache the data anyway — no need for a wasteful duplicate.
-                if cache_mgr_clone.find_best_covering_download(msg_id, current_offset, end_byte).await.is_some() {
+                // If another SEQUENTIAL download covers our continuation range,
+                // it will cache the data anyway — no need for a wasteful duplicate.
+                if cache_mgr_clone.find_best_covering_download(msg_id, current_offset, file_end).await.is_some() {
                     log::info!(
                         "[CONTINUATION] Skipping for msg {} — covering download exists, it will cache the data",
                         msg_id
                     );
                     return;
                 }
+
+                // Register continuation covering the ENTIRE file range (0→file_end),
+                // not just current_offset→file_end. This ensures that requests for
+                // segments that straddle the prebuffer→continuation boundary (e.g.
+                // seg 2 at 4997040-7495183 where prebuffer ended at 5242880) will
+                // find this download and subscribe to it. The continuation's
+                // progress_rx will show progress >= current_offset immediately,
+                // so subscribers will know bytes 0→current_offset are on disk.
+                let cont_register_start = 0u64;
+                // Register continuation with initial_progress=current_offset.
+                // This initializes the watch channel to current_offset (not 0),
+                // eliminating the race condition where subscribers read progress=0
+                // before the update_download_progress call broadcasts current_offset.
+                // Subscribers immediately see bytes 0→current_offset as on disk.
+                let registered = cache_mgr_clone.register_download(msg_id, cont_register_start, file_end, true, current_offset).await;
+                let cont_start_byte = if registered.is_some() { cont_register_start } else { current_offset };
+
+                // Note: No need for a separate update_download_progress call —
+                // the watch channel is already initialized with current_offset.
+                // The separate broadcast was causing a race condition where
+                // subscribers could read start_byte=0 before the update arrived.
 
                 let client = match client_opt {
                     Some(c) => c,
@@ -136,11 +433,6 @@ impl Drop for ContinuationGuard {
                         return;
                     }
                 };
-
-                // Continuation is NOT registered with the coordinator.
-                // It writes to cache silently — new requests find data via
-                // fast-path cache check, not coordinator subscription.
-                // This prevents "subscribing to slow background task" problem.
 
                 let chunks_to_skip = (current_offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
                 let bytes_to_discard = current_offset % TELEGRAM_CHUNK_SIZE as u64;
@@ -161,6 +453,7 @@ impl Drop for ContinuationGuard {
                 let mut offset = current_offset;
                 let mut first_chunk = true;
                 let mut bytes_total: u64 = 0;
+                let mut pending_ranges: Vec<(u64, u64)> = Vec::new(); // Batched meta save
                 let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
                 let mut iter = download_iter;
 
@@ -174,10 +467,13 @@ impl Drop for ContinuationGuard {
                     // Re-check covering download periodically — if a player-facing
                     // SEQUENTIAL download started and covers our range, stop the
                     // continuation (the player download will cache data faster).
+                    // Exclude continuation downloads (is_continuation flag) so we
+                    // don't find ourselves and loop infinitely.
                     if bytes_total > 0 && bytes_total % (4 * 1024 * 1024) == 0 {
-                        if cache_mgr_clone.find_best_covering_download(msg_id, offset, end_byte).await.is_some() {
+                        let covering = cache_mgr_clone.find_best_covering_download(msg_id, offset, file_end).await;
+                        if covering.is_some() && !covering.unwrap().is_continuation {
                             log::info!(
-                                "[CONTINUATION] Stopping for msg {} — covering download appeared at offset {}",
+                                "[CONTINUATION] Stopping for msg {} — player-facing covering download appeared at offset {}",
                                 msg_id, offset
                             );
                             break;
@@ -195,7 +491,7 @@ impl Drop for ContinuationGuard {
                                 first_chunk = false;
                             }
 
-                            let remaining_bytes = end_byte - offset + 1;
+                            let remaining_bytes = file_end - offset + 1;
                             let final_data = if chunk_data.len() as u64 > remaining_bytes {
                                 chunk_data[..remaining_bytes as usize].to_vec()
                             } else {
@@ -220,28 +516,34 @@ impl Drop for ContinuationGuard {
                                 let _ = cache_file.seek(SeekFrom::Start(offset));
                                 let _ = cache_file.write_all(&final_data);
 
-                                // Update meta
-                                let _lock = cache_mgr_clone.lock_meta(msg_id).await;
-                                let mut meta = match cache_mgr_clone.load_meta(msg_id) {
-                                    Some(m) => m,
-                                    None => {
-                                        log::warn!("[CONTINUATION] Meta missing for msg {}, creating recovery", msg_id);
-                                        CacheMeta {
-                                            message_id: msg_id,
-                                            folder_id,
-                                            total_size,
-                                            filename: filename.clone(),
-                                            cached_ranges: Vec::new(),
-                                            mime_type: mime.clone(),
+                                // Accumulate range for batched meta save.
+                                // Instead of saving meta on every chunk (expensive
+                                // sync_all + rename on Windows), accumulate ranges
+                                // and flush every 4MB to reduce I/O overhead.
+                                pending_ranges.push((offset, chunk_range_end));
+                                if pending_ranges.len() >= 8 || chunk_range_end >= file_end {
+                                    let _lock = cache_mgr_clone.lock_meta(msg_id).await;
+                                    let mut meta = match cache_mgr_clone.load_meta(msg_id) {
+                                        Some(m) => m,
+                                        None => {
+                                            log::warn!("[CONTINUATION] Meta missing for msg {}, creating recovery", msg_id);
+                                            CacheMeta {
+                                                message_id: msg_id,
+                                                folder_id,
+                                                total_size,
+                                                filename: filename.clone(),
+                                                cached_ranges: Vec::new(),
+                                                mime_type: mime.clone(),
+                                            }
                                         }
+                                    };
+                                    meta.cached_ranges.extend(pending_ranges.drain(..));
+                                    merge_ranges(&mut meta.cached_ranges);
+                                    if let Err(e) = cache_mgr_clone.save_meta(&meta) {
+                                        log::warn!("[CONTINUATION] Failed to save meta for msg {}: {}", msg_id, e);
                                     }
-                                };
-                                meta.cached_ranges.push((offset, chunk_range_end));
-                                merge_ranges(&mut meta.cached_ranges);
-                                if let Err(e) = cache_mgr_clone.save_meta(&meta) {
-                                    log::warn!("[CONTINUATION] Failed to save meta for msg {}: {}", msg_id, e);
+                                    drop(_lock);
                                 }
-                                drop(_lock);
                             } else {
                                 log::debug!("[CONTINUATION] Skipping cached range {}-{} for msg {}", offset, chunk_range_end, msg_id);
                             }
@@ -249,14 +551,21 @@ impl Drop for ContinuationGuard {
                             offset += bytes_in_chunk;
                             bytes_total += bytes_in_chunk;
 
-                            // Throttle
-                            if limit_kb > 0 {
+                            // Broadcast progress to coordinator so subscribed
+                            // player requests know data is available in cache.
+                            cache_mgr_clone.update_download_progress(msg_id, cont_start_byte, chunk_range_end).await;
+
+                            // Throttle only when no player is subscribed.
+                            // If the coordinator has subscribers watching our
+                            // progress channel, skip throttling — the player
+                            // needs data fast and is actively waiting.
+                            if limit_kb > 0 && registered.is_none() {
                                 let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
                                 let sleep_ms = sleep_ms.min(2000);
                                 tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                             }
 
-                            if chunk_range_end >= end_byte {
+                            if chunk_range_end >= file_end {
                                 log::info!("[CONTINUATION] Completed background download for msg {} up to offset {}", msg_id, offset);
                                 break;
                             }
@@ -272,6 +581,25 @@ impl Drop for ContinuationGuard {
                     }
                 }
                 log::info!("[CONTINUATION] Background task ended for msg {}, downloaded {} bytes, final offset {}", msg_id, bytes_total, offset);
+
+                // Flush any remaining pending meta ranges before unregister.
+                if !pending_ranges.is_empty() {
+                    let _lock = cache_mgr_clone.lock_meta(msg_id).await;
+                    let mut meta = cache_mgr_clone.load_meta(msg_id);
+                    if let Some(ref mut m) = meta {
+                        m.cached_ranges.extend(pending_ranges);
+                        merge_ranges(&mut m.cached_ranges);
+                        if let Err(e) = cache_mgr_clone.save_meta(m) {
+                            log::warn!("[CONTINUATION] Final meta flush failed for msg {}: {}", msg_id, e);
+                        }
+                    }
+                    drop(_lock);
+                }
+
+                // Unregister from coordinator so it doesn't show stale entries.
+                if registered.is_some() {
+                    cache_mgr_clone.unregister_download(msg_id, cont_start_byte, file_end).await;
+                }
             });
         }
     }
@@ -285,13 +613,18 @@ pub(crate) struct StreamTokenData {
 #[derive(serde::Deserialize)]
 pub(crate) struct StreamQuery {
     pub(crate) token: Option<String>,
+    /// When true, only serve data that is already cached on disk.
+    /// If the requested range is NOT cached, return 503 immediately —
+    /// no subscription to active downloads, no targeted download spawn.
+    /// Used by the TS keyframe scanner to avoid triggering scattered
+    /// targeted downloads at far-ahead byte offsets.
+    pub(crate) cached_only: Option<bool>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
 /// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
-const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 3;
 
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
@@ -527,7 +860,17 @@ async fn stream_media(
                     file.read_exact(&mut buf)?;
                     Ok(buf)
                 })() {
-                    Ok(slice) => {
+                    Ok(mut slice) => {
+                        // Rewrite init_prefix in the response if this range covers the
+                        // first bytes of a TS file. The init_prefix contains rewritten
+                        // PAT+PMT packets (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x0F)
+                        // that mediabunny's TS demuxer needs. Without rewriting, the raw
+                        // TS data has PMT PID 0x0FFF (null PID) which prevents demuxing.
+                        if let Some(ref cache_mgr) = **cache {
+                            let data_path = cache_mgr.data_path(message_id);
+                            rewrite_ts_stream_in_buf(&mut slice, start_byte, cache_mgr, message_id, Some(&data_path));
+                        }
+
                         log::info!("[PREBUFFER] HIT: msg {} range {}-{} served from disk cache",
                             message_id, start_byte, end_byte);
 
@@ -560,6 +903,20 @@ async fn stream_media(
         } else {
             log::info!("[PREBUFFER] MISS: msg {} no meta found", message_id);
         }
+    }
+
+    // === cached_only: Return 503 immediately for uncached ranges ===
+    // When the TS keyframe scanner sends cached_only=true, we skip all
+    // coordinator logic (subscription + targeted download spawn) and just
+    // tell the scanner "this range isn't cached yet, try later."
+    if query.cached_only.unwrap_or(false) {
+        log::info!("[PREBUFFER] CACHED_ONLY: msg {} range {}-{} not cached, returning 503",
+            message_id, start_byte, end_byte);
+        return HttpResponse::ServiceUnavailable()
+            .insert_header(("Retry-After", "5"))
+            .insert_header(("X-Reason", "cached-only-miss"))
+            .insert_header(("X-Cache", "MISS"))
+            .body("Range not cached — cached_only mode");
     }
 
     // === COORDINATOR: Check if an active SEQUENTIAL download already covers our range ===
@@ -665,6 +1022,9 @@ async fn stream_media(
                                         let mut buf = vec![0u8; read_len];
                                         match read_file.read_exact(&mut buf) {
                                             Ok(()) => {
+                                                // Rewrite init_prefix if this chunk covers the first bytes of a TS file
+                                                let data_path = cache_mgr_clone.data_path(subscriber_msg);
+                                                rewrite_ts_stream_in_buf(&mut buf, read_offset, &cache_mgr_clone, subscriber_msg, Some(&data_path));
                                                 bytes_remaining -= read_len as u64;
                                                 read_offset += read_len as u64;
                                                 yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
@@ -711,6 +1071,9 @@ async fn stream_media(
                     let mut buf = vec![0u8; chunk_size];
                     match read_file.read_exact(&mut buf) {
                         Ok(()) => {
+                            // Rewrite init_prefix if this chunk covers the first bytes of a TS file
+                            let data_path = cache_mgr_clone.data_path(subscriber_msg);
+                            rewrite_ts_stream_in_buf(&mut buf, read_offset, &cache_mgr_clone, subscriber_msg, Some(&data_path));
                             bytes_remaining -= chunk_size as u64;
                             read_offset += chunk_size as u64;
                             yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
@@ -906,7 +1269,16 @@ async fn stream_media(
                         }
 
                         bytes_sent += bytes_in_chunk;
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(final_data));
+
+                        // Rewrite PAT/PMT for TS files — same fix as SEQUENTIAL path
+                        let chunk_start_byte = current_offset;
+                        let mut yield_data = final_data;
+                        if let Some(ref cache_mgr) = cache_mgr_opt {
+                            let data_path = cache_mgr.data_path(message_id);
+                            rewrite_ts_stream_in_buf(&mut yield_data, chunk_start_byte, cache_mgr, message_id, Some(&data_path));
+                        }
+
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
 
                         // Throttle
                         let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
@@ -988,7 +1360,7 @@ async fn stream_media(
         // MAX_CONCURRENT_DOWNLOADS limit is reached (shouldn't happen since
         // we checked above), just proceed without registration.
         let _registered = if let Some(ref cm) = cache_mgr_for_stream {
-            cm.register_download(message_id, start_byte, end_byte).await.is_some()
+            cm.register_download(message_id, start_byte, end_byte, false, start_byte).await.is_some()
         } else {
             false
         };
@@ -1023,7 +1395,8 @@ async fn stream_media(
                 cache_mgr: cache_mgr_for_stream.clone(),
                 message_id,
                 start_byte,
-                end_byte,
+                request_end_byte: end_byte,
+                total_file_size: size,
                 bytes_sent: bytes_sent_atomic.clone(),
                 client: Some(client.clone()),
                 media: media.clone(),
@@ -1169,7 +1542,26 @@ async fn stream_media(
                     current_offset += bytes_in_chunk;
                     bytes_sent += bytes_in_chunk;
                     bytes_sent_atomic.store(bytes_sent, Ordering::Relaxed);
-                    yield Ok::<_, actix_web::Error>(web::Bytes::from(final_data));
+
+                    // Rewrite init_prefix and inline PAT/PMT if this chunk covers
+                    // TS file data. The HIT path already applies rewriting when
+                    // reading from cache, but the SEQUENTIAL (MISS) path downloads
+                    // raw data from Telegram and writes it to cache WITHOUT rewriting.
+                    // This means the raw data (with PMT PID 0x0FFF and stream_type 0x15)
+                    // reaches the client. Mediabunny can't parse stream_type 0x15
+                    // (AAC LATM), so the transmuxer fails to produce audio segments.
+                    // The fix: rewrite the chunk data BEFORE yielding to the client.
+                    // The cache file still stores raw data (for HIT path rewriting).
+                    // Note: rewrite_ts_stream_in_buf is safe on already-rewritten data
+                    // — it won't double-rewrite (patterns won't match on rewritten bytes).
+                    let chunk_start_byte = current_offset - bytes_in_chunk;
+                    let mut yield_data = final_data;
+                    if let Some(ref cache_mgr) = cache_mgr_opt {
+                        let data_path = cache_mgr.data_path(message_id);
+                        rewrite_ts_stream_in_buf(&mut yield_data, chunk_start_byte, cache_mgr, message_id, Some(&data_path));
+                    }
+
+                    yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
 
                     // Throttle: sleep after chunk release to enforce prebuffer speed limit
                     // Semaphore is already released (yield point), so download task can
@@ -1234,7 +1626,7 @@ pub async fn start_streaming_server(
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason"])
             .allow_private_network_access()
             .max_age(3600);
 
@@ -1286,7 +1678,7 @@ mod tests {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason"])
             .allow_private_network_access()
             .max_age(3600);
 
@@ -1330,7 +1722,7 @@ mod tests {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason"])
             .allow_private_network_access()
             .max_age(3600);
 
@@ -1365,7 +1757,7 @@ mod tests {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason"])
             .allow_private_network_access()
             .max_age(3600);
 
@@ -1393,5 +1785,179 @@ mod tests {
         assert!(lower.contains("content-range"), "Content-Range must be exposed");
         assert!(lower.contains("content-length"), "Content-Length must be exposed");
         assert!(lower.contains("accept-ranges"), "Accept-Ranges must be exposed");
+        assert!(lower.contains("x-reason"), "X-Reason must be exposed");
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::continuation_should_run;
+
+    // === continuation_should_run tests ===
+    // These test the pure decision logic extracted from ContinuationGuard::drop.
+    // The function decides whether a background continuation download should be
+    // spawned after the HTTP response ends, based on how much data remains
+    // in the file beyond what was already served.
+
+    /// Pre-buffer scenario: 5MB served on a 1.3GB file.
+    /// This is THE critical bug case — old logic used request end_byte (5242880)
+    /// instead of total_file_size (1313957192), so remaining=0 after serving
+    /// all 5MB, and no continuation was spawned. New logic correctly calculates
+    /// remaining ≈ 1.3GB and spawns continuation from byte 5242881 to file end.
+    #[test]
+    fn continuation_prebuffer_5mb_on_large_file() {
+        let total_file_size: u64 = 1_313_957_192; // 1.3GB .ts file
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 5_242_881; // 5MB pre-buffer served completely
+
+        let (should, remaining, offset, file_end) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(should, "5MB pre-buffer on 1.3GB file MUST trigger continuation");
+        assert_eq!(remaining, total_file_size - bytes_sent, "remaining = total - sent");
+        assert_eq!(offset, bytes_sent, "continuation starts at sent boundary");
+        assert_eq!(file_end, total_file_size - 1, "continuation downloads to file end");
+    }
+
+    /// Full file request completed: all bytes served, remaining=0, no continuation.
+    #[test]
+    fn continuation_full_file_completed() {
+        let total_file_size: u64 = 10_000_000;
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 10_000_000;
+
+        let (should, remaining, _, _) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(!should, "Full file served — no continuation needed");
+        assert_eq!(remaining, 0);
+    }
+
+    /// Mid-stream disconnect: client disconnects at 3MB of 1.3GB file.
+    /// Remaining ≈ 1.27GB > 2MB → continuation spawned from 3MB onwards.
+    #[test]
+    fn continuation_mid_stream_disconnect() {
+        let total_file_size: u64 = 1_313_957_192;
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 3_000_000;
+
+        let (should, remaining, offset, file_end) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(should, "Mid-stream disconnect must trigger continuation");
+        assert_eq!(remaining, total_file_size - bytes_sent);
+        assert_eq!(offset, bytes_sent);
+        assert_eq!(file_end, total_file_size - 1);
+    }
+
+    /// Zero bytes sent: trivially short download, don't spawn continuation.
+    #[test]
+    fn continuation_zero_bytes_sent() {
+        let (should, _, _, _) = continuation_should_run(1_000_000_000, 0, 0);
+        assert!(!should, "Zero bytes sent — no continuation");
+    }
+
+    /// Small remaining (<2MB): not worth spawning a background task.
+    #[test]
+    fn continuation_small_remaining() {
+        let total_file_size: u64 = 3_000_000; // 3MB file
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 1_500_000; // 1.5MB sent, 1.5MB remaining
+
+        let (should, remaining, _, _) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(!should, "Remaining <2MB — no continuation");
+        assert_eq!(remaining, 1_500_000);
+    }
+
+    /// Exactly 2MB remaining: boundary case — should continue (check is strict <).
+    #[test]
+    fn continuation_exactly_2mb_remaining() {
+        let two_mb = 2 * 1024 * 1024;
+        let total_file_size: u64 = two_mb + 5_000_000; // 7MB file
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 5_000_000; // 5MB sent, exactly 2MB remaining
+
+        let (should, remaining, _, _) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(should, "Exactly 2MB remaining passes the >=2MB threshold, so continuation is spawned");
+        assert_eq!(remaining, two_mb);
+    }
+
+    /// Just above 2MB remaining: should continue.
+    #[test]
+    fn continuation_just_above_2mb_remaining() {
+        let two_mb = 2 * 1024 * 1024;
+        let total_file_size: u64 = two_mb + 5_000_000 + 1;
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = 5_000_000;
+
+        let (should, remaining, _, _) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(should, "Remaining >2MB — should continue");
+        assert_eq!(remaining, two_mb + 1);
+    }
+
+    /// total_file_size == 0: defensive bail out.
+    #[test]
+    fn continuation_zero_file_size() {
+        let (should, remaining, _, _) = continuation_should_run(0, 0, 0);
+        assert!(!should, "Zero file size — bail out");
+        assert_eq!(remaining, 0);
+    }
+
+    /// start_byte >= total_file_size: range beyond file end, bail out.
+    #[test]
+    fn continuation_start_beyond_file() {
+        let (should, _, _, _) = continuation_should_run(1_000_000, 1_500_000, 0);
+        assert!(!should, "start_byte > total_file_size — bail out");
+    }
+
+    /// start_byte == total_file_size: exactly at end, bail out.
+    #[test]
+    fn continuation_start_at_file_end() {
+        let (should, _, _, _) = continuation_should_run(1_000_000, 1_000_000, 0);
+        assert!(!should, "start_byte == total_file_size — bail out");
+    }
+
+    /// Range request not starting at 0: pre-buffer was Range: bytes=1000000-6242880.
+    /// After serving 5242881 bytes, continuation starts at 1000000+5242881=6242881
+    /// and goes to file end.
+    #[test]
+    fn continuation_nonzero_start_byte() {
+        let total_file_size: u64 = 1_313_957_192;
+        let start_byte: u64 = 1_000_000;
+        let bytes_sent: u64 = 5_242_881;
+
+        let (should, remaining, offset, file_end) =
+            continuation_should_run(total_file_size, start_byte, bytes_sent);
+
+        assert!(should);
+        assert_eq!(remaining, total_file_size - start_byte - bytes_sent);
+        assert_eq!(offset, start_byte + bytes_sent);
+        assert_eq!(file_end, total_file_size - 1);
+    }
+
+    /// Old bug regression test: request end_byte was used instead of total_file_size.
+    /// Simulates the OLD behavior where remaining = (end_byte - start_byte + 1) - sent.
+    /// For pre-buffer (0-5242880, 5242881 sent), old remaining = 0 → no continuation.
+    /// New remaining = (total_file_size - start_byte) - sent ≈ 1.3GB → continuation.
+    #[test]
+    fn regression_old_remaining_vs_new_remaining() {
+        let total_file_size: u64 = 1_313_957_192;
+        let request_end_byte: u64 = 5_242_880;
+        let start_byte: u64 = 0;
+        let bytes_sent: u64 = request_end_byte + 1; // All 5MB served
+
+        // OLD calculation (bug): remaining = (end_byte - start_byte + 1) - sent = 0
+        let old_remaining = (request_end_byte - start_byte + 1) - bytes_sent;
+        assert_eq!(old_remaining, 0, "OLD: remaining = 0 after serving all pre-buffer → no continuation (BUG)");
+
+        // NEW calculation (fix): remaining = (total_file_size - start_byte) - sent ≈ 1.3GB
+        let (_, new_remaining, _, _) = continuation_should_run(total_file_size, start_byte, bytes_sent);
+        assert!(new_remaining > 2 * 1024 * 1024, "NEW: remaining >> 2MB → continuation spawned (FIXED)");
     }
 }

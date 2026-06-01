@@ -2,6 +2,17 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../types';
 import { SourceBufferWrapper } from '../lib/faststream/players/SourceBufferWrapper';
+import { detectFormat, type DetectedFormat } from '../lib/faststream/utils/FormatDetector';
+import { MediabunnyTransmuxer } from '../lib/faststream/players/MediabunnyTransmuxer';
+import { MuxJsTsTransmuxer } from '../lib/faststream/players/MuxJsTsTransmuxer';
+
+// Diagnostic logging helper — routes to both console and Rust backend terminal.
+// Critical for debugging MSE/transmuxer issues where browser console isn't visible.
+function diagLog(msg: string) {
+  console.log(msg);
+  invoke('cmd_log', { message: msg }).catch(() => {});
+}
+import { type TSKeyframeEntry } from '../lib/faststream/utils/TSByteOffsetScanner';
 
 /**
  * MSE (MediaSource Extensions) player hook using FastStream's approach.
@@ -53,15 +64,35 @@ export interface MSEGetters {
   getVideoTrackInfo: () => { trackId: number; codec: string } | null;
   getMP4BoxClass: () => any;
   getFileLength: () => number;
+  isTransmuxer: () => boolean;
+  getFormat: () => string; // 'mp4' | 'mkv' | 'ts' | 'unknown'
+  isTransmuxerActive: boolean; // State that triggers re-render when transmuxer initializes
+  keyframeIndexReady: boolean; // State that triggers re-render when keyframe index is built
+  getKeyframeTimestamps: () => number[]; // Cached keyframe timestamps for thumbnail pipeline
+  getKeyframeByteOffsets: () => TSKeyframeEntry[]; // Byte-offset index for OffsetCustomSource
+  getTsHeaderData: () => Uint8Array | null; // TS header (PAT/PMT) for OffsetCustomSource
+  getTransmuxerSourceConfig: () => { url: string; fileSize: number; headers?: Record<string, string> } | null;
 }
 
 const FRAGMENT_SIZES = [
-  512 * 1024,   // 512KB — fast first frame after seek
+  512 * 1024,   // 512KB — fast first frame after seek (MP4 moov discovery)
   1024 * 1024,  // 1MB
   2 * 1024 * 1024,  // 2MB
   4 * 1024 * 1024,  // 4MB
   8 * 1024 * 1024,  // 8MB — steady state, saturates bandwidth
 ];
+
+// TS format needs a larger initial prefetch because mediabunny's MpegTsDemuxer.readMetadata()
+// scans sequentially from byte 0 in 188-byte strides until ALL elementary streams are
+// initialized (PAT found, PMT found, video IDR keyframe with SPS data extracted). The seed
+// data serves reads within [0, seedLength] from memory (zero latency), bypassing HTTP
+// round-trip delays through the Tauri/WebView2 bridge (~0.5-1s per request). If the scan
+// goes beyond the seed boundary, each 188-byte read becomes a separate HTTP request through
+// the bridge, making the scan extremely slow (~64KB/s). 20MB ensures readMetadata() completes
+// within the seed for virtually all TS files (covers PAT/PMT, audio stream init, first video
+// IDR/SPS, plus ~30s of playback data). 5MB was insufficient — the first video IDR with SPS
+// data lay beyond 5MB on test files, forcing the demuxer into slow HTTP reads that hung init.
+const TS_INITIAL_PREFETCH = 20 * 1024 * 1024; // 20MB
 const MAX_BUFFER_BYTES = 50 * 1024 * 1024; // 50MB max buffer before eviction (Bug #16: reduced from 100MB)
 const BUFFER_KEEP_BEHIND = 30; // Keep 30s behind current playback position
 const MAX_BUFFER_AHEAD_SECONDS = 120; // Bug #16: backpressure — stop downloading when >2min buffered ahead
@@ -122,6 +153,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Tracks when moovBufferRef.current is set — needed for pipeline re-trigger
   // when moov is set AFTER thumbnailDataReady (faststarted files with moov beyond first chunk)
   const [moovBufferReady, setMoovBufferReady] = useState(false);
+  // State that becomes true when the transmuxer initializes — used as a
+  // dependency trigger so effects in useThumbnailExtractor re-run after
+  // transmuxer init (refs don't cause re-renders, but state does).
+  const [isTransmuxerActive, setIsTransmuxerActive] = useState(false);
+  // State that becomes true when the keyframe index finishes building —
+  // triggers a re-render so thumbnail pipeline can pick up the index.
+  const [keyframeIndexReady, setKeyframeIndexReady] = useState(false);
   const isCompleteRef = useRef(false);
   // Once the download loop reaches fileLength, the backend has all data cached.
   // This ref never resets — even if a backward seek resets isComplete=false,
@@ -142,12 +180,57 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // so rapid clicks/arrow-key skips only trigger the LAST position, reducing wasteful
   // overlapping downloads on unbuffered parts
   const seekDebounceTimerRef = useRef<number | null>(null);
-  const SEEK_DEBOUNCE_MS = 500; // 500ms debounce for unbuffered seeks — prevents overlapping downloads from rapid arrow-key spam while still feeling responsive
+  const SEEK_DEBOUNCE_MS = 500; // MP4/MKV — 500ms debounce for unbuffered seeks
+  const SEEK_DEBOUNCE_MS_TS = 2000; // TS format — longer debounce because getKeyPacket is slow (prevent concurrent seeks during drag)
   // Track when the last unbuffered seek was actually executed (instant or debounce expired).
   // The FIRST seek is instant; subsequent seeks within SEEK_DEBOUNCE_MS are debounced.
   const lastSeekTimeRef = useRef<number>(0);
+  // Whether a transmuxer seek (seekTo + resetForSeek) is currently in progress.
+  // Prevents starting a new seek while the previous one is still running getKeyPacket
+  // (8-18s for TS). Without this, the debounce resets when the seek STARTS, so
+  // subsequent seeks during a long-running getKeyPacket pass the debounce check
+  // and start concurrently — wasting bandwidth and coordinator slots.
+  const transmuxerSeekInProgressRef = useRef(false);
   // Downloaded byte ranges — merged and converted to time for green buffer bar
   const downloadedRangesRef = useRef<[number, number][]>([]);
+  // Transmuxer for TS/MKV format playback (null when not active)
+  const transmuxerInitInProgressRef = useRef(false);
+  const transmuxerRef = useRef<MediabunnyTransmuxer | MuxJsTsTransmuxer | null>(null);
+  // MSE initialization timeout ref — stored so we can clear it when init
+  // succeeds (prevents the timeout from triggering fallback after a slow
+  // but successful transmuxer init). For TS/MKV files, transmuxer init
+  // can take 20+ seconds (downloading + parsing), so the timeout checks
+  // transmuxerInitInProgressRef and extends itself if still initializing.
+  const initTimeoutRef = useRef<number | null>(null);
+  // Seek offset for transmuxer progress tracking: 0 during initial playback,
+  // seekTime after a seek. Transmuxer timestamps are relative (start from 0)
+  // after trim, so we add this offset to get the absolute file position.
+  const seekOffsetRef = useRef(0);
+  // When true, onInitSegment/onMediaSegment buffer data instead of appending.
+  // Used during transmuxer seek — segments must be buffered until
+  // setTimestampOffset() is called (which clears the SB queue).
+  const bufferingForSeekRef = useRef(false);
+  const seekBufferRef = useRef<Array<{ type: 'init' | 'media'; data: ArrayBuffer; timestamp?: number }>>([]);
+  // Refill mechanism: after a limited seek (30s of data), monitor the buffer
+  // and trigger refill seeks when buffer ahead drops below threshold.
+  const refillTimerRef = useRef<number | null>(null);
+  const refillInProgressRef = useRef(false);
+  // Streaming chain generation — incremented when chain is stopped/started
+  // so ongoing async refills can bail out if superseded by a new seek.
+  const streamingChainGenRef = useRef(0);
+  // Tracks the keyframe timestamp of the last refill seekTo. When a refill
+  // finds the same keyframe as the previous refill (no new data progress),
+  // it means we've reached EOF — the chain should stop and call endOfStream.
+  const lastRefillKeyframeRef = useRef<number | null>(null);
+  // Counter for consecutive noProgress detections. Requires 2+ consecutive
+  // same-keyframe refills before declaring EOF — prevents cutting off the
+  // last few seconds when a large keyframe interval near EOF causes the
+  // refill position to map back to the same keyframe (e.g., last keyframe
+  // at 2066.66s but duration is 2073.2s — one noProgress is normal, two
+  // means we're truly stuck at the last keyframe).
+  const consecutiveNoProgressRef = useRef(0);
+  // Detected file format (stored for MSEGetters — thumbnail pipeline needs it)
+  const formatRef = useRef<DetectedFormat>('unknown');
   // Cached init segments (codec config) — re-appended after each SourceBuffer clear
   const initSegmentsRef = useRef<Array<{ id: number; buffer: ArrayBuffer }>>([]);
   // Cached moov buffer + fileStart for thumbnail mini-MSE pipeline
@@ -262,6 +345,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
   }, [file, activeFolderId]);
 
+  // Ref for flushRangeReport — prevents MSE effect from re-running when
+  // file/activeFolderId change identity (which changes flushRangeReport's
+  // useCallback identity). The MSE player must NOT restart mid-playback just
+  // because the range report callback got a new reference. Using a ref ensures
+  // cleanup always calls the latest function without triggering a re-init.
+  const flushRangeReportRef = useRef(flushRangeReport);
+  flushRangeReportRef.current = flushRangeReport;
+
   // Track downloaded byte ranges for the green buffer bar.
   // Converts byte ranges to time ranges using the duration/fileLength ratio.
   const trackDownloadedRange = useCallback((byteStart: number, byteEnd: number) => {
@@ -300,6 +391,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
     prevUrlRef.current = streamUrl;
     cancelledRef.current = false;
+    transmuxerInitInProgressRef.current = false;
     setUseNative(false);
     setUnsupportedCodec(null);
 
@@ -341,6 +433,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     setMseUrl(null);
 
     // Try MSE first
+    diagLog(`[MSE] Initializing MSE player for streamUrl=${streamUrl}, file=${file?.name}`);
     let blobUrl: string | null = null;
     try {
       const mediaSource = new MediaSource();
@@ -351,18 +444,42 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       const onSourceOpen = () => {
         if (cancelledRef.current) return;
+        diagLog('[MSE] sourceopen event fired — starting format detection and player init');
         initMP4Box(streamUrl, mediaSource, blobUrl!);
       };
 
       mediaSource.addEventListener('sourceopen', onSourceOpen, { once: true });
 
-      // Timeout for MSE initialization (20s to allow fetching moov atom)
-      setTimeout(() => {
-        if (!state.current.initialized && !cancelledRef.current) {
-          setError('MSE initialization timeout');
-          setUseNative(true);
+      // Timeout for MSE initialization. For MP4 files, 20s is enough to
+      // fetch the moov atom. For TS/MKV files, transmuxer init can take
+      // 20+ seconds (downloading + parsing), so the timeout checks
+      // transmuxerInitInProgressRef and extends itself by 20s if the
+      // transmuxer is still initializing, up to a maximum of 60s total.
+      const MSE_INIT_TIMEOUT_MS = 20000;
+      const MSE_INIT_MAX_TIMEOUT_MS = 60000;
+      let timeoutElapsed = 0;
+      const checkInitTimeout = () => {
+        if (state.current.initialized || cancelledRef.current) {
+          // Init succeeded or cancelled — no need for timeout
+          initTimeoutRef.current = null;
+          return;
         }
-      }, 20000);
+        timeoutElapsed += MSE_INIT_TIMEOUT_MS;
+        if (transmuxerInitInProgressRef.current && timeoutElapsed < MSE_INIT_MAX_TIMEOUT_MS) {
+          // Transmuxer still initializing — extend timeout instead of
+          // triggering fallback (changing v.src closes MediaSource before
+          // addSourceBuffer completes, causing InvalidStateError)
+          console.log(`[MSE] Init timeout check: transmuxer still initializing (${timeoutElapsed / 1000}s elapsed) — extending timeout`);
+          initTimeoutRef.current = window.setTimeout(checkInitTimeout, MSE_INIT_TIMEOUT_MS);
+          return;
+        }
+        // Truly timed out — no transmuxer init in progress or max timeout reached
+        console.error(`[MSE] Initialization timeout (${timeoutElapsed / 1000}s) — falling back to native playback`);
+        setError('MSE initialization timeout');
+        setUseNative(true);
+        initTimeoutRef.current = null;
+      };
+      initTimeoutRef.current = window.setTimeout(checkInitTimeout, MSE_INIT_TIMEOUT_MS);
     } catch (e) {
       setError('MediaSource not supported');
       setUseNative(true);
@@ -370,19 +487,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     return () => {
       cancelledRef.current = true;
+      // Clear MSE init timeout
+      if (initTimeoutRef.current !== null) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
       // Clear seek debounce timer
       if (seekDebounceTimerRef.current !== null) {
         clearTimeout(seekDebounceTimerRef.current);
         seekDebounceTimerRef.current = null;
       }
+      // Stop streaming chain
+      stopStreamingChain();
+      refillInProgressRef.current = false;
+      transmuxerSeekInProgressRef.current = false;
       // Flush remaining range reports before cleanup
-      flushRangeReport();
+      flushRangeReportRef.current();
       // Revoke blob URL on cleanup
       if (blobUrl) {
         URL.revokeObjectURL(blobUrl);
       }
     };
-  }, [streamUrl, flushRangeReport]);
+  }, [streamUrl]);
 
   const cleanup = () => {
     abortRef.current?.abort();
@@ -394,8 +520,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     state.current.audioSourceBuffer?.destroy();
     state.current.videoSourceBuffer = null;
     state.current.audioSourceBuffer = null;
+    if (transmuxerRef.current) {
+      transmuxerRef.current.dispose();
+      transmuxerRef.current = null;
+    }
+    seekOffsetRef.current = 0;
+    bufferingForSeekRef.current = false;
+    seekBufferRef.current = [];
+    stopStreamingChain();
+    refillInProgressRef.current = false;
     state.current.mp4box = null;
     state.current.initialized = false;
+    setIsTransmuxerActive(false);
     clearDownloadedRanges();
   };
 
@@ -414,6 +550,310 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
     }
     return totalAhead;
+  };
+
+  /** Refill mechanism for transmuxer playback.
+   *  After a limited seek, continuously stream data until buffer is sufficient.
+   *  The streaming chain triggers the first refill immediately after the initial
+   *  seek completes (no timer delay), then chains subsequent refills as needed
+   *  until buffer ahead >= REFILL_THRESHOLD_SECONDS. */
+  // immediately after the initial seek (no timer delay), then chains
+  // subsequent refills as needed until buffer ahead >= threshold.
+  const REFILL_THRESHOLD_SECONDS = 15;
+  // Smaller chunks (5s) produce faster refills: iteration covers less cold
+  // data, and overlap filter skips less cached data. With minimumFragmentDuration=0.5,
+  // each 5s chunk produces ~10 segments for smooth MSE streaming.
+  const REFILL_CHUNK_DURATION = 5;
+  // Initial user seek produces enough data for smooth playback start.
+  // 10s provides sufficient runway for the first cold refill (which takes
+  // 5-7s downloading new clusters), preventing playback stalls. The extra
+  // iteration time (~2ms cached, ~1-2s cold) is negligible compared to
+  // getKeyPacket time (5-12s). Also enables reaching 15s threshold in
+  // just 1 refill cycle for cached scenarios (overlap filter skips fewer
+  // segments relative to the larger initial buffer).
+  const INITIAL_SEEK_DURATION = 15;
+  // Maximum maxDuration for refill seeks. Capped to prevent excessive
+  // iteration when video plays far past seekOffsetRef.current. When
+  // (video.currentTime - seekOffset) + ahead + REFILL_CHUNK_DURATION
+  // exceeds this cap, the Output only produces data up to seekOffset + cap,
+  // which may be insufficient — but the chain will immediately trigger
+  // another refill. This prevents single refill iterations from taking
+  // 10+ seconds on cold data far from the cached region.
+  const REFILL_MAX_DURATION_CAP = 25;
+
+  /** Start the streaming chain: triggers first refill immediately, then chains
+   *  subsequent refills until buffer ahead >= REFILL_THRESHOLD_SECONDS.
+   *  Replaces the old refill timer (1s interval polling). */
+  const startStreamingChain = () => {
+    stopStreamingChain(); // Clear any existing chain
+    streamingChainGenRef.current++;
+    // Reset EOF tracking — new chain starts fresh
+    lastRefillKeyframeRef.current = null;
+    consecutiveNoProgressRef.current = 0;
+    console.log('[MSE] Starting streaming chain for transmuxer playback');
+    // Trigger first refill immediately — no timer delay
+    executeStreamingRefill();
+  };
+
+  const stopStreamingChain = () => {
+    streamingChainGenRef.current++;
+    refillTimerRef.current = null;
+    refillInProgressRef.current = false;
+    // Abort ongoing refill iteration in MediabunnyTransmuxer
+    transmuxerRef.current?.abortSeek();
+    console.log('[MSE] Streaming chain stopped');
+  };
+
+  /** Execute a streaming refill — continuation or discontinuity mode.
+   *  Continuation: keyframeTimestamp matches seekOffsetRef.current → skip init segment
+   *    and setTimestampOffset, append media segments directly. Faster because:
+   *    - No init segment production (Output callbacks skip ftyp+moov)
+   *    - No setTimestampOffset call (SourceBuffer queue stays intact)
+   *    - No SourceBuffer abort/reset (data flows directly)
+   *  Discontinuity: keyframeTimestamp differs → full approach (init segment +
+   *    setTimestampOffset + flush all buffered segments).
+   *
+   *  After each refill completes, checks if buffer ahead is still below threshold
+   *  and chains another refill immediately (no timer delay). This creates a
+   *  continuous streaming loop until buffer is sufficient. */
+  const executeStreamingRefill = async () => {
+    if (refillInProgressRef.current) return;
+    refillInProgressRef.current = true;
+    const chainGeneration = streamingChainGenRef.current;
+
+    try {
+      const video = videoRef.current;
+      const transmuxer = transmuxerRef.current;
+      const sb = state.current.videoSourceBuffer;
+      if (!video || !transmuxer || !sb || video.ended || sb.hasFatalError) {
+        refillInProgressRef.current = false;
+        return;
+      }
+
+      // Always seek from buffer end (discontinuity mode).
+      // Previous approach (continuation from seekOffsetRef.current) re-iterated
+      // the same data range, causing the overlap filter to skip more data each
+      // cycle while the buffer shrunk instead of growing. Discontinuity mode
+      // always produces fresh data beyond the buffer end, guaranteeing net
+      // positive buffer growth per cycle.
+      //
+      // Discontinuity mode: seek to buffer end, find nearest keyframe, produce
+      // data from keyframe onward with setTimestampOffset. The SourceBuffer
+      // merges the new data with existing buffer. getKeyPacket for cached data
+      // is fast (~1-2ms), making the setTimestampOffset overhead negligible.
+      const ahead = getBufferedAheadSeconds();
+      const refillPosition = video.currentTime + ahead;
+
+      // maxDuration covers from keyframeTimestamp to (refillPosition + REFILL_CHUNK_DURATION).
+      // Since the keyframe can be up to ~12s before refillPosition (keyframe interval),
+      // we add 12 as a conservative estimate. Capped at REFILL_MAX_DURATION_CAP.
+      const maxDuration = Math.min(REFILL_CHUNK_DURATION + 12, REFILL_MAX_DURATION_CAP);
+
+      // Always skip init segment for refills — SourceBuffer already has it from
+      // the initial seek. Producing a new init segment is wasteful and causes
+      // MSE codec re-initialization overhead.
+      const skipInit = true;
+
+      // Enable buffering mode for the refill seek
+      bufferingForSeekRef.current = true;
+      seekBufferRef.current = [];
+
+      // seekTo creates a fresh Input with the persistent TauriStreamSource,
+      // guaranteeing a clean demuxer state that can iterate from any position.
+      const keyframeTimestamp = await transmuxer.seekTo(refillPosition, maxDuration, { skipInitSegment: skipInit });
+
+      // Bail out if chain was stopped while we were waiting for seekTo.
+      // CRITICAL: do NOT clear bufferingForSeekRef or seekBufferRef when the
+      // generation is stale — a new seek handler may have already set these
+      // refs for its own use. Clearing them would cause the new seek's
+      // segments to be appended directly with wrong timestampOffset (the
+      // refill's async abort undoes the new seek's synchronous setup).
+      if (chainGeneration !== streamingChainGenRef.current) {
+        refillInProgressRef.current = false;
+        return;
+      }
+
+      // Disable buffering mode
+      bufferingForSeekRef.current = false;
+
+      // EOF detection: when a refill finds the same keyframe as the previous
+      // refill (no new data progress), or when refillPosition is close to the
+      // end of the file, we've reached EOF. Stop the chain and signal
+      // endOfStream to the browser so it fires the 'ended' event and shows
+      // the replay overlay. Without this, the refill loops infinitely at EOF
+      // producing the same tiny data while buffer shrinks, and video.ended
+      // never becomes true.
+      //
+      // noProgress requires 2+ consecutive same-keyframe detections to avoid
+      // cutting off the last few seconds when a large keyframe interval near
+      // EOF causes the refill position to map back to the same keyframe once
+      // (normal behavior — the next refill should progress past it). Only
+      // after 2+ consecutive same-keyframes do we declare true EOF.
+      //
+      // nearEOF uses a dynamic threshold based on keyframe index when available:
+      // duration - (estimated keyframe interval). If no index, falls back to
+      // duration - 5 (conservative default). This prevents triggering too early
+      // when the last keyframe is several seconds before duration end.
+      const duration = state.current.duration;
+      const keyframeIndex = transmuxerRef.current?.getKeyframeTimestamps();
+      // Estimate keyframe interval from index (average gap between last 5 keyframes)
+      let estimatedKeyframeInterval = 5; // conservative default
+      if (keyframeIndex && keyframeIndex.length >= 6) {
+        const last5 = keyframeIndex.slice(-6);
+        const avgGap = (last5[last5.length - 1] - last5[0]) / (last5.length - 1);
+        estimatedKeyframeInterval = Math.max(avgGap, 2); // at least 2s
+      }
+      const isNearEOF = refillPosition >= duration - estimatedKeyframeInterval;
+      const isNoProgress = keyframeTimestamp !== null &&
+        lastRefillKeyframeRef.current !== null &&
+        Math.abs(keyframeTimestamp - lastRefillKeyframeRef.current) < 0.1;
+      if (isNoProgress) {
+        consecutiveNoProgressRef.current++;
+      } else {
+        consecutiveNoProgressRef.current = 0;
+      }
+      // Require 2+ consecutive noProgress OR nearEOF with at least 1 noProgress
+      const isConfirmedEOF = (consecutiveNoProgressRef.current >= 2) ||
+        (isNearEOF && consecutiveNoProgressRef.current >= 1);
+      if (isConfirmedEOF && keyframeTimestamp !== null) {
+        console.log(`[MSE] EOF detected: nearEOF=${isNearEOF} (pos=${refillPosition.toFixed(1)}s, dur=${duration.toFixed(1)}s, keyframeInterval=${estimatedKeyframeInterval.toFixed(1)}s), noProgress=${isNoProgress} (consecutive=${consecutiveNoProgressRef.current}, keyframe=${keyframeTimestamp.toFixed(2)}s, last=${lastRefillKeyframeRef.current?.toFixed(2)}s) — ending stream`);
+        // Mark completion so the near-end seek guard works
+        hasEverCompletedRef.current = true;
+        // Process the last refill's segments before ending stream
+        evictOldBuffer();
+        // TS format: timestampOffset=0 (keepOriginalTimestamps:true, absolute timestamps)
+        // MKV format: timestampOffset=keyframeTimestamp (keepOriginalTimestamps:false, normalized)
+        const isTsFormat = formatRef.current === 'ts';
+        const tsOffset = isTsFormat ? 0 : keyframeTimestamp;
+        seekOffsetRef.current = tsOffset;
+        await sb.setTimestampOffset(tsOffset);
+        const buffer = seekBufferRef.current;
+        seekBufferRef.current = [];
+        let segmentCount = 0;
+        for (const item of buffer) {
+          if (item.type === 'media') {
+            sb.appendBuffer(item.data);
+            segmentCount++;
+          }
+        }
+        console.log(`[MSE] EOF final refill: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${segmentCount} segments`);
+        await sb.waitForQueueDrain();
+        // Signal end of stream to the browser
+        const ms = state.current.mediaSource;
+        if (ms && ms.readyState === 'open') {
+          try { ms.endOfStream(); console.log('[MSE] endOfStream called at EOF'); } catch (e) { console.warn('[MSE] endOfStream failed:', e); }
+        }
+        setIsComplete(true);
+        isCompleteRef.current = true;
+        refillInProgressRef.current = false;
+        // Don't chain any more refills — the stream is ended
+        return;
+      }
+      // Update last refill keyframe for progress tracking
+      if (keyframeTimestamp !== null) {
+        lastRefillKeyframeRef.current = keyframeTimestamp;
+      }
+
+      if (keyframeTimestamp !== null) {
+        // Discontinuity refill: set timestampOffset and flush buffered segments.
+        // TS format: timestampOffset=0 (keepOriginalTimestamps:true → absolute timestamps)
+        // MKV format: timestampOffset=keyframeTimestamp (keepOriginalTimestamps:false → normalized)
+        evictOldBuffer();
+        const isTsFormat = formatRef.current === 'ts';
+        const tsOffset = isTsFormat ? 0 : keyframeTimestamp;
+        seekOffsetRef.current = tsOffset;
+        await sb.setTimestampOffset(tsOffset);
+
+        const buffer = seekBufferRef.current;
+        seekBufferRef.current = [];
+        let segmentCount = 0;
+        for (const item of buffer) {
+          if (item.type === 'media') {
+            sb.appendBuffer(item.data);
+            segmentCount++;
+            // Progress tracking
+            const absoluteTimestamp = item.timestamp! + seekOffsetRef.current;
+            if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.fileLength > 0) {
+              const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+              setPrefetchedBytes(estimatedBytes);
+              trackDownloadedRange(estimatedBytes, estimatedBytes + item.data.byteLength);
+            }
+          }
+        }
+
+        console.log(`[MSE] Discontinuity refill: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${segmentCount} segments`);
+        await sb.waitForQueueDrain();
+
+        // Update keyframeIndexReady if the transmuxer's partial index became available
+        // during this seek (incremental timestamps from refill seeks). This triggers
+        // the thumbnail pipeline to use the index.
+        if (!keyframeIndexReady && transmuxer.isKeyframeIndexReady()) {
+          setKeyframeIndexReady(true);
+        }
+      } else {
+        // Refill failed — discard buffered segments
+        seekBufferRef.current = [];
+        console.warn('[MSE] Streaming refill failed');
+      }
+    } catch (e) {
+      // Only clear bufferingForSeekRef if this refill's generation is still
+      // the active one. If the generation is stale (a new seek started),
+      // the new seek handler owns these refs and we must not interfere.
+      if (chainGeneration === streamingChainGenRef.current) {
+        bufferingForSeekRef.current = false;
+        seekBufferRef.current = [];
+      }
+      console.error('[MSE] Streaming refill error:', e);
+    } finally {
+      refillInProgressRef.current = false;
+
+      // Don't chain if this refill's generation is stale (chain was stopped/restarted)
+      if (chainGeneration !== streamingChainGenRef.current) return;
+
+      // Continuous buffer monitoring: always schedule a re-check after this refill.
+      // When buffer is low (< threshold), re-check immediately (0ms delay).
+      // When buffer is sufficient (>= threshold), use adaptive delay:
+      //   delay = min(5000, max(2000, (ahead - threshold) * 200))
+      //   This gives 2s at threshold, 4.5s at 25s ahead, 5s at 40s+ ahead.
+      //   Prevents buffer growing beyond 30-40s by reducing refill frequency
+      //   when buffer is large.
+      // This ensures the chain never fully stops — it continuously monitors
+      // buffer health and refills when the video consumes enough data.
+      // Without this, the chain stops when buffer reaches threshold, and
+      // the video stalls when the initial buffer runs out (no re-trigger).
+      const video = videoRef.current;
+      const transmuxer = transmuxerRef.current;
+      const sb = state.current.videoSourceBuffer;
+      if (video && transmuxer && sb && !video.ended && !sb.hasFatalError && !isCompleteRef.current) {
+        const ahead = getBufferedAheadSeconds();
+        // Hard cap on buffer ahead: skip refills entirely when > 30s ahead.
+        // Prevents buffer from growing excessively (e.g., 62.9s ahead for TS)
+        // which wastes bandwidth, risks QuotaExceededError, and slows seeks
+        // because more data needs to be evicted.
+        const MAX_BUFFER_AHEAD = 30;
+        if (ahead >= MAX_BUFFER_AHEAD) {
+          console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s exceeds hard cap ${MAX_BUFFER_AHEAD}s — sleeping 2000ms before re-check`);
+          setTimeout(() => {
+            if (streamingChainGenRef.current === chainGeneration) {
+              executeStreamingRefill();
+            }
+          }, 2000);
+        } else {
+          const delay = ahead < REFILL_THRESHOLD_SECONDS ? 0 : Math.min(5000, Math.max(2000, Math.floor((ahead - REFILL_THRESHOLD_SECONDS) * 200)));
+          if (delay === 0) {
+            console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s below threshold ${REFILL_THRESHOLD_SECONDS}s — chaining next refill immediately`);
+          } else {
+            console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s sufficient — sleeping ${delay}ms before re-check`);
+          }
+          setTimeout(() => {
+            // Re-check generation before executing — chain may have been stopped
+            if (streamingChainGenRef.current === chainGeneration) {
+              executeStreamingRefill();
+            }
+          }, delay);
+        }
+      }
+    }
   };
 
   /** Remove buffered data older than (currentTime - BUFFER_KEEP_BEHIND) when buffer is too large.
@@ -518,17 +958,68 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
       }
 
-      const data = await response.arrayBuffer();
+      let data = await response.arrayBuffer();
       if (cancelledRef.current) return;
 
-      // Check if it's a valid MP4 (starts with ftyp box)
-      const view = new DataView(data);
-      const boxType = String.fromCharCode(view.getUint8(4), view.getUint8(5), view.getUint8(6), view.getUint8(7));
+      // Diagnostic: dump first 16 bytes to help debug format detection
+      const firstBytes = new Uint8Array(data.slice(0, 16));
+      const hexDump = Array.from(firstBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+      diagLog(`[MSE] First 16 bytes: ${hexDump} (format detection input)`);
+      diagLog(`[MSE] Filename for format detection: ${file?.name ?? 'null'}`);
 
-      if (boxType !== 'ftyp' && boxType !== 'jP  ') {
+      // Detect file format from first bytes
+      const format = detectFormat(data, file?.name);
+      formatRef.current = format;
+      diagLog(`[MSE] detectFormat result: ${format}`);
+
+      if (format === 'unknown') {
+        diagLog('[MSE] Unknown format — falling back to native playback');
         setUseNative(true);
         return;
       }
+
+      if (format === 'ts') {
+        // TS format with mux.js — push-based, no large prefetch needed.
+        // mux.js processes data on-the-fly: push first chunk → get init + media segments.
+        // No sequential scan, no 20MB seed requirement like mediabunny.
+        diagLog(`[MSE] ts: mux.js push-based — using initial chunk (${data.byteLength} bytes), no extra prefetch`);
+      } else if (format === 'mkv' || format === 'webm') {
+        // MKV/WebM formats need a larger initial prefetch because mediabunny's
+        // Input reads progressively during init (canRead + track discovery +
+        // codec extraction). With only 512KB cached, reads beyond that trigger
+        // slow 64KB/s MISS downloads from Telegram. Fetch additional data up
+        // to TS_INITIAL_PREFETCH so the transmuxer init completes within
+        // cached territory.
+        if (data.byteLength < TS_INITIAL_PREFETCH && state.current.fileLength > TS_INITIAL_PREFETCH) {
+          diagLog(`[MSE] ${format}: fetching additional prefetch data (${data.byteLength} → ${TS_INITIAL_PREFETCH} bytes)`);
+          try {
+            const extraResponse = await fetch(url, {
+              headers: { Range: `bytes=${data.byteLength}-${TS_INITIAL_PREFETCH - 1}` },
+            });
+            if (extraResponse.ok || extraResponse.status === 206) {
+              const extraData = await extraResponse.arrayBuffer();
+              if (!cancelledRef.current) {
+                // Merge first chunk + extra data into one contiguous buffer
+                const merged = new Uint8Array(data.byteLength + extraData.byteLength);
+                merged.set(new Uint8Array(data), 0);
+                merged.set(new Uint8Array(extraData), data.byteLength);
+                data = merged.buffer; // Replace data with merged buffer so seedData covers full prefetch
+                diagLog(`[MSE] ${format}: prefetch complete, ${data.byteLength} bytes cached`);
+              }
+            }
+          } catch (e: any) {
+            diagLog(`[MSE] ${format}: extra prefetch failed (${e.message}), proceeding with ${data.byteLength} bytes`);
+          }
+        }
+      }
+
+      // Common path for both TS (mux.js) and MKV/WebM (mediabunny)
+      diagLog(`[MSE] Detected ${format} format — initializing transmuxer, fileLength=${state.current.fileLength}`);
+      await initTransmuxerPlayer(url, mediaSource, blobUrl!, format, data);
+      return;
+
+      // MP4 format — proceed with MP4Box.js
+      console.log('[MSE] Detected MP4 format — proceeding with MP4Box.js');
 
       // Report initial chunk range to cache backend (even if we don't feed to mp4box yet)
       reportRangesToBackend(0, firstChunkSize - 1);
@@ -550,7 +1041,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // onMP4BoxReady fires (when we know the exact moov offset/size from mp4box).
         const moovExtract = extractMoovFromForwardScan(data);
         if (moovExtract) {
-          moovBufferRef.current = { buffer: moovExtract.data, fileStart: moovExtract.fileStart };
+          moovBufferRef.current = { buffer: moovExtract!.data, fileStart: moovExtract!.fileStart };
           setMoovBufferReady(true);
           console.log('[MSE] Moov extracted from first chunk for thumbnail pipeline');
         } else {
@@ -594,6 +1085,470 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     } catch (e: any) {
       console.error('[MSE] Setup failed:', e);
       if (!cancelledRef.current) {
+        diagLog(`[MSE] Setup failed: ${e.message} — falling back to native`);
+        setUseNative(true);
+      }
+    }
+  };
+
+  /** Initialize the transmuxer player for TS/MKV files.
+   *  Uses Mediabunny to demux the input and remux to fMP4/WebM segments for MSE. */
+  const initTransmuxerPlayer = async (url: string, mediaSource: MediaSource, _blobUrl: string, format: DetectedFormat, firstChunkData: ArrayBuffer) => {
+    diagLog(`[MSE] initTransmuxerPlayer: format=${format}, seedData=${firstChunkData.byteLength} bytes (${(firstChunkData.byteLength/1024/1024).toFixed(1)}MB)`);
+    let muxJsMediaSegmentCount = 0;
+    try {
+      // TS format: use mux.js (push-based, instant init, no sequential scan)
+      // MKV/WebM format: use mediabunny (works well, no changes needed)
+      if (format === 'ts') {
+        const muxTsTransmuxer = new MuxJsTsTransmuxer({
+          url,
+          fileSize: state.current.fileLength,
+          firstChunkData,
+          onInitSegment: (data: ArrayBuffer) => {
+            if (cancelledRef.current) return;
+            diagLog(`[MSE] MuxJsTs init segment: ${data.byteLength} bytes`);
+            if (bufferingForSeekRef.current) {
+              seekBufferRef.current.push({ type: 'init', data: data.slice(0) });
+              initSegmentsRef.current = [{ id: 1, buffer: data.slice(0) }];
+              return;
+            }
+            // Append init segment to combined SourceBuffer (contains both video+audio trak boxes)
+            state.current.videoSourceBuffer?.appendBuffer(data);
+            initSegmentsRef.current = [{ id: 1, buffer: data.slice(0) }];
+          },
+          onMediaSegment: (data: ArrayBuffer, timestamp: number) => {
+            if (cancelledRef.current) return;
+            if (bufferingForSeekRef.current) {
+              seekBufferRef.current.push({ type: 'media', data: data.slice(0), timestamp });
+              return;
+            }
+            evictOldBuffer();
+            // Append to combined SourceBuffer (contains both audio+video tracks)
+            state.current.videoSourceBuffer?.appendBuffer(data);
+            // Diagnostic: log SourceBuffer buffered ranges after first 10 appends
+            muxJsMediaSegmentCount++;
+            if (muxJsMediaSegmentCount <= 10) {
+              const sbVideo = state.current.videoSourceBuffer;
+              if (sbVideo) {
+                try {
+                  const rangesV = sbVideo.buffered;
+                  let rangeStrV = '';
+                  for (let i = 0; i < rangesV.length; i++) {
+                    rangeStrV += `[${rangesV.start(i).toFixed(2)}-${rangesV.end(i).toFixed(2)}s]`;
+                  }
+                  diagLog(`[MSE] MuxJsTs onMediaSegment #${muxJsMediaSegmentCount}: ${data.byteLength} bytes, ts=${timestamp.toFixed(3)}s, SB=${rangeStrV}, sbQueue=${sbVideo.queueLength}`);
+                } catch (_) {}
+              }
+            }
+            const absoluteTimestamp = timestamp + seekOffsetRef.current;
+            if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.duration !== Infinity && state.current.fileLength > 0) {
+              const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+              setPrefetchedBytes(estimatedBytes);
+              trackDownloadedRange(estimatedBytes, estimatedBytes + data.byteLength);
+            }
+          },
+          onDurationKnown: (duration: number) => {
+            if (cancelledRef.current) return;
+            diagLog(`[MSE] MuxJsTs duration known: ${duration}s`);
+            state.current.duration = duration;
+            if (state.current.fileLength > 0 && duration > 0 && duration !== Infinity) {
+              state.current.bitrate = state.current.fileLength / duration;
+            }
+            try {
+              mediaSource.duration = duration;
+            } catch (_e) {
+              setTimeout(() => { try { mediaSource.duration = duration; } catch (_) {} }, 100);
+            }
+          },
+          onCodecUnsupported: (codec: string) => {
+            if (cancelledRef.current) return;
+            diagLog(`[MSE] MuxJsTs codec unsupported: ${codec}`);
+            setError(`Codec not supported for MSE playback: ${codec}`);
+            setUseNative(true);
+          },
+          onError: (error: Error) => {
+            if (cancelledRef.current) return;
+            diagLog(`[MSE] MuxJsTs ERROR: ${error.message}`);
+            setError(error.message);
+            setUseNative(true);
+          },
+        });
+
+        transmuxerInitInProgressRef.current = true;
+        const result = await muxTsTransmuxer.init();
+        if (!result || cancelledRef.current) {
+          transmuxerInitInProgressRef.current = false;
+          diagLog('[MSE] MuxJsTs init FAILED or cancelled — no result');
+          return;
+        }
+
+        diagLog(`[MSE] MuxJsTs init success: mimeType=${result.mimeType}, videoMimeType=${result.videoMimeType}, audioMimeType=${result.audioMimeType}`);
+
+        // Create COMBINED SourceBuffer for TS format.
+        // Chrome's MSE does strict codec checking for separate audio SourceBuffers
+        // — HE-AAC data (audioObjectType 0x40/SBR) is rejected when the codec
+        // string says mp4a.40.2 (AAC-LC). Combined SourceBuffer is more lenient:
+        // Chrome auto-detects HE-AAC from the AudioSpecificConfig and accepts
+        // the mismatch. With keepOriginalTimestamps:true + GOP cache clearing +
+        // true passthrough, audio/video offset is ~0.04-0.23s (natural TS
+        // stream offset) — negligible in combined mode.
+        try {
+          const sbCombined = mediaSource.addSourceBuffer(result.mimeType);
+          state.current.videoSourceBuffer = new SourceBufferWrapper(sbCombined);
+          state.current.videoSourceBuffer.setTimestampOffset(0);
+          state.current.audioSourceBuffer = null; // No separate audio SB for TS
+          diagLog(`[MSE] Created combined SourceBuffer for TS with mimeType: ${result.mimeType}`);
+        } catch (e: any) {
+          console.error(`[MSE] Failed to add combined SourceBuffer "${result.mimeType}":`, e);
+          const fallbackMimes = ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4'];
+          for (const mime of fallbackMimes) {
+            try {
+              if (MediaSource.isTypeSupported(mime)) {
+                const sb = mediaSource.addSourceBuffer(mime);
+                state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
+                state.current.videoSourceBuffer.setTimestampOffset(0);
+                state.current.audioSourceBuffer = null;
+                console.log(`[MSE] Created combined SourceBuffer with fallback mimeType: ${mime}`);
+                break;
+              }
+            } catch (_) { continue; }
+          }
+          if (!state.current.videoSourceBuffer) {
+            diagLog(`[MSE] SourceBuffer creation failed for TS — falling back to native`);
+            setUseNative(true);
+            return;
+          }
+        }
+
+        transmuxerInitInProgressRef.current = false;
+        state.current.initialized = true;
+        if (initTimeoutRef.current !== null) {
+          clearTimeout(initTimeoutRef.current);
+          initTimeoutRef.current = null;
+        }
+        transmuxerRef.current = muxTsTransmuxer;
+        setIsTransmuxerActive(true);
+
+        // The init segment and first media segment were produced during
+        // muxTsTransmuxer.init() BEFORE the SourceBuffer existed, so the
+        // onInitSegment/onMediaSegment callbacks silently dropped them.
+        // Now that the SourceBuffer exists, append them from the returned data.
+        if (result.initSegment && state.current.videoSourceBuffer) {
+          diagLog(`[MSE] Appending init segment to combined SourceBuffer: ${result.initSegment.byteLength} bytes`);
+          state.current.videoSourceBuffer.appendBuffer(result.initSegment);
+          initSegmentsRef.current = [{ id: 1, buffer: result.initSegment }];
+        }
+        if (result.firstMediaSegment && state.current.videoSourceBuffer) {
+          diagLog(`[MSE] Appending first media segment to combined SourceBuffer: ${result.firstMediaSegment.byteLength} bytes, ts=${result.firstMediaTimestamp.toFixed(3)}s`);
+          evictOldBuffer();
+          state.current.videoSourceBuffer.appendBuffer(result.firstMediaSegment);
+        }
+
+        // Diagnostic: check SourceBuffer ranges after init + first media segment
+        setTimeout(() => {
+          const sbVideo = state.current.videoSourceBuffer;
+          if (sbVideo) {
+            try {
+              const rangesV = sbVideo.buffered;
+              let rangeStrV = '';
+              for (let i = 0; i < rangesV.length; i++) {
+                rangeStrV += `[${rangesV.start(i).toFixed(2)}-${rangesV.end(i).toFixed(2)}s]`;
+              }
+              diagLog(`[MSE] SourceBuffer ranges after init+firstMedia: ${rangeStrV}`);
+            } catch (_) {}
+          }
+        }, 500);
+
+        // Build keyframe index in background
+        setTimeout(() => {
+          if (!cancelledRef.current && transmuxerRef.current) {
+            transmuxerRef.current.buildKeyframeIndex().then(() => {
+              if (!cancelledRef.current) {
+                setKeyframeIndexReady(true);
+                console.log('[MSE] Keyframe index ready — thumbnail pipeline will use it');
+              }
+            }).catch((e) => {
+              console.warn('[MSE] Keyframe index build failed (non-critical):', e);
+            });
+          }
+        }, 0);
+
+        // Start progressive streaming (push-based, different from mediabunny's Conversion)
+        setIsPrefetching(true);
+        setSpeed(0);
+
+        muxTsTransmuxer.startStreaming().then(() => {
+          if (!cancelledRef.current) {
+            console.log('[MSE] MuxJsTs streaming complete');
+            setIsComplete(true);
+            isCompleteRef.current = true;
+            hasEverCompletedRef.current = true;
+            setIsPrefetching(false);
+            setSpeed(0);
+            setPrefetchedBytes(state.current.fileLength);
+            const ms = state.current.mediaSource;
+            if (ms && ms.readyState === 'open') {
+              try { ms.endOfStream(); console.log('[MSE] endOfStream called after streaming complete'); } catch (e) { console.warn('[MSE] endOfStream failed:', e); }
+            }
+          }
+        }).catch((e: Error) => {
+          if (!cancelledRef.current) {
+            // Abort/dispose errors are expected during seeks — don't treat as fatal
+            const msg = e.message || '';
+            const isExpected = msg.includes('aborted') || msg.includes('disposed') || msg.includes('cancelled');
+            if (isExpected) {
+              console.log('[MSE] MuxJsTs streaming aborted (expected during seek/dispose)');
+              return;
+            }
+            console.error('[MSE] MuxJsTs streaming failed:', e);
+            setError(e.message);
+          }
+        });
+        return;
+      }
+
+      // MKV/WebM format: use mediabunny (unchanged)
+      const transmuxer = new MediabunnyTransmuxer({
+        format,
+        sourceConfig: {
+          url,
+          fileSize: state.current.fileLength,
+          maxCacheSize: 32 * 1024 * 1024, // 32 MiB — reduces duplicate HTTP range requests during concurrent video+audio iterations (default 8 MiB is too small)
+          prefetchProfile: 'network', // MKV/WebM: 'network' (3 workers, aggressive random prefetch) for fast random access.
+          seedData: firstChunkData, // In-memory first chunk data — reads within [0, firstChunkData.byteLength] bypass HTTP entirely (zero latency). Eliminates the ~0.5-1s per-request round-trip delay through the Tauri/WebView2 bridge that made the transmuxer init take 30+ seconds.
+        },
+        onInitSegment: (data: ArrayBuffer) => {
+          if (cancelledRef.current) return;
+          diagLog(`[MSE] Transmuxer init segment: ${data.byteLength} bytes`);
+          // During seek: buffer segments until setTimestampOffset() is called,
+          // because setTimestampOffset() clears the SB queue and would discard
+          // segments queued before the offset is set.
+          if (bufferingForSeekRef.current) {
+            seekBufferRef.current.push({ type: 'init', data: data.slice(0) });
+            initSegmentsRef.current = [{ id: 1, buffer: data.slice(0) }];
+            return;
+          }
+          // Append init segment to SourceBuffer
+          state.current.videoSourceBuffer?.appendBuffer(data);
+          // Cache init segment for re-append after seek
+          initSegmentsRef.current = [{ id: 1, buffer: data.slice(0) }];
+        },
+        onMediaSegment: (data: ArrayBuffer, timestamp: number) => {
+          if (cancelledRef.current) return;
+          // During seek: buffer segments until setTimestampOffset() is called
+          if (bufferingForSeekRef.current) {
+            seekBufferRef.current.push({ type: 'media', data: data.slice(0), timestamp });
+            return;
+          }
+          // Evict old buffer BEFORE appending (same pattern as MP4's onSegment)
+          evictOldBuffer();
+          // Backpressure: if buffer ahead exceeds MAX_BUFFER_AHEAD_SECONDS,
+          // also evict far-ahead data to prevent QuotaExceededError.
+          // (Conversion.execute() can't be paused, so we evict instead.)
+          const video = videoRef.current;
+          if (video) {
+            const ahead = getBufferedAheadSeconds();
+            if (ahead > MAX_BUFFER_AHEAD_SECONDS) {
+              const sb = state.current.videoSourceBuffer;
+              if (sb) {
+                const ranges = sb.buffered;
+                // Evict ranges far ahead of playback (> MAX_BUFFER_AHEAD_SECONDS)
+                const maxAheadEnd = video.currentTime + MAX_BUFFER_AHEAD_SECONDS;
+                for (let i = 0; i < ranges.length; i++) {
+                  if (ranges.start(i) > maxAheadEnd) {
+                    sb.remove(ranges.start(i), ranges.end(i));
+                  } else if (ranges.end(i) > maxAheadEnd) {
+                    sb.remove(maxAheadEnd, ranges.end(i));
+                  }
+                }
+              }
+            }
+          }
+          // Append media segment to SourceBuffer
+          state.current.videoSourceBuffer?.appendBuffer(data);
+
+          // Progress tracking — adjust timestamp for seek offset
+          // (transmuxer timestamps are relative after trim, starting from 0)
+          const absoluteTimestamp = timestamp + seekOffsetRef.current;
+          if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.duration !== Infinity && state.current.fileLength > 0) {
+            const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+            setPrefetchedBytes(estimatedBytes);
+            // Track for green buffer bar (time-based, not byte-based)
+            trackDownloadedRange(estimatedBytes, estimatedBytes + data.byteLength);
+          }
+        },
+        onDurationKnown: (duration: number) => {
+          if (cancelledRef.current) return;
+          diagLog(`[MSE] Transmuxer duration known: ${duration}s`);
+          state.current.duration = duration;
+          // Calculate bitrate for evictOldBuffer (same as MP4 path)
+          // Skip for Infinity (deferred TS duration — will update when real duration arrives)
+          if (state.current.fileLength > 0 && duration > 0 && duration !== Infinity) {
+            state.current.bitrate = state.current.fileLength / duration;
+          }
+          // Set MediaSource.duration so the video element reports the correct duration
+          // (instead of Infinity). Safe to set before SourceBuffer is created — no SB is updating.
+          try {
+            mediaSource.duration = duration;
+          } catch (_e) {
+            // SourceBuffer might be updating — retry with a small delay
+            setTimeout(() => {
+              try { mediaSource.duration = duration; } catch (_) {}
+            }, 100);
+          }
+        },
+        onSpeedUpdate: (speed: number) => {
+          if (cancelledRef.current) return;
+          setSpeed(speed);
+        },
+        onProgressUpdate: (_processedTime: number, estimatedBytes: number) => {
+          if (cancelledRef.current) return;
+          // Update prefetchedBytes more accurately from transmuxer progress
+          setPrefetchedBytes(estimatedBytes);
+        },
+        onCodecUnsupported: (codec: string) => {
+          if (cancelledRef.current) return;
+          diagLog(`[MSE] Transmuxer codec unsupported: ${codec}`);
+          // Codec not supported by MSE — try native playback first, then error+download
+          setError(`Codec not supported for MSE playback: ${codec}`);
+          setUseNative(true);
+        },
+        onError: (error: Error) => {
+          if (cancelledRef.current) return;
+          diagLog(`[MSE] Transmuxer ERROR: ${error.message}`);
+          setError(error.message);
+          setUseNative(true);
+        },
+      });
+
+      // Initialize the transmuxer (read file header, determine codecs)
+      // Mark init as in-progress so the fatal video error handler doesn't
+      // trigger fallback during init (the video element fires error code 4
+      // because the blob URL has no data yet — this is expected, not fatal).
+      transmuxerInitInProgressRef.current = true;
+      const result = await transmuxer.init();
+      if (!result || cancelledRef.current) {
+        transmuxerInitInProgressRef.current = false;
+        diagLog('[MSE] Transmuxer init FAILED or cancelled — no result');
+        return;
+      }
+
+      diagLog(`[MSE] Transmuxer init success: decision=${result.mseDecision}, mimeType=${result.mimeType}`);
+
+      // Create SourceBuffer with the mime type from the init result
+      // For fMP4/WebM, a single combined SourceBuffer handles interleaved video+audio
+      try {
+        const sb = mediaSource.addSourceBuffer(result.mimeType);
+        state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
+        state.current.videoSourceBuffer.setTimestampOffset(0);
+        diagLog(`[MSE] Created combined SourceBuffer with mimeType: ${result.mimeType}`);
+      } catch (e: any) {
+        console.error(`[MSE] Failed to add SourceBuffer with mimeType "${result.mimeType}":`, e);
+        // Try fallback mime types
+        const fallbackMimes = result.mseDecision === 'fmp4'
+          ? ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4']
+          : ['video/webm; codecs="vp9, opus"', 'video/webm; codecs="vp8, opus"', 'video/webm'];
+
+        for (const mime of fallbackMimes) {
+          try {
+            if (MediaSource.isTypeSupported(mime)) {
+              const sb = mediaSource.addSourceBuffer(mime);
+              state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
+              state.current.videoSourceBuffer.setTimestampOffset(0);
+              console.log(`[MSE] Created SourceBuffer with fallback mimeType: ${mime}`);
+              break;
+            }
+          } catch (_) {
+            continue;
+          }
+        }
+
+        if (!state.current.videoSourceBuffer) {
+          setError(`MSE SourceBuffer creation failed for ${format}`);
+          transmuxerInitInProgressRef.current = false;
+          diagLog(`[MSE] SourceBuffer creation failed for ${format} — falling back to native`);
+          setUseNative(true);
+          return;
+        }
+      }
+
+      // Transmuxer init is complete and SourceBuffer is ready — the fatal video
+      // error handler can now safely trigger fallback if needed
+      transmuxerInitInProgressRef.current = false;
+
+      // Mark as initialized — MSE is ready to receive segments
+      state.current.initialized = true;
+      // Clear init timeout — MSE init succeeded, no need for fallback
+      if (initTimeoutRef.current !== null) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
+      transmuxerRef.current = transmuxer;
+      // Set state to trigger re-render in effects that depend on mseGetters
+      setIsTransmuxerActive(true);
+
+      // Build keyframe index in background — dramatically speeds up subsequent
+      // seeks for TS format (O(log n) binary search vs 8-12s linear scan).
+      // Start scanner immediately — no computeDuration random reads needed
+      // (scanner uses direct fetch, independent of mediabunny's ReadOrchestrator).
+      // MKV format also starts immediately — no computeDuration random reads needed.
+      const scannerDelay = 0;
+      setTimeout(() => {
+        if (!cancelledRef.current && transmuxerRef.current) {
+          transmuxerRef.current.buildKeyframeIndex().then(() => {
+            if (!cancelledRef.current) {
+              setKeyframeIndexReady(true);
+              console.log('[MSE] Keyframe index ready — thumbnail pipeline will use it');
+            }
+          }).catch((e) => {
+            console.warn('[MSE] Keyframe index build failed (non-critical):', e);
+          });
+        }
+      }, scannerDelay);
+
+      // Start progressive transmuxing (produces segments via callbacks)
+      setIsPrefetching(true);
+      setSpeed(0);
+
+      transmuxer.startTransmuxing().then(() => {
+        if (!cancelledRef.current) {
+          console.log('[MSE] Transmuxing complete');
+          setIsComplete(true);
+          isCompleteRef.current = true;
+          hasEverCompletedRef.current = true;
+          setIsPrefetching(false);
+          setSpeed(0);
+          setPrefetchedBytes(state.current.fileLength);
+          // Signal end of stream to the browser so it fires the 'ended' event
+          // and shows the replay overlay. Without this, video.ended never
+          // becomes true and the replay overlay never appears.
+          const ms = state.current.mediaSource;
+          if (ms && ms.readyState === 'open') {
+            try { ms.endOfStream(); console.log('[MSE] endOfStream called after transmuxing complete'); } catch (e) { console.warn('[MSE] endOfStream failed:', e); }
+          }
+        }
+      }).catch((e: Error) => {
+        if (!cancelledRef.current) {
+          // ConversionCanceledError and InputDisposedError are expected when
+          // seekTo() cancels the Conversion and disposes the Input during an
+          // active transmux — don't treat as fatal error that tears down MSE
+          const isExpectedSeekError = e.message?.includes('has been canceled') ||
+            e.name === 'ConversionCanceledError' ||
+            e.message?.includes('Input has been disposed') ||
+            e.name === 'InputDisposedError';
+          if (isExpectedSeekError) {
+            console.log('[MSE] Conversion canceled/disposed (expected during seek)');
+            return;
+          }
+          console.error('[MSE] Transmuxing failed:', e);
+          setError(e.message);
+        }
+      });
+    } catch (e: any) {
+      transmuxerInitInProgressRef.current = false;
+      console.error('[MSE] Transmuxer setup failed:', e);
+      if (!cancelledRef.current) {
+        setError(`Transmuxer setup failed: ${e.message}`);
         setUseNative(true);
       }
     }
@@ -1335,6 +2290,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       state.current.initialized = true;
+      // Clear init timeout — MSE init succeeded, no need for fallback
+      if (initTimeoutRef.current !== null) {
+        clearTimeout(initTimeoutRef.current);
+        initTimeoutRef.current = null;
+      }
       setIsPrefetching(true);
 
       // Set up mp4box callback for segments
@@ -1642,13 +2602,193 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (!state.current.initialized || !streamUrl || useNative) return;
     if (state.current.fileLength <= 0 || !isFinite(timeSeconds) || timeSeconds < 0) return;
 
-    // Clamp timeSeconds to just below duration so seeks near the end still
-    // go through the normal flow. The download loop's syncOffset >= fileLength
-    // guard handles the true end-of-file case (preventing 416 errors).
-    // Without this clamp, clicking the progress bar at the very edge produces
-    // timeSeconds = duration exactly, which previously caused invalid range
-    // requests.
     const clampedTime = Math.min(timeSeconds, state.current.duration - 0.001);
+
+    // Transmuxer seek: TS/MKV files use time-based seeking, not byte-range
+    if (transmuxerRef.current) {
+      const video = videoRef.current;
+      if (!video) return;
+
+      // Near-end FORWARD seek guard (same logic as MP4 path):
+      // After completion, forward seeks near the end → force video end.
+      // Backward seeks must fall through to normal flow to avoid infinite cycles.
+      if (hasEverCompletedRef.current && clampedTime >= state.current.duration - 5.1) {
+        if (video.ended) return;
+        const isForwardSeek = clampedTime > video.currentTime;
+        if (isForwardSeek) {
+          if (seekDebounceTimerRef.current !== null) {
+            clearTimeout(seekDebounceTimerRef.current);
+            seekDebounceTimerRef.current = null;
+          }
+          console.log(`[MSE] Transmuxer near-end FORWARD seek after completion: ${clampedTime.toFixed(1)}s — forcing video end`);
+          video.pause();
+          const sb = video.buffered;
+          const nearEndThreshold = state.current.duration - 5.1;
+          let nearEndTime: number | null = null;
+          for (let i = 0; i < sb.length; i++) {
+            if (sb.end(i) >= nearEndThreshold) {
+              nearEndTime = Math.min(sb.end(i) - 0.05, state.current.duration);
+              break;
+            }
+          }
+          if (nearEndTime !== null) {
+            video.currentTime = nearEndTime;
+          }
+          video.dispatchEvent(new Event('ended'));
+          return;
+        } else {
+          console.log(`[MSE] Transmuxer near-end BACKWARD seek after completion: ${clampedTime.toFixed(1)}s — allowing normal seek`);
+        }
+      }
+
+      // Check if already buffered — instant seek, no debounce needed
+      const buffered = video.buffered;
+      for (let i = 0; i < buffered.length; i++) {
+        if (clampedTime >= buffered.start(i) && clampedTime <= buffered.end(i)) {
+          console.log(`[MSE] Transmuxer seek buffered: ${clampedTime.toFixed(1)}s — instant`);
+          video.currentTime = clampedTime;
+          // Clear any pending debounce timer
+          if (seekDebounceTimerRef.current !== null) {
+            clearTimeout(seekDebounceTimerRef.current);
+            seekDebounceTimerRef.current = null;
+          }
+          return;
+        }
+      }
+
+      // Unbuffered — apply debounce logic with format-aware timing.
+      // TS format uses longer debounce (2000ms) because getKeyPacket takes 8-12s
+      // and rapid progress bar dragging wastes multiple canceled getKeyPacket calls.
+      // MP4/MKV uses shorter debounce (500ms) since their seeks are faster.
+      // Also: if a previous seek is still in progress (transmuxerSeekInProgressRef),
+      // force debouncing regardless of timing — prevents concurrent seeks during
+      // a long-running getKeyPacket (8-18s for TS).
+      const debounceMs = formatRef.current === 'ts' ? SEEK_DEBOUNCE_MS_TS : SEEK_DEBOUNCE_MS;
+      const isSeekInProgress = transmuxerSeekInProgressRef.current;
+      const isFirstSeek = !isSeekInProgress && (lastSeekTimeRef.current === 0 || (Date.now() - lastSeekTimeRef.current) >= debounceMs);
+      console.log(`[MSE] Transmuxer seek unbuffered: ${clampedTime.toFixed(1)}s — ${isFirstSeek ? 'instant' : 'debounced'} (debounce=${debounceMs}ms, format=${formatRef.current}, seekInProgress=${isSeekInProgress})`);
+
+      // Set currentTime for visual feedback
+      video.currentTime = clampedTime;
+
+      const executeTransmuxerSeek = () => {
+        setIsComplete(false);
+        isCompleteRef.current = false;
+        lastSeekTimeRef.current = Date.now();
+        transmuxerSeekInProgressRef.current = true; // Prevent concurrent seeks
+        clearDownloadedRanges();
+
+        // Stop streaming chain — new seek will start its own chain after completion
+        stopStreamingChain();
+        refillInProgressRef.current = false;
+
+        const sbVideo = state.current.videoSourceBuffer;
+        const isTsFormat = formatRef.current === 'ts';
+        if (sbVideo) {
+          // Enable buffering mode: segments produced during seekTo will be
+          // buffered in seekBufferRef instead of appended to the SourceBuffer.
+          // This is necessary because setTimestampOffset() clears the SB queue,
+          // and we can't set timestampOffset until we know the keyframe timestamp.
+          bufferingForSeekRef.current = true;
+          seekBufferRef.current = [];
+
+          // Reset SourceBuffer for TS format (combined video+audio)
+          const resetPromises = [sbVideo.resetForSeek()];
+
+          Promise.all(resetPromises).then(async () => {
+            const keyframeTimestamp = await transmuxerRef.current!.seekTo(clampedTime, INITIAL_SEEK_DURATION);
+
+            // Disable buffering mode — segments from now on append directly
+            bufferingForSeekRef.current = false;
+
+            if (keyframeTimestamp !== null) {
+              // TS format: keepOriginalTimestamps:true → timestamps are absolute.
+              // Use setTimestampOffset(0) (not keyframeTimestamp) to clear SB
+              // queues. MKV format: keepOriginalTimestamps:false → use
+              // setTimestampOffset(keyframeTimestamp) for absolute positioning.
+              const tsOffset = isTsFormat ? 0 : keyframeTimestamp;
+              seekOffsetRef.current = tsOffset;
+              await sbVideo.setTimestampOffset(tsOffset);
+
+              // Flush buffered segments to combined SourceBuffer.
+              const buffer = seekBufferRef.current;
+              seekBufferRef.current = [];
+              for (const item of buffer) {
+                if (item.type === 'init') {
+                  sbVideo.appendBuffer(item.data);
+                } else if (item.type === 'media') {
+                  sbVideo.appendBuffer(item.data);
+                  // Progress tracking for buffered media segments
+                  const absoluteTimestamp = item.timestamp! + seekOffsetRef.current;
+                  if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.fileLength > 0) {
+                    const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+                    setPrefetchedBytes(estimatedBytes);
+                    trackDownloadedRange(estimatedBytes, estimatedBytes + item.data.byteLength);
+                  }
+                }
+              }
+
+              console.log(`[MSE] Transmuxer seek complete: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${buffer.length} buffered segments`);
+
+              // Wait for SourceBuffer to process all queued data
+              await sbVideo.waitForQueueDrain();
+
+              // Set video.currentTime to the actual keyframe position for accurate playback start
+              video.currentTime = keyframeTimestamp;
+
+              // Start streaming chain for continuous playback after limited seek
+              startStreamingChain();
+              transmuxerSeekInProgressRef.current = false; // Seek complete — allow new seeks
+
+              // Update keyframeIndexReady if the transmuxer's partial index became available
+              // during this seek (incremental timestamps). This triggers the thumbnail pipeline.
+              if (!keyframeIndexReady && transmuxerRef.current?.isKeyframeIndexReady()) {
+                setKeyframeIndexReady(true);
+              }
+            } else {
+              // Seek failed — discard buffered segments
+              seekBufferRef.current = [];
+              transmuxerSeekInProgressRef.current = false; // Seek failed — allow new seeks
+            }
+          }).catch((e: Error) => {
+            bufferingForSeekRef.current = false;
+            seekBufferRef.current = [];
+            transmuxerSeekInProgressRef.current = false; // Seek failed — allow new seeks
+            console.error('[MSE] Transmuxer seek failed:', e);
+            setError(`Seek failed: ${e.message}`);
+          });
+        } else {
+          transmuxerSeekInProgressRef.current = true;
+          transmuxerRef.current?.seekTo(clampedTime, INITIAL_SEEK_DURATION).then((result) => {
+            transmuxerSeekInProgressRef.current = false;
+            return result;
+          }).catch((e: Error) => {
+            transmuxerSeekInProgressRef.current = false;
+            console.error('[MSE] Transmuxer seek failed:', e);
+            setError(`Seek failed: ${e.message}`);
+          });
+        }
+      };
+
+      const timeSinceLastSeek = Date.now() - lastSeekTimeRef.current;
+      if (timeSinceLastSeek >= debounceMs || lastSeekTimeRef.current === 0) {
+        if (seekDebounceTimerRef.current !== null) {
+          clearTimeout(seekDebounceTimerRef.current);
+          seekDebounceTimerRef.current = null;
+        }
+        executeTransmuxerSeek();
+      } else {
+        if (seekDebounceTimerRef.current !== null) {
+          clearTimeout(seekDebounceTimerRef.current);
+        }
+        const remainingDebounce = debounceMs - timeSinceLastSeek;
+        seekDebounceTimerRef.current = window.setTimeout(() => {
+          seekDebounceTimerRef.current = null;
+          executeTransmuxerSeek();
+        }, remainingDebounce);
+      }
+      return;
+    }
 
     // Near-end FORWARD seek after completion — directly end the video.
     // Only force the replay overlay for FORWARD seeks near the end (user
@@ -1828,11 +2968,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // (CHUNK_DEMUXER_ERROR_APPEND_FAILED), fall back to native playback.
     // The error is permanent — once HTMLMediaElement.error is set, no more
     // data can be appended to the SourceBuffer, so MSE is irrecoverable.
+    //
+    // IMPORTANT: During transmuxer initialization, the video element fires
+    // error code 4 (MEDIA_ERR_SRC_NOT_SUPPORTED) because the blob URL has
+    // no data yet. This is expected — NOT fatal. Don't trigger fallback
+    // during init, because setting useNative=true changes v.src which
+    // closes the MediaSource before addSourceBuffer completes.
     if (el) {
       el.addEventListener('error', () => {
         const err = el.error;
         if (err && (err.code === MediaError.MEDIA_ERR_DECODE ||
                     err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)) {
+          if (transmuxerInitInProgressRef.current) {
+            console.warn('[MSE] Video error (code', err.code, ') during transmuxer init — ignoring (expected, blob URL has no data yet)');
+            return;
+          }
           if (!cancelledRef.current && !useNative) {
             console.warn('[MSE] Fatal video error (code', err.code, ') — falling back to native playback');
             setUseNative(true);
@@ -1856,6 +3006,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const getVideoTrackInfoCb = useCallback(() => videoTrackInfoRef.current, []);
   const getMP4BoxClassCb = useCallback(() => mp4BoxClassRef.current, []);
   const getFileLengthCb = useCallback(() => state.current.fileLength, []);
+  const isTransmuxerCb = useCallback(() => !!transmuxerRef.current, []);
+  const getFormatCb = useCallback(() => formatRef.current, []);
 
   return {
     mseUrl: useNative ? null : mseUrl,
@@ -1882,6 +3034,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     getInitSegments: getInitSegmentsCb,
     getVideoTrackInfo: getVideoTrackInfoCb,
     getMP4BoxClass: getMP4BoxClassCb,
+    isTransmuxer: isTransmuxerCb,
+    getFormat: getFormatCb,
+    isTransmuxerActive,
+    getKeyframeTimestamps: () => transmuxerRef.current?.getKeyframeTimestamps() ?? [],
+    getKeyframeByteOffsets: () => transmuxerRef.current?.getKeyframeByteOffsets() ?? [],
+    getTsHeaderData: () => transmuxerRef.current?.getTsHeaderData() ?? null,
+    getTransmuxerSourceConfig: () => transmuxerRef.current?.getSourceConfig() ?? null,
+    keyframeIndexReady,
     thumbnailDataReady,
     moovBufferReady,
   };
