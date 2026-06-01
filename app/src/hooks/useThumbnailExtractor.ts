@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { MSEGetters } from './useMSEPlayer';
+import { Input, EncodedPacketSink, MATROSKA, MPEG_TS, ALL_FORMATS } from 'mediabunny';
+import type { InputVideoTrack, VideoCodec, EncodedPacket } from 'mediabunny';
+import { createTauriStreamSource, type TauriStreamSourceConfig } from '../lib/faststream/utils/TauriStreamSource';
+
+import { createOffsetTauriStreamSource, type TSKeyframeEntry } from '../lib/faststream/utils/TSByteOffsetScanner';
 
 /**
  * Hover preview thumbnail extractor.
@@ -495,6 +500,463 @@ class ThumbnailPipeline {
   }
 }
 
+// ─── Transmuxer Thumbnail Pipeline (WebCodecs VideoDecoder) ────────────
+// Uses mediabunny Input + getKeyPacket() → toEncodedVideoChunk() → VideoDecoder
+// for on-demand thumbnail capture at any position in MKV/TS files.
+// Bypasses MSE entirely — no SourceBuffer, no MediaSource, no hidden video.
+// Downloads only ONE keyframe cluster per hover (vs 3s of data via refillSeek).
+
+class TransmuxerThumbnailPipeline {
+  canvas: HTMLCanvasElement;
+  input: Input | null = null;
+  videoTrack: InputVideoTrack | null = null;
+  videoSink: EncodedPacketSink | null = null;
+  videoCodec: VideoCodec | null = null;
+  decoderConfig: VideoDecoderConfig | null = null;
+  duration: number = 0;
+  format: string;
+  sourceConfig: TauriStreamSourceConfig;
+  // Keyframe index from MediabunnyTransmuxer — allows binary search
+  // for instant keyframe lookup instead of slow getKeyPacket for TS.
+  keyframeTimestamps: number[] = [];
+  // Byte-offset keyframe index + header data + source config for OffsetCustomSource.
+  // When available, TS captures use temporary OffsetSource Inputs for fast seeks
+  // instead of slow getKeyPacket (8-12s per call).
+  keyframeByteOffsets: TSKeyframeEntry[] = [];
+  tsHeaderData: Uint8Array | null = null;
+  sourceConfigWithHeaders: { url: string; fileSize: number; headers?: Record<string, string> } | null = null;
+  ready = false;
+  active = true;
+  busy = false;
+  _initInProgress = false;
+
+  constructor(
+    streamUrl: string,
+    fileLength: number,
+    format: string,
+    canvas: HTMLCanvasElement,
+    keyframeTimestamps?: number[],
+  ) {
+    this.canvas = canvas;
+    this.format = format;
+    // The pipeline's Input reads small amounts at the beginning of the file
+    // (canRead, getPrimaryVideoTrack, etc.) — these subscribe to the
+    // sequential download, not targeted downloads. With prefetchProfile:
+    // 'none', the Input won't make background reads into uncached territory.
+    // NOTE: cached_only=true is NOT used here — it blocks initialization reads
+    // (byte 0-204) when the meta file hasn't been created yet. Only the
+    // TSScanner and OffsetCustomSource use cached_only=true.
+    this.sourceConfig = {
+      url: streamUrl,
+      fileSize: fileLength,
+      prefetchProfile: 'none', // No prefetch — prevents background reads into uncached territory
+    };
+    this.keyframeTimestamps = keyframeTimestamps ?? [];
+  }
+
+  /** Update keyframe timestamps from the transmuxer's cached index.
+   *  Called when the keyframe index finishes building in the background,
+   *  allowing subsequent thumbnail captures to use binary search instead
+   *  of slow linear getKeyPacket for TS format. */
+  updateKeyframeTimestamps(timestamps: number[]): void {
+    this.keyframeTimestamps = timestamps;
+  }
+
+  /** Update byte-offset keyframe data for OffsetCustomSource-based TS captures.
+   *  When available, TS thumbnail captures use temporary OffsetSource Inputs
+   *  for fast seeks (<1s) instead of slow getKeyPacket (8-12s per call). */
+  updateKeyframeData(
+    byteOffsets: TSKeyframeEntry[],
+    headerData: Uint8Array | null,
+    sourceConfig: { url: string; fileSize: number; headers?: Record<string, string> } | null,
+  ): void {
+    this.keyframeByteOffsets = byteOffsets;
+    this.tsHeaderData = headerData;
+    this.sourceConfigWithHeaders = sourceConfig;
+  }
+
+  /** Initialize the thumbnail pipeline. Creates Input, gets video track and decoder config. */
+  async init(): Promise<boolean> {
+    if (!this.active) return false;
+
+    this._initInProgress = true;
+
+    try {
+      // Check if VideoDecoder is available
+      if (typeof VideoDecoder === 'undefined') {
+        console.warn('[TransmuxerThumbnailPipeline] VideoDecoder not available');
+        return false;
+      }
+
+      // Create Input from TauriStreamSource (separate from main player)
+      const source = createTauriStreamSource(this.sourceConfig);
+      const formats = this.format === 'ts' ? [MPEG_TS] :
+                      this.format === 'mkv' ? [MATROSKA] :
+                      ALL_FORMATS;
+      this.input = new Input({ source, formats });
+
+      const canRead = await this.input.canRead();
+      if (!canRead || !this.active) {
+        // Init was cancelled (destroy() called during init) — clean up Input
+        if (this.input) { this.input.dispose(); this.input = null; }
+        this._initInProgress = false;
+        if (!this.active) console.log('[TransmuxerThumbnailPipeline] Init cancelled during canRead');
+        else console.warn('[TransmuxerThumbnailPipeline] Cannot read file');
+        return false;
+      }
+
+      // Get duration
+      this.duration = await this.input.computeDuration();
+
+      // Get video track
+      this.videoTrack = await this.input.getPrimaryVideoTrack();
+      if (!this.videoTrack || !this.active) {
+        if (this.input) { this.input.dispose(); this.input = null; }
+        this._initInProgress = false;
+        if (!this.active) console.log('[TransmuxerThumbnailPipeline] Init cancelled during getVideoTrack');
+        else console.warn('[TransmuxerThumbnailPipeline] No video track');
+        return false;
+      }
+
+      // Get video codec
+      this.videoCodec = await this.videoTrack.getCodec();
+
+      // Get decoder config (includes codec string + SPS/PPS description)
+      this.decoderConfig = await this.videoTrack.getDecoderConfig();
+      if (!this.decoderConfig || !this.active) {
+        if (this.input) { this.input.dispose(); this.input = null; }
+        this._initInProgress = false;
+        if (!this.active) console.log('[TransmuxerThumbnailPipeline] Init cancelled during getDecoderConfig');
+        else console.warn('[TransmuxerThumbnailPipeline] No decoder config');
+        return false;
+      }
+
+      // Check if the codec is supported by VideoDecoder
+      const support = await VideoDecoder.isConfigSupported(this.decoderConfig);
+      if (!support.supported) {
+        console.warn('[TransmuxerThumbnailPipeline] Codec not supported by VideoDecoder:', this.decoderConfig.codec);
+        return false;
+      }
+
+      // Create EncodedPacketSink for keyframe lookup
+      this.videoSink = new EncodedPacketSink(this.videoTrack);
+
+      this.ready = true;
+      this._initInProgress = false;
+      console.log('[TransmuxerThumbnailPipeline] Ready — duration=' + this.duration.toFixed(1) + 's, codec=' + this.decoderConfig.codec);
+      return true;
+    } catch (e) {
+      // Init failed — clean up Input to avoid orphaned resources
+      if (this.input) { this.input.dispose(); this.input = null; }
+      this._initInProgress = false;
+      console.warn('[TransmuxerThumbnailPipeline] Init failed:', e);
+      return false;
+    }
+  }
+
+  /** Capture a thumbnail at the given time position using WebCodecs VideoDecoder.
+   *  For TS format with byte-offset index: uses OffsetCustomSource for fast seeks (<1s).
+   *  For TS format without byte-offset index: skips (too slow — 8-12s per call).
+   *  For MKV format: uses mediabunny getKeyPacket (fast — cluster-based seeking). */
+  async captureAtTime(
+    time: number,
+    frameBuffer: Map<number, string>,
+    insertionOrder: number[],
+    forceUpdateCachedTimes: () => void,
+  ): Promise<boolean> {
+    if (!this.ready || !this.active || this.busy) return false;
+
+    const bucket = Math.floor(time / BUCKET_SIZE) * BUCKET_SIZE;
+    if (frameBuffer.has(bucket)) return true;
+
+    // For TS format: use OffsetCustomSource when byte-offset data is available,
+    // otherwise skip entirely (getKeyPacket for TS is 8-12s per call — unacceptable).
+    if (this.format === 'ts') {
+      if (this.keyframeByteOffsets.length > 0 && this.tsHeaderData && this.sourceConfigWithHeaders) {
+        return await this._captureTSWithOffsetSource(time, bucket, frameBuffer, insertionOrder, forceUpdateCachedTimes);
+      }
+      console.warn('[TransmuxerThumbnailPipeline] TS capture skipped — byte-offset index not available yet');
+      return false;
+    }
+
+    this.busy = true;
+
+    try {
+      // 1. Find nearest keyframe — use cached keyframe index when available
+      //    for instant binary search (O(log n)) instead of slow getKeyPacket
+      //    for TS format (8-12s linear scan per call).
+      let keyPacket: EncodedPacket | null;
+      let keyframeTimestampFromIndex: number | null = null;
+
+      if (this.keyframeTimestamps.length > 0) {
+        // Binary search for nearest keyframe ≤ time
+        const ts = this.keyframeTimestamps;
+        let lo = 0, hi = ts.length - 1;
+        while (lo < hi) {
+          const mid = lo + ((hi - lo + 1) >> 1);
+          if (ts[mid] <= time) {
+            lo = mid;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        if (ts[lo] <= time) {
+          keyframeTimestampFromIndex = ts[lo];
+          // Use the known timestamp with verifyKeyPackets: false — our index
+          // already confirmed this is a keyframe during the metadataOnly scan.
+          keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
+        } else {
+          // All keyframes are after time — use the first one
+          keyframeTimestampFromIndex = ts[0];
+          keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
+        }
+      } else {
+        // No keyframe index — fall back to standard getKeyPacket with verification
+        keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
+      }
+
+      if (!keyPacket || !this.active) {
+        console.warn('[TransmuxerThumbnailPipeline] No keyframe at time:', time);
+        return false;
+      }
+
+      // 2. Set up VideoDecoder output capture — always keep the latest decoded frame
+      //    (closest to hover position). Previous frames are closed immediately.
+      //    Uses an array container instead of a let variable because TypeScript
+      //    cannot narrow let variables that are reassigned inside closures.
+      const capturedFrames: VideoFrame[] = [];
+      const decoder = new VideoDecoder({
+        output: (frame: VideoFrame) => {
+          // Close all previous frames and keep only the latest one
+          while (capturedFrames.length > 0) {
+            capturedFrames.pop()!.close();
+          }
+          capturedFrames.push(frame);
+        },
+        error: (e: Error) => {
+          console.warn('[TransmuxerThumbnailPipeline] Decode error:', e);
+        },
+      });
+
+      // 3. Configure decoder with codec config from video track
+      decoder.configure(this.decoderConfig!);
+
+      // 4. Decode the keyframe packet
+      const keyChunk = keyPacket.toEncodedVideoChunk();
+      decoder.decode(keyChunk);
+
+      // 5. Optionally decode a few delta packets for better position accuracy.
+      //    If hover position is more than 0.5s from keyframe, iterate packets
+      //    up to 3s past the keyframe to get closer to the hover position.
+      //    The output callback automatically closes old frames and keeps the latest one.
+      const timeGap = time - keyPacket.timestamp;
+      if (timeGap > 0.5 && this.videoSink) {
+        const packets = this.videoSink.packets(keyPacket, undefined, { verifyKeyPackets: true });
+        for await (const packet of packets) {
+          if (!this.active) break;
+          const deltaFromKey = packet.timestamp - keyPacket.timestamp;
+          // Stop after 3s past keyframe or when we've passed the hover position
+          if (deltaFromKey > 3 || packet.timestamp >= time) break;
+          decoder.decode(packet.toEncodedVideoChunk());
+        }
+      }
+
+      // 6. Flush decoder — forces all pending decoded frames to be output
+      await decoder.flush();
+      decoder.close();
+
+      // Extract captured frame from array container
+      if (capturedFrames.length === 0 || !this.active) {
+        console.warn('[TransmuxerThumbnailPipeline] No frame captured for time:', time);
+        return false;
+      }
+      const frame = capturedFrames[0];
+
+      // 7. Draw frame on canvas
+      const ctx = this.canvas.getContext('2d')!;
+      ctx.drawImage(frame, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+      const dataUrl = this.canvas.toDataURL('image/jpeg', 0.6);
+      frame.close();
+
+      // 8. Cache thumbnail
+      frameBuffer.set(bucket, dataUrl);
+      insertionOrder.push(bucket);
+      while (frameBuffer.size > MAX_BUFFER_SIZE && insertionOrder.length > 0) {
+        const oldest = insertionOrder.shift()!;
+        frameBuffer.delete(oldest);
+      }
+      forceUpdateCachedTimes();
+
+      console.log('[TransmuxerThumbnailPipeline] Captured thumbnail at ' + time.toFixed(2) + 's (keyframe=' + keyPacket.timestamp.toFixed(2) + 's, gap=' + timeGap.toFixed(2) + 's)');
+      return true;
+    } catch (e) {
+      console.warn('[TransmuxerThumbnailPipeline] captureAtTime failed:', e);
+      return false;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Fast TS thumbnail capture using OffsetCustomSource.
+   *  Creates a temporary Input that starts with header data (PAT/PMT) followed by
+   *  data from the keyframe byte offset. getKeyPacket finds the keyframe quickly
+   *  because it's near the start of the virtual file (<1s vs 8-12s for TS). */
+  private async _captureTSWithOffsetSource(
+    time: number,
+    bucket: number,
+    frameBuffer: Map<number, string>,
+    insertionOrder: number[],
+    forceUpdateCachedTimes: () => void,
+  ): Promise<boolean> {
+    this.busy = true;
+
+    try {
+      // 1. Binary search byte-offset index for nearest keyframe ≤ time
+      const kf = this.keyframeByteOffsets;
+      let lo = 0, hi = kf.length - 1;
+      while (lo < hi) {
+        const mid = lo + ((hi - lo + 1) >> 1);
+        if (kf[mid].timestamp <= time) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+
+      let targetEntry: TSKeyframeEntry;
+      if (kf[lo].timestamp <= time) {
+        targetEntry = kf[lo];
+      } else {
+        // All keyframes are after time — use the first one
+        targetEntry = kf[0];
+      }
+
+      // 2. Create OffsetCustomSource — virtual file: header + data from byteOffset
+      const offsetSource = createOffsetTauriStreamSource({
+        url: this.sourceConfigWithHeaders!.url,
+        fileSize: this.sourceConfigWithHeaders!.fileSize,
+        byteOffset: targetEntry.byteOffset,
+        headerData: this.tsHeaderData!,
+        headers: this.sourceConfigWithHeaders!.headers ?? {},
+        maxCacheSize: 4 * 1024 * 1024, // 4 MiB — enough for keyframe + delta data
+        prefetchProfile: 'none', // No prefetch — only reads specific bytes for thumbnail decode
+      });
+
+      // 3. Create temporary Input from OffsetCustomSource
+      let tempInput: Input | null = null;
+      try {
+        tempInput = new Input({ source: offsetSource, formats: [MPEG_TS] });
+        const canRead = await tempInput.canRead();
+        if (!canRead || !this.active) {
+          console.warn('[TransmuxerThumbnailPipeline] OffsetSource Input cannot read');
+          return false;
+        }
+
+        // 4. Get video track + create EncodedPacketSink
+        const videoTrack = await tempInput.getPrimaryVideoTrack();
+        if (!videoTrack || !this.active) {
+          console.warn('[TransmuxerThumbnailPipeline] No video track in OffsetSource Input');
+          return false;
+        }
+        const tempSink = new EncodedPacketSink(videoTrack);
+
+        // 5. Get keyframe packet — fast because keyframe is near start of virtual file
+        const keyPacket = await tempSink.getKeyPacket(targetEntry.timestamp, { verifyKeyPackets: false });
+        if (!keyPacket || !this.active) {
+          console.warn('[TransmuxerThumbnailPipeline] No keyframe packet from OffsetSource at', targetEntry.timestamp.toFixed(2));
+          return false;
+        }
+
+        // 6. Set up VideoDecoder — reuse cached decoderConfig from initial Input
+        const capturedFrames: VideoFrame[] = [];
+        const decoder = new VideoDecoder({
+          output: (frame: VideoFrame) => {
+            while (capturedFrames.length > 0) {
+              capturedFrames.pop()!.close();
+            }
+            capturedFrames.push(frame);
+          },
+          error: (e: Error) => {
+            console.warn('[TransmuxerThumbnailPipeline] Decode error:', e);
+          },
+        });
+
+        decoder.configure(this.decoderConfig!);
+
+        // 7. Decode the keyframe packet
+        decoder.decode(keyPacket.toEncodedVideoChunk());
+
+        // 8. Optionally decode delta packets for better position accuracy
+        const timeGap = time - keyPacket.timestamp;
+        if (timeGap > 0.5) {
+          for await (const packet of tempSink.packets(keyPacket, undefined, { verifyKeyPackets: true })) {
+            if (!this.active) break;
+            const deltaFromKey = packet.timestamp - keyPacket.timestamp;
+            if (deltaFromKey > 3 || packet.timestamp >= time) break;
+            decoder.decode(packet.toEncodedVideoChunk());
+          }
+        }
+
+        // 9. Flush decoder
+        await decoder.flush();
+        decoder.close();
+
+        if (capturedFrames.length === 0 || !this.active) {
+          console.warn('[TransmuxerThumbnailPipeline] No frame captured for time:', time.toFixed(2));
+          return false;
+        }
+        const frame = capturedFrames[0];
+
+        // 10. Draw frame on canvas
+        const ctx = this.canvas.getContext('2d')!;
+        ctx.drawImage(frame, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+        const dataUrl = this.canvas.toDataURL('image/jpeg', 0.6);
+        frame.close();
+
+        // 11. Cache thumbnail
+        frameBuffer.set(bucket, dataUrl);
+        insertionOrder.push(bucket);
+        while (frameBuffer.size > MAX_BUFFER_SIZE && insertionOrder.length > 0) {
+          const oldest = insertionOrder.shift()!;
+          frameBuffer.delete(oldest);
+        }
+        forceUpdateCachedTimes();
+
+        console.log('[TransmuxerThumbnailPipeline] OffsetSource capture at ' + time.toFixed(2) + 's (keyframe=' + keyPacket.timestamp.toFixed(2) + 's, gap=' + timeGap.toFixed(2) + 's, byteOffset=' + targetEntry.byteOffset + ')');
+        return true;
+      } finally {
+        // Dispose temporary Input — release OffsetSource resources
+        if (tempInput) {
+          tempInput.dispose();
+        }
+      }
+    } catch (e) {
+      console.warn('[TransmuxerThumbnailPipeline] _captureTSWithOffsetSource failed:', e);
+      return false;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  destroy(): void {
+    this.active = false;
+    this.ready = false;
+    this.busy = false;
+    // Don't dispose input synchronously — if init() is still running,
+    // disposing the Input causes "Assertion failed" in ReadOrchestrator
+    // because canRead() has pending reads on the now-disposed source.
+    // Instead, init() checks this.active after each async step and
+    // disposes the input itself if active became false during init.
+    if (this.input && !this._initInProgress) {
+      this.input.dispose();
+      this.input = null;
+    }
+    this.videoTrack = null;
+    this.videoSink = null;
+    this.decoderConfig = null;
+  }
+}
+
 // ─── Hook ────────────────────────────────────────────────────────────────
 
 export function useThumbnailExtractor(
@@ -504,8 +966,10 @@ export function useThumbnailExtractor(
   mseGetters?: MSEGetters,
   thumbnailDataReady?: boolean,
   moovBufferReady?: boolean,
+  maxCachedTime?: number,
 ) {
   const [ready, setReady] = useState(false);
+  const readyRef = useRef(false); // Mirror of ready state for async loops
   const [cachedTimes, setCachedTimes] = useState<Set<number>>(new Set());
 
   const frameBufferRef = useRef<Map<number, string>>(new Map());
@@ -514,12 +978,17 @@ export function useThumbnailExtractor(
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const durationRef = useRef(0);
+  const maxCachedTimeRef = useRef(0);
+
+  // Keep refs in sync with props
+  useEffect(() => { maxCachedTimeRef.current = maxCachedTime ?? 0; }, [maxCachedTime]);
 
   const desiredHoverTimeRef = useRef<number>(-1);
   const hoverActiveRef = useRef(false);
 
   const lastCachedUpdateRef = useRef(0);
   const pipelineRef = useRef<ThumbnailPipeline | null>(null);
+  const transmuxerPipelineRef = useRef<TransmuxerThumbnailPipeline | null>(null);
   
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -577,14 +1046,15 @@ export function useThumbnailExtractor(
 
   // ─── Mini MSE Pipeline Setup (MSE mode) ──────────────────────────────
 
-  // Create canvas for MSE mode (needed for both pipeline and main video capture)
+  // Create canvas for MSE mode (needed for pipeline-based thumbnail capture).
+  // For native mode, the hidden video setup creates its own canvas.
   useEffect(() => {
     if (!useNative && streamUrl) {
       const canvas = document.createElement('canvas');
       canvas.width = THUMBNAIL_WIDTH;
       canvas.height = THUMBNAIL_HEIGHT;
       canvasRef.current = canvas;
-      setReady(true); // Ready for passive capture immediately
+      setReady(true); readyRef.current = true; // Ready for passive capture immediately
     }
   }, [useNative, streamUrl]);
 
@@ -647,7 +1117,99 @@ export function useThumbnailExtractor(
     };
   }, [useNative, streamUrl, mseGetters, thumbnailDataReady, moovBufferReady]);
 
-  // ─── Hidden Video Setup (NATIVE mode) ────────────────────────────────
+  // ─── Transmuxer Thumbnail Pipeline Setup (MKV/TS on-demand thumbnails) ────
+  // Creates a second Input + VideoDecoder for thumbnail extraction at any position.
+  // Separate from main transmuxer so seeking doesn't disrupt playback.
+  // NOTE: This effect only re-runs when isTransmuxerActive changes (false→true).
+  // It does NOT re-run when keyframeIndexReady changes — the keyframe index
+  // update is handled by the separate "Keyframe Index Update" effect below.
+  // Using a ref for mseGetters prevents the effect from re-running when
+  // mseGetters object reference changes due to state updates like keyframeIndexReady.
+  const mseGettersRef = useRef(mseGetters);
+  mseGettersRef.current = mseGetters;
+
+  useEffect(() => {
+    const getters = mseGettersRef.current;
+    if (useNative || !streamUrl || !getters || !getters.isTransmuxerActive) return;
+
+    let cancelled = false;
+    const fileLength = getters.getFileLength();
+    const format = getters.getFormat();
+
+    if (fileLength <= 0 || format === 'unknown' || format === 'mp4') {
+      console.warn('[ThumbnailExtractor] Transmuxer pipeline: not applicable (format=' + format + ', fileLength=' + fileLength + ')');
+      return;
+    }
+
+    // MSE canvas must be created for thumbnail capture
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      const newCanvas = document.createElement('canvas');
+      newCanvas.width = THUMBNAIL_WIDTH;
+      newCanvas.height = THUMBNAIL_HEIGHT;
+      canvasRef.current = newCanvas;
+    }
+
+    const pipeline = new TransmuxerThumbnailPipeline(
+      streamUrl,
+      fileLength,
+      format,
+      canvasRef.current!,
+      getters.getKeyframeTimestamps(), // Cached keyframe index for fast seek
+    );
+
+    transmuxerPipelineRef.current = pipeline;
+
+    pipeline.init().then((success) => {
+      if (cancelled) return;
+      if (success && pipeline.active) {
+        console.log('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialized successfully');
+        setReady(true); readyRef.current = true;
+      } else {
+        console.warn('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialization failed');
+        pipeline.destroy();
+        transmuxerPipelineRef.current = null;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      console.log('[ThumbnailExtractor] Transmuxer pipeline effect cleanup');
+      if (transmuxerPipelineRef.current) {
+        transmuxerPipelineRef.current.destroy();
+        transmuxerPipelineRef.current = null;
+      }
+    };
+  }, [useNative, streamUrl, mseGetters?.isTransmuxerActive]);
+
+  // ─── Keyframe Index Update ─────────────────────────────────────────────
+  // The keyframe index is built in background after transmuxer init.
+  // When it becomes available, push it to the thumbnail pipeline so
+  // subsequent captures use binary search instead of slow getKeyPacket.
+  // Also push byte-offset data for TS OffsetCustomSource-based captures.
+  // Uses mseGettersRef to avoid depending on the mseGetters object directly.
+  useEffect(() => {
+    const getters = mseGettersRef.current;
+    if (!getters || !getters.keyframeIndexReady || !transmuxerPipelineRef.current) return;
+
+    const timestamps = getters.getKeyframeTimestamps();
+    if (timestamps.length > 0) {
+      transmuxerPipelineRef.current.updateKeyframeTimestamps(timestamps);
+    }
+
+    // Push byte-offset data for OffsetCustomSource-based TS captures
+    const byteOffsets = getters.getKeyframeByteOffsets?.() ?? [];
+    const headerData = getters.getTsHeaderData?.() ?? null;
+    const sourceConfig = getters.getTransmuxerSourceConfig?.() ?? null;
+    if (byteOffsets.length > 0) {
+      transmuxerPipelineRef.current.updateKeyframeData(byteOffsets, headerData, sourceConfig);
+      console.log(`[ThumbnailExtractor] Updated keyframe data: ${timestamps.length} timestamps, ${byteOffsets.length} byte-offsets`);
+    } else {
+      console.log(`[ThumbnailExtractor] Updated keyframe timestamps: ${timestamps.length} available (no byte-offsets yet)`);
+    }
+  }, [mseGetters?.keyframeIndexReady]);
+
+  // ─── Hidden Video Setup (NATIVE mode only) ────────────────────────────────
 
   useEffect(() => {
     if (!streamUrl || !useNative) return;
@@ -671,7 +1233,7 @@ export function useThumbnailExtractor(
 
     video.addEventListener('loadedmetadata', () => {
       durationRef.current = video.duration;
-      setReady(true);
+      setReady(true); readyRef.current = true;
     });
 
     video.addEventListener('error', () => {
@@ -690,7 +1252,7 @@ export function useThumbnailExtractor(
 
       frameBufferRef.current.clear();
       insertionOrderRef.current = [];
-      setReady(false);
+      setReady(false); readyRef.current = false;
       desiredHoverTimeRef.current = -1;
       hoverActiveRef.current = false;
     };
@@ -811,7 +1373,7 @@ export function useThumbnailExtractor(
         done = true;
         video.removeEventListener('loadedmetadata', onLoaded);
         durationRef.current = video.duration;
-        setReady(true);
+        setReady(true); readyRef.current = true;
         resolve(true);
       };
       video.addEventListener('loadedmetadata', onLoaded);
@@ -869,24 +1431,44 @@ export function useThumbnailExtractor(
 
           video.pause();
         } else {
-          // MSE mode: use mini MSE pipeline for any position (buffered or unbuffered)
+          // MSE mode: use mini MSE pipeline (MP4) or transmuxer thumbnail pipeline (MKV/TS)
           const pipeline = pipelineRef.current;
+          const transmuxerPipeline = transmuxerPipelineRef.current;
+          const getters = mseGettersRef.current;
+
+          // For TS format, skip captures until keyframe byte-offset index is ready.
+          // Without it, getKeyPacket is 8-12s per call — unacceptable for hover UX.
+          if (transmuxerPipeline && getters && getters.getFormat() === 'ts' && !getters.keyframeIndexReady) {
+            await new Promise(r => setTimeout(r, 200));
+            continue;
+          }
+
           if (pipeline && pipeline.ready && !pipeline.busy) {
-            console.log('[ThumbnailExtractor] Hover: calling captureAtTime for time', desiredTime);
+            console.log('[ThumbnailExtractor] Hover: calling MP4 captureAtTime for time', desiredTime);
             const captured = await pipeline.captureAtTime(
               desiredTime,
               frameBufferRef.current,
               insertionOrderRef.current,
               forceUpdateCachedTimes,
             );
-            console.log('[ThumbnailExtractor] Hover: captureAtTime result', captured);
+            console.log('[ThumbnailExtractor] Hover: MP4 captureAtTime result', captured);
             if (!captured && active) {
-              // Pipeline failed — brief wait before retry
+              await new Promise(r => setTimeout(r, 200));
+            }
+          } else if (transmuxerPipeline && transmuxerPipeline.ready && !transmuxerPipeline.busy) {
+            console.log('[ThumbnailExtractor] Hover: calling transmuxer captureAtTime for time', desiredTime);
+            const captured = await transmuxerPipeline.captureAtTime(
+              desiredTime,
+              frameBufferRef.current,
+              insertionOrderRef.current,
+              forceUpdateCachedTimes,
+            );
+            console.log('[ThumbnailExtractor] Hover: transmuxer captureAtTime result', captured);
+            if (!captured && active) {
               await new Promise(r => setTimeout(r, 200));
             }
           } else {
-            // Pipeline not ready or busy — brief wait
-            console.log('[ThumbnailExtractor] Hover: pipeline not available, ready=', pipeline?.ready, 'busy=', pipeline?.busy, 'pipeline=', !!pipeline);
+            console.log('[ThumbnailExtractor] Hover: no pipeline available, mp4=', !!pipeline, 'transmuxer=', !!transmuxerPipeline);
             await new Promise(r => setTimeout(r, 200));
           }
         }

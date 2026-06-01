@@ -77,6 +77,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [cacheComplete, setCacheComplete] = useState(false);
   // Time ranges from backend cache (includes both playback buffer + download)
   const [cachedTimeRanges, setCachedTimeRanges] = useState<[number, number][]>([]);
+  // Maximum time position with cached data — used to prevent thumbnail
+  // extractor from seeking beyond available data (which causes 503 → fatal error)
+  const maxCachedTime = cachedTimeRanges.length > 0
+    ? Math.max(...cachedTimeRanges.map(r => r[1]))
+    : 0;
   const [controlsHeight, setControlsHeight] = useState(0);
   const [miniBarVisible, setMiniBarVisible] = useState(false);
 
@@ -86,12 +91,58 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const dlTransferIdRef = useRef<string>('');
   const dismissTimerRef = useRef<number>(0);
 
-  // MSE player with native fallback
+  // MSE player handles ALL formats (MP4/MKV/WebM/TS).
+  // TS files now use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
+  // keyframe seeking instead of hls.js. This eliminates MISS-FAR targeted
+  // downloads at seek positions — same "seek poison" approach as .mp4 files.
+
+  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId);
+
+  // MSE player handles ALL formats (MP4, TS, MKV, WebM).
+  // TS files use MediabunnyTransmuxer instead of hls.js.
+
+  // Merge into unified player interface — MSE player handles everything
+  const player = {
+    mseUrl: msePlayer.mseUrl,
+    error: msePlayer.error,
+    useNative: msePlayer.useNative,
+    unsupportedCodec: msePlayer.unsupportedCodec,
+    prefetchedBytes: msePlayer.prefetchedBytes,
+    totalBytes: msePlayer.totalBytes,
+    isPrefetching: msePlayer.isPrefetching,
+    isPaused: msePlayer.isPaused,
+    isComplete: msePlayer.isComplete,
+    speed: msePlayer.speed,
+    pausePrefetch: msePlayer.pausePrefetch,
+    resumePrefetch: msePlayer.resumePrefetch,
+    seekTo: msePlayer.seekTo,
+    setVideoRef: msePlayer.setVideoRef,
+    downloadedTimeRanges: msePlayer.downloadedTimeRanges,
+    byteToTime: msePlayer.byteToTime,
+    setSuppressBackendReports: msePlayer.setSuppressBackendReports,
+    thumbnailDataReady: msePlayer.thumbnailDataReady,
+    moovBufferReady: msePlayer.moovBufferReady,
+    isTransmuxer: msePlayer.isTransmuxer,
+    isTransmuxerActive: msePlayer.isTransmuxerActive,
+    keyframeIndexReady: msePlayer.keyframeIndexReady,
+    getMoovBuffer: msePlayer.getMoovBuffer,
+    getFirstChunk: msePlayer.getFirstChunk,
+    getInitSegments: msePlayer.getInitSegments,
+    getVideoTrackInfo: msePlayer.getVideoTrackInfo,
+    getMP4BoxClass: msePlayer.getMP4BoxClass,
+    getFileLength: msePlayer.getFileLength,
+    getFormat: msePlayer.getFormat,
+    getKeyframeTimestamps: msePlayer.getKeyframeTimestamps,
+    getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets,
+    getTsHeaderData: msePlayer.getTsHeaderData,
+    getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig,
+  };
+
   const {
-    mseUrl,
-    error: mseError,
-    useNative,
-    unsupportedCodec,
+    mseUrl: playerMseUrl,
+    error: playerError,
+    useNative: playerUseNative,
+    unsupportedCodec: playerUnsupportedCodec,
     prefetchedBytes,
     totalBytes,
     isPrefetching,
@@ -105,37 +156,35 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
     setSuppressBackendReports,
-    getMoovBuffer,
-    getFirstChunk,
-    getInitSegments,
-    getVideoTrackInfo,
-    getMP4BoxClass,
-    getFileLength,
     thumbnailDataReady,
     moovBufferReady,
-  } = useMSEPlayer(streamUrl, file, activeFolderId);
+    isTransmuxer,
+    isTransmuxerActive: _isTransmuxerActive,
+    keyframeIndexReady: _keyframeIndexReady,
+  } = player;
 
-  // Native playback fallback: when MSE fails (e.g., codec not supported),
+  // Native playback fallback: when MSE/HLS fails (e.g., codec not supported),
   // the player falls back to native <video> using streamUrl directly.
-  // Only show error if there's an actual error from the MSE player, not just
+  // Only show error if there's an actual error from the player, not just
   // because native mode is active.
   useEffect(() => {
-    if (unsupportedCodec) {
-      setErr(unsupportedCodec);
+    if (playerUnsupportedCodec) {
+      setErr(playerUnsupportedCodec);
       setLoad(false);
-    } else if (useNative && mseError && !mseUrl) {
-      setErr(mseError);
+    } else if (playerUseNative && playerError && !playerMseUrl) {
+      setErr(playerError);
       setLoad(false);
     }
-  }, [useNative, mseUrl, mseError, unsupportedCodec]);
+  }, [playerUseNative, playerMseUrl, playerError, playerUnsupportedCodec]);
 
-  // Thumbnail extractor — ref-based hover processor + synchronous cache check
-  // useMemo stabilizes mseGetters so the effect in useThumbnailExtractor doesn't re-run on every render
+  // Thumbnail extractor — all formats use MSE-based extraction now
+  // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
+  // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength,
-  }), [getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady]);
 
-  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
@@ -415,24 +464,29 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const v = vidRef.current;
     if (!v) return;
 
-    // Pass video element to MSE hook for seek currentTime setting
+    // Pass video element to player hook
     setVideoRef(v);
 
-    // MSE mode uses a Blob URL (same-origin, bypasses WebView2 restrictions).
-    // Native fallback uses streamUrl directly — the Actix streaming server
-    // now includes CORS headers with Access-Control-Allow-Private-Network: true,
-    // allowing cross-port localhost requests under Chromium's LNA/PNA restrictions.
-    // Native <video> handles moov-at-end files via Range requests naturally
-    // (browser requests moov from tail first). Works in both dev and production
-    // thanks to tauri-plugin-localhost (app runs from http://localhost, same-origin
-    // with the streaming server).
-    const videoUrl = useNative ? streamUrl : mseUrl;
-    if (!videoUrl) return;
-
-    console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
-    v.src = videoUrl;
-    setLastVideoSrc(videoUrl);
-    v.autoplay = true;
+    // Video src assignment depends on playback mode:
+    // - MSE mode (ALL formats including TS): uses Blob URL (same-origin, bypasses WebView2 restrictions)
+    //   Native fallback uses streamUrl directly — the Actix streaming server
+    //   includes CORS headers with Access-Control-Allow-Private-Network: true.
+    //   TS files use MSE transmuxer (MediabunnyTransmuxer) instead of hls.js.
+    if (playerUseNative) {
+      // Native fallback: use streamUrl directly
+      console.log('[Player] Native fallback: setting video src to streamUrl');
+      v.src = streamUrl;
+      setLastVideoSrc(streamUrl);
+      v.autoplay = true;
+    } else {
+      // MSE mode (ALL formats): use Blob URL
+      const videoUrl = playerMseUrl;
+      if (!videoUrl) return;
+      console.log('[Player] Setting video src:', videoUrl);
+      v.src = videoUrl;
+      setLastVideoSrc(videoUrl);
+      v.autoplay = true;
+    }
 
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
@@ -444,7 +498,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.playbackRate = settings.playerSpeed;
       v.loop = loop;
       setLoad(false);
-      // Ensure playback starts (autoplay may be blocked by browser)
       v.play().catch((e) => console.warn('[Player] play() failed:', e));
     };
     const onCanPlay = () => {
@@ -459,7 +512,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onErr = () => {
       const err = v.error;
       console.error('[Player] video error:', err?.code, err?.message, 'src:', v.src);
-      setErr(mseError || `Video error: ${err?.message || 'unknown'}`);
+      setErr(playerError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
     const onTime = () => {
@@ -516,6 +569,15 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
+    const onDurChange = () => {
+      // MSE streams may report Infinity at loadedmetadata then update via durationchange
+      // once MediaSource.duration is set (e.g., for transmuxer TS/MKV playback)
+      if (isFinite(v.duration) && v.duration > 0) {
+        setDur(v.duration);
+        durRef.current = v.duration;
+      }
+    };
+    v.addEventListener('durationchange', onDurChange);
     return () => {
       setVideoRef(null);
       v.removeEventListener('loadedmetadata', onMeta);
@@ -528,8 +590,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
+      v.removeEventListener('durationchange', onDurChange);
     };
-  }, [streamUrl, mseUrl, useNative, setVideoRef]);
+  }, [streamUrl, playerMseUrl, playerUseNative, setVideoRef]);
 
   // Buffer state is already updated by timeupdate and progress events above
 
@@ -624,14 +687,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     if (!v) return;
     setVideoEnded(false);
     videoEndedRef.current = false;
-    if (useNative) {
+    if (playerUseNative) {
       v.play().catch(() => {});
     } else {
       seekTo(0);
       // seekTo sets pendingSeek + restarts download loop; video.play() starts playback
       v.play().catch(() => {});
     }
-  }, [useNative, seekTo]);
+  }, [playerUseNative, seekTo]);
 
   useEffect(() => {
     if (pip && vidRef.current) {
@@ -659,7 +722,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const v = vidRef.current;
     if (!v) return;
     const target = Math.max(0, Math.min(v.currentTime + s, dur));
-    if (useNative) {
+    if (playerUseNative) {
       v.currentTime = target;
     } else if (target >= dur) {
       // Seeking to/past the end → directly show replay overlay.
@@ -676,7 +739,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     } else {
       seekTo(target);
     }
-  }, [dur, useNative, seekTo]);
+  }, [dur, playerUseNative, seekTo]);
   const seekFwd = useCallback(() => {
     // When replay overlay is showing, ignore forward seeks — the video
     // has already ended. Pressing space/k calls replay() via toggle().
@@ -728,7 +791,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     }
     const r = barRef.current.getBoundingClientRect();
     const targetTime = ((e.clientX - r.left) / r.width) * dur;
-    if (useNative) {
+    if (playerUseNative) {
       vidRef.current.currentTime = targetTime;
     } else if (targetTime >= dur) {
       vidRef.current.currentTime = dur;
@@ -740,7 +803,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     } else {
       seekTo(targetTime);
     }
-  }, [dur, useNative, seekTo]);
+  }, [dur, playerUseNative, seekTo]);
 
   const tipRafRef = useRef(0);
   const hoverDebounceRef = useRef(0);
@@ -768,18 +831,25 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         clearTimeout(hoverDebounceRef.current);
         clearDesiredHover();
       } else {
-        // Not cached: show spinner immediately, but delay the on-demand seek
-        // by 1 second. This prevents accidental/sweep hovers from triggering
-        // expensive network seeks. If the user stays at this position for 1s,
-        // the hover processor starts generating the thumbnail.
-        setThumbUrl(null);
-        setThumbLoading(true);
+        // Not cached: show spinner if thumbnails CAN be generated.
+        // - Native mode: hidden video can seek to any position
+        // - MP4 MSE: mini pipeline + moov buffer enables on-demand capture
+        // - Transmuxer (MKV/TS): second transmuxer instance + hidden video + MSE
+        const canGenerateThumbnails = playerUseNative || (thumbnailDataReady && moovBufferReady) || isTransmuxer();
+        if (canGenerateThumbnails) {
+          setThumbUrl(null);
+          setThumbLoading(true);
 
-        // Cancel previous debounce timer
-        clearTimeout(hoverDebounceRef.current);
-        hoverDebounceRef.current = window.setTimeout(() => {
-          setDesiredHoverTime(hoverTime);
-        }, 1000);
+          // Cancel previous debounce timer
+          clearTimeout(hoverDebounceRef.current);
+          hoverDebounceRef.current = window.setTimeout(() => {
+            setDesiredHoverTime(hoverTime);
+          }, 1000);
+        } else {
+          setThumbUrl(null);
+          setThumbLoading(false);
+          clearDesiredHover();
+        }
       }
     }
   }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
@@ -820,7 +890,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         {err ? (
           <div className="text-center px-8">
             <div className="text-amber-400 text-lg mb-2">{err}</div>
-            {unsupportedCodec ? (
+            {playerUnsupportedCodec ? (
               <div className="flex gap-3 justify-center">
                 <button onClick={handleDownload} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Download Video</button>
                 <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-nobuf-subtext rounded-lg transition-colors">Close</button>
@@ -878,6 +948,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             setTip(p => ({ ...p, show: false }));
             clearTimeout(hoverDebounceRef.current);
             clearDesiredHover();
+            // Clear thumbnail loading state — spinner should disappear
+            // immediately when mouse leaves the progress bar
+            setThumbLoading(false);
+            setThumbUrl(null);
+            lastThumbTimeRef.current = -1;
           }}
         >
           {/* Visual bar track */}

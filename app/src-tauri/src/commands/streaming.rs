@@ -216,6 +216,13 @@ pub async fn cmd_delete_cache(
     message_id: i32,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
+    // Check for active downloads BEFORE attempting deletion.
+    // The download coordinator uses async mutex, so we check here
+    // (in the async Tauri command) rather than in the sync delete_cache method.
+    if cache_state.has_active_download(message_id).await {
+        return Err("Cache has active download — retry later".to_string());
+    }
+
     let deleted = cache_state
         .delete_cache(message_id)
         .map_err(|e| format!("Failed to delete cache: {}", e))?;
