@@ -72,6 +72,28 @@ function AppContent() {
     checkSession();
   }, []);
 
+  // ── Frontend cleanup on window close ──
+  // When the user closes the window (X button, Alt+F4, etc.), the
+  // beforeunload event fires. We signal the Rust backend to clean up
+  // all cache files NOW (while the process is still alive) rather than
+  // relying solely on RunEvent::Exit (which races with handle closure
+  // on Windows). The Rust RunEvent::Exit handler is still the primary
+  // cleanup path — this is a belt-and-suspenders approach.
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      try {
+        // Fire-and-forget: invoke doesn't wait, but the IPC message
+        // reaches the Rust side before the process terminates.
+        invoke("cmd_clean_cache").catch(() => {});
+      } catch {
+        // Ignore — Rust-side RunEvent::Exit will handle it
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
+
   // Styled splash screen while verifying the session
   if (authStatus === "loading") {
     return (

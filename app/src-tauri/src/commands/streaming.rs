@@ -497,3 +497,29 @@ async fn background_cache_download(
 
     Ok(())
 }
+
+/// Get total cache size on disk (in bytes). Scans all files in the
+/// stream-cache directory including remux/ subdirectory.
+#[tauri::command]
+pub async fn cmd_get_cache_total_size(
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<u64, String> {
+    let cache_dir = cache_state.cache_dir().clone();
+    let mut total: u64 = 0;
+
+    fn scan_dir(dir: &std::path::Path, total: &mut u64) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, total);
+                } else if let Ok(meta) = std::fs::metadata(&path) {
+                    *total += meta.len();
+                }
+            }
+        }
+    }
+
+    scan_dir(&cache_dir, &mut total);
+    Ok(total)
+}

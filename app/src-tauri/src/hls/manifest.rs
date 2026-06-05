@@ -210,7 +210,7 @@ pub fn extract_video_attrs_from_raw_msg(
             tl::enums::DocumentAttribute::HasStickers => "HasStickers",
             tl::enums::DocumentAttribute::CustomEmoji(_) => "CustomEmoji",
         }).collect();
-        log::debug!("[HLS] No Video/Audio attribute found; present attrs: {:?}", attr_names);
+        log::warn!("[HLS] No Video/Audio attribute found; present attrs: {:?}", attr_names);
     }
 
     duration.map(|d| (d, width.unwrap_or(0), height.unwrap_or(0)))

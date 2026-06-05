@@ -1,4 +1,4 @@
-declare module 'mux.js' {
+﻿declare module 'mux.js' {
   const muxjs: {
     mp4: {
       Transmuxer: new (options?: {

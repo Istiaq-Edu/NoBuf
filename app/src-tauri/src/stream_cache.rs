@@ -787,6 +787,99 @@ impl StreamCacheManager {
         Ok(())
     }
 
+    /// Robust version of clear_all that handles Windows file-lock issues.
+    ///
+    /// On Windows, `remove_dir_all()` fails entirely if ANY file in the
+    /// directory has an open handle (ERROR_SHARING_VIOLATION). This is
+    /// especially likely because open_data_file_write() opens .dat files
+    /// with FILE_SHARE_READ | FILE_SHARE_WRITE (no FILE_SHARE_DELETE),
+    /// which means even our own handles block deletion.
+    ///
+    /// Strategy: iterate files individually, delete what we can, retry
+    /// locked files after a short delay. Report total freed bytes.
+    pub fn clear_all_robust(&self) -> std::io::Result<()> {
+        if !self.cache_dir.exists() {
+            return Ok(());
+        }
+
+        let mut total_freed: u64 = 0;
+        let mut failed_files: Vec<(PathBuf, std::io::Error)> = Vec::new();
+
+        // Walk the directory tree and delete files one by one
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Handle subdirectories (e.g., remux/)
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
+                            let size = std::fs::metadata(&sub_path).map(|m| m.len()).unwrap_or(0);
+                            match std::fs::remove_file(&sub_path) {
+                                Ok(()) => total_freed += size,
+                                Err(e) => failed_files.push((sub_path, e)),
+                            }
+                        }
+                    }
+                    // Try to remove the now-empty subdirectory
+                    let _ = std::fs::remove_dir(&path);
+                } else {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => total_freed += size,
+                        Err(e) => failed_files.push((path, e)),
+                    }
+                }
+            }
+        }
+
+        // Retry locked files after a short delay (handles race with
+        // file handles closing from server shutdown)
+        if !failed_files.is_empty() {
+            log::info!(
+                "[CACHE] {} files locked on first pass, retrying after 1s...",
+                failed_files.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
+            let still_locked: Vec<_> = failed_files.into_iter().filter(|(path, first_err)| {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        total_freed += size;
+                        false // removed, filter out
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[CACHE] Still can't delete {:?}: {} (first: {})",
+                            path, e, first_err
+                        );
+                        true // still locked
+                    }
+                }
+            }).collect();
+
+            if !still_locked.is_empty() {
+                log::warn!(
+                    "[CACHE] {} files still locked after retry — will be cleaned on next startup",
+                    still_locked.len()
+                );
+            }
+        }
+
+        log::info!(
+            "[CACHE] clear_all_robust: freed {:.1} MB from {:?}",
+            total_freed as f64 / 1e6,
+            self.cache_dir
+        );
+
+        // Try to remove the now-empty cache directory and recreate it
+        let _ = std::fs::remove_dir_all(&self.cache_dir);
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+
+        Ok(())
+    }
+
     /// Get the cache directory path
     pub fn cache_dir(&self) -> &PathBuf {
         &self.cache_dir
