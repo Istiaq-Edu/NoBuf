@@ -1,4 +1,4 @@
-// Restore mux.js extendFirstKeyFrame to original behavior.
+﻿// Restore mux.js extendFirstKeyFrame to original behavior.
 //
 // The true passthrough patch (return gops) preserved all P-frames but
 // allowed segments starting with P-frames (mid-GOP flushes). Chrome's MSE
@@ -30,7 +30,7 @@ const PATCHED_MARKER = 'PATCHED: Restored original extendFirstKeyFrame';
 // The patch script will detect existing patches and replace them
 // with the original (unpatched) code.
 
-// No new code to apply — we're RESTORING the original extendFirstKeyFrame.
+// No new code to apply ΓÇö we're RESTORING the original extendFirstKeyFrame.
 // The script below detects existing patches and removes them, restoring
 // the original mux.js code.
 
@@ -42,7 +42,7 @@ const filesToRestore = [
   join(process.cwd(), 'node_modules/mux.js/dist/mux-mp4.js'),
 ];
 
-// Original extendFirstKeyFrame code (ES/cjs format — named function)
+// Original extendFirstKeyFrame code (ES/cjs format ΓÇö named function)
 const originalCodeEs = [
   'var extendFirstKeyFrame = function extendFirstKeyFrame(gops) {',
   '  var currentGop;',
@@ -64,7 +64,7 @@ const originalCodeEs = [
   '};',
 ].join('\n');
 
-// Original extendFirstKeyFrame code (lib format — unnamed function)
+// Original extendFirstKeyFrame code (lib format ΓÇö unnamed function)
 const originalCodeLib = [
   'var extendFirstKeyFrame = function(gops) {',
   '  var currentGop;',
@@ -88,7 +88,7 @@ const originalCodeLib = [
   '};',
 ].join('\n');
 
-// Original extendFirstKeyFrame code (dist format — indented)
+// Original extendFirstKeyFrame code (dist format ΓÇö indented)
 const originalCodeDist = [
   '  var extendFirstKeyFrame = function extendFirstKeyFrame(gops) {',
   '    var currentGop;',
@@ -166,6 +166,51 @@ for (const filePath of filesToRestore) {
   }
 }
 
+// Patch mp4-generator.js: replace mvhd(0xffffffff) with mvhd(0x7FFFFFFF)
+// and track.duration || 0xffffffff with || 0x7FFFFFFF.
+// Chrome interprets 0xFFFFFFFF in mvhd as Infinity duration, causing
+// DurationChanged on every media segment append (8-9s per append).
+// Using 0x7FFFFFFF (max int32, ~6.6 hours at 90kHz) prevents this.
+// Runtime patching (patchMvhdDuration in useMSEPlayer.ts) overrides
+// this with the actual estimated duration, but this source-level patch
+// provides a better default if runtime patching isn't applied.
+const generatorFiles = [
+  join(process.cwd(), 'node_modules/mux.js/lib/mp4/mp4-generator.js'),
+  join(process.cwd(), 'node_modules/mux.js/es/mp4/mp4-generator.js'),
+  join(process.cwd(), 'node_modules/mux.js/cjs/mp4/mp4-generator.js'),
+  join(process.cwd(), 'node_modules/mux.js/dist/mux.js'),
+  join(process.cwd(), 'node_modules/mux.js/dist/mux-mp4.js'),
+];
+
+for (const filePath of generatorFiles) {
+  try {
+    let content = readFileSync(filePath, 'utf8');
+    let modified = false;
+
+    // Patch 1: mvhd(0xffffffff) → mvhd(0x7FFFFFFF) in moov() function
+    if (content.includes('mvhd(0xffffffff)')) {
+      content = content.replace('mvhd(0xffffffff)', 'mvhd(0x7FFFFFFF)');
+      modified = true;
+    }
+    // Also handle uppercase variant
+    if (content.includes('mvhd(0xFFFFFFFF)')) {
+      content = content.replace('mvhd(0xFFFFFFFF)', 'mvhd(0x7FFFFFFF)');
+      modified = true;
+    }
+
+    // Patch 2: track.duration || 0xffffffff → || 0x7FFFFFFF in trak() function
+    if (content.includes('track.duration || 0xffffffff')) {
+      content = content.replace(/track\.duration \|\| 0xffffffff/g, 'track.duration || 0x7FFFFFFF');
+      modified = true;
+    }
+
+    if (modified) {
+      writeFileSync(filePath, content, 'utf8');
+      console.log(`Patched mvhd duration in: ${filePath}`);
+    }
+  } catch (e) {
+    console.log(`Generator file not found or error: ${filePath} - ${e.message}`);
+  }
+}
+
 console.log('\nPatch restoration complete. Original extendFirstKeyFrame ensures keyframe-aligned segments.');
-console.log('Trade-off: ~0.07-0.33s P-frames dropped per flush (minor stuttering, no quality deformation).');
-console.log('Mitigated by FLUSH_INTERVAL=8 (2MB per flush, fewer mid-GOP flushes).');

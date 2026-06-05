@@ -39,7 +39,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
   const [rate, setRate] = useState(settings.playerSpeed);
-  const [buf, setBuf] = useState(0);
+  const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   // Track the actual URL set as <video>.src for diagnostic display
@@ -106,6 +106,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     mseUrl: msePlayer.mseUrl,
     error: msePlayer.error,
     useNative: msePlayer.useNative,
+    remuxUrl: msePlayer.remuxUrl,
     unsupportedCodec: msePlayer.unsupportedCodec,
     prefetchedBytes: msePlayer.prefetchedBytes,
     totalBytes: msePlayer.totalBytes,
@@ -142,6 +143,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     mseUrl: playerMseUrl,
     error: playerError,
     useNative: playerUseNative,
+    remuxUrl: playerRemuxUrl,
     unsupportedCodec: playerUnsupportedCodec,
     prefetchedBytes,
     totalBytes,
@@ -181,8 +183,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
   // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady,
-  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config]);
 
   const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -379,8 +381,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // Download handler — player prebuffer and file download run simultaneously,
   // interleaved at the Rust level via a Semaphore(1) that serializes all Telegram
   // iter_download calls. Only one chunk request hits Telegram at a time → no FLOOD_WAIT.
-  // Green bar merges player's in-memory ranges (downloadedTimeRanges) and download's
-  // cache ranges (cachedTimeRanges from cmd_get_cache_status polling).
+  // Green bar = disk cache (cachedTimeRanges from cmd_get_cache_status polling).
+  // Gray/White bar = in-memory SourceBuffer (video.buffered — instant seeks).
+  // Yellow bar = thumbnail coverage.
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
@@ -473,25 +476,88 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     //   includes CORS headers with Access-Control-Allow-Private-Network: true.
     //   TS files use MSE transmuxer (MediabunnyTransmuxer) instead of hls.js.
     if (playerUseNative) {
-      // Native fallback: use streamUrl directly
-      console.log('[Player] Native fallback: setting video src to streamUrl');
-      v.src = streamUrl;
-      setLastVideoSrc(streamUrl);
+      // Native fallback: use remux URL (ffmpeg TS→MP4) if available, otherwise raw streamUrl
+      // Two strategies in the /remux/ endpoint:
+      //   Strategy A (file cached): disk remux with faststart → moov has correct duration
+      //   Strategy B (not cached): piped fMP4 → empty_moov with duration=0
+      // For Strategy B, we must override the player UI duration from metadata.
+      const nativeUrl = playerRemuxUrl || streamUrl;
+      console.log('[Player] Native fallback: setting video src to', nativeUrl === playerRemuxUrl ? 'remux URL' : 'streamUrl');
+
+      // For remux URLs: Override the player UI duration with the KNOWN duration.
+      // When the file is NOT cached, the /remux/ endpoint streams piped fMP4
+      // with empty_moov (duration=0 in moov box). Chrome reads this as
+      // "live streaming" and video.duration shows ~3s. Override from metadata.
+      // When the file IS cached, faststart moov has the correct duration
+      // and Chrome gets it right — the override is harmless (same value).
+      if (nativeUrl === playerRemuxUrl && file) {
+        let knownDuration = 0;
+        // Priority 1: Telegram metadata duration
+        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
+          knownDuration = file.duration;
+        }
+        // Priority 2: Bitrate estimation from file size
+        // TS files sent as documents won't have file.duration from Telegram.
+        // Estimate at ~4Mbps average bitrate (typical for 1080p video).
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8; // bits / bitrate = seconds
+        }
+        if (knownDuration > 0) {
+          console.log('[Player] Remux: overriding duration to', knownDuration.toFixed(1), 's');
+          setDur(knownDuration);
+          durRef.current = knownDuration;
+        }
+      }
+
+      v.src = nativeUrl;
+      setLastVideoSrc(nativeUrl);
       v.autoplay = true;
     } else {
       // MSE mode (ALL formats): use Blob URL
+      // For mpegts.js (TS files), mseUrl is null because mpegts.js creates
+      // its own MediaSource and sets video.src internally. We must NOT
+      // skip event listener setup — just skip the src assignment.
       const videoUrl = playerMseUrl;
-      if (!videoUrl) return;
-      console.log('[Player] Setting video src:', videoUrl);
-      v.src = videoUrl;
-      setLastVideoSrc(videoUrl);
+      if (videoUrl) {
+        console.log('[Player] Setting video src:', videoUrl);
+        v.src = videoUrl;
+        setLastVideoSrc(videoUrl);
+      } else {
+        console.log('[Player] MSE URL is null (mpegts.js mode) — skipping video.src, mpegts.js will set it');
+        // mpegts.js will set video.src after attachMediaElement()
+        // Mark as MSE blob URL for the durationchange guard
+        setLastVideoSrc('mpegts://internal');
+      }
       v.autoplay = true;
     }
 
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
-      setDur(v.duration);
-      durRef.current = v.duration;
+      // For TS files via mpegts.js: video.duration is often Infinity
+      // because TS has no global duration header. Override with known duration.
+      if (!isFinite(v.duration) && file) {
+        let knownDuration = 0;
+        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
+          knownDuration = file.duration;
+        }
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8; // ~4Mbps estimate
+        }
+        if (knownDuration > 0) {
+          console.log('[Player] MPEGTS: overriding Infinity duration to', knownDuration.toFixed(1), 's');
+          setDur(knownDuration);
+          durRef.current = knownDuration;
+        }
+      } else {
+        // For remux URLs in piped mode: video.duration is unreliable (empty_moov = ~3s).
+        // If we already set a metadata-provided duration, don't let video.duration
+        // overwrite it. For cached mode, video.duration is correct from faststart moov.
+        const isRemux = lastVideoSrc === playerRemuxUrl;
+        if (!isRemux || v.duration > durRef.current) {
+          setDur(v.duration);
+          durRef.current = v.duration;
+        }
+      }
       setVol(v.volume);
       setMuted(v.muted);
       setVideoResolution({ w: v.videoWidth, h: v.videoHeight });
@@ -572,9 +638,31 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onDurChange = () => {
       // MSE streams may report Infinity at loadedmetadata then update via durationchange
       // once MediaSource.duration is set (e.g., for transmuxer TS/MKV playback)
+      // or when mpegts.js sets mediaSource.duration after our explicit override.
       if (isFinite(v.duration) && v.duration > 0) {
-        setDur(v.duration);
-        durRef.current = v.duration;
+        // For remux URLs in piped mode: only accept LARGER duration values.
+        // Piped fMP4 may gradually discover more duration as fragments arrive,
+        // but should never overwrite the metadata-provided real duration with ~3s.
+        const isRemux = lastVideoSrc === playerRemuxUrl;
+        if (!isRemux || v.duration > durRef.current) {
+          console.log('[Player] durationchange:', v.duration, 's (was:', durRef.current, ')');
+          setDur(v.duration);
+          durRef.current = v.duration;
+        }
+      } else if (!isFinite(v.duration) && file) {
+        // mpegts.js may report Infinity — override from metadata
+        let knownDuration = 0;
+        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
+          knownDuration = file.duration;
+        }
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8;
+        }
+        if (knownDuration > 0 && durRef.current !== knownDuration) {
+          console.log('[Player] durationchange Infinity → override:', knownDuration.toFixed(1), 's');
+          setDur(knownDuration);
+          durRef.current = knownDuration;
+        }
       }
     };
     v.addEventListener('durationchange', onDurChange);
@@ -592,7 +680,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('progress', onProgress);
       v.removeEventListener('durationchange', onDurChange);
     };
-  }, [streamUrl, playerMseUrl, playerUseNative, setVideoRef]);
+  }, [streamUrl, playerMseUrl, playerUseNative, playerRemuxUrl, setVideoRef]);
 
   // Buffer state is already updated by timeupdate and progress events above
 
@@ -881,7 +969,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [toggle, seek, setVol2, mute, fs2, handleClose, onNext, onPrev, vol, rate, rate2, dur]);
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
-  const bufPct = dur > 0 ? (buf / dur) * 100 : 0;
 
   return (
     <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex flex-col select-none">
@@ -957,32 +1044,46 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Green buffer bar — all locally available data (SourceBuffer + disk cache) */}
+            {/* Gray/White bar — in-memory SourceBuffer (instant seeks, no network) */}
             {(() => {
               const vid = vidRef.current;
-              const bufferedRanges: [number, number][] = [];
+              const ranges: [number, number][] = [];
               if (vid && vid.buffered && vid.buffered.length > 0) {
                 for (let i = 0; i < vid.buffered.length; i++) {
-                  bufferedRanges.push([vid.buffered.start(i), vid.buffered.end(i)]);
+                  ranges.push([vid.buffered.start(i), vid.buffered.end(i)]);
                 }
               }
-              const merged = [...bufferedRanges, ...cachedTimeRanges];
-              if (merged.length === 0 || dur <= 0) return null;
-              const sorted = merged.sort((a, b) => a[0] - b[0]);
-              const deduped: [number, number][] = [];
-              for (const r of sorted) {
-                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1] + 0.01) {
-                  deduped.push(r);
-                } else {
-                  deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
-                }
-              }
-              return deduped.map(([ts, te], i) => {
+              if (ranges.length === 0 || dur <= 0) return null;
+              return ranges.map(([ts, te], i) => {
                 const leftPct = (ts / dur) * 100;
                 const widthPct = ((te - ts) / dur) * 100;
                 return (
                   <div
-                    key={`buf-${i}`}
+                    key={`mem-${i}`}
+                    className="absolute inset-y-0 bg-white/30 rounded-full z-10"
+                    style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
+                  />
+                );
+              });
+            })()}
+            {/* Green bar — disk cache (fast seeks, ~100-500ms, from cmd_get_cache_status) */}
+            {cachedTimeRanges.length > 0 && dur > 0 && (() => {
+              // Merge overlapping cached ranges
+              const sorted = [...cachedTimeRanges].sort((a, b) => a[0] - b[0]);
+              const merged: [number, number][] = [];
+              for (const r of sorted) {
+                if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
+                  merged.push([r[0], r[1]]);
+                } else {
+                  merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
+                }
+              }
+              return merged.map(([ts, te], i) => {
+                const leftPct = (ts / dur) * 100;
+                const widthPct = ((te - ts) / dur) * 100;
+                return (
+                  <div
+                    key={`cache-${i}`}
                     className="absolute bottom-0 h-[3px] bg-green-400/70 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
@@ -1013,14 +1114,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={i}
-                    className="absolute top-0 h-[3px] bg-yellow-400/70 rounded-full z-10"
+                    className="absolute top-0 h-[3px] bg-yellow-400/70 rounded-full z-30"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* MSE buffer indicator */}
-            <div className="absolute inset-y-0 left-0 bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
+            {/* (in-memory indicator replaced by gray/white video.buffered bar above) */}
             {/* Playback position */}
             <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
             {/* Knob */}

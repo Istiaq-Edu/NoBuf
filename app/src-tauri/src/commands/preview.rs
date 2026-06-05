@@ -162,14 +162,39 @@ pub async fn cmd_get_preview(
 pub async fn cmd_clean_cache(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Clean preview cache
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e: tauri::Error| e.to_string())?
         .join("previews");
     if cache_dir.exists() {
-        let _ = std::fs::remove_dir_all(cache_dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
+
+    // Clean thumbnail cache (unbounded — can grow to hundreds of MBs)
+    if let Ok(data_dir) = app_handle.path().app_data_dir() {
+        let thumb_dir = data_dir.join("thumbnails");
+        if thumb_dir.exists() {
+            let _ = std::fs::remove_dir_all(&thumb_dir);
+        }
+    }
+
+    // Clean stream cache (the big one — can be GBs of .dat files)
+    if let Some(cache_mgr) = app_handle.try_state::<crate::stream_cache::StreamCacheManager>() {
+        if let Err(e) = cache_mgr.clear_all_robust() {
+            log::warn!("[cmd_clean_cache] clear_all_robust failed: {}", e);
+            // Fallback to simple
+            let _ = cache_mgr.clear_all();
+        }
+    }
+
+    // Clean orphaned remux files in %TEMP%
+    let temp_remux = std::env::temp_dir().join("nobuf_remux");
+    if temp_remux.exists() {
+        let _ = std::fs::remove_dir_all(&temp_remux);
+    }
+
     Ok(())
 }
 

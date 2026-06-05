@@ -957,6 +957,373 @@ class TransmuxerThumbnailPipeline {
   }
 }
 
+// ─── fMP4 Backend Thumbnail Pipeline ──────────────────────────────────
+// Uses the TS→fMP4 backend segment endpoints for thumbnail extraction.
+// Creates a hidden <video> + MediaSource + SourceBuffer, fetches init segment
+// and time-based media segments from the backend, seeks and captures frames.
+// Same MSE approach as ThumbnailPipeline but uses backend endpoints instead
+// of mp4box.js for seeking (because the source is TS, not MP4).
+
+class Fmp4ThumbnailPipeline {
+  video: HTMLVideoElement;
+  mediaSource: MediaSource | null = null;
+  sourceBuffer: SourceBuffer | null = null;
+  blobUrl: string | null = null;
+  canvas: HTMLCanvasElement;
+  initSegment: ArrayBuffer | null = null;
+  // Backend fMP4 endpoint config
+  fmp4BaseUrl: string;
+  folderId: string;
+  messageId: string;
+  queryParams: string;
+  mimeType: string;
+  duration: number = 0;
+  ready = false;
+  active = true;
+  busy = false;
+
+  constructor(
+    config: {
+      baseUrl: string;
+      folderId: string;
+      messageId: string;
+      queryParams: string;
+      mimeType: string;
+      duration: number;
+    },
+    canvas: HTMLCanvasElement,
+  ) {
+    this.fmp4BaseUrl = config.baseUrl;
+    this.folderId = config.folderId;
+    this.messageId = config.messageId;
+    this.queryParams = config.queryParams;
+    this.mimeType = config.mimeType;
+    this.duration = config.duration;
+    this.canvas = canvas;
+
+    // Create hidden video element
+    this.video = document.createElement('video');
+    this.video.muted = true;
+    this.video.playsInline = true;
+    this.video.preload = 'auto';
+    this.video.style.position = 'absolute';
+    this.video.style.left = '-9999px';
+    this.video.style.width = '1px';
+    this.video.style.height = '1px';
+    document.body.appendChild(this.video);
+  }
+
+  /** Initialize the fMP4 thumbnail pipeline. Fetches init segment, sets up MSE. */
+  async init(): Promise<boolean> {
+    if (!this.active) return false;
+
+    const mimeType = this.mimeType;
+    if (!MediaSource.isTypeSupported(mimeType)) {
+      console.warn(`[Fmp4ThumbnailPipeline] Codec not supported: ${mimeType}`);
+      return false;
+    }
+
+    // Create MediaSource and blob URL
+    this.mediaSource = new MediaSource();
+    this.blobUrl = URL.createObjectURL(this.mediaSource);
+
+    // Set video.src BEFORE waiting for sourceopen
+    this.video.src = this.blobUrl;
+
+    // Wait for sourceopen
+    await new Promise<void>((resolve) => {
+      if (this.mediaSource!.readyState === 'open') {
+        resolve();
+      } else {
+        this.mediaSource!.addEventListener('sourceopen', () => resolve(), { once: true });
+      }
+    });
+
+    if (!this.active) return false;
+
+    // Create SourceBuffer
+    this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
+
+    // Fetch init segment from backend
+    const initUrl = `${this.fmp4BaseUrl}/init/${this.folderId}/${this.messageId}?${this.queryParams}`;
+    console.log('[Fmp4ThumbnailPipeline] Fetching init segment:', initUrl);
+
+    const initResp = await fetch(initUrl);
+    if (!initResp.ok) {
+      console.warn(`[Fmp4ThumbnailPipeline] Init segment fetch failed (HTTP ${initResp.status})`);
+      return false;
+    }
+
+    this.initSegment = await initResp.arrayBuffer();
+
+    // Append init segment to SourceBuffer
+    await this._waitForUpdateEnd();
+    this.sourceBuffer!.appendBuffer(this.initSegment);
+    await this._waitForUpdateEnd();
+
+    // Fetch a small initial segment (first 0.5s) so the video element gets metadata
+    const segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=0&duration=0.5`;
+    console.log('[Fmp4ThumbnailPipeline] Fetching initial segment:', segUrl);
+
+    const segResp = await fetch(segUrl);
+    if (segResp.ok) {
+      const segData = await segResp.arrayBuffer();
+      if (segData.byteLength > 0) {
+        await this._waitForUpdateEnd();
+        this.sourceBuffer!.appendBuffer(segData);
+        await this._waitForUpdateEnd();
+      }
+    }
+
+    // Wait for loadedmetadata
+    await new Promise<boolean>((resolve) => {
+      if (this.video.readyState >= 1) {
+        resolve(true);
+        return;
+      }
+      let done = false;
+      const onLoaded = () => {
+        if (done) return;
+        done = true;
+        this.video.removeEventListener('loadedmetadata', onLoaded);
+        resolve(true);
+      };
+      this.video.addEventListener('loadedmetadata', onLoaded);
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          this.video.removeEventListener('loadedmetadata', onLoaded);
+          resolve(false);
+        }
+      }, 10000);
+    });
+
+    if (!this.active) return false;
+
+    // Update duration from video if not already set
+    if (this.video.duration && isFinite(this.video.duration) && this.video.duration > 0) {
+      this.duration = this.video.duration;
+    }
+
+    this.ready = true;
+    console.log('[Fmp4ThumbnailPipeline] Pipeline ready, duration=' + this.duration.toFixed(1) + 's');
+    return true;
+  }
+
+  /** Wait for SourceBuffer updateend event */
+  private async _waitForUpdateEnd(): Promise<void> {
+    const sb = this.sourceBuffer;
+    if (!sb) return;
+    if (!sb.updating) return;
+    return new Promise<void>((resolve) => {
+      sb.addEventListener('updateend', () => resolve(), { once: true });
+    });
+  }
+
+  /** Remove all buffered data from SourceBuffer */
+  private async _removeAllBufferedData(): Promise<void> {
+    const sb = this.sourceBuffer;
+    if (!sb) return;
+
+    await this._waitForUpdateEnd();
+
+    const buffered = sb.buffered;
+    if (buffered.length === 0) return;
+
+    const start = buffered.start(0);
+    const end = buffered.end(buffered.length - 1);
+
+    sb.remove(start, end);
+    await this._waitForUpdateEnd();
+  }
+
+  /** Seek hidden video to a time position and wait for seeked event */
+  private async _seekVideo(time: number): Promise<boolean> {
+    const video = this.video;
+
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const onSeeked = () => {
+        if (done) return;
+        done = true;
+        video.removeEventListener('seeked', onSeeked);
+        resolve(true);
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.currentTime = time;
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          video.removeEventListener('seeked', onSeeked);
+          resolve(false);
+        }
+      }, 5000);
+    });
+  }
+
+  /** Wait for the video decoder to actually render the frame at the seek position */
+  private async _waitForFrameRender(seekTarget: number): Promise<void> {
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const onFrame = (_now: number, metadata: any) => {
+          if (settled) return;
+          const mediaTime = metadata.mediaTime ?? metadata.currentTime ?? this.video.currentTime;
+          if (Math.abs(mediaTime - seekTarget) < 0.1) {
+            settled = true;
+            resolve();
+          } else {
+            this.video.requestVideoFrameCallback(onFrame);
+          }
+        };
+        this.video.requestVideoFrameCallback(onFrame);
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        }, 2000);
+      });
+    } else {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+
+  /** Capture a frame at the given time position using backend fMP4 segments.
+   *  Returns true if a frame was captured and stored in the frame buffer. */
+  async captureAtTime(
+    time: number,
+    frameBuffer: Map<number, string>,
+    insertionOrder: number[],
+    forceUpdateCachedTimes: () => void,
+  ): Promise<boolean> {
+    if (!this.ready || !this.active || this.busy) return false;
+
+    const bucket = Math.floor(time / BUCKET_SIZE) * BUCKET_SIZE;
+    if (frameBuffer.has(bucket)) return true;
+
+    this.busy = true;
+
+    try {
+      // 1. Remove all old SourceBuffer data
+      await this._removeAllBufferedData();
+
+      // 2. Re-append init segment
+      if (this.initSegment) {
+        this.sourceBuffer!.appendBuffer(this.initSegment);
+        await this._waitForUpdateEnd();
+      }
+
+      // 3. Fetch media segment at desired time from backend
+      const segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time}&duration=0.5`;
+      console.log('[Fmp4ThumbnailPipeline] Fetching segment at time=' + time.toFixed(2) + 's');
+
+      const segResp = await fetch(segUrl);
+      if (!segResp.ok) {
+        console.warn(`[Fmp4ThumbnailPipeline] Segment fetch failed (HTTP ${segResp.status})`);
+        return false;
+      }
+
+      const segData = await segResp.arrayBuffer();
+      if (segData.byteLength === 0) {
+        console.warn('[Fmp4ThumbnailPipeline] Empty segment for time:', time);
+        return false;
+      }
+
+      // 4. Append segment to SourceBuffer
+      await this._waitForUpdateEnd();
+      this.sourceBuffer!.appendBuffer(segData);
+      await this._waitForUpdateEnd();
+
+      // 5. Check if SourceBuffer covers the desired time
+      const sbBuffered = this.sourceBuffer!.buffered;
+      let seekTarget = time;
+      if (sbBuffered.length > 0) {
+        // Find the range that covers our target time
+        let coversTime = false;
+        for (let i = 0; i < sbBuffered.length; i++) {
+          if (sbBuffered.start(i) <= time && sbBuffered.end(i) >= time) {
+            coversTime = true;
+            break;
+          }
+        }
+        // If not covered, seek to the start of the first range
+        if (!coversTime) {
+          seekTarget = sbBuffered.start(0);
+          console.log('[Fmp4ThumbnailPipeline] Target time not in buffer, seeking to ' + seekTarget.toFixed(2));
+        }
+      }
+
+      // 6. Seek video to target time
+      const seeked = await this._seekVideo(seekTarget);
+      if (!seeked) {
+        console.warn('[Fmp4ThumbnailPipeline] Video seek failed for time:', seekTarget.toFixed(2));
+        return false;
+      }
+
+      // 7. Wait for frame render
+      await this._waitForFrameRender(seekTarget);
+
+      // 8. Capture frame
+      const canvas = this.canvas;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+
+      frameBuffer.set(bucket, dataUrl);
+      insertionOrder.push(bucket);
+      // FIFO eviction
+      while (frameBuffer.size > MAX_BUFFER_SIZE && insertionOrder.length > 0) {
+        const oldest = insertionOrder.shift()!;
+        frameBuffer.delete(oldest);
+      }
+
+      forceUpdateCachedTimes();
+      console.log('[Fmp4ThumbnailPipeline] Captured thumbnail at ' + time.toFixed(2) + 's (seekTarget=' + seekTarget.toFixed(2) + ')');
+      return true;
+    } catch (e) {
+      console.warn('[Fmp4ThumbnailPipeline] captureAtTime failed:', e);
+      return false;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  destroy(): void {
+    this.active = false;
+    this.ready = false;
+    this.busy = false;
+
+    if (this.video) {
+      this.video.pause();
+      this.video.removeAttribute('src');
+      this.video.load();
+      if (this.video.parentNode) {
+        document.body.removeChild(this.video);
+      }
+    }
+
+    if (this.mediaSource) {
+      try { this.mediaSource.endOfStream(); } catch (_) { /* ignore */ }
+    }
+
+    if (this.sourceBuffer) {
+      try { this.sourceBuffer.abort(); } catch (_) { /* ignore */ }
+    }
+
+    if (this.blobUrl) {
+      URL.revokeObjectURL(this.blobUrl);
+    }
+
+    this.initSegment = null;
+    this.video = null as any;
+    this.mediaSource = null;
+    this.sourceBuffer = null;
+    this.blobUrl = null;
+    this.canvas = null as any;
+  }
+}
+
 // ─── Hook ────────────────────────────────────────────────────────────────
 
 export function useThumbnailExtractor(
@@ -989,6 +1356,7 @@ export function useThumbnailExtractor(
   const lastCachedUpdateRef = useRef(0);
   const pipelineRef = useRef<ThumbnailPipeline | null>(null);
   const transmuxerPipelineRef = useRef<TransmuxerThumbnailPipeline | null>(null);
+  const fmp4PipelineRef = useRef<Fmp4ThumbnailPipeline | null>(null);
   
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -1181,6 +1549,53 @@ export function useThumbnailExtractor(
       }
     };
   }, [useNative, streamUrl, mseGetters?.isTransmuxerActive]);
+
+  // ─── fMP4 Backend Thumbnail Pipeline Setup (TS→fMP4 backend pipeline) ──────
+  // When the backend TS→fMP4 pipeline is active (isFmp4Stream=true), use the
+  // backend's fMP4 segment endpoints for thumbnail extraction instead of
+  // mp4box.js (which can't parse TS) or WebCodecs (which needs mediabunny).
+  // Uses mseGettersRef to avoid depending on mseGetters object directly.
+  useEffect(() => {
+    const getters = mseGettersRef.current;
+    if (useNative || !streamUrl || !getters || !thumbnailDataReady || !getters.isFmp4Stream()) return;
+
+    const fmp4Config = getters.getFmp4Config();
+    if (!fmp4Config) return;
+
+    let cancelled = false;
+
+    // MSE canvas must be created for thumbnail capture
+    if (!canvasRef.current) {
+      const newCanvas = document.createElement('canvas');
+      newCanvas.width = THUMBNAIL_WIDTH;
+      newCanvas.height = THUMBNAIL_HEIGHT;
+      canvasRef.current = newCanvas;
+    }
+
+    const pipeline = new Fmp4ThumbnailPipeline(fmp4Config, canvasRef.current!);
+    fmp4PipelineRef.current = pipeline;
+
+    pipeline.init().then((success) => {
+      if (cancelled) return;
+      if (success && pipeline.active) {
+        console.log('[ThumbnailExtractor] fMP4 thumbnail pipeline initialized successfully');
+        setReady(true); readyRef.current = true;
+      } else {
+        console.warn('[ThumbnailExtractor] fMP4 thumbnail pipeline initialization failed');
+        pipeline.destroy();
+        fmp4PipelineRef.current = null;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      console.log('[ThumbnailExtractor] fMP4 pipeline effect cleanup');
+      if (fmp4PipelineRef.current) {
+        fmp4PipelineRef.current.destroy();
+        fmp4PipelineRef.current = null;
+      }
+    };
+  }, [useNative, streamUrl, thumbnailDataReady]);
 
   // ─── Keyframe Index Update ─────────────────────────────────────────────
   // The keyframe index is built in background after transmuxer init.
@@ -1431,19 +1846,36 @@ export function useThumbnailExtractor(
 
           video.pause();
         } else {
-          // MSE mode: use mini MSE pipeline (MP4) or transmuxer thumbnail pipeline (MKV/TS)
+          // MSE mode: use mini MSE pipeline (MP4), fMP4 backend pipeline (TS→fMP4), or transmuxer pipeline (MKV/WebM)
           const pipeline = pipelineRef.current;
           const transmuxerPipeline = transmuxerPipelineRef.current;
+          const fmp4Pipeline = fmp4PipelineRef.current;
           const getters = mseGettersRef.current;
 
-          // For TS format, skip captures until keyframe byte-offset index is ready.
+          // For TS format with client-side transmuxer (not fMP4 backend), skip captures
+          // until keyframe byte-offset index is ready.
           // Without it, getKeyPacket is 8-12s per call — unacceptable for hover UX.
-          if (transmuxerPipeline && getters && getters.getFormat() === 'ts' && !getters.keyframeIndexReady) {
+          // Note: fMP4 backend pipeline does NOT need keyframeIndexReady — it fetches
+          // segments from the server by timestamp, no byte-offset seeking needed.
+          if (transmuxerPipeline && getters && getters.getFormat() === 'ts' && !getters.isFmp4Stream() && !getters.keyframeIndexReady) {
             await new Promise(r => setTimeout(r, 200));
             continue;
           }
 
-          if (pipeline && pipeline.ready && !pipeline.busy) {
+          if (fmp4Pipeline && fmp4Pipeline.ready && !fmp4Pipeline.busy) {
+            // fMP4 backend pipeline (TS→fMP4): fetches segments from backend by timestamp
+            console.log('[ThumbnailExtractor] Hover: calling fMP4 captureAtTime for time', desiredTime);
+            const captured = await fmp4Pipeline.captureAtTime(
+              desiredTime,
+              frameBufferRef.current,
+              insertionOrderRef.current,
+              forceUpdateCachedTimes,
+            );
+            console.log('[ThumbnailExtractor] Hover: fMP4 captureAtTime result', captured);
+            if (!captured && active) {
+              await new Promise(r => setTimeout(r, 200));
+            }
+          } else if (pipeline && pipeline.ready && !pipeline.busy) {
             console.log('[ThumbnailExtractor] Hover: calling MP4 captureAtTime for time', desiredTime);
             const captured = await pipeline.captureAtTime(
               desiredTime,
@@ -1468,7 +1900,7 @@ export function useThumbnailExtractor(
               await new Promise(r => setTimeout(r, 200));
             }
           } else {
-            console.log('[ThumbnailExtractor] Hover: no pipeline available, mp4=', !!pipeline, 'transmuxer=', !!transmuxerPipeline);
+            console.log('[ThumbnailExtractor] Hover: no pipeline available, mp4=', !!pipeline, 'transmuxer=', !!transmuxerPipeline, 'fmp4=', !!fmp4Pipeline);
             await new Promise(r => setTimeout(r, 200));
           }
         }

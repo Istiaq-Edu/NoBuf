@@ -16,17 +16,32 @@ export class SourceBufferWrapper {
    *  calls will fail. Stop processing queue entirely to prevent infinite
    *  cascade of InvalidStateError logs (Bug #4 fix). */
   private fatalError = false;
+  /** Set when QuotaExceededError was hit — download loop should pause. */
+  private quotaExceeded = false;
+
+  private appendCounter = 0;
+  private appendStartTime = 0;
+  private lastAppendSize = 0;
 
   constructor(sourceBuffer: SourceBuffer) {
     this.sourceBuffer = sourceBuffer;
     this.sourceBuffer.addEventListener('updateend', () => {
       this.processing = false;
+      this.appendCounter++;
+      const elapsed = Date.now() - this.appendStartTime;
+      if (this.appendCounter <= 30 || this.appendCounter % 20 === 0) {
+        try {
+          const b = this.sourceBuffer.buffered;
+          let rs = '';
+          for (let i = 0; i < b.length; i++) rs += `[${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}s]`;
+          console.log(`[SBW] updateend #${this.appendCounter}: ${elapsed}ms, ${this.lastAppendSize}B, queue=${this.queue.length}, SB=${rs}`);
+        } catch (_) {}
+      }
       this.processQueue();
     });
     this.sourceBuffer.addEventListener('error', (e) => {
-      console.error('[SourceBuffer] error:', e);
+      console.error('[SourceBuffer] error event:', e, `after ${Date.now() - this.appendStartTime}ms`);
       this.processing = false;
-      // Don't retry after error event — check if it's fatal
       this.checkFatalError();
     });
   }
@@ -54,6 +69,35 @@ export class SourceBufferWrapper {
    *  no more data can be appended (HTMLMediaElement.error is not null). */
   get hasFatalError(): boolean {
     return this.fatalError;
+  }
+
+  /** Returns true if the last appendBuffer hit QuotaExceededError.
+   *  The download loop should pause until the player consumes buffer. */
+  get isQuotaExceeded(): boolean {
+    return this.quotaExceeded;
+  }
+
+  /** Clear the quota exceeded flag after eviction frees space. */
+  clearQuotaExceeded(): void {
+    this.quotaExceeded = false;
+  }
+
+  /** Set appendWindowStart/End to filter overlap-region frames. */
+  setAppendWindow(start: number, end: number = Infinity): void {
+    try {
+      this.sourceBuffer.appendWindowStart = start;
+      this.sourceBuffer.appendWindowEnd = end;
+    } catch (_) {
+      // Some implementations don't support appendWindow
+    }
+  }
+
+  /** Clear appendWindow (allow all frames). */
+  clearAppendWindow(): void {
+    try {
+      this.sourceBuffer.appendWindowStart = 0;
+      this.sourceBuffer.appendWindowEnd = Infinity;
+    } catch (_) { /* ignore */ }
   }
 
   get queueLength(): number {
@@ -93,6 +137,8 @@ export class SourceBufferWrapper {
 
     try {
       if (op.type === 'append' && op.data) {
+        this.appendStartTime = Date.now();
+        this.lastAppendSize = op.data.byteLength;
         this.sourceBuffer.appendBuffer(op.data);
       } else if (op.type === 'remove' && op.start !== undefined && op.end !== undefined) {
         this.sourceBuffer.remove(op.start, op.end);
@@ -127,12 +173,13 @@ export class SourceBufferWrapper {
       // call. The next onSegment callback will call evictOldBuffer() BEFORE
       // appendBuffer(), freeing space and resuming queue processing naturally.
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+        this.quotaExceeded = true;
         console.warn('[SourceBuffer] QuotaExceededError — buffer full, stopping queue. Eviction will free space before next append.');
         this.processing = false;
         return;
       }
 
-      console.error('SourceBuffer operation failed:', e);
+      console.error(`[SourceBuffer] operation failed (type=${op.type}, queue=${this.queue.length}):`, e);
       this.processing = false;
       this.processQueue();
     }

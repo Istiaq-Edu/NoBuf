@@ -26,6 +26,7 @@ import {
   EncodedAudioPacketSource,
   EncodedPacketSink,
   CustomSource,
+  BufferSource,
 } from 'mediabunny';
 
 import type { VideoCodec, AudioCodec, EncodedPacket } from 'mediabunny';
@@ -142,7 +143,8 @@ export class MediabunnyTransmuxer {
   // an OffsetCustomSource that starts from the keyframe byte offset, making
   // getKeyPacket scan only a small portion of the file instead of the whole thing.
   private keyframeByteOffsets: TSKeyframeEntry[] = [];
-  private tsHeaderData: Uint8Array | null = null; // First ~64 KiB (PAT/PMT) for OffsetCustomSource
+  private tsHeaderData: Uint8Array | null = null;
+  private initInputRef: Input | null = null;
 
   constructor(config: TransmuxerConfig) {
     this.config = config;
@@ -152,16 +154,106 @@ export class MediabunnyTransmuxer {
     if (this.disposed) return null;
 
     try {
-      // Create persistent TauriStreamSource — its cache survives across Input
-      // recreations, so refill seeks benefit from cached cluster data.
       this.streamSource = createTauriStreamSource(this.config.sourceConfig);
-      // Master ref keeps source alive even when Inputs are disposed.
       this.masterSourceRef = this.streamSource.ref();
 
       const formats = this.config.format === 'ts' ? [MPEG_TS] :
                       this.config.format === 'mkv' ? [MATROSKA] :
                       ALL_FORMATS;
 
+      let initInput: Input | undefined;
+      const isTs = this.config.format === 'ts';
+
+      if (isTs && this.config.sourceConfig.seedData) {
+        const initSource = new BufferSource(this.config.sourceConfig.seedData);
+        initInput = new Input({ source: initSource, formats: [MPEG_TS] });
+        const t0init = performance.now();
+        try {
+          await initInput.getTracks();
+          this.initInputRef = initInput;
+          diagLog(`[Transmuxer] init: initInput pre-warmed from ${this.config.sourceConfig.seedData.byteLength} bytes seed, took ${((performance.now() - t0init) / 1000).toFixed(2)}s`);
+        } catch (e) {
+          diagLog(`[Transmuxer] init: initInput pre-warm failed: ${e}, continuing without`);
+          initInput = undefined;
+        }
+      }
+
+      // For TS: skip Conversion.init() — it calls getFirstTimestamp() which
+      // reads packets past the seed (40+ seconds over HTTP). Instead, use
+      // seekTo(0) in startTransmuxing() which produces segments via manual
+      // packet-copy (proven path, same as seeking). The main Input is created
+      // lazily inside seekTo() with initInput for fast codec matching.
+      // For non-TS (MKV): use the existing Conversion path (fast random access).
+      if (isTs) {
+        const trackInput = initInput || (() => { throw new Error('No initInput for TS'); })();
+
+        const t2 = performance.now();
+        diagLog(`[Transmuxer] init: calling getPrimaryVideoTrack() on initInput`);
+        const videoTrack = await trackInput.getPrimaryVideoTrack();
+        diagLog(`[Transmuxer] init: getPrimaryVideoTrack()=${videoTrack ? 'found' : 'null'} took ${((performance.now() - t2)/1000).toFixed(1)}s`);
+
+        const t3 = performance.now();
+        diagLog(`[Transmuxer] init: calling getPrimaryAudioTrack() on initInput`);
+        const audioTrack = await trackInput.getPrimaryAudioTrack();
+        diagLog(`[Transmuxer] init: getPrimaryAudioTrack()=${audioTrack ? 'found' : 'null'} took ${((performance.now() - t3)/1000).toFixed(1)}s`);
+
+        this.videoCodec = videoTrack ? await videoTrack.getCodec() : null;
+        this.audioCodec = audioTrack ? await audioTrack.getCodec() : null;
+        diagLog(`[Transmuxer] init: videoCodec=${this.videoCodec}, audioCodec=${this.audioCodec}`);
+        const videoCodecString = videoTrack ? await videoTrack.getCodecParameterString() : null;
+        const audioCodecString = audioTrack ? await audioTrack.getCodecParameterString() : null;
+
+        this.mseDecision = decideMseCodec(this.videoCodec, this.audioCodec);
+
+        if (this.mseDecision === 'unsupported') {
+          const codecStr = `${this.videoCodec || 'unknown-video'}/${this.audioCodec || 'unknown-audio'}`;
+          this.config.onCodecUnsupported(codecStr);
+          return null;
+        }
+
+        this.mimeType = this.buildMimeType(videoCodecString, audioCodecString, this.videoCodec, this.audioCodec);
+
+        if (this.mimeType && !MediaSource.isTypeSupported(this.mimeType)) {
+          const codecStr = `${this.videoCodec || 'unknown-video'}/${this.audioCodec || 'unknown-audio'}`;
+          this.config.onCodecUnsupported(codecStr);
+          return null;
+        }
+
+        this.videoTrackInfo = videoTrack ? {
+          codec: this.videoCodec || 'unknown',
+          type: 'video',
+          width: await videoTrack.getCodedWidth(),
+          height: await videoTrack.getCodedHeight(),
+          language: await videoTrack.getLanguageCode(),
+          codecParameterString: videoCodecString,
+        } : null;
+
+        this.audioTrackInfo = audioTrack ? {
+          codec: this.audioCodec || 'unknown',
+          type: 'audio',
+          sampleRate: await audioTrack.getSampleRate(),
+          channels: await audioTrack.getNumberOfChannels(),
+          language: await audioTrack.getLanguageCode(),
+          codecParameterString: audioCodecString,
+        } : null;
+
+        this.duration = Infinity;
+        this.fileLength = this.config.sourceConfig.fileSize;
+        diagLog(`[Transmuxer] init: TS — duration=Infinity, skipping Conversion.init()`);
+        this.config.onDurationKnown(Infinity);
+        this.deferComputeDuration();
+
+        diagLog(`[Transmuxer] init: SUCCESS — ts → ${this.mseDecision}, mimeType=${this.mimeType}`);
+
+        return {
+          mseDecision: this.mseDecision,
+          mimeType: this.mimeType,
+          videoTrack: this.videoTrackInfo,
+          audioTrack: this.audioTrackInfo,
+        };
+      }
+
+      // Non-TS (MKV) path: use Conversion for streaming
       this.input = new Input({ source: this.streamSource, formats });
 
       const t0 = performance.now();
@@ -172,36 +264,15 @@ export class MediabunnyTransmuxer {
         throw new Error(`Cannot read ${this.config.format} file`);
       }
 
-      // Duration discovery strategy:
-      // - TS format: computeDuration() scans entire file (40+ seconds for large
-      //   files). Use getDurationFromMetadata() first (fast, reads file header).
-      //   If null (expected for TS — no metadata duration), defer the full scan
-      //   to background so the player starts immediately with Infinity duration.
-      // - Other formats (MP4/MKV): getDurationFromMetadata() usually works, so
-      //   we get the duration quickly. If null, fall back to computeDuration().
       let duration: number | null = null;
-
-      if (this.config.format === 'ts') {
-        // TS format has NO metadata duration — getDurationFromMetadata() reads
-        // the ENTIRE stream sequentially to compute duration from PCR values,
-        // which takes 21+ minutes for a 1.3GB file and blocks init completely.
-        // Skip it entirely: duration stays Infinity, and the real duration is
-        // discovered later from the byte-offset scanner (sequential cached reads)
-        // or from SourceBuffer buffered ranges as playback progresses.
-        duration = Infinity;
-        diagLog(`[Transmuxer] init: TS format — skipping getDurationFromMetadata(), duration=Infinity`);
-        this.deferComputeDuration(); // disabled — logs "disabled" message
+      const t1 = performance.now();
+      diagLog(`[Transmuxer] init: calling getDurationFromMetadata()`);
+      const metadataDuration = await this.input.getDurationFromMetadata();
+      diagLog(`[Transmuxer] init: getDurationFromMetadata()=${metadataDuration} took ${((performance.now() - t1)/1000).toFixed(1)}s`);
+      if (metadataDuration !== null) {
+        duration = metadataDuration;
       } else {
-        // Non-TS formats: try metadata first, fall back to full computation
-        const t1 = performance.now();
-        diagLog(`[Transmuxer] init: calling getDurationFromMetadata()`);
-        const metadataDuration = await this.input.getDurationFromMetadata();
-        diagLog(`[Transmuxer] init: getDurationFromMetadata()=${metadataDuration} took ${((performance.now() - t1)/1000).toFixed(1)}s`);
-        if (metadataDuration !== null) {
-          duration = metadataDuration;
-        } else {
-          duration = await this.input.computeDuration();
-        }
+        duration = await this.input.computeDuration();
       }
 
       this.duration = duration;
@@ -652,29 +723,296 @@ export class MediabunnyTransmuxer {
     };
   }
 
-  async startTransmuxing(): Promise<void> {
-    if (this.disposed || !this.conversion) return;
+  /** Phase 1 for TS: produce init + media segments from initInput (BufferSource).
+   *  All reads are in-memory (instant) — no HTTP binary search overhead.
+   *  Produces ~5-10s of video from the 20MB seed data. */
+  private async produceSegmentsFromInitInput(): Promise<number | null> {
+    if (!this.initInputRef || this.disposed) return null;
+
+    const initInput = this.initInputRef;
+    const generation = this.seekGeneration;
+
+    const videoTrack = await initInput.getPrimaryVideoTrack();
+    const audioTrack = await initInput.getPrimaryAudioTrack();
+    if (!videoTrack) return null;
+
+    this.setupOutput(generation);
+    const output = this.output!;
+
+    const videoSource = new EncodedVideoPacketSource(this.videoCodec!);
+    const audioSource = this.audioCodec ? new EncodedAudioPacketSource(this.audioCodec) : null;
+
+    output.addVideoTrack(videoSource);
+    if (audioSource) output.addAudioTrack(audioSource);
+
+    await output.start();
+
+    const videoSink = new EncodedPacketSink(videoTrack);
+    const keyPacket = await videoSink.getFirstKeyPacket();
+    if (!keyPacket) return null;
+
+    const keyframeTimestamp = keyPacket.timestamp;
+
+    const videoDecoderConfig = await videoTrack.getDecoderConfig();
+    const videoMeta = { decoderConfig: videoDecoderConfig ?? undefined };
+
+    let audioStartPacket: EncodedPacket | null = null;
+    let audioSink: EncodedPacketSink | null = null;
+    let audioSkipped = false;
+    if (audioTrack && audioSource) {
+      audioSink = new EncodedPacketSink(audioTrack);
+      audioStartPacket = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
+      if (!audioStartPacket) {
+        audioSource.close();
+        audioSink = null;
+        audioSkipped = true;
+      }
+    }
+
+    const audioDecoderConfig = audioTrack ? await audioTrack.getDecoderConfig() : null;
+    const audioMeta = audioDecoderConfig
+      ? { decoderConfig: audioDecoderConfig as AudioDecoderConfig | undefined }
+      : undefined;
+
+    const videoPromise = this.iterateVideoPackets(
+      videoSink, keyPacket, videoSource, videoMeta, keyframeTimestamp, generation, Infinity, false,
+    );
+    const audioPromise = audioSink && audioSource && audioStartPacket
+      ? this.iterateAudioPackets(
+          audioSink, audioStartPacket, audioSource, audioMeta, keyframeTimestamp, generation, Infinity,
+        )
+      : Promise.resolve();
 
     try {
+      await Promise.all([videoPromise, audioPromise]);
+    } catch (e) {
+      diagLog(`[Transmuxer] Phase 1 iteration ended: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    try { videoSource.close(); } catch (_) {}
+    if (audioSource && !audioSkipped) {
+      try { audioSource.close(); } catch (_) {}
+    }
+
+    if (generation === this.seekGeneration) {
+      try { await output.finalize(); } catch (_) {}
+    }
+
+    return keyframeTimestamp;
+  }
+
+  /** Phase 2 for TS: sequential iteration from byte 0 using TauriStreamSource.
+   *  The first 20MB (seed) reads are instant, so skipping past Phase 1's
+   *  data takes ~1s. Past the seed, the read-ahead buffer handles HTTP.
+   *  No binary search, no scanner wait needed. */
+  private async sequentialContinue(skipBeforeTime: number): Promise<void> {
+    if (this.disposed || !this.streamSource) return;
+
+    const formats = [MPEG_TS];
+    const generation = this.seekGeneration;
+
+    this.input = new Input({
+      source: this.streamSource,
+      formats,
+      initInput: this.initInputRef ?? undefined,
+    });
+
+    diagLog(`[Transmuxer] seqContinue: calling canRead at t=${performance.now().toFixed(0)}ms`);
+    const t0 = performance.now();
+    const canRead = await this.input.canRead();
+    diagLog(`[Transmuxer] seqContinue: canRead took ${((performance.now() - t0)/1000).toFixed(2)}s`);
+    if (!canRead) return;
+
+    diagLog(`[Transmuxer] seqContinue: calling getPrimaryVideoTrack at t=${performance.now().toFixed(0)}ms`);
+    const t1 = performance.now();
+    const videoTrack = await this.input.getPrimaryVideoTrack();
+    diagLog(`[Transmuxer] seqContinue: getPrimaryVideoTrack took ${((performance.now() - t1)/1000).toFixed(2)}s`);
+    diagLog(`[Transmuxer] seqContinue: calling getPrimaryAudioTrack at t=${performance.now().toFixed(0)}ms`);
+    const t2 = performance.now();
+    const audioTrack = await this.input.getPrimaryAudioTrack();
+    diagLog(`[Transmuxer] seqContinue: getPrimaryAudioTrack took ${((performance.now() - t2)/1000).toFixed(2)}s`);
+    if (!videoTrack) return;
+
+    const videoSink = new EncodedPacketSink(videoTrack);
+    diagLog(`[Transmuxer] seqContinue: calling getFirstKeyPacket at t=${performance.now().toFixed(0)}ms`);
+    const t3 = performance.now();
+    const firstKey = await videoSink.getFirstKeyPacket();
+    diagLog(`[Transmuxer] seqContinue: getFirstKeyPacket took ${((performance.now() - t3)/1000).toFixed(2)}s`);
+    if (!firstKey) return;
+
+    const keyframeTimestamp = firstKey.timestamp;
+    diagLog(`[Transmuxer] seqContinue: firstKey at ${keyframeTimestamp.toFixed(3)}s, skipBefore=${skipBeforeTime.toFixed(2)}s`);
+
+    diagLog(`[Transmuxer] seqContinue: calling setupOutput at t=${performance.now().toFixed(0)}ms`);
+    const t4 = performance.now();
+    this.setupOutput(generation, true); // skipInitSegment = true
+    diagLog(`[Transmuxer] seqContinue: setupOutput took ${((performance.now() - t4)/1000).toFixed(2)}s`);
+    const output = this.output!;
+
+    const videoSource = new EncodedVideoPacketSource(this.videoCodec!);
+    const audioSource = this.audioCodec ? new EncodedAudioPacketSource(this.audioCodec) : null;
+
+    output.addVideoTrack(videoSource);
+    if (audioSource) output.addAudioTrack(audioSource);
+
+    diagLog(`[Transmuxer] seqContinue: calling output.start at t=${performance.now().toFixed(0)}ms`);
+    const t5 = performance.now();
+    await output.start();
+    diagLog(`[Transmuxer] seqContinue: output.start took ${((performance.now() - t5)/1000).toFixed(2)}s`);
+
+    diagLog(`[Transmuxer] seqContinue: calling videoTrack.getDecoderConfig at t=${performance.now().toFixed(0)}ms`);
+    const t6 = performance.now();
+    const videoDecoderConfig = await videoTrack.getDecoderConfig();
+    diagLog(`[Transmuxer] seqContinue: videoTrack.getDecoderConfig took ${((performance.now() - t6)/1000).toFixed(2)}s`);
+    const videoMeta = { decoderConfig: videoDecoderConfig ?? undefined };
+
+    let audioStartPacket: EncodedPacket | null = null;
+    let audioSink: EncodedPacketSink | null = null;
+    let audioSkipped = false;
+    if (audioTrack && audioSource) {
+      audioSink = new EncodedPacketSink(audioTrack);
+      diagLog(`[Transmuxer] seqContinue: calling audioSink.getKeyPacket at t=${performance.now().toFixed(0)}ms`);
+      const t7 = performance.now();
+      audioStartPacket = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
+      diagLog(`[Transmuxer] seqContinue: audioSink.getKeyPacket took ${((performance.now() - t7)/1000).toFixed(2)}s`);
+      if (!audioStartPacket) {
+        audioSource.close();
+        audioSink = null;
+        audioSkipped = true;
+      }
+    }
+
+    diagLog(`[Transmuxer] seqContinue: calling audioTrack.getDecoderConfig at t=${performance.now().toFixed(0)}ms`);
+    const t8 = performance.now();
+    const audioDecoderConfig = audioTrack ? await audioTrack.getDecoderConfig() : null;
+    diagLog(`[Transmuxer] seqContinue: audioTrack.getDecoderConfig took ${((performance.now() - t8)/1000).toFixed(2)}s`);
+    const audioMeta = audioDecoderConfig
+      ? { decoderConfig: audioDecoderConfig as AudioDecoderConfig | undefined }
+      : undefined;
+
+    let videoFirst = true;
+    let audioFirst = true;
+    let videoStarted = false;
+    let audioStarted = false;
+
+    const videoPromise = (async () => {
+      for await (const packet of videoSink.packets(firstKey, undefined, { verifyKeyPackets: false })) {
+        if (this.disposed || generation !== this.seekGeneration) {
+          videoSource.close();
+          return;
+        }
+
+        const adjustedTimestamp = Math.max(0, packet.timestamp - keyframeTimestamp);
+
+        if (!videoStarted && packet.timestamp < skipBeforeTime - 0.5) {
+          continue;
+        }
+        videoStarted = true;
+
+        const adjusted = packet.clone({ timestamp: adjustedTimestamp });
+        if (videoFirst) {
+          await videoSource.add(adjusted, videoMeta);
+          videoFirst = false;
+        } else {
+          await videoSource.add(adjusted);
+        }
+        this.lastProcessedTime = packet.timestamp;
+      }
+    })();
+
+    const audioPromise = audioSink && audioSource && audioStartPacket
+      ? (async () => {
+          for await (const packet of audioSink.packets(audioStartPacket!)) {
+            if (this.disposed || generation !== this.seekGeneration) {
+              audioSource.close();
+              return;
+            }
+
+            if (!audioStarted && packet.timestamp < skipBeforeTime - 0.5) {
+              continue;
+            }
+            audioStarted = true;
+
+            const adjustedTimestamp = Math.max(0, packet.timestamp - keyframeTimestamp);
+            const adjusted = packet.clone({ timestamp: adjustedTimestamp });
+            if (audioFirst) {
+              await audioSource.add(adjusted, audioMeta);
+              audioFirst = false;
+            } else {
+              await audioSource.add(adjusted);
+            }
+          }
+        })()
+      : Promise.resolve();
+
+    const iterStart = performance.now();
+    await Promise.all([videoPromise, audioPromise]);
+    diagLog(`[Transmuxer] seqContinue: iteration took ${((performance.now() - iterStart)/1000).toFixed(1)}s`);
+
+    try { videoSource.close(); } catch (_) {}
+    if (audioSource && !audioSkipped) {
+      try { audioSource.close(); } catch (_) {}
+    }
+
+    if (generation === this.seekGeneration) {
+      try { await output.finalize(); } catch (_) {}
+      diagLog('[Transmuxer] seqContinue: finalized');
+    }
+  }
+
+  async startTransmuxing(): Promise<void> {
+    if (this.disposed) return;
+
+    try {
+      if (this.config.format === 'ts' && this.initInputRef) {
+        // Phase 1: produce segments from initInput (BufferSource, all in-memory).
+        // getKeyPacket/getFirstKeyPacket on initInput is instant — no binary
+        // search over HTTP. Produces init segment + ~5-10s of video from 20MB seed.
+        diagLog('[Transmuxer] Phase 1: starting with initInput');
+        const phase1Result = await this.produceSegmentsFromInitInput();
+        diagLog(`[Transmuxer] Phase 1 done: keyframe=${phase1Result}, lastTime=${this.lastProcessedTime.toFixed(2)}s`);
+
+        // Phase 2: sequential continuation from main Input.
+        // Instead of binary-search seekTo (30-60s over HTTP), iterate from
+        // byte 0 using streamSource. The first 20MB reads from seed (instant),
+        // so we skip past Phase 1's data in ~1s. Past the seed, the read-ahead
+        // buffer fetches 8MB chunks. No binary search, no scanner wait.
+        // Start scanner in background for future seeks (non-blocking).
+        if (!this.keyframeIndexPromise && !this.keyframeIndexBuilt) {
+          this.buildKeyframeIndex();
+        }
+
+        if (!this.disposed) {
+          diagLog('[Transmuxer] Phase 2: sequential continuation');
+          await this.sequentialContinue(this.lastProcessedTime);
+        }
+        return;
+      }
+
+      // No initInput or non-TS: use seekTo(0) or Conversion
+      if (this.config.format === 'ts') {
+        diagLog('[Transmuxer] startTransmuxing: TS — no initInput, using seekTo(0)');
+        await this.seekTo(0);
+        return;
+      }
+
+      if (!this.conversion) return;
+
       this.conversion.onProgress = (_progress: number, processedTime: number) => {
         this.lastProcessedTime = processedTime;
 
-        // Speed tracking: throttle updates to 250ms
         const now = Date.now();
         if (now - this.lastSpeedThrottle > 250 && this.duration > 0 && this.fileLength > 0) {
           this.lastSpeedThrottle = now;
 
-          // Estimate bytes processed from time processed (rough VBR approximation)
           const estimatedBytes = Math.floor((processedTime / this.duration) * this.fileLength);
 
           this.speedHistory.push({ processedTime, wallTime: now });
 
-          // Evict entries older than 5s
           while (this.speedHistory.length > 0 && this.speedHistory[0].wallTime < now - 5000) {
             this.speedHistory.shift();
           }
 
-          // Calculate speed: (bytesDelta / wallTimeDelta) using VBR-estimated bytes
           if (this.speedHistory.length > 1) {
             const first = this.speedHistory[0];
             const last = this.speedHistory[this.speedHistory.length - 1];
@@ -685,20 +1023,14 @@ export class MediabunnyTransmuxer {
             }
           }
 
-          // Progress update: estimated bytes processed
           this.config.onProgressUpdate?.(processedTime, estimatedBytes);
         }
       };
 
       await this.conversion.execute();
       console.log('[Transmuxer] Conversion complete');
-      // Final speed = 0 on completion
       this.config.onSpeedUpdate?.(0);
     } catch (e) {
-      // ConversionCanceledError and InputDisposedError are expected when seekTo()
-      // cancels the Conversion and disposes the Input during an active transmux.
-      // Re-throw so the caller (useMSEPlayer) can handle silently instead of
-      // treating as a fatal error that tears down MSE.
       const isExpectedSeekError = e instanceof Error && (
         e.message.includes('has been canceled') ||
         e.name === 'ConversionCanceledError' ||
@@ -797,12 +1129,12 @@ export class MediabunnyTransmuxer {
           prefetchProfile: 'fileSystem', // 1 sequential prefetch worker — 'none' causes 188-byte HTTP requests for each TS packet
         });
 
-        this.input = new Input({ source: offsetSource, formats });
+        this.input = new Input({ source: offsetSource, formats, initInput: this.initInputRef ?? undefined });
         console.log(`[Transmuxer] seekTo: using OffsetCustomSource — byteOffset=${byteOffsetKeyframe.byteOffset}, keyframeTs=${byteOffsetKeyframe.timestamp.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s`);
       } else {
         // No byte-offset index (MKV, or TS before scanner completes) — use
-        // persistent streamSource. For TS, getKeyPacket scans from byte 0.
-        this.input = new Input({ source: this.streamSource!, formats });
+        // persistent streamSource with initInput for codec matching.
+        this.input = new Input({ source: this.streamSource!, formats, initInput: this.initInputRef ?? undefined });
       }
 
       const canRead = await this.input.canRead();
@@ -903,9 +1235,9 @@ export class MediabunnyTransmuxer {
       // Get decoder configs for first packet metadata
       const videoDecoderConfig = await videoTrack.getDecoderConfig();
       const videoMeta = { decoderConfig: videoDecoderConfig ?? undefined };
-      const audioDecoderConfig = audioTrack ? await audioTrack.getDecoderConfig() : null;
-      const audioMeta = audioDecoderConfig
-        ? { decoderConfig: audioDecoderConfig as AudioDecoderConfig | undefined }
+
+      const audioMeta = audioTrack
+        ? { decoderConfig: (await audioTrack.getDecoderConfig()) as AudioDecoderConfig | undefined }
         : undefined;
 
       // Find audio starting point nearest to keyframeTimestamp
@@ -1129,6 +1461,7 @@ export class MediabunnyTransmuxer {
     this.keyframeIndexPartial = false;
     this.keyframeByteOffsets = [];
     this.tsHeaderData = null;
+    this.initInputRef = null;
     if (this.conversion) {
       this.conversion.cancel().catch(() => {});
     }

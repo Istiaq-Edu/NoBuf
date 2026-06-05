@@ -259,3 +259,21 @@ pub async fn cmd_generate_sprite_sheet(
         total_duration: duration,
     })
 }
+
+#[tauri::command]
+pub async fn cmd_probe_duration(
+    message_id: i32,
+    folder_id: Option<i64>,
+    stream_config: State<'_, StreamConfig>,
+) -> Result<f64, String> {
+    let folder_segment = match folder_id {
+        Some(id) => id.to_string(),
+        None => "home".to_string(),
+    };
+    let stream_url = format!(
+        "http://127.0.0.1:{}/stream/{}/{}?token={}",
+        stream_config.port, folder_segment, message_id, stream_config.token
+    );
+    let ffmpeg_path = ensure_ffmpeg()?;
+    get_video_duration(&ffmpeg_path, &stream_url)
+}

@@ -1,9 +1,9 @@
-/**
- * MuxJsTsTransmuxer — Push-based TS→fMP4 transmuxer using mux.js.
+﻿/**
+ * MuxJsTsTransmuxer ΓÇö Push-based TSΓåÆfMP4 transmuxer using mux.js.
  *
  * Replaces mediabunny's sequential-scan approach for TS format.
- * mux.js is push-based: feed Uint8Array chunks → get fMP4 init + media segments.
- * No sequential metadata scan needed — produces output within milliseconds.
+ * mux.js is push-based: feed Uint8Array chunks ΓåÆ get fMP4 init + media segments.
+ * No sequential metadata scan needed ΓÇö produces output within milliseconds.
  *
  * Architecture:
  * 1. Fetch byte ranges from TauriStreamSource HTTP endpoint
@@ -12,8 +12,8 @@
  * 4. Callbacks route segments to MSE SourceBuffer
  * 5. Seeking uses scanTSFile byte-offset index + fresh Transmuxer
  *
- * CRITICAL: keepOriginalTimestamps:true + GOP cache clearing + restored
- * original extendFirstKeyFrame + COMBINED audio/video SourceBuffer.
+ * CRITICAL: keepOriginalTimestamps:false + GOP cache clearing + restored
+ * original extendFirstKeyFrame + combined SourceBuffer (remux:true, mode=sequence).
  *
  * Root cause of quality deformation: true passthrough (return gops) allowed
  * segments starting with P-frames (mid-GOP flushes). Chrome's MSE decoder
@@ -25,7 +25,7 @@
  * keyframe alignment) and extends the keyframe's duration to cover removed
  * time. Trade-off: ~0.07-0.33s P-frames dropped per flush (~1-5% data),
  * causing minor stuttering but NO quality deformation.
- * Mitigated by FLUSH_INTERVAL=8 (2MB per flush, fewer mid-GOP flushes).
+ * Mitigated by FLUSH_INTERVAL=4 (8MB per flush, fewer mid-GOP flushes).
  *
  * Root cause of audio/video misalignment: mux.js GOP fusion prepends VIDEO
  * GOPs only (never audio). In a combined SourceBuffer, this creates 0.38-
@@ -35,15 +35,15 @@
  * HE-AAC from AudioSpecificConfig (strict codec matching only for separate
  * audio SBs). Audio/video offset (~0.04-0.22s) is natural TS stream offset.
  *
- * With keepOriginalTimestamps:true + GOP cache clearing + original
- * extendFirstKeyFrame + combined SourceBuffer:
- * - Original absolute timestamps → timestampOffset=0 for all operations
+ * With keepOriginalTimestamps:false + GOP cache clearing + original
+ * extendFirstKeyFrame + combined SourceBuffer (remux:true, mode=sequence):
+ * - Normalized timestamps (start near 0) → timestampOffset=keyframeTimestamp for seeks
  * - No GOP fusion (cache cleared after each flush) → prependedContentDuration=0
  * - Keyframe-aligned segments (original extendFirstKeyFrame) → no artifacts
- * - Minor P-frame drops (~0.07-0.33s per flush) → stuttering, mitigated by FLUSH_INTERVAL=8
- * - Audio/video offset is natural TS stream offset (~0.04-0.22s) — acceptable
+ * - Minor P-frame drops (~0.07-0.33s per flush) → stuttering, mitigated by FLUSH_INTERVAL=1
+ * - Combined SB + mode=sequence → Chrome auto-sequences frames, avoids gap resolution
  *
- * AVC (H.264) only — mux.js does not support HEVC transmuxing.
+ * AVC (H.264) only ΓÇö mux.js does not support HEVC transmuxing.
  * HEVC TS files fall back to native <video> playback.
  */
 
@@ -60,11 +60,16 @@ export interface MuxJsTsConfig {
   url: string;
   fileSize: number;
   firstChunkData: ArrayBuffer;
-  onInitSegment: (data: ArrayBuffer) => void;
-  onMediaSegment: (data: ArrayBuffer, timestamp: number) => void;
+  abortSignal?: AbortSignal;
+  onInitSegment: (data: ArrayBuffer, type: 'combined') => void;
+  onMediaSegment: (data: ArrayBuffer, timestamp: number, type: 'combined') => void;
   onDurationKnown: (duration: number) => void;
   onCodecUnsupported: (codec: string) => void;
   onError: (error: Error) => void;
+  onSpeedUpdate?: (speed: number) => void;
+  onProgressUpdate?: (streamingOffset: number) => void;
+  onWaitForQueue?: () => Promise<void>;
+  getBufferedAhead?: () => number;
 }
 
 const H264_STREAM_TYPE = 0x1B;
@@ -140,8 +145,8 @@ function detectVideoCodecFromPmt(data: Uint8Array): number | null {
 }
 
 /** Extract only PAT and PMT TS packets from header data.
- *  Used for seek transmuxer initialization — provides stream mapping
- *  (PID → stream type) without including any PES data from byte 0.
+ *  Used for seek transmuxer initialization ΓÇö provides stream mapping
+ *  (PID ΓåÆ stream type) without including any PES data from byte 0.
  *  PES data from byte 0 would pollute normalized timestamps because
  *  mux.js sets timelineStartInfo from the earliest DTS in pushed data.
  *  With only PAT/PMT (no PES), the timeline start comes from the
@@ -204,14 +209,19 @@ function extractPmtPackets(data: Uint8Array): Uint8Array {
   return result;
 }
 
+/**
+ * @deprecated This transmuxer is deprecated in favor of server-side TS→fMP4 transmuxing.
+ * The backend /fmp4/ endpoints now handle TS→fMP4 conversion, producing proper fMP4 segments
+ * that are appended directly to MSE SourceBuffer — same as the MP4 pipeline.
+ * This class is kept as a fallback for when the backend pipeline fails.
+ * DO NOT add new features to this class.
+ */
 export class MuxJsTsTransmuxer {
   private config: MuxJsTsConfig;
   private disposed = false;
   private transmuxer: any = null;
   private videoCodec: 'avc' | 'hevc' | null = null;
   private mimeType = '';
-  private videoMimeType = '';
-  private audioMimeType = '';
   private duration = Infinity;
   private fileLength: number;
   private initSegmentBuffer: ArrayBuffer | null = null;
@@ -245,7 +255,7 @@ export class MuxJsTsTransmuxer {
     this.tsHeaderData = new Uint8Array(config.firstChunkData.slice(0, Math.min(65536, config.firstChunkData.byteLength)));
   }
 
-  async init(): Promise<{ mimeType: string; videoMimeType: string; audioMimeType: string; videoCodec: string; videoTrack: any; audioTrack: any; initSegment: ArrayBuffer; firstMediaSegment: ArrayBuffer | null; firstMediaTimestamp: number } | null> {
+  async init(): Promise<{ mimeType: string; videoCodec: string; videoTrack: any; audioTrack: any; initSegment: ArrayBuffer; firstMediaSegment: ArrayBuffer | null; firstMediaTimestamp: number; extraMediaSegments: Array<{ data: ArrayBuffer; timestamp: number }> } | null> {
     if (this.disposed) return null;
 
     const seedData = new Uint8Array(this.config.firstChunkData);
@@ -257,14 +267,14 @@ export class MuxJsTsTransmuxer {
     diagLog(`[MuxJsTs] PMT stream_type detected: 0x${(pmtStreamType ?? 0).toString(16)}`);
 
     if (pmtStreamType === HEVC_STREAM_TYPE) {
-      diagLog(`[MuxJsTs] HEVC (H.265) detected — not supported by mux.js, falling back to native playback`);
+      diagLog(`[MuxJsTs] HEVC (H.265) detected ΓÇö not supported by mux.js, falling back to native playback`);
       this.videoCodec = 'hevc';
       this.config.onCodecUnsupported('hevc/aac');
       return null;
     }
 
     if (pmtStreamType === null) {
-      diagLog(`[MuxJsTs] Could not detect video codec from PMT — trying mux.js anyway`);
+      diagLog(`[MuxJsTs] Could not detect video codec from PMT ΓÇö trying mux.js anyway`);
     }
 
     this.videoCodec = 'avc';
@@ -279,25 +289,26 @@ export class MuxJsTsTransmuxer {
       const fallback = (muxjs as any)?.Transmuxer || (muxjs as any)?.default?.mp4?.Transmuxer;
       diagLog(`[MuxJsTs] Fallback Transmuxer type: ${typeof fallback}`);
       if (!fallback) {
-        diagLog(`[MuxJsTs] No Transmuxer found — mux.js import is broken`);
+        diagLog(`[MuxJsTs] No Transmuxer found ΓÇö mux.js import is broken`);
         this.config.onCodecUnsupported('unknown/aac');
         return null;
       }
     }
 
-    // CRITICAL: keepOriginalTimestamps:true — original absolute timestamps.
-    // Combined with GOP cache clearing and combined SourceBuffer:
-    // - timestampOffset=0 for all operations (timestamps already absolute)
+    // CRITICAL: keepOriginalTimestamps:false ΓÇö normalized timestamps start near 0.
+    // Combined with GOP cache clearing and combined SourceBuffer (mode=sequence):
+    // - timestampOffset=keyframeTimestamp for seeks (caller sets via setTimestampOffset)
     // - No GOP fusion (cache cleared after each flush)
-    // - Audio/video in one combined SourceBuffer (Chrome auto-detects HE-AAC)
-    // - Natural audio/video offset (~0.04-0.22s) is acceptable in combined mode
+    // - mode=sequence: Chrome auto-sequences frames, avoids gap/overlap resolution
+    //   that caused 10-21s append freezes in segments mode
     const transmuxer = new (TransmuxerClass || (muxjs as any)?.Transmuxer || (muxjs as any)?.default?.mp4?.Transmuxer)({
-      keepOriginalTimestamps: true,
+      keepOriginalTimestamps: false,
+      remux: true,
     });
-    diagLog(`[MuxJsTs] transmuxer created: keepOriginalTimestamps=true, type=${typeof transmuxer}`);
+    diagLog(`[MuxJsTs] transmuxer created: keepOriginalTimestamps=false, remux=true, type=${typeof transmuxer}`);
     this.transmuxer = transmuxer;
 
-    // Timing event listeners — persist from init through streaming.
+    // Timing event listeners ΓÇö persist from init through streaming.
     // Do NOT remove these (bug #13: removing caused ts=0.000s).
     transmuxer.on('videoTimingInfo', (timingInfo: any) => {
       this.latestVideoTimingInfo = timingInfo;
@@ -324,56 +335,62 @@ export class MuxJsTsTransmuxer {
       }
     });
 
-    let initSegmentReceived = false;
     let initSegmentData: Uint8Array | null = null;
     let firstMediaSegmentData: Uint8Array | null = null;
     let firstTimestamp = 0;
+    const extraMediaSegments: Array<{ data: ArrayBuffer; timestamp: number }> = [];
 
     const initDataHandler = (segment: any) => {
       if (this.disposed) return;
+
       if (segment.initSegment) {
         initSegmentData = segment.initSegment;
-        initSegmentReceived = true;
-        diagLog(`[MuxJsTs] Init segment received: ${(initSegmentData as Uint8Array).byteLength} bytes`);
+        diagLog(`[MuxJsTs] Combined init segment received: ${segment.initSegment.byteLength} bytes`);
       }
       if (segment.data) {
         if (!firstMediaSegmentData) {
           firstMediaSegmentData = segment.data;
-          diagLog(`[MuxJsTs] Init-phase first media: latestVideoSegmentTimingInfo=${JSON.stringify(this.latestVideoSegmentTimingInfo ?? null)}`);
+          diagLog(`[MuxJsTs] Init-phase first combined media: latestVideoSegmentTimingInfo=${JSON.stringify(this.latestVideoSegmentTimingInfo ?? null)}`);
           if (this.latestVideoSegmentTimingInfo) {
-            // With keepOriginalTimestamps:true, baseMediaDecodeTime is original
-            // absolute DTS. For initial streaming, this ≈ 0 (byte 0 data).
             firstTimestamp = this.latestVideoSegmentTimingInfo.baseMediaDecodeTime / 90000;
             diagLog(`[MuxJsTs] Init-phase firstTimestamp: ${firstTimestamp.toFixed(3)}s (bmdt=${this.latestVideoSegmentTimingInfo.baseMediaDecodeTime})`);
           } else if (this.latestVideoTimingInfo) {
             firstTimestamp = this.latestVideoTimingInfo.start / 90000;
             diagLog(`[MuxJsTs] Init-phase firstTimestamp (fallback): ${firstTimestamp.toFixed(3)}s`);
           }
+        } else {
+          const md = segment.data as Uint8Array;
+          const mediaAb = md.buffer.slice(md.byteOffset, md.byteOffset + md.byteLength);
+          const ts = this.latestVideoSegmentTimingInfo
+            ? this.latestVideoSegmentTimingInfo.baseMediaDecodeTime / 90000
+            : (this.latestVideoTimingInfo?.start ?? 0) / 90000;
+          extraMediaSegments.push({ data: mediaAb, timestamp: ts });
+          this.lastProcessedTime = ts;
         }
       }
     };
 
     transmuxer.on('data', initDataHandler);
 
-    diagLog(`[MuxJsTs] Pushing seed data: ${seedData.byteLength} bytes`);
-    transmuxer.push(seedData);
-    transmuxer.flush();
-    // Clear GOP cache after init-phase flush to prevent GOP fusion.
-    // GOP fusion only prepends video GOPs (not audio), creating
-    // audio/video offset in a combined SourceBuffer. Clearing
-    // avoids redundant data overlap and ensures consistent
-    // segment boundaries.
-    this.clearGopCache();
+    const SEED_CHUNK = 1 * 1024 * 1024;
+    diagLog(`[MuxJsTs] Pushing seed data: ${seedData.byteLength} bytes in ${Math.ceil(seedData.byteLength / SEED_CHUNK)} chunks of ${SEED_CHUNK}B`);
+    for (let i = 0; i < seedData.byteLength; i += SEED_CHUNK) {
+      const chunk = seedData.subarray(i, Math.min(i + SEED_CHUNK, seedData.byteLength));
+      transmuxer.push(chunk);
+      transmuxer.flush();
+      this.clearGopCache();
+    }
 
-    if (!initSegmentReceived) {
-      const CHUNK_SIZE = 512 * 1024;
+    if (!initSegmentData) {
       let offset = seedData.byteLength;
-      for (let i = 0; i < 20 && !initSegmentReceived; i++) {
+      for (let i = 0; i < 20 && !initSegmentData; i++) {
         if (offset >= this.fileLength) break;
+        const CHUNK_SIZE = 512 * 1024;
         const end = Math.min(offset + CHUNK_SIZE, this.fileLength);
         try {
           const response = await fetch(this.streamUrl, {
             headers: { Range: `bytes=${offset}-${end - 1}` },
+            signal: this.config.abortSignal,
           });
           if (!response.ok && response.status !== 206) break;
           const chunk = new Uint8Array(await response.arrayBuffer());
@@ -392,7 +409,7 @@ export class MuxJsTsTransmuxer {
       this.streamingOffset = seedData.byteLength;
     }
 
-    if (!initSegmentReceived || !initSegmentData) {
+    if (!initSegmentData) {
       diagLog(`[MuxJsTs] Failed to get init segment — codec not supported or corrupt file`);
       transmuxer.off('data', initDataHandler);
       this.config.onCodecUnsupported('unknown/aac');
@@ -403,7 +420,6 @@ export class MuxJsTsTransmuxer {
     this.initSegmentBuffer = initBuf.buffer.slice(initBuf.byteOffset, initBuf.byteOffset + initBuf.byteLength);
 
     diagLog(`[MuxJsTs] Init segment ready (${this.initSegmentBuffer!.byteLength} bytes), returning to caller`);
-    this.config.onDurationKnown(Infinity);
 
     // Pre-compute PAT/PMT-only data for seek transmuxer initialization
     if (this.tsHeaderData) {
@@ -419,34 +435,29 @@ export class MuxJsTsTransmuxer {
       this.lastProcessedTime = firstTimestamp;
     }
 
-    // Parse init segment to extract codec strings
+    // Parse init segments to extract codec strings
     const tools = muxjs?.mp4?.tools || (muxjs as any)?.default?.mp4?.tools;
-    const parsedInit: any[] = tools ? tools.inspect(initBuf) : [];
     let videoCodecString = 'avc1.42E01E';
-
-    // Audio codec: use mux.js's sampleEntry.audioObjectType.
-    // NOTE: mux.js returns audioObjectType=2 for both AAC-LC and HE-AAC
-    // (ADTS uses implicit SBR signaling). Chrome's combined SourceBuffer
-    // auto-detects HE-AAC, so mp4a.40.2 works in combined mode. Separate
-    // audio SourceBuffers reject HE-AAC with mp4a.40.2 (strict codec match).
     let audioCodecString = 'mp4a.40.2';
 
-    // Video: extract avc1 profile/level from SPS in init segment's moov box
-    for (const box of parsedInit) {
-      if (box.type === 'moov' && box.boxes) {
-        for (const subBox of box.boxes) {
-          if (subBox.type === 'trak' && subBox.boxes) {
-            for (const trakSub of subBox.boxes) {
-              if (trakSub.type === 'mdia' && trakSub.boxes) {
-                for (const mdiaSub of trakSub.boxes) {
-                  if (mdiaSub.type === 'stbl' && mdiaSub.boxes) {
-                    for (const stblSub of mdiaSub.boxes) {
-                      if (stblSub.type === 'stsd' && stblSub.boxes && stblSub.boxes.length > 0) {
-                        const sampleEntry = stblSub.boxes[0];
-                        if (sampleEntry.type === 'avc1' && sampleEntry.avcData) {
-                          videoCodecString = `avc1.${sampleEntry.avcData}`;
-                        } else if (sampleEntry.type === 'mp4a' && sampleEntry.audioObjectType) {
-                          audioCodecString = `mp4a.40.${sampleEntry.audioObjectType}`;
+    const parseCodecFromMoov = (initData: Uint8Array, isAudio: boolean) => {
+      const parsed: any[] = tools ? tools.inspect(initData) : [];
+      for (const box of parsed) {
+        if (box.type === 'moov' && box.boxes) {
+          for (const subBox of box.boxes) {
+            if (subBox.type === 'trak' && subBox.boxes) {
+              for (const trakSub of subBox.boxes) {
+                if (trakSub.type === 'mdia' && trakSub.boxes) {
+                  for (const mdiaSub of trakSub.boxes) {
+                    if (mdiaSub.type === 'stbl' && mdiaSub.boxes) {
+                      for (const stblSub of mdiaSub.boxes) {
+                        if (stblSub.type === 'stsd' && stblSub.boxes && stblSub.boxes.length > 0) {
+                          const sampleEntry = stblSub.boxes[0];
+                          if (!isAudio && sampleEntry.type === 'avc1' && sampleEntry.avcData) {
+                            videoCodecString = `avc1.${sampleEntry.avcData}`;
+                          } else if (isAudio && sampleEntry.type === 'mp4a' && sampleEntry.audioObjectType) {
+                            audioCodecString = `mp4a.40.${sampleEntry.audioObjectType}`;
+                          }
                         }
                       }
                     }
@@ -457,15 +468,16 @@ export class MuxJsTsTransmuxer {
           }
         }
       }
-    }
+    };
+
+    if (initSegmentData) parseCodecFromMoov(initSegmentData, false);
+    if (initSegmentData) parseCodecFromMoov(initSegmentData, true);
 
     this.mimeType = `video/mp4; codecs="${videoCodecString}, ${audioCodecString}"`;
-    this.videoMimeType = `video/mp4; codecs="${videoCodecString}"`;
-    this.audioMimeType = `audio/mp4; codecs="${audioCodecString}"`;
-    diagLog(`[MuxJsTs] MIME types: combined=${this.mimeType}, video=${this.videoMimeType}, audio=${this.audioMimeType}`);
+    diagLog(`[MuxJsTs] MIME type: ${this.mimeType}`);
 
-    // Remove init-phase data handler — streaming uses its own.
-    // CRITICAL: Do NOT remove timing listeners — they persist for streaming (bug #13).
+    // Remove init-phase data handler ΓÇö streaming uses its own.
+    // CRITICAL: Do NOT remove timing listeners ΓÇö they persist for streaming (bug #13).
     transmuxer.off('data', initDataHandler);
     // Reset stale init-phase timing values so first streaming flush gets fresh data
     this.latestVideoSegmentTimingInfo = null;
@@ -475,66 +487,77 @@ export class MuxJsTsTransmuxer {
 
     this.buildKeyframeIndex();
 
-    diagLog(`[MuxJsTs] init: SUCCESS — AVC TS → fMP4, keepOriginalTimestamps=true, combined SourceBuffer, mimeType=${this.mimeType}`);
+    diagLog(`[MuxJsTs] init: SUCCESS ΓÇö AVC TS ΓåÆ fMP4, keepOriginalTimestamps=false, remux=true (combined SB, mode=sequence), mimeType=${this.mimeType}`);
     return {
       mimeType: this.mimeType,
-      videoMimeType: this.videoMimeType,
-      audioMimeType: this.audioMimeType,
       videoCodec: 'avc',
       videoTrack: { codec: 'avc', type: 'video' },
       audioTrack: { codec: 'aac', type: 'audio' },
       initSegment: this.initSegmentBuffer!,
       firstMediaSegment,
       firstMediaTimestamp,
+      extraMediaSegments,
     };
   }
 
   async startStreaming(): Promise<void> {
     if (this.disposed) return;
 
-    const CHUNK_SIZE = 256 * 1024;
-    const FLUSH_INTERVAL = 8;
+    const FRAGMENT_SIZES = [512 * 1024, 512 * 1024, 1024 * 1024, 1024 * 1024, 1024 * 1024];
+    const FLUSH_INTERVAL = 1;
     let offset = this.streamingOffset;
     const generation = this.seekGeneration;
     let chunkCount = 0;
+    let chunksAfterSeek = 0;
+    let lastSpeedTime = 0;
+    let speedBytesSinceLast = 0;
+    let lastProgressTime = 0;
 
-    diagLog(`[MuxJsTs] startStreaming: from offset ${offset}, fileLength=${this.fileLength}, keepOriginalTimestamps=true`);
+    diagLog(`[MuxJsTs] startStreaming: from offset ${offset}, fileLength=${this.fileLength}, keepOriginalTimestamps=false`);
 
     const streamDataHandler = (segment: any) => {
       if (this.disposed || generation !== this.seekGeneration) return;
 
       if (segment.initSegment) {
-        diagLog(`[MuxJsTs] Streaming: skipping redundant init segment`);
+        const newInit = segment.initSegment as Uint8Array;
+        const existingInit = this.initSegmentBuffer;
+        let isDifferent = true;
+        if (existingInit && newInit.byteLength === existingInit.byteLength) {
+          const newView = new Uint8Array(newInit.buffer, newInit.byteOffset, newInit.byteLength);
+          const existView = new Uint8Array(existingInit);
+          isDifferent = false;
+          for (let i = 0; i < newView.length; i++) {
+            if (newView[i] !== existView[i]) { isDifferent = true; break; }
+          }
+        }
+        if (isDifferent) {
+          const initAb = newInit.buffer.slice(newInit.byteOffset, newInit.byteOffset + newInit.byteLength);
+          diagLog(`[MuxJsTs] Streaming: new combined init segment (${initAb.byteLength} bytes)`);
+          this.config.onInitSegment(initAb, 'combined');
+          this.initSegmentBuffer = initAb;
+        }
       }
 
       if (segment.data) {
         const dataBytes = segment.data.byteLength;
         const mediaAb = segment.data.buffer.slice(segment.data.byteOffset, segment.data.byteOffset + segment.data.byteLength);
-        const segTimingInfo = this.latestVideoSegmentTimingInfo;
-        const rawTimingInfo = this.latestVideoTimingInfo;
-        // With keepOriginalTimestamps:true: baseMediaDecodeTime is the original
-        // absolute DTS (in 90kHz). For initial streaming with timestampOffset=0,
-        // this IS the absolute position on the timeline.
-        const timestamp = segTimingInfo
-          ? segTimingInfo.baseMediaDecodeTime / 90000
-          : (rawTimingInfo?.start ?? 0) / 90000;
+        const timestamp = this.latestVideoSegmentTimingInfo
+          ? this.latestVideoSegmentTimingInfo.baseMediaDecodeTime / 90000
+          : (this.latestVideoTimingInfo?.start ?? 0) / 90000;
 
-        const prependedDuration = segTimingInfo?.prependedContentDuration ?? 0;
         this.streamingSegCounter++;
         const segIdx = this.streamingSegCounter;
-        if (segIdx <= 10) {
-          const audioBmdt = this.latestAudioSegmentTimingInfo?.baseMediaDecodeTime ?? null;
-          diagLog(`[MuxJsTs] Streaming seg#${segIdx}: ts=${timestamp.toFixed(3)}s, bmdt=${segTimingInfo?.baseMediaDecodeTime ?? 'null'}, audioBmdt=${audioBmdt}, prependedContentDuration=${prependedDuration} (${(prependedDuration / 90000).toFixed(3)}s)`);
-          // With GOP cache clearing, prependedContentDuration should be 0
-          // (no GOP fusion). If > 0, cache clearing failed — investigate.
+        if (segIdx <= 30) {
+          diagLog(`[MuxJsTs] Streaming combined seg#${segIdx}: ${dataBytes}B, ts=${timestamp.toFixed(3)}s`);
         }
 
-        diagLog(`[MuxJsTs] Streaming: media segment ${dataBytes} bytes, ts=${timestamp.toFixed(3)}s, prepended=${(prependedDuration / 90000).toFixed(3)}s`);
-        this.config.onMediaSegment(mediaAb, timestamp);
+        this.config.onMediaSegment(mediaAb, timestamp, 'combined');
         this.lastProcessedTime = timestamp;
-        // Reset timing info after using it so stale values don't leak across flushes
         this.latestVideoSegmentTimingInfo = null;
         this.latestVideoTimingInfo = null;
+        if (this.latestAudioSegmentTimingInfo) {
+          diagLog(`[MuxJsTs] Combined seg audio timing: audioBmdt=${this.latestAudioSegmentTimingInfo.baseMediaDecodeTime / 90000}s`);
+        }
         this.latestAudioSegmentTimingInfo = null;
       }
     };
@@ -542,11 +565,22 @@ export class MuxJsTsTransmuxer {
     this.transmuxer.on('data', streamDataHandler);
 
     while (!this.disposed && generation === this.seekGeneration && offset < this.fileLength) {
-      const end = Math.min(offset + CHUNK_SIZE, this.fileLength);
+      if (this.config.getBufferedAhead) {
+        const ahead = this.config.getBufferedAhead();
+        if (ahead > 30) {
+          await new Promise<void>(r => setTimeout(r, 500));
+          if (this.disposed || generation !== this.seekGeneration) break;
+          continue;
+        }
+      }
+
+      const chunkSize = FRAGMENT_SIZES[Math.min(chunksAfterSeek, FRAGMENT_SIZES.length - 1)];
+      const end = Math.min(offset + chunkSize, this.fileLength);
 
       try {
         const response = await fetch(this.streamUrl, {
           headers: { Range: `bytes=${offset}-${end - 1}` },
+          signal: this.config.abortSignal,
         });
         if (!response.ok && response.status !== 206) {
           diagLog(`[MuxJsTs] Streaming fetch failed at offset ${offset}: status ${response.status}`);
@@ -556,8 +590,26 @@ export class MuxJsTsTransmuxer {
 
         this.transmuxer.push(chunk);
         chunkCount++;
+        chunksAfterSeek++;
         offset += chunk.byteLength;
         this.streamingOffset = offset;
+
+        speedBytesSinceLast += chunk.byteLength;
+        const now = Date.now();
+
+        if (now - lastProgressTime >= 250) {
+          lastProgressTime = now;
+          this.config.onProgressUpdate?.(offset);
+        }
+
+        if (now - lastSpeedTime >= 1000 && lastSpeedTime > 0) {
+          const elapsed = (now - lastSpeedTime) / 1000;
+          this.config.onSpeedUpdate?.(speedBytesSinceLast / elapsed);
+          speedBytesSinceLast = 0;
+          lastSpeedTime = now;
+        } else if (lastSpeedTime === 0) {
+          lastSpeedTime = now;
+        }
 
         // Flush periodically to emit buffered fMP4 segments.
         // Clear GOP cache after each flush to prevent GOP fusion.
@@ -566,8 +618,16 @@ export class MuxJsTsTransmuxer {
         if (chunkCount % FLUSH_INTERVAL === 0) {
           this.transmuxer.flush();
           this.clearGopCache();
+          if (this.config.onWaitForQueue) {
+            await this.config.onWaitForQueue();
+            if (this.disposed || generation !== this.seekGeneration) break;
+          }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.name === 'AbortError') {
+          diagLog(`[MuxJsTs] Streaming aborted at offset ${offset}`);
+          break;
+        }
         diagLog(`[MuxJsTs] Streaming error at offset ${offset}: ${e}`);
         break;
       }
@@ -582,6 +642,8 @@ export class MuxJsTsTransmuxer {
     }
 
     this.transmuxer.off('data', streamDataHandler);
+    this.config.onSpeedUpdate?.(0);
+    this.config.onProgressUpdate?.(offset);
     diagLog(`[MuxJsTs] Streaming ended at offset ${offset}`);
 
     // If streaming was interrupted (seek/dispose), throw so the .catch()
@@ -613,11 +675,12 @@ export class MuxJsTsTransmuxer {
     diagLog(`[MuxJsTs] seekTo: keyframe at ${keyframeTs.toFixed(3)}s, byteOffset=${keyframeEntry.byteOffset}`);
 
     const TransmuxerClass = muxjs?.mp4?.Transmuxer || (muxjs as any)?.Transmuxer || (muxjs as any)?.default?.mp4?.Transmuxer;
-    // CRITICAL: keepOriginalTimestamps:true for seek transmuxer.
-    // Original absolute timestamps → caller uses setTimestampOffset(0)
-    // and seekOffsetRef=0 (timestamps are already at absolute positions).
+    // CRITICAL: keepOriginalTimestamps:false for seek transmuxer (matches main transmuxer).
+    // Normalized timestamps start near 0 ΓåÆ caller uses setTimestampOffset(keyframeTimestamp)
+    // to position the data on the MSE timeline.
     const seekTransmuxer = new TransmuxerClass({
-      keepOriginalTimestamps: true,
+      keepOriginalTimestamps: false,
+      remux: true,
     });
     const skipInit = options?.skipInitSegment ?? false;
     const segments: Array<{ init: Uint8Array | null; media: Uint8Array | null; timestamp: number }> = [];
@@ -634,9 +697,6 @@ export class MuxJsTsTransmuxer {
 
     seekTransmuxer.on('data', (segment: any) => {
       if (currentGeneration !== this.seekGeneration) return;
-      // With keepOriginalTimestamps:true, baseMediaDecodeTime is the
-      // original absolute DTS. Timestamp IS the absolute position.
-      // Caller uses setTimestampOffset(0) and seekOffsetRef=0.
       const timestamp = seekSegTimingInfo
         ? seekSegTimingInfo.baseMediaDecodeTime / 90000
         : (seekRawTimingInfo?.start ?? 0) / 90000;
@@ -665,12 +725,13 @@ export class MuxJsTsTransmuxer {
         // Fallback: if tsPmtData wasn't pre-computed, use full tsHeaderData
         // This may include byte-0 PES data, but it's better than no stream mapping
         dataToPush.push(this.tsHeaderData);
-        diagLog(`[MuxJsTs] seek: WARNING — using full tsHeaderData (${this.tsHeaderData.byteLength} bytes) as fallback, may include byte-0 PES data`);
+        diagLog(`[MuxJsTs] seek: WARNING ΓÇö using full tsHeaderData (${this.tsHeaderData.byteLength} bytes) as fallback, may include byte-0 PES data`);
       }
 
       const end = Math.min(keyframeEntry.byteOffset + SEEK_FETCH_SIZE, this.fileLength);
       const response = await fetch(this.streamUrl, {
         headers: { Range: `bytes=${keyframeEntry.byteOffset}-${end - 1}` },
+        signal: this.config.abortSignal,
       });
       if (!response.ok && response.status !== 206) {
         diagLog(`[MuxJsTs] Seek fetch failed: status ${response.status}`);
@@ -688,24 +749,22 @@ export class MuxJsTsTransmuxer {
         if (currentGeneration !== this.seekGeneration) return null;
         if (seg.init && !skipInit) {
           const initAb = seg.init.buffer.slice(seg.init.byteOffset, seg.init.byteOffset + seg.init.byteLength);
-          this.config.onInitSegment(initAb);
+          this.config.onInitSegment(initAb, 'combined');
           this.initSegmentBuffer = initAb;
         }
         if (seg.media) {
           const mediaAb = seg.media.buffer.slice(seg.media.byteOffset, seg.media.byteOffset + seg.media.byteLength);
-          // Return keyframeTs as the seek target — with keepOriginalTimestamps:true,
-          // caller uses setTimestampOffset(0) and seekOffsetRef=0
-          // (timestamps are already at absolute positions)
-          this.config.onMediaSegment(mediaAb, keyframeTs);
+          this.config.onMediaSegment(mediaAb, keyframeTs, 'combined');
           this.lastProcessedTime = keyframeTs;
         }
       }
 
       this.streamingOffset = end;
-      diagLog(`[MuxJsTs] seekTo: completed, keyframeTs=${keyframeTs.toFixed(3)}s, segments=${segments.length}`);
+      diagLog(`[MuxJsTs] seekTo: completed, keyframeTs=${keyframeTs.toFixed(3)}s, combinedSegs=${segments.length}`);
       return keyframeTs;
-    } catch (e) {
+    } catch (e: any) {
       if (currentGeneration !== this.seekGeneration) return null;
+      if (e?.name === 'AbortError') return null;
       diagLog(`[MuxJsTs] seekTo error: ${e}`);
       this.config.onError(e instanceof Error ? e : new Error(String(e)));
       return null;
@@ -777,7 +836,7 @@ export class MuxJsTsTransmuxer {
    * audio stays at original position). Clearing after each flush ensures:
    * - prependedContentDuration = 0 (no fusion)
    * - Keyframe-aligned segments (original extendFirstKeyFrame handles
-   *   incomplete first GOPs by removing them — no quality deformation)
+   *   incomplete first GOPs by removing them ΓÇö no quality deformation)
    * - Combined SourceBuffer maintains audio/video alignment */
   private clearGopCache(): void {
     try {
@@ -786,7 +845,7 @@ export class MuxJsTsTransmuxer {
         pipeline.videoSegmentStream.gopCache_ = [];
       }
     } catch (_) {
-      // GOP cache access failed — non-critical, fusion may occur
+      // GOP cache access failed ΓÇö non-critical, fusion may occur
     }
   }
 
@@ -802,6 +861,7 @@ export class MuxJsTsTransmuxer {
     this.keyframeIndexBuilt = false;
     this.tsHeaderData = null;
     this.tsPmtData = null;
+    this.initSegmentBuffer = null;
     if (this.transmuxer) {
       try { this.transmuxer.off('data'); this.transmuxer.off('done'); this.transmuxer.off('videoTimingInfo'); this.transmuxer.off('videoSegmentTimingInfo'); } catch (_) {}
       try { this.transmuxer.reset(); } catch (_) {}

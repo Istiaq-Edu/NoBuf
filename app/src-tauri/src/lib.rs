@@ -19,6 +19,8 @@ pub mod api_routes;
 pub mod hls;
 pub mod download_pool;
 pub mod faststart;
+pub mod ts_demux;
+pub mod fmp4;
 
 /// Single source of truth for the Actix streaming server port.
 /// Referenced in lib.rs (server startup) and exposed to the frontend
@@ -256,12 +258,63 @@ pub fn run() {
             // Initialize stream cache manager
             // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
             // subject to automatic cleanup by Storage Sense, Disk Cleanup,
-            // and antivirus â€” which can delete .dat and .meta files mid-stream
+            // and antivirus — which can delete .dat and .meta files mid-stream
             // causing catastrophic cached-range loss.
             let cache_dir = app.path().app_data_dir()
                 .map_err(|e| format!("app_data_dir: {}", e))
                 .unwrap_or_else(|_| std::env::temp_dir().join("nobuf-cache"))
                 .join("stream-cache");
+
+            // ── Startup orphan cleanup ──
+            // On previous exit, clear_all() may have failed due to open file
+            // handles on Windows (ERROR_SHARING_VIOLATION). This leaves GBs of
+            // orphaned .dat files on disk. Wipe the cache directory BEFORE
+            // creating the StreamCacheManager and starting the server — at
+            // startup there are no open handles, so deletion always succeeds.
+            if cache_dir.exists() {
+                log::info!("[STARTUP-CLEANUP] Removing orphaned stream-cache at {:?}...", cache_dir);
+                match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => log::info!("[STARTUP-CLEANUP] Successfully removed orphaned stream-cache"),
+                    Err(e) => log::warn!("[STARTUP-CLEANUP] Failed to remove stream-cache: {} (will continue)", e),
+                }
+            }
+
+            // Also clean up any orphaned remux files in %TEMP% from previous sessions
+            // where cache_mgr was None (edge case — these are NEVER cleaned otherwise)
+            let temp_remux = std::env::temp_dir().join("nobuf_remux");
+            if temp_remux.exists() {
+                log::info!("[STARTUP-CLEANUP] Removing orphaned temp remux dir at {:?}...", temp_remux);
+                match std::fs::remove_dir_all(&temp_remux) {
+                    Ok(()) => log::info!("[STARTUP-CLEANUP] Successfully removed temp remux dir"),
+                    Err(e) => log::warn!("[STARTUP-CLEANUP] Failed to remove temp remux: {}", e),
+                }
+            }
+
+            // Clean up thumbnail cache (unbounded — can grow to hundreds of MBs)
+            let thumb_dir = app.path().app_data_dir()
+                .map_err(|e| format!("app_data_dir: {}", e))
+                .unwrap_or_else(|_| std::env::temp_dir().join("nobuf-cache"))
+                .join("thumbnails");
+            if thumb_dir.exists() {
+                log::info!("[STARTUP-CLEANUP] Removing orphaned thumbnail cache at {:?}...", thumb_dir);
+                match std::fs::remove_dir_all(&thumb_dir) {
+                    Ok(()) => log::info!("[STARTUP-CLEANUP] Successfully removed thumbnail cache"),
+                    Err(e) => log::warn!("[STARTUP-CLEANUP] Failed to remove thumbnail cache: {}", e),
+                }
+            }
+
+            // Clean up preview cache (pruned to 80MB at runtime, but not on exit)
+            let preview_dir = app.path().app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("nobuf-preview"))
+                .join("previews");
+            if preview_dir.exists() {
+                log::info!("[STARTUP-CLEANUP] Removing orphaned preview cache at {:?}...", preview_dir);
+                match std::fs::remove_dir_all(&preview_dir) {
+                    Ok(()) => log::info!("[STARTUP-CLEANUP] Successfully removed preview cache"),
+                    Err(e) => log::warn!("[STARTUP-CLEANUP] Failed to remove preview cache: {}", e),
+                }
+            }
+
             let cache_mgr = match stream_cache::StreamCacheManager::new(cache_dir) {
                 Ok(cache_mgr) => {
                     app.manage(cache_mgr.clone());
@@ -355,6 +408,8 @@ pub fn run() {
             commands::cmd_stop_background_cache,
             commands::cmd_rename_folder,
             commands::cmd_start_auto_sync,
+            commands::cmd_probe_duration,
+            commands::cmd_get_cache_total_size,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
@@ -366,7 +421,7 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            log::info!("Application exiting â€” shutting down background services...");
+            log::info!("Application exiting — shutting down background services...");
 
             // 1. Shutdown the grammers network runner
             let shutdown_arc = app_handle.state::<TelegramState>().runner_shutdown.clone();
@@ -383,9 +438,14 @@ pub fn run() {
                 log::info!("Stopping Actix streaming server...");
                 drop(handle.stop(true));
                 // Give the server time to finish in-flight streaming requests
-                // before we clear the cache â€” prevents concurrent writes during
-                // cache deletion which can cause meta corruption on Windows.
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // and close all file handles before we clear the cache.
+                // On Windows, open handles (from open_data_file_write with
+                // FILE_SHARE_READ | FILE_SHARE_WRITE) block remove_dir_all()
+                // with ERROR_SHARING_VIOLATION. 2 seconds is enough for the
+                // Actix worker threads to drop StreamingGuard → close file
+                // handles. If this still fails, the startup orphan cleanup
+                // will catch it on next launch.
+                std::thread::sleep(std::time::Duration::from_millis(2000));
             }
 
             // 3. Stop the API server (graceful)
@@ -396,14 +456,46 @@ pub fn run() {
                 drop(handle.stop(true));
             }
 
-            // 4. Clear stream cache
+            // 4. Clear stream cache (includes remux/ subdirectory)
+            // Uses robust per-file deletion with retry — if remove_dir_all fails
+            // due to a locked file, we still delete everything else.
             if let Some(cache_mgr) = app_handle.try_state::<stream_cache::StreamCacheManager>() {
-                log::info!("Clearing stream cache...");
-                if let Err(e) = cache_mgr.clear_all() {
-                    log::error!("Failed to clear stream cache: {}", e);
+                log::info!("Clearing stream cache at {:?}...", cache_mgr.cache_dir());
+                if let Err(e) = cache_mgr.clear_all_robust() {
+                    log::error!("Failed to clear stream cache (robust): {}", e);
+                    // Fallback: try the simple clear_all
+                    if let Err(e2) = cache_mgr.clear_all() {
+                        log::error!("Failed to clear stream cache (simple): {}", e2);
+                    }
                 }
             }
-            // 5. Clean up partial download files
+
+            // 5. Clean up orphaned remux files in %TEMP% (from sessions where cache_mgr was None)
+            let temp_remux = std::env::temp_dir().join("nobuf_remux");
+            if temp_remux.exists() {
+                log::info!("Cleaning up temp remux dir at {:?}...", temp_remux);
+                let _ = std::fs::remove_dir_all(&temp_remux);
+            }
+
+            // 6. Clean up thumbnail cache (unbounded, never pruned)
+            if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                let thumb_dir = data_dir.join("thumbnails");
+                if thumb_dir.exists() {
+                    log::info!("Cleaning up thumbnail cache at {:?}...", thumb_dir);
+                    let _ = std::fs::remove_dir_all(&thumb_dir);
+                }
+            }
+
+            // 7. Clean up preview cache
+            if let Ok(cache_dir) = app_handle.path().app_cache_dir() {
+                let preview_dir = cache_dir.join("previews");
+                if preview_dir.exists() {
+                    log::info!("Cleaning up preview cache at {:?}...", preview_dir);
+                    let _ = std::fs::remove_dir_all(&preview_dir);
+                }
+            }
+
+            // 8. Clean up partial download files
             let state = app_handle.state::<TelegramState>();
             let partials = state.partial_downloads.clone();
             if let Ok(mut paths) = partials.try_lock() {

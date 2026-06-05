@@ -50,6 +50,7 @@
     "allow-cmd-get-cache-status",
     "allow-cmd-delete-cache",
     "allow-cmd-start-background-cache",
-    "allow-cmd-stop-background-cache"
+    "allow-cmd-stop-background-cache",
+    "allow-cmd-probe-duration"
   ]
 }
