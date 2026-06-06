@@ -12,30 +12,66 @@
  *   mpegts.js FetchStreamLoader → self.fetch(url, {Range: bytes=X-})
  *       ↓
  *   fetch interceptor (installed on window.fetch)
- *       ├─ Fully cached:     return Response from memory (0ms latency)
- *       ├─ Partially cached: return cached bytes + chain server for remainder
- *       └─ Not cached:       forward to server, tee stream to cache + mpegts.js
+ *       ├─ Fully cached (small): return Response from memory (0ms latency)
+ *       ├─ Not cached / large range: forward to server, siphon chunks to cache
+ *       └─ (NO partial-chained mode — it causes abort crashes & DTS corruption)
  *
- * Bar color mapping:
- *   Gray/White = SourceBuffer (video.buffered) — instant seeks
- *   Green      = Disk cache (cmd_get_cache_status) — fast seeks
- *   + ShadowCache feeds into both: cached bytes → faster lazyLoad resume → more
- *     SourceBuffer data stays current; server CACHE-PREFIX is bypassed entirely
- *     for fully-cached ranges.
+ * CRITICAL DESIGN NOTES:
+ *
+ *   1. Range header extraction: mpegts.js uses `new Headers()` for fetch
+ *      init, so `init.headers` is a Headers object, NOT a plain object.
+ *      Must use `headers.get('Range')`, NOT `headers['Range']`.
+ *
+ *   2. NO `tee()`: response.body.tee() keeps the HTTP connection alive
+ *      after mpegts.js aborts (because the cache branch is still reading).
+ *      This causes data to keep flowing into the demuxer after abort,
+ *      corrupting DTS values and producing duration = 2^32/1000 overflow.
+ *
+ *   3. NO `createChainedResponse` (partial hit + server chain):
+ *      Using ReadableStream `start()` eagerly reads ALL server data even
+ *      after the player aborts. Using `pull()` fixes the abort issue but
+ *      creates a new problem: the cached portion has already been processed
+ *      by the demuxer on the previous fetch, so re-serving it causes the
+ *      demuxer to re-process data it already transmuxed → DTS frame drops
+ *      ("Dropping 1 audio frame ... dtsCorrection overlap" flood).
+ *
+ *      The CORRECT approach: let mpegts.js fetch from the server as normal
+ *      (the server's CACHE-PREFIX feature serves cached bytes from disk),
+ *      and only siphon the server's response chunks into the shadow cache
+ *      for future HIT scenarios. For HIT scenarios, only serve the exact
+ *      byte range mpegts.js requests — which is typically lazyLoadMaxDuration
+ *      worth of data (~30s ≈ 15MB), well within SourceBuffer quota.
+ *
+ *   4. SourceBuffer quota: NEVER serve more than ~30MB in a single HIT.
+ *      Large PARTIAL hits (156MB+) overflow SourceBuffer → crash.
+ *      If the requested range exceeds the cap, fall through to server.
  */
 
 export interface ByteRange {
   start: number;   // byte offset in file
   end: number;     // byte offset of last byte (inclusive)
   data: Uint8Array;
+  dataOffset?: number;  // byte offset within `data` where valid bytes start (0 = full entry)
+  dataLength?: number;  // number of valid bytes (data.length if omitted)
 }
+
+/** Max bytes to serve in a single HIT response. 30MB ≈ 60s at 4Mbps — safe for SourceBuffer. */
+const MAX_HIT_SERVE_BYTES = 30 * 1024 * 1024;
 
 export class StreamShadowCache {
   private entries: ByteRange[] = [];  // sorted by start, non-overlapping, merged
   private _totalBytes: number = 0;
-  private maxBytes: number;
+  readonly maxBytes: number;
   private _fileLength: number = 0;
   private _urlKey: string = '';   // substring to match stream URLs, e.g. "/stream/3574767635/3"
+
+  /** Current total bytes stored in cache. */
+  get totalBytes(): number { return this._totalBytes; }
+
+  /** Read-only access to entry ranges for UI rendering. */
+  get entryRanges(): { start: number; end: number }[] {
+    return this.entries.map(e => ({ start: e.start, end: e.end }));
+  }
 
   constructor(maxBytes = 300 * 1024 * 1024) {  // 300MB default
     this.maxBytes = maxBytes;
@@ -43,7 +79,6 @@ export class StreamShadowCache {
 
   get fileLength(): number { return this._fileLength; }
   get urlKey(): string { return this._urlKey; }
-  get totalBytes(): number { return this._totalBytes; }
   get entryCount(): number { return this.entries.length; }
 
   /** Reset cache for a new video. */
@@ -52,6 +87,15 @@ export class StreamShadowCache {
     this._totalBytes = 0;
     this._urlKey = urlKey;
     this._fileLength = fileLength;
+  }
+
+  /** Check if a specific byte offset is covered by cached entries. */
+  hasByte(offset: number): boolean {
+    for (const entry of this.entries) {
+      if (offset >= entry.start && offset <= entry.end) return true;
+      if (entry.start > offset) break;  // entries are sorted
+    }
+    return false;
   }
 
   /** Store bytes in the cache. Merges with adjacent/overlapping entries. */
@@ -80,21 +124,22 @@ export class StreamShadowCache {
     const mergedLen = mergedEnd - mergedStart + 1;
 
     const mergedData = new Uint8Array(mergedLen);
-    // First, zero-fill (shouldn't be needed if ranges are contiguous, but safety)
-    // Then copy each range's data
     for (const r of allRanges) {
+      // Respect dataOffset/dataLength for trimmed entries
+      const baseOffset = r.dataOffset ?? 0;
+      const baseLength = r.dataLength ?? r.data.length;
+      const validData = (baseOffset === 0 && baseLength === r.data.length)
+        ? r.data
+        : r.data.subarray(baseOffset, baseOffset + baseLength);
       if (r.start === start && r.data === data) {
-        // This is the new data being inserted
-        mergedData.set(data, r.start - mergedStart);
+        mergedData.set(validData, r.start - mergedStart);
       } else {
-        // This is an existing entry — copy from its data
-        const offset = r.start - mergedStart;
-        mergedData.set(r.data, offset);
+        mergedData.set(validData, r.start - mergedStart);
       }
     }
 
     // Remove old entries and insert merged
-    const removedBytes = toMerge.reduce((s, e) => s + e.data.length, 0);
+    const removedBytes = toMerge.reduce((s, e) => s + (e.dataLength ?? e.data.length), 0);
     this.entries.splice(i, j - i, { start: mergedStart, end: mergedEnd, data: mergedData });
     this._totalBytes += mergedData.length - removedBytes;
 
@@ -123,19 +168,46 @@ export class StreamShadowCache {
   getRange(from: number, to: number): Uint8Array | null {
     for (const entry of this.entries) {
       if (entry.start <= from && entry.end >= to) {
+        const baseOffset = entry.dataOffset ?? 0;
         const offset = from - entry.start;
         const length = to - from + 1;
-        return entry.data.subarray(offset, offset + length);
+        return entry.data.subarray(baseOffset + offset, baseOffset + offset + length);
       }
     }
     return null;
   }
 
-  /** Evict oldest (lowest byte offset) entries to stay under maxBytes. */
+  /** Evict entries to stay under maxBytes. Evicts oldest (lowest byte offset) first.
+   *  Also splits a single oversized entry if it exceeds the budget. */
   private evict(): void {
-    while (this._totalBytes > this.maxBytes && this.entries.length > 1) {
+    // If a single entry exceeds the budget, trim it from the start
+    if (this.entries.length === 1 && this._totalBytes > this.maxBytes) {
+      const entry = this.entries[0];
+      const baseLength = entry.dataLength ?? entry.data.length;
+      const excess = this._totalBytes - this.maxBytes;
+      const trimBytes = Math.min(excess, baseLength);
+      if (trimBytes >= baseLength) {
+        // Entire entry would be removed — just clear it
+        this.entries = [];
+        this._totalBytes = 0;
+        return;
+      }
+      // Trim from the start (drop oldest bytes) — zero-copy via dataOffset
+      const baseOffset = entry.dataOffset ?? 0;
+      this.entries[0] = {
+        start: entry.start + trimBytes,
+        end: entry.end,
+        data: entry.data,
+        dataOffset: baseOffset + trimBytes,
+        dataLength: baseLength - trimBytes,
+      };
+      this._totalBytes -= trimBytes;
+      return;
+    }
+    // Normal eviction: remove oldest entries until under budget
+    while (this._totalBytes > this.maxBytes && this.entries.length > 0) {
       const removed = this.entries.shift()!;
-      this._totalBytes -= removed.data.length;
+      this._totalBytes -= removed.dataLength ?? removed.data.length;
     }
   }
 
@@ -143,13 +215,46 @@ export class StreamShadowCache {
   trimAround(centerByte: number, windowBytes: number): void {
     const minByte = Math.max(0, centerByte - windowBytes);
     const maxByte = centerByte + windowBytes;
-    this.entries = this.entries.filter(entry => {
+    const newEntries: ByteRange[] = [];
+    for (const entry of this.entries) {
       if (entry.end < minByte || entry.start > maxByte) {
-        this._totalBytes -= entry.data.length;
-        return false;
+        // Entire entry is outside the window — drop it
+        const len = entry.dataLength ?? entry.data.length;
+        this._totalBytes -= len;
+        continue;
       }
-      return true;
-    });
+      // Entry partially overlaps the window — trim via dataOffset/dataLength (zero-copy)
+      const baseOffset = entry.dataOffset ?? 0;
+      const baseLength = entry.dataLength ?? entry.data.length;
+      let newStart = entry.start;
+      let newEnd = entry.end;
+      let newDataOffset = baseOffset;
+      let newDataLength = baseLength;
+
+      if (entry.start < minByte) {
+        // Trim leading portion: [entry.start, minByte) is outside
+        const trimBytes = minByte - entry.start;
+        newDataOffset = baseOffset + trimBytes;
+        newDataLength = baseLength - trimBytes;
+        newStart = minByte;
+      }
+      if (entry.end > maxByte) {
+        // Trim trailing portion: (maxByte, entry.end] is outside
+        const trimBytes = entry.end - maxByte;
+        newDataLength = (newDataLength ?? baseLength) - trimBytes;
+        newEnd = maxByte;
+      }
+      const oldLen = baseLength;
+      this._totalBytes -= oldLen - newDataLength;
+      newEntries.push({
+        start: newStart,
+        end: newEnd,
+        data: entry.data,
+        dataOffset: newDataOffset,
+        dataLength: newDataLength,
+      });
+    }
+    this.entries = newEntries;
   }
 
   /** Stats for debugging. */
@@ -173,8 +278,57 @@ let originalFetch: typeof window.fetch | null = null;
 let statsLogTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * Extract Range header from various header formats.
+ * mpegts.js uses `new Headers()` objects, not plain `{key: value}` objects.
+ */
+function extractRangeHeader(headers: HeadersInit | undefined): { from: number; toStr: string | null } | null {
+  if (!headers) return null;
+
+  // Try Headers object first (has .get() method)
+  if (typeof (headers as any).get === 'function') {
+    const rangeVal = (headers as any).get('Range');
+    if (rangeVal) {
+      const m = rangeVal.match(/^bytes=(\d+)-(\d*)$/);
+      if (m) return { from: parseInt(m[1]), toStr: m[2] || null };
+    }
+    return null;
+  }
+
+  // Plain object
+  if (typeof headers === 'object' && !Array.isArray(headers)) {
+    const h = headers as Record<string, string>;
+    for (const key in h) {
+      if (key.toLowerCase() === 'range' && h[key]) {
+        const m = h[key].match(/^bytes=(\d+)-(\d*)$/);
+        if (m) return { from: parseInt(m[1]), toStr: m[2] || null };
+      }
+    }
+  }
+
+  // Array of [key, value] pairs
+  if (Array.isArray(headers)) {
+    for (const pair of headers) {
+      const [key, value] = pair;
+      if (key.toLowerCase() === 'range' && value) {
+        const m = value.match(/^bytes=(\d+)-(\d*)$/);
+        if (m) return { from: parseInt(m[1]), toStr: m[2] || null };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Install the fetch interceptor. All HTTP requests for the stream URL
  * will be checked against the shadow cache before hitting the server.
+ *
+ * Strategy:
+ *   - FULL HIT (range ≤ 30MB): serve from memory — 0ms latency
+ *   - FULL HIT (range > 30MB): fall through to server (too large for SourceBuffer)
+ *   - PARTIAL / MISS: forward to server, siphon chunks to cache for future hits
+ *   - NO "chained" responses (serving cached + server data in one stream) —
+ *     that causes abort crashes and DTS corruption
  */
 export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
   if (originalFetch) return;  // already installed
@@ -201,62 +355,43 @@ export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
       : (input as Request).url;
 
     // Only intercept our stream URLs
-    if (!url.includes(shadowCache.urlKey)) {
+    if (url.indexOf(shadowCache.urlKey) === -1) {
       return originalFetch!.call(window, input, init);
     }
 
-    // Extract Range header
-    let rangeFrom: number | null = null;
-    let rangeToStr: string | null = null;
+    // ── Extract Range header ──
+    const rangeInfo = extractRangeHeader(init?.headers);
+    if (!rangeInfo) {
+      // No Range header (shouldn't happen for mpegts.js — it always uses Range)
+      return forwardAndSiphon(input, init, 0);
+    }
 
-    if (init?.headers) {
-      const h = init.headers as Record<string, string>;
-      if (h['Range']) {
-        const m = h['Range'].match(/^bytes=(\d+)-(\d*)$/);
-        if (m) {
-          rangeFrom = parseInt(m[1]);
-          rangeToStr = m[2] || null;
+    const from = rangeInfo.from;
+    const toStr = rangeInfo.toStr;
+    const to = toStr ? parseInt(toStr) : shadowCache.fileLength - 1;
+    const rangeSize = to - from + 1;
+
+    // ── Check cache for FULL HIT only ──
+    // Only serve from cache if:
+    //   1. The entire requested range is cached contiguously
+    //   2. The range size is ≤ 30MB (safe for SourceBuffer)
+    // Otherwise, let the server handle it (server has CACHE-PREFIX for disk-cached data).
+    if (rangeSize <= MAX_HIT_SERVE_BYTES) {
+      const cachedEnd = shadowCache.cachedUpTo(from);
+      if (cachedEnd >= to) {
+        const cachedData = shadowCache.getRange(from, to);
+        if (cachedData) {
+          console.log(`[SHADOW-CACHE] HIT: bytes ${from}-${to} (${(rangeSize / 1048576).toFixed(1)}MB) served from memory`);
+          return createCacheResponse(from, to, cachedData, shadowCache.fileLength);
         }
       }
+    } else if (shadowCache.cachedUpTo(from) >= to) {
+      // Large range fully cached but too big for SourceBuffer — log and skip
+      console.log(`[SHADOW-CACHE] SKIP-HIT: bytes ${from}-${to} (${(rangeSize / 1048576).toFixed(1)}MB) fully cached but exceeds ${MAX_HIT_SERVE_BYTES / 1048576}MB cap — server will serve with CACHE-PREFIX`);
     }
 
-    // No Range header → forward and cache from byte 0
-    if (rangeFrom === null) {
-      return forwardAndCache(input, init, 0);
-    }
-
-    const from = rangeFrom;
-    const to = rangeToStr ? parseInt(rangeToStr) : shadowCache.fileLength - 1;
-
-    // ── Check cache ──
-    const cachedEnd = shadowCache.cachedUpTo(from);
-
-    // Case 1: Fully cached
-    if (cachedEnd >= to) {
-      const cachedData = shadowCache.getRange(from, to);
-      if (cachedData) {
-        console.log(`[SHADOW-CACHE] HIT: bytes ${from}-${to} (${((to - from) / 1048576).toFixed(1)}MB) served from memory`);
-        return createCacheResponse(from, to, cachedData, shadowCache.fileLength);
-      }
-    }
-
-    // Case 2: Partially cached — serve what we have, then chain server for remainder
-    if (cachedEnd >= from) {
-      const cacheTo = cachedEnd;
-      const cachedData = shadowCache.getRange(from, cacheTo);
-      if (cachedData && cachedData.length > 0) {
-        console.log(`[SHADOW-CACHE] PARTIAL: bytes ${from}-${cacheTo} from memory (${((cacheTo - from) / 1048576).toFixed(1)}MB), ${cacheTo + 1}-${to} from server`);
-        // Modify Range header to request only the uncached portion
-        const newHeaders = { ...(init?.headers as Record<string, string> || {}),
-          Range: `bytes=${cacheTo + 1}-${rangeToStr || ''}` };
-        const newInit = { ...init, headers: newHeaders };
-        const serverResponse = await originalFetch!.call(window, input, newInit);
-        return createChainedResponse(from, to, cachedData, serverResponse);
-      }
-    }
-
-    // Case 3: Not cached — forward to server and cache the response
-    return forwardAndCache(input, init, from);
+    // ── Forward to server and siphon chunks to cache ──
+    return forwardAndSiphon(input, init, from);
   };
 
   console.log('[SHADOW-CACHE] Fetch interceptor installed');
@@ -288,7 +423,7 @@ function createCacheResponse(from: number, to: number, data: Uint8Array, fileLen
   // mpegts.js FetchStreamLoader._pump reads chunks from response.body.getReader().
   const stream = new ReadableStream({
     start(controller) {
-      controller.enqueue(data);
+      controller.enqueue(data.slice());  // .slice() to give player its own buffer
       controller.close();
     }
   });
@@ -304,89 +439,76 @@ function createCacheResponse(from: number, to: number, data: Uint8Array, fileLen
   });
 }
 
-function createChainedResponse(
-  from: number, to: number,
-  cachedData: Uint8Array,
-  serverResponse: Response
-): Response {
-  let bytePos = from + cachedData.length;
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      // 1. Yield cached bytes first (instant — no network wait)
-      controller.enqueue(cachedData);
-
-      // 2. Chain server response for the remainder, caching each chunk
-      if (serverResponse.body) {
-        const reader = serverResponse.body.getReader();
-        try {
-          while (true) {
-            const result = await reader.read();
-            if (result.done) break;
-            const chunk = result.value instanceof Uint8Array
-              ? result.value
-              : new Uint8Array(result.value);
-            controller.enqueue(chunk);
-            // Cache the server bytes
-            shadowCache?.put(bytePos, chunk.slice());  // .slice() to detach from underlying buffer
-            bytePos += chunk.length;
-          }
-        } catch (e) {
-          // Server error during streaming — just end the stream
-          console.warn('[SHADOW-CACHE] Server stream error during chain:', e);
-        }
-      }
-
-      controller.close();
-    }
-  });
-
-  return new Response(stream, {
-    status: 206,
-    statusText: 'Partial Content',
-    headers: {
-      'Content-Type': 'video/mp2t',
-      'Content-Range': `bytes ${from}-${to}/${shadowCache!.fileLength}`,
-      'Content-Length': String(to - from + 1),
-    }
-  });
-}
-
-async function forwardAndCache(
+/**
+ * Forward request to server and siphon chunks to cache.
+ *
+ * Uses pull-based ReadableStream so that when mpegts.js aborts the fetch
+ * (lazyLoad suspend), the pull() callback stops being called, the server
+ * response is dropped, and the HTTP connection closes immediately.
+ *
+ * This avoids both:
+ *   - tee() keeping the connection alive after abort (DTS corruption)
+ *   - start() eagerly reading all data after the stream is closed (enqueue crash)
+ */
+function forwardAndSiphon(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
   startByte: number
 ): Promise<Response> {
-  const response = await originalFetch!.call(window, input, init);
+  return originalFetch!.call(window, input, init).then((response) => {
+    if (!response.body || !shadowCache) return response;
 
-  if (!response.body || !shadowCache) return response;
+    const serverReader = response.body.getReader();
+    let bytePos = startByte;
+    let serverDone = false;
 
-  // Tee the stream: one branch for mpegts.js, one for caching.
-  // tee() internally buffers until both readers consume, but since both
-  // read at similar rates (chunk-by-chunk), memory overhead is minimal.
-  const [playerStream, cacheStream] = response.body.tee();
+    const playerStream = new ReadableStream({
+      async pull(controller) {
+        if (serverDone) {
+          controller.close();
+          return;
+        }
 
-  let bytePos = startByte;
-  const cacheReader = cacheStream.getReader();
-  // Fire-and-forget: read cacheStream and store bytes
-  (async () => {
-    try {
-      while (true) {
-        const result = await cacheReader.read();
-        if (result.done) break;
-        const chunk = result.value instanceof Uint8Array
-          ? result.value
-          : new Uint8Array(result.value);
-        shadowCache?.put(bytePos, chunk.slice());
-        bytePos += chunk.length;
+        try {
+          const result = await serverReader.read();
+          if (result.done) {
+            serverDone = true;
+            controller.close();
+            return;
+          }
+
+          const chunk = result.value instanceof Uint8Array
+            ? result.value
+            : new Uint8Array(result.value);
+
+          // Enqueue to player
+          controller.enqueue(chunk.slice());
+
+          // Siphon to cache (only if under budget — avoids unbounded growth)
+          try {
+            if (shadowCache && shadowCache.totalBytes < shadowCache.maxBytes) {
+              shadowCache.put(bytePos, chunk.slice());
+            }
+          } catch { /* cache errors are non-fatal */ }
+          bytePos += chunk.length;
+
+        } catch (e) {
+          serverDone = true;
+          controller.error(e);
+        }
+      },
+
+      cancel() {
+        // Player cancelled (abort) — release the server reader
+        serverReader.cancel().catch(() => {});
+        serverDone = true;
       }
-    } catch { /* ignore — cache errors shouldn't affect playback */ }
-  })();
+    });
 
-  // Return playerStream to mpegts.js with original response metadata
-  return new Response(playerStream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
+    return new Response(playerStream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   });
 }

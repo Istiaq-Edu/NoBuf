@@ -3429,6 +3429,104 @@ async fn fmp4_metadata(
                         None
                     }
                 } else {
+                    // Strategy 1.5: Download the tail of the file from Telegram
+                    // to compute accurate PTS-based duration. FFmpeg does this
+                    // (reads last ~250KB for final PTS). Caches result for reuse.
+                    const TAIL_SCAN_SIZE: u64 = 512 * 1024; // 512KB (enough for final PTS)
+                    let tail_start = m.total_size.saturating_sub(TAIL_SCAN_SIZE);
+                    let tail_end = m.total_size.saturating_sub(1);
+                    let tail_size = tail_end - tail_start + 1;
+
+                    log::info!("[FMP4-META] msg {} tail not cached — downloading last {}MB from Telegram for PTS duration", message_id, tail_size / (1024*1024));
+
+                    // Try to get the Telegram client and media for this message
+                    let mut tail_pts_duration: Option<f64> = None;
+
+                    let folder_id_val = if folder_id_str == "me" || folder_id_str == "home" || folder_id_str == "null" {
+                        None
+                    } else {
+                        folder_id_str.parse::<i64>().ok()
+                    };
+
+                    let client_guard = { data.client.lock().await.clone() };
+                    if let Some(client) = client_guard {
+                        if let Ok(peer) = resolve_peer(&client, folder_id_val, &data.peer_cache).await {
+                            if let Ok(messages) = client.get_messages_by_id(&peer, &[message_id]).await {
+                                if let Some(msg) = messages.into_iter().next().flatten() {
+                                    if let Some(media) = msg.media() {
+                                        // Try DownloadPool first (parallel), then single-client fallback
+                                        let pool_guard = { data.download_pool.lock().await.clone() };
+                                        let tail_result = if let Some(pool) = pool_guard {
+                                            pool.download_range(&media, tail_start, tail_end, m.total_size).await
+                                        } else {
+                                                Err("No DownloadPool".to_string())
+                                            };
+
+                                        let tail_data = match tail_result {
+                                            Ok(data) => data,
+                                            Err(e) => {
+                                                log::warn!("[FMP4-META] msg {} DownloadPool tail scan failed ({}), using 4Mbps fallback", message_id, e);
+                                                Vec::new() // Will fall through to Strategy 2
+                                            }
+                                        };
+
+                                        if tail_data.len() > 188 * 10 {
+                                            // Need a separate copy for caching since tail_ts may own tail_data
+                                            let tail_data_for_cache = tail_data.clone();
+                                            let tail_ts = if is_m2ts {
+                                                strip_m2ts_prefix(&tail_data, true)
+                                            } else {
+                                                tail_data
+                                            };
+                                            let mut tail_demux = TsDemuxer::new().with_stream_info(stream_info.clone());
+                                            tail_demux.feed(&tail_ts);
+                                            tail_demux.flush();
+                                            let tail_frames = tail_demux.take_frames();
+
+                                            if let Some(final_pts) = tail_frames.iter()
+                                                .filter(|f| f.stream_type == 0x1B || f.stream_type == 0x24)
+                                                .map(|f| f.pts)
+                                                .max()
+                                            {
+                                                if final_pts > init_pts {
+                                                    let dur = (final_pts - init_pts) as f64 / 90000.0;
+                                                    log::info!("[FMP4-META] msg {} Tail-download PTS duration={:.1}s (init_pts={}, final_pts={})", message_id, dur, init_pts, final_pts);
+                                                    tail_pts_duration = Some(dur);
+
+                                                    // Also cache the tail data for reuse by streaming
+                                                    {
+                                                        let _lock4 = cache_mgr.lock_meta(message_id).await;
+                                                        let mut meta2 = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                                                            message_id,
+                                                            folder_id: 0,
+                                                            total_size: m.total_size,
+                                                            filename: String::new(),
+                                                            cached_ranges: vec![],
+                                                            mime_type: String::new(),
+                                                        });
+                                                        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&data_path) {
+                                                            if f.seek(SeekFrom::Start(tail_start)).is_ok() {
+                                                                let _ = f.write_all(&tail_data_for_cache);
+                                                                // Update cached_ranges
+                                                                meta2.cached_ranges.push((tail_start, tail_end));
+                                                                meta2.cached_ranges.sort_by_key(|r| r.0);
+                                                                merge_ranges(&mut meta2.cached_ranges);
+                                                                let _ = cache_mgr.save_meta(&meta2);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if tail_pts_duration.is_some() {
+                        tail_pts_duration
+                    } else {
                     // Strategy 2: progressive bitrate estimation from cached data.
                     // Scan whatever data IS currently cached (beyond the initial
                     // ~25MB) to estimate average bitrate, then compute
@@ -3510,6 +3608,7 @@ async fn fmp4_metadata(
                     }
 
                     best_duration
+                    } // closes Strategy 1.5 else block (tail_pts_duration was None)
                 }
             } else {
                 None
