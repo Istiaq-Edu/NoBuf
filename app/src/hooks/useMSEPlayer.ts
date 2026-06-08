@@ -16,6 +16,86 @@ import { type TSKeyframeEntry } from '../lib/faststream/utils/TSByteOffsetScanne
 import { StreamShadowCache, installStreamCacheInterceptor, uninstallStreamCacheInterceptor } from '../lib/faststream/StreamShadowCache';
 
 /**
+ * Align a byte position to a TS-packet boundary that starts with the 0x47 sync byte.
+ *
+ * After rounding to a 188-byte boundary, the byte at that position may NOT be 0x47
+ * (e.g. the TS stream has a different packet alignment, or the file has headers
+ * before the first TS packet). If we feed the TSDemuxer a byte that isn't 0x47,
+ * it reports "sync_byte=198, not 0x47" and tries to resync, producing 25+ repeated
+ * sync errors, garbage frames, and large audio timestamp gaps (46293ms observed).
+ *
+ * This function:
+ *   1. Rounds `bytePos` DOWN to the nearest 188-byte boundary
+ *   2. Reads 1 byte from the shadow cache at that position (if cache available)
+ *   3. If it's 0x47, returns that position
+ *   4. If not, scans forward by 188 bytes up to 5 times looking for 0x47
+ *   5. If no 0x47 found in cache, returns the 188-aligned position (best effort)
+ *
+ * @param bytePos - The candidate byte position (already approximately 188-aligned)
+ * @param cache - The StreamShadowCache instance (may be null)
+ * @returns The best TS-sync-byte-aligned position
+ */
+function alignToTSSyncByte(bytePos: number, cache: StreamShadowCache | null): number {
+  // Step 1: Round down to 188-byte boundary
+  let aligned = Math.floor(bytePos / 188) * 188;
+  if (aligned < 0) aligned = 0;
+
+  // Step 2: If no cache, can't verify — return 188-aligned position (best effort)
+  if (!cache) {
+    diagLog(`[TS-SYNC-ALIGN] No shadow cache available — using 188-aligned byte ${aligned} (cannot verify 0x47)`);
+    return aligned;
+  }
+
+  // Step 2b: If cache exists but has no entries, skip forward/backward scan.
+  // The cache was fully evicted — we can't verify 0x47 but also can't find
+  // evidence of a problem. Return the 188-aligned position directly.
+  if (cache.entryCount === 0) {
+    diagLog(`[TS-SYNC-ALIGN] INFO: Cache empty — using 188-aligned byte ${aligned} (cannot verify 0x47, no cache data available)`);
+    return aligned;
+  }
+
+  // Step 3: Scan forward at 188-byte boundaries looking for 0x47 sync byte
+  const MAX_SCAN = 5; // Scan up to 5 packets forward (~940 bytes)
+  for (let i = 0; i <= MAX_SCAN; i++) {
+    const candidate = aligned + i * 188;
+    // Read 1 byte at candidate position from cache
+    const byteData = cache.getRange(candidate, candidate);
+    if (byteData && byteData[0] === 0x47) {
+      if (i > 0) {
+        diagLog(`[TS-SYNC-ALIGN] 0x47 sync byte found at offset ${candidate} (scanned ${i} packets forward from ${aligned})`);
+      }
+      return candidate;
+    }
+  }
+
+  // Step 4: Cache-gap fallback — forward scan all returned null.
+  // This happens when the cache ends just before the target position
+  // (e.g. cache covers [0, X] and target is X+1). Since TS packets are
+  // periodic with 0x47 every 188 bytes, if we can verify 0x47 at a
+  // cache-covered 188-boundary, we can extrapolate forward to the target.
+  // Scan backward up to 5 packets from the aligned position.
+  const MAX_BACK_SCAN = 5;
+  const cacheEndByte = cache.cachedUpTo(aligned); // furthest contiguous cached byte from aligned
+  for (let i = 1; i <= MAX_BACK_SCAN; i++) {
+    const backCandidate = aligned - i * 188;
+    if (backCandidate < 0) break;
+    // Only check positions that are within the cache's coverage
+    if (backCandidate > cacheEndByte) continue;
+    const byteData = cache.getRange(backCandidate, backCandidate);
+    if (byteData && byteData[0] === 0x47) {
+      // Verified 0x47 at a cache-covered boundary. Since TS packets are
+      // periodic (0x47 every 188 bytes), the target boundary also has 0x47.
+      diagLog(`[TS-SYNC-ALIGN] INFO: Cache-gap extrapolation — verified 0x47 at cache-covered byte ${backCandidate}, extrapolating forward ${i} packets to ${aligned} (cache ends at ${cacheEndByte})`);
+      return aligned;
+    }
+  }
+
+  // Step 5: No 0x47 found anywhere — return original aligned position with warning
+  diagLog(`[TS-SYNC-ALIGN] WARNING: No 0x47 sync byte found at 188-byte boundaries ${aligned - MAX_BACK_SCAN * 188}..${aligned + MAX_SCAN * 188} (cache ends at ${cacheEndByte}) — using ${aligned} (may cause sync errors)`);
+  return aligned;
+}
+
+/**
  * MSE (MediaSource Extensions) player hook using FastStream's approach.
  * Falls back to native video if MSE fails (non-MP4 format, etc.)
  */
@@ -107,6 +187,7 @@ const TS_INITIAL_PREFETCH = 20 * 1024 * 1024; // 20MB
 const MAX_BUFFER_BYTES = 20 * 1024 * 1024; // 20MB max buffer before eviction
 const BUFFER_KEEP_BEHIND = 30; // Keep 30s behind current playback position
 const MAX_BUFFER_AHEAD_SECONDS = 30; // Backpressure — stop downloading when >30s buffered ahead
+const PREBUFFER_CAP_BYTES = 250 * 1024 * 1024; // 250MB cap for independent prebuffer downloads (shadow cache is 300MB, no point exceeding)
 
 /** Get chunk size based on how many chunks have been fetched since last seek */
 function getChunkSize(chunksAfterSeek: number): number {
@@ -282,6 +363,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const mpegtsSpeedHistoryRef = useRef<{ time: number; byte: number }[]>([]); // download speed tracking for TS
   const mpegtsFailedRef = useRef(false);     // Set true if mpegts.js fails, skip retry
   const mpegtsDurationRef = useRef<number>(0); // Duration from metadata for mpegts.js
+  const proactivePrebufferMsgIdRef = useRef<number>(0); // msg_id being proactively prebuffered
+  const independentPrebufferRef = useRef<{
+    abortController: AbortController | null;
+    active: boolean;
+    startByte: number;
+    downloadedBytes: number;
+  }>({ abortController: null, active: false, startByte: 0, downloadedBytes: 0 });
   // Refs for cleanup — store handler function references so effect cleanup
   // can removeEventListener even though the functions are defined later in the effect body
   const quotaGuardHandlerRef = useRef<(() => void) | null>(null);
@@ -683,6 +771,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // ── Shadow cache interceptor ──
       uninstallStreamCacheInterceptor();
       shadowCacheRef.current = null;
+      // ── Independent prebuffer ──
+      if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+        independentPrebufferRef.current.abortController.abort();
+        independentPrebufferRef.current.active = false;
+        independentPrebufferRef.current.abortController = null;
+      }
       // ── SourceBuffer wrappers ──
       state.current.videoSourceBuffer?.destroy();
       state.current.audioSourceBuffer?.destroy();
@@ -715,6 +809,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       (window as any).__nobuf_evictionResumePending = false;
       (window as any).__nobuf_evictionResumeByte = 0;
       (window as any).__nobuf_nuclearRecoveryInProgress = false;
+      (window as any).__nobuf_userSeekInProgress = false;
+      // Stop proactive disk prebuffer for this file
+      const _ppMsgId = proactivePrebufferMsgIdRef.current;
+      if (_ppMsgId) {
+        invoke('cmd_stop_proactive_prebuffer', { messageId: _ppMsgId }).catch(() => {});
+        proactivePrebufferMsgIdRef.current = 0;
+      }
       // Revoke blob URL on cleanup
       if (blobUrl) {
         URL.revokeObjectURL(blobUrl);
@@ -724,6 +825,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   const cleanup = () => {
     abortRef.current?.abort();
+    // Cancel independent prebuffer
+    if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+      independentPrebufferRef.current.abortController.abort();
+      independentPrebufferRef.current.active = false;
+      independentPrebufferRef.current.abortController = null;
+    }
     if (seekDebounceTimerRef.current !== null) {
       clearTimeout(seekDebounceTimerRef.current);
       seekDebounceTimerRef.current = null;
@@ -783,6 +890,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     (window as any).__nobuf_evictionResumePending = false;
     (window as any).__nobuf_evictionResumeByte = 0;
     (window as any).__nobuf_nuclearRecoveryInProgress = false;
+    (window as any).__nobuf_userSeekInProgress = false;
+    // Stop proactive disk prebuffer
+    const _ppMsgId2 = proactivePrebufferMsgIdRef.current;
+    if (_ppMsgId2) {
+      invoke('cmd_stop_proactive_prebuffer', { messageId: _ppMsgId2 }).catch(() => {});
+      proactivePrebufferMsgIdRef.current = 0;
+    }
   };
 
   /** Calculate how many seconds of video are buffered ahead of current playback.
@@ -1483,7 +1597,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                                      // immediately re-suspends → download stops for 90+ seconds.
                                      // 180 gives enough headroom after BUFFER_FULL recovery to avoid
                                      // immediate re-suspend, while still capping memory growth.
-      lazyLoadRecoverDuration: 30,   // Resume 30s before buffer end — natural backpressure
+      lazyLoadRecoverDuration: 60,   // Resume 60s before buffer end — gives download time to refill
+                                     // before buffer runs out. 30s was too aggressive — buffer
+                                     // could drain before download catches up.
       seekType: 'range',             // Use HTTP Range for seeking (our server supports it)
       autoCleanupSourceBuffer: true, // Evict backward data when quota approached
                                      // 10 min behind (user's specified window).
@@ -1780,29 +1896,32 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   }
                 }
                 // ── Remuxer reset for nuclear recovery ──
-                // After nuclear recovery, ALL SourceBuffers are cleared, so we need
-                // _dtsBaseInited=false so the remuxer recalculates _dtsBase from new data.
-                // BUT we must NOT call remuxer.seek() — it destroys codec metadata the
-                // demuxer won't re-emit, killing the pipeline (no output produced).
+                // After nuclear recovery, ALL SourceBuffers are cleared and we resume
+                // from a byte offset near currentTime.  We must NOT reset _dtsBaseInited
+                // or the _dtsBase values: the existing _dtsBase (≈0 from initial playback)
+                // maps rawDTS → outputDTS correctly so outputDTS ≈ rawDTS ≈ media time,
+                // which is continuous with where the SourceBuffer needs data.  If we reset
+                // _dtsBaseInited=false, the remuxer recalculates _dtsBase from the first
+                // sample at the resumed byte position, producing outputDTS≈0 while the
+                // video is at currentTime=104.6s → ahead≈−104.6s → permanent stall.
                 // insertDiscontinuity() resets _videoNextDts/_audioNextDts and
-                // _isInitialMetadataDispatched so the remuxer starts a new segment.
+                // _isInitialMetadataDispatched so the remuxer starts a new segment,
+                // while preserving the existing _dtsBase for correct DTS mapping.
                 const tController = (player as any)?._player_engine?._transmuxer?._controller;
                 const remuxer = tController?._remuxer as any;
                 if (remuxer) {
                   try {
                     // DO NOT call remuxer.seek() — it breaks the pipeline
-                    remuxer._dtsBaseInited = false;
-                    remuxer._audioDtsBase = Infinity;
-                    remuxer._videoDtsBase = Infinity;
-                    remuxer._dtsBase = -1;
+                    // DO NOT reset _dtsBaseInited / _dtsBase — see comment above
                     remuxer.insertDiscontinuity?.();
                     // Clear stashed samples + segment info lists — same as remuxer.seek()
-                    // but without destroying codec metadata (which seek() does).
+                    // but without destroying codec metadata (which seek() does)
+                    // and without resetting _dtsBase (which would cause outputDTS≈0 stall).
                     remuxer._audioStashedLastSample = null;
                     remuxer._videoStashedLastSample = null;
                     remuxer._videoSegmentInfoList?.clear?.();
                     remuxer._audioSegmentInfoList?.clear?.();
-                    diagLog('[MPEGTS] DTS overflow recovery: _dtsBaseInited=false + insertDiscontinuity (NO seek)');
+                    diagLog('[MPEGTS] DTS overflow recovery: insertDiscontinuity (NO _dtsBase reset, NO seek)');
                   } catch (e: any) {
                     diagLog(`[MPEGTS] DTS overflow recovery remuxer reset failed: ${e.message}`);
                   }
@@ -1834,7 +1953,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   const durForByte = mpegtsDurationRef.current || known || 1;
                   const fLenForByte = state.current.fileLength || 0;
                   if (durForByte > 0 && fLenForByte > 0) {
-                    const restartByte = Math.floor(((curTime / durForByte) * fLenForByte) / 188) * 188;
+                    // Start 6s before currentTime to ensure audio overlap coverage
+                    // (audio is interleaved 3-5s ahead of video in TS streams).
+                    const safetyTime = Math.max(0, curTime - 6);
+                    const rawRestartByte = Math.floor(((safetyTime / durForByte) * fLenForByte) / 188) * 188;
+                    const restartByte = alignToTSSyncByte(rawRestartByte, shadowCacheRef.current);
                     ioCtrlRestart._resumeFrom = Math.max(0, restartByte);
                   }
                 }
@@ -1955,13 +2078,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           lc._config.lazyLoadMaxDuration = 120;      // Suspend when buffer >120s ahead; resume via lazyLoadRecoverDuration
                                                      // Previous 9999 allowed unbounded buffering → excessive memory usage.
                                                      // BUFFER_FULL (SourceBuffer quota) also triggers suspend, handled by quota guard.
-          lc._config.lazyLoadRecoverDuration = 30;  // Resume 30s before buffer end
+          lc._config.lazyLoadRecoverDuration = 60;  // Resume 60s before buffer end
 
           // 10 min behind playhead (user's specified window).
           lc._config.autoCleanupMaxBackwardDuration = 600;  // 10 min behind
           lc._config.autoCleanupMinBackwardDuration = 300;   // start cleanup when >5 min behind
 
-          diagLog(`[MPEGTS] Buffer window: 10min behind + continuous ahead, lazyLoad=ON (maxDuration=180, quota-guard-managed)`);
+          diagLog(`[MPEGTS] Buffer window: 10min behind + continuous ahead, lazyLoad=ON (maxDuration=120, recoverDuration=60, safeResumeAt=90, quota-guard-managed), _onIOSeeked=no-op (manual insertDiscontinuity)`);
         }
       };
       adjustBufferForSpeed(); // set initial values
@@ -1998,6 +2121,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const engine = (player as any)?._player_engine;
         const loadingCtrl = engine?._loading_controller;
         if (loadingCtrl) {
+          // ── Patch _onIOSeeked to prevent unwanted insertDiscontinuity ──
+          // IOController.resume() → _internalSeek() → _onIOSeeked() → insertDiscontinuity()
+          // This fires on EVERY resume, including lazyLoad resume where DTS is continuous.
+          // insertDiscontinuity resets _audioNextDts/_videoNextDts to undefined, which
+          // causes the remuxer to enter the "after-seek" code path and compute wrong
+          // dtsCorrection → ALL audio frames dropped → DTS overflow → nuclear recovery.
+          // Fix: replace _onIOSeeked to only fire insertDiscontinuity on USER-INITIATED seek.
+          // Our patched resumeTransmuxer calls insertDiscontinuity manually for eviction.
+          const tCtrl = (player as any)?._player_engine?._transmuxer?._controller;
+          if (tCtrl?._ioctl) {
+            const origInsertDiscontOnSeeked = tCtrl._onIOSeeked?.bind(tCtrl);
+            tCtrl._ioctl.onSeeked = function () {
+              // Only fire insertDiscontinuity on user-initiated seek (our seek handler
+              // sets __nobuf_userSeekInProgress=true). For lazyLoad resume and
+              // Early-EOF reconnection, DTS is continuous — skip insertDiscontinuity.
+              if ((window as any).__nobuf_userSeekInProgress === true) {
+                origInsertDiscontOnSeeked?.();
+              }
+            };
+          }
+
           const origResume = loadingCtrl.resumeTransmuxer.bind(loadingCtrl);
           loadingCtrl.resumeTransmuxer = function () {
             const isEvictionResume = (window as any).__nobuf_evictionResumePending === true;
@@ -2050,14 +2194,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   diagLog('[MPEGTS] resumeTransmuxer: insertDiscontinuity + demuxer reset (eviction, keep _dtsBase) — NO seek');
                 } else {
                   // ── Normal lazyLoad resume ──
-                  // _resumeFrom hasn't changed significantly; data continues from where it
-                  // left off, so the DTS space is still valid. Only insertDiscontinuity is
-                  // needed — it resets _audioNextDts/_videoNextDts to undefined so the first
-                  // batch after resume gets dtsCorrection=0 (clean continuation).
-                  // Do NOT reset _dtsBaseInited/_audioDtsBase/_videoDtsBase here; the
-                  // dtsCorrection logic depends on segment info lists being intact.
-                  remuxer.insertDiscontinuity?.();
-                  diagLog('[MPEGTS] resumeTransmuxer: insertDiscontinuity only (lazyLoad resume)');
+                  // The download resumes from the SAME byte position (_resumeFrom hasn't
+                  // changed). The DTS space is CONTINUOUS — no discontinuity exists.
+                  // Do NOT call insertDiscontinuity() — it resets _audioNextDts/_videoNextDts
+                  // to undefined, which makes the remuxer enter the "after-seek" code path
+                  // (mp4-remuxer.js firstSegmentAfterSeek branch). The stale segment info list
+                  // then produces wrong dtsCorrection (e.g. curRefDts=150975ms while
+                  // originalDts=0ms → dtsCorrection=-150975ms → ALL audio frames dropped).
+                  // The preserved _nextDts values are the correct reference for continuous data.
+                  diagLog('[MPEGTS] resumeTransmuxer: lazyLoad resume — no insertDiscontinuity (DTS continuous)');
                 }
               }
               // ── Demuxer state reset (critical for eviction resume) ──
@@ -2095,14 +2240,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   if ('last_pcr_base_' in demuxer) demuxer.last_pcr_base_ = -1;
                   diagLog('[MPEGTS] resumeTransmuxer: demuxer FULL RESET (pes_queues, tracks, wraparound)');
                 } else {
-                  // LazyLoad resume: only clear audio interpolation state
-                  // (these were already cleared before but are harmless to repeat)
-                  if (demuxer.audio_last_sample_pts_ !== undefined) {
-                    demuxer.audio_last_sample_pts_ = undefined;
-                  }
-                  if (demuxer.aac_last_incomplete_data_ != null) {
-                    demuxer.aac_last_incomplete_data_ = null;
-                  }
+                  // LazyLoad resume: DTS space is continuous, demuxer state is valid.
+                  // No cleanup needed — the demuxer's interpolation state (audio_last_sample_pts_,
+                  // aac_last_incomplete_data_) is correct for the data about to arrive.
                 }
               }
             } catch (e: any) {
@@ -2111,24 +2251,102 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             if (isEvictionResume) {
               const resumeByte = (window as any).__nobuf_evictionResumeByte || 0;
               (window as any).__nobuf_evictionResumeByte = 0;
-              if (resumeByte > 0) {
-                const ioCtrl = loadingCtrl._ioctl || (player as any)?._player_engine?._transmuxer?._controller?._ioctl;
-                if (ioCtrl?.seek) {
-                  diagLog(`[MPEGTS] Eviction resume: ioctl.seek(${resumeByte}) — bypassing origResume`);
-                  ioCtrl.seek(resumeByte);
-                } else {
-                  diagLog('[MPEGTS] Eviction resume: no ioctl.seek available, falling back to origResume');
-                  origResume();
-                }
+              // Set _resumeFrom on the IOController so origResume() fetches from the
+              // correct byte position. origResume() → IOController.resume() →
+              // _internalSeek(_resumeFrom) will use this value.
+              const ioCtrl = loadingCtrl._ioctl || (player as any)?._player_engine?._transmuxer?._controller?._ioctl;
+              if (resumeByte > 0 && ioCtrl) {
+                ioCtrl._resumeFrom = resumeByte;
+                diagLog(`[MPEGTS] Eviction resume: set ioCtrl._resumeFrom=${resumeByte}, calling origResume()`);
               } else {
-                diagLog('[MPEGTS] Eviction resume: resumeByte=0, falling back to origResume');
-                origResume();
+                diagLog(`[MPEGTS] Eviction resume: resumeByte=${resumeByte}, ioCtrl=${ioCtrl ? 'available' : 'null'}, calling origResume()`);
+              }
+              // Set one-shot skip flag so the next lazyLoad suspend (NOT BUFFER_FULL)
+              // is skipped after eviction resume. Without this, lazyLoad immediately
+              // re-suspends because ahead ≈ 120s ≈ lazyLoadMax=120, creating an instant
+              // suspend loop. The flag is checked in our patched suspendTransmuxer and
+              // cleared after skipping exactly one lazyLoad suspend.
+              const lc2 = (player as any)?._player_engine?._loading_controller;
+              if (lc2?._config) {
+                lc2._config.__nobuf_skipNextLazySuspend = true;
+                diagLog(`[MPEGTS] Eviction resume: set __nobuf_skipNextLazySuspend=true (one-shot lazyLoad suspend skip)`);
+              }
+              origResume();
+              // ── BUG 2 FIX: Inline _resumeFrom=0 corruption check after origResume() ──
+              // IOController.resume() internally sets _resumeFrom=0 (or corrupts it)
+              // and then calls _internalSeek(savedPos). But _resumeFrom is now 0 in the
+              // IOController's state. The per-tick Layer B quota guard requires
+              // ioCtrl._paused===true to fire, but right after resume(), _paused is false.
+              // This means the guard NEVER catches the corruption on the tick right after
+              // resume. If the player re-suspends 1-2s later, the suspendTransmuxer
+              // patch can't fix it either because preSuspendByte is lost.
+              // Fix: check IMMEDIATELY after origResume(), without requiring _paused.
+              {
+                const ioCtrlPostResume = engine._transmuxer?._controller?._ioctl;
+                const postResumeResumeFrom = ioCtrlPostResume?._resumeFrom ?? -1;
+                if (postResumeResumeFrom === 0 && ioCtrlPostResume) {
+                  const videoEl = (player as any)?._media_element as HTMLVideoElement | undefined;
+                  const ctPostResume = videoEl?.currentTime ?? 0;
+                  if (ctPostResume > 30) {
+                    // Restore from the preSuspendByte saved by suspendTransmuxer
+                    const savedPreSuspendByte = (window as any).__nobuf_preSuspendByte ?? -1;
+                    let correctedByte = savedPreSuspendByte > 0 ? savedPreSuspendByte : -1;
+                    // Fallback: compute from currentTime/duration ratio
+                    if (correctedByte <= 0) {
+                      const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
+                      const fLen = state.current.fileLength || 0;
+                      if (dur > 0 && fLen > 0) {
+                        correctedByte = Math.floor(((ctPostResume / dur) * fLen) / 188) * 188;
+                      }
+                    }
+                    if (correctedByte > 0) {
+                      correctedByte = alignToTSSyncByte(correctedByte, shadowCacheRef.current);
+                      ioCtrlPostResume._resumeFrom = correctedByte;
+                      diagLog(`[MPEGTS] resumeTransmuxer INLINE FIX: _resumeFrom corrupted to 0 after origResume (ct=${ctPostResume.toFixed(1)}s) — RESTORED to ${correctedByte} (preSuspendByte=${savedPreSuspendByte})`);
+                    }
+                  }
+                }
               }
             } else {
+              // ── Normal lazyLoad resume ──
+              // origResume() → IOController.resume() → _internalSeek() → _onIOSeeked()
+              // → remuxer.insertDiscontinuity() resets _audioNextDts/_videoNextDts to undefined.
+              // This is WRONG for lazyLoad resume — DTS is continuous (same byte position).
+              // We patched _onIOSeeked to be a no-op below, so insertDiscontinuity won't fire
+              // from the IOController resume path. Our eviction path calls it manually when needed.
               origResume();
+              // ── BUG 2 FIX: Inline _resumeFrom=0 corruption check after origResume() ──
+              // Same as the eviction path — IOController.resume() may corrupt _resumeFrom to 0.
+              // The Layer B quota guard requires _paused===true, which is false right after
+              // resume. This inline check catches corruption immediately, regardless of _paused.
+              {
+                const ioCtrlPostResume = engine._transmuxer?._controller?._ioctl;
+                const postResumeResumeFrom = ioCtrlPostResume?._resumeFrom ?? -1;
+                if (postResumeResumeFrom === 0 && ioCtrlPostResume) {
+                  const videoEl = (player as any)?._media_element as HTMLVideoElement | undefined;
+                  const ctPostResume = videoEl?.currentTime ?? 0;
+                  if (ctPostResume > 30) {
+                    const savedPreSuspendByte = (window as any).__nobuf_preSuspendByte ?? -1;
+                    let correctedByte = savedPreSuspendByte > 0 ? savedPreSuspendByte : -1;
+                    if (correctedByte <= 0) {
+                      const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
+                      const fLen = state.current.fileLength || 0;
+                      if (dur > 0 && fLen > 0) {
+                        correctedByte = Math.floor(((ctPostResume / dur) * fLen) / 188) * 188;
+                      }
+                    }
+                    if (correctedByte > 0) {
+                      correctedByte = alignToTSSyncByte(correctedByte, shadowCacheRef.current);
+                      ioCtrlPostResume._resumeFrom = correctedByte;
+                      diagLog(`[MPEGTS] resumeTransmuxer INLINE FIX (lazyLoad): _resumeFrom corrupted to 0 after origResume (ct=${ctPostResume.toFixed(1)}s) — RESTORED to ${correctedByte} (preSuspendByte=${savedPreSuspendByte})`);
+                    }
+                  }
+                }
+              }
+              diagLog('[MPEGTS] resumeTransmuxer: lazyLoad resume — _onIOSeeked no-op prevents insertDiscontinuity');
             }
           };
-          diagLog('[MPEGTS] Patched LoadingController.resumeTransmuxer: eviction→insertDiscontinuity+demuxer reset (keep _dtsBase), lazyLoad→insertDiscontinuity only');
+          diagLog('[MPEGTS] Patched LoadingController.resumeTransmuxer: eviction→insertDiscontinuity+demuxer reset (keep _dtsBase), lazyLoad→origResume only (no DTS reset)');
 
           // Also hook suspendTransmuxer for auto-recovery
           // CRITICAL BUG #1: _onMSEBufferFull calls suspendTransmuxer() but does NOT
@@ -2158,7 +2376,92 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             const ahead = bufEnd - ct;
             diagLog(`[MPEGTS] suspendTransmuxer: currentTime=${ct.toFixed(1)}s, bufferEnd=${bufEnd.toFixed(1)}s, ahead=${ahead.toFixed(1)}s`);
 
+            // ── PART A: Save IOController position BEFORE origSuspend() ──
+            // When IOController.pause() fires (from suspend), it computes _resumeFrom
+            // from _currentRange.to + 1. But if _currentRange.to = -1 (because it's only
+            // updated on loader COMPLETE, not during chunk arrival), _resumeFrom becomes 0.
+            // Save the correct position now so we can restore it after origSuspend().
+            const ioCtrlBefore = engine._transmuxer?._controller?._ioctl;
+            const savedResumeFrom = ioCtrlBefore?._resumeFrom ?? -1;
+            const savedCurrentRangeTo = ioCtrlBefore?._currentRange?.to ?? -1;
+            const savedStashByteStart = ioCtrlBefore?._stashByteStart ?? 0;
+            // If stash has data, _resumeFrom will be set to _stashByteStart (correct).
+            // If stash is empty, _resumeFrom = _currentRange.to + 1 (may be 0 if .to=-1).
+            // Best pre-suspend byte = stash data end or _currentRange.to + 1.
+            // Fallback: use saved _resumeFrom (correct before resume() cleared it to 0).
+            const preSuspendByte = ioCtrlBefore?._stashUsed !== 0
+              ? savedStashByteStart
+              : (savedCurrentRangeTo >= 0 ? savedCurrentRangeTo + 1 : (savedResumeFrom > 0 ? savedResumeFrom : -1));
+
+            // ── Save preSuspendByte to window-level variable ──
+            // The resumeTransmuxer patch reads this for an inline _resumeFrom=0
+            // check after origResume(). Without this, the resumeTransmuxer patch
+            // has no way to know the correct byte position if _resumeFrom was
+            // corrupted during IOController.resume() (BUG 2 fix).
+            (window as any).__nobuf_preSuspendByte = preSuspendByte;
+
+            // ── One-shot lazyLoad suspend skip (after eviction resume) ──
+            // After eviction resume, ahead ≈ 120s ≈ lazyLoadMax, so lazyLoad would
+            // immediately re-suspend. The eviction resume path sets the
+            // __nobuf_skipNextLazySuspend flag to suppress exactly ONE lazyLoad suspend.
+            // BUFFER_FULL suspends (mseCtrl._isBufferFull === true) are NEVER skipped.
+            const mseCtrlPre = (player as any)?._player_engine?._msectrl;
+            const lcConfig = loadingCtrl?._config;
+            if (lcConfig?.__nobuf_skipNextLazySuspend === true && mseCtrlPre?._isBufferFull !== true) {
+              // This is a lazyLoad suspend (not BUFFER_FULL) and the one-shot flag is set.
+              // Skip origSuspend() and clear the flag — this prevents the instant
+              // re-suspend loop after eviction resume without defeating lazyLoad entirely.
+              delete lcConfig.__nobuf_skipNextLazySuspend;
+              diagLog(`[MPEGTS] LazyLoad suspend SKIPPED (one-shot after eviction resume) — ahead=${ahead.toFixed(1)}s, _isBufferFull=${mseCtrlPre?._isBufferFull}`);
+              return;  // Do NOT call origSuspend()
+            }
+            // If flag is set but this IS a BUFFER_FULL suspend, clear the flag and
+            // fall through — BUFFER_FULL suspends must always be honored.
+            if (lcConfig?.__nobuf_skipNextLazySuspend === true) {
+              delete lcConfig.__nobuf_skipNextLazySuspend;
+              diagLog(`[MPEGTS] __nobuf_skipNextLazySuspend cleared (BUFFER_FULL suspend — must honor)`);
+            }
+
             origSuspend();
+
+            // ── PART A: AFTER origSuspend(), detect and fix _resumeFrom corruption ──
+            // IOController.pause() may have set _resumeFrom = _currentRange.to + 1 = 0
+            // when _currentRange.to = -1 (no loader COMPLETE yet). This causes the next
+            // resume to fetch from byte 0, producing data at DTS≈0 while SourceBuffer has
+            // content at ~191s, dropping all audio.
+            // Grace period: ct > 30 — during initial download (ct < 30), _resumeFrom=0
+            // is the normal initial state and should not be treated as corruption.
+            const ioCtrlAfter = engine._transmuxer?._controller?._ioctl;
+            const resumeFromAfter = ioCtrlAfter?._resumeFrom ?? -1;
+            if (resumeFromAfter === 0 && ct > 30 && preSuspendByte > 0) {
+              // _resumeFrom was corrupted to 0 — restore from pre-suspend position
+              // Prefer shadow cache's contiguous end over the raw pre-suspend byte,
+              // to avoid re-downloading bytes the cache already has.
+              let correctedByte = preSuspendByte;
+              const cache = shadowCacheRef.current;
+              if (cache && cache.entryCount > 0) {
+                // Cache has data — prefer its contiguous end over preSuspendByte
+                // to avoid re-downloading bytes the cache already has.
+                const cacheEnd = cache.cachedUpTo(0);
+                if (cacheEnd >= 0 && cacheEnd + 1 > correctedByte) {
+                  correctedByte = cacheEnd + 1; // cachedUpTo returns inclusive end
+                }
+                // Align to 188-byte TS packet boundary and verify 0x47 sync byte
+                correctedByte = alignToTSSyncByte(correctedByte, cache);
+              } else {
+                // Cache is empty (evicted) — can't verify 0x47 but preSuspendByte
+                // is correct (saved before IOController paused). Just 188-align it.
+                // The IOController's _internalSeek will fetch from this byte,
+                // and the server provides valid TS data starting at the nearest
+                // packet boundary.
+                correctedByte = Math.floor(correctedByte / 188) * 188;
+                diagLog(`[MPEGTS] suspendTransmuxer: Cache empty, using 188-aligned preSuspendByte ${correctedByte} (cannot verify 0x47)`);
+              }
+              if (correctedByte > 0 && ioCtrlAfter) {
+                ioCtrlAfter._resumeFrom = correctedByte;
+                diagLog(`[MPEGTS] suspendTransmuxer: _resumeFrom CORRUPTED to 0 (ct=${ct.toFixed(1)}s, preSuspendByte=${preSuspendByte}, _currentRange.to=${savedCurrentRangeTo}) — RESTORED to ${correctedByte}`);
+              }
+            }
 
             // Register timeupdate listener for auto-resume (BUFFER_FULL path needs this)
             if (loadingCtrl._media_element && loadingCtrl.e?.onMediaTimeUpdate) {
@@ -2166,14 +2469,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             }
 
             // Mark BUFFER_FULL if this is a quota suspension (not lazyLoad)
-            // With lazyLoadMaxDuration=180, lazyLoad suspends at ahead>180s (normal).
-            // BUFFER_FULL occurs when SourceBuffer byte quota is hit (ahead may be < 180s).
-            // Detect BUFFER_FULL by checking if ahead < lazyLoadMax AND not proactive.
-            const lazyLoadMax = (player as any)?._config?.lazyLoadMaxDuration ?? 120;
-            if (ahead < lazyLoadMax) {
+            // LazyLoad suspends when ahead >= lazyLoadMaxDuration (normal).
+            // BUFFER_FULL occurs when SourceBuffer byte quota is hit (QuotaExceededError).
+            // We detect BUFFER_FULL by checking the MSE controller's _isBufferFull flag.
+            // The old heuristic (ahead < lazyLoadMax) was too aggressive — it marked
+            // lazyLoad suspends at ahead ≈ lazyLoadMax as BUFFER_FULL, causing
+            // infinite eviction loops.
+            const mseCtrl = (player as any)?._player_engine?._msectrl;
+            if (mseCtrl?._isBufferFull === true) {
               // This is a BUFFER_FULL suspension (not lazyLoad)
               (window as any).__nobuf_bufferFullDetected = true;
-              diagLog('[MPEGTS] BUFFER_FULL detected — flag set, quota guard will evict and resume');
+              diagLog('[MPEGTS] BUFFER_FULL detected (mseCtrl._isBufferFull=true) — flag set, quota guard will evict and resume');
             }
           };
 
@@ -2240,32 +2546,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       (window as any).__nobuf_ptsDuration = 0;             // clear PTS-based duration
 
       // Helper: resume download AND register timeupdate listener for auto-recovery.
-      // With lazyLoad=true, the timeupdate listener IS registered by mpegts.js
-      // via _suspendTransmuxerIfBufferedPositionExceeded. But if we reach here
-      // from a BUFFER_FULL path (rather than lazyLoad suspend), the listener
-      // might not be registered. We add it as a safety measure.
-      const resumeWithAutoRecovery = (lc: any) => {
-        if (!lc) {
-          diagLog(`[MPEGTS-QUOTA] resumeWithAutoRecovery: SKIP (no loadingCtrl)`);
-          return;
-        }
-        // NOTE: We no longer check lc._paused before resuming.
-        // For proactive eviction, we PAUSE the download ourselves (via lc.suspendTransmuxer()),
-        // so _paused IS true. For BUFFER_FULL, mpegts.js already paused it.
-        // The old `if (!lc._paused) return` guard caused proactive evictions to
-        // be no-ops because the download was never paused → resume skipped →
-        // eviction removed data but download immediately re-filled it.
-        try {
-          diagLog('[MPEGTS-QUOTA] resumeWithAutoRecovery: calling resumeTransmuxer()');
-          lc.resumeTransmuxer();
-          // Register timeupdate listener so mpegts.js can auto-resume in future
-          // BUFFER_FULL cycles (same as _suspendTransmuxerIfBufferedPositionExceeded
-          // does, but that path doesn't register the listener for BUFFER_FULL).
-          lc._media_element?.addEventListener('timeupdate', lc.e?.onMediaTimeUpdate);
-        } catch (e: any) {
-          diagLog(`[MPEGTS] resumeWithAutoRecovery failed: ${e.message}`);
-        }
-      };
+      // resumeWithAutoRecovery was REMOVED — the quota guard must NEVER auto-resume.
+      // LazyLoad manages its own resume via timeupdate listener.
+      // BUFFER_FULL eviction resumes via onEvictDone → resumeTransmuxer().
+      // Auto-resuming from the quota guard creates a suspend/resume fight that
+      // corrupts IOController._resumeFrom → fetch from byte 0 → all audio dropped.
 
       const sourceBufferQuotaGuard = () => {
         // Bail out if nuclear recovery is in progress — don't trigger eviction+resume cycles
@@ -2285,6 +2570,72 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const ioCtrl = engine._transmuxer?._controller?._ioctl;
         const resumeFrom = ioCtrl?._resumeFrom ?? -1;
 
+        // ── PART B: Defensive _resumeFrom===0 corruption guard ──
+        // On every quota guard tick, check if _resumeFrom got corrupted to 0
+        // while playback is well past the start (currentTime > 30) AND the
+        // player is PAUSED. During initial download (ct < 30), _resumeFrom=0
+        // is the NORMAL initial state (download starts from byte 0). Only
+        // flag corruption when the player has been running (ct > 30) with
+        // _resumeFrom=0 — this means the download completed some data but the
+        // IOController lost track of where to resume from.
+        // Corruption can happen when IOController.resume() clears _resumeFrom=0,
+        // then _internalSeek triggers cache-served data that fills the buffer
+        // past lazyLoadMax, causing an immediate re-suspend. IOController.pause()
+        // then computes _resumeFrom = _currentRange.to + 1 = 0 (because
+        // _currentRange.to is only updated on loader COMPLETE, not during
+        // chunk arrival). The next safe-resume would fetch from byte 0,
+        // producing data at DTS≈0 while the SourceBuffer has content at ~191s,
+        // which drops ALL audio and triggers DTS overflow.
+        // NOTE: Added ioCtrl._paused check. When IOController is actively
+        // downloading (_paused===false), _resumeFrom=0 is the normal initial
+        // state and NOT corruption — it stays at 0 until the first
+        // pause/suspend cycle sets it. Only treat _resumeFrom=0 as corruption
+        // when _paused===true, meaning the IOController should have a valid
+        // resume-from byte but lost it.
+        if (resumeFrom === 0 && curTime > 30 && (state.current.fileLength || 0) > 0 && ioCtrl?._paused) {
+          let correctedByte = -1;
+          // Strategy 1: Use shadow cache's cachedUpTo() to find the furthest
+          // contiguous cached byte from the current playback position.
+          const cache = shadowCacheRef.current;
+          if (cache && cache.entryCount > 0) {
+            const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
+            const fLen = state.current.fileLength || 0;
+            if (dur > 0 && fLen > 0) {
+              // Approximate byte position for current time
+              const approxByte = Math.floor((curTime / dur) * fLen);
+              const alignedApprox = Math.floor(approxByte / 188) * 188;
+              const cacheEnd = cache.cachedUpTo(alignedApprox);
+              // Only use shadow-cache strategy if cache covers the target position.
+              // When cacheEnd < alignedApprox, the cache was evicted and doesn't cover
+              // the target — fall through to time-ratio strategy instead.
+              if (cacheEnd >= alignedApprox) {
+                correctedByte = cacheEnd + 1; // cachedUpTo returns inclusive end
+              }
+            }
+          }
+          // Strategy 2: Fallback to currentTime/duration ratio
+          if (correctedByte < 0) {
+            const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
+            const fLen = state.current.fileLength || 0;
+            if (dur > 0 && fLen > 0) {
+              correctedByte = Math.floor(((curTime / dur) * fLen) / 188) * 188;
+            }
+          }
+          // Apply correction if we found a valid byte position
+          if (correctedByte > 0 && ioCtrl) {
+            // Verify 0x47 TS sync byte at the 188-byte-aligned position
+            correctedByte = alignToTSSyncByte(correctedByte, cache);
+            // Only log once per corruption event (not every 100ms tick)
+            const lastFixTs = (window as any).__nobuf_resumeFromFixTs || 0;
+            const now = Date.now();
+            if (now - lastFixTs > 2000) {
+              diagLog(`[MPEGTS-QUOTA] _resumeFrom CORRUPTION DETECTED: _resumeFrom=0 at ct=${curTime.toFixed(1)}s — RESTORED to ${correctedByte} (strategy=${cache ? 'shadow-cache' : 'time-ratio'})`);
+              (window as any).__nobuf_resumeFromFixTs = now;
+            }
+            ioCtrl._resumeFrom = correctedByte;
+          }
+        }
+
         // Calculate total buffered duration
         let totalBuffered = 0;
         for (let i = 0; i < sb.length; i++) {
@@ -2301,7 +2652,34 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const cache = shadowCacheRef.current;
           const cacheRanges: Array<{start: number, end: number}> = cache ? cache.entryRanges ?? [] : [];
           const cacheBytes = cacheRanges.reduce((sum: number, r: {start: number, end: number}) => sum + (r.end - r.start), 0);
-          diagLog(`[MPEGTS-STATE] ct=${curTime.toFixed(1)}s bufEnd=${bufEnd.toFixed(1)}s ahead=${ahead.toFixed(1)}s totalBuf=${totalBuffered.toFixed(1)}s paused=${isPaused} bufFull=${isBufferFull} _resumeFrom=${resumeFrom} cacheBytes=${(cacheBytes/1048576).toFixed(1)}MB cacheRanges=${cacheRanges.length} aggressive=${_aggressiveCleanupActive} removeInProgress=${_removeInProgress}`);
+          diagLog(`[MPEGTS-STATE] ct=${curTime.toFixed(1)}s bufEnd=${bufEnd.toFixed(1)}s ahead=${ahead.toFixed(1)}s totalBuf=${totalBuffered.toFixed(1)}s paused=${isPaused} bufFull=${isBufferFull} _resumeFrom=${resumeFrom} cacheBytes=${(cacheBytes/1048576).toFixed(1)}MB cacheRanges=${cacheRanges.length} aggressive=${_aggressiveCleanupActive} removeInProgress=${_removeInProgress} indepPrebuf=${independentPrebufferRef.current.active ? `${(independentPrebufferRef.current.downloadedBytes/1048576).toFixed(1)}MB` : 'off'}`);
+        }
+
+        // ── Proactive disk prebuffer: report playback position to Rust backend ──
+        // Every 10s, tell the backend where we're watching so it can proactively
+        // download ahead to disk cache. When lazyLoad resumes, the /stream endpoint
+        // serves from cache (CACHE-PREFIX) instead of fetching from Telegram.
+        if (knownDuration && knownFilesize && !video.paused) {
+          const _now = Date.now();
+          if (!(sourceBufferQuotaGuard as any)._lastProactiveReport || _now - (sourceBufferQuotaGuard as any)._lastProactiveReport > 10000) {
+            (sourceBufferQuotaGuard as any)._lastProactiveReport = _now;
+            diagLog(`[PROACTIVE] Reporting position: msg=${parsed.messageId} folder=${parsed.folderId} ct=${curTime.toFixed(1)}s dur=${knownDuration.toFixed(1)}s size=${knownFilesize}`);
+            invoke('cmd_report_playback_position', {
+              messageId: parseInt(parsed.messageId),
+              folderId: parseInt(parsed.folderId),
+              currentTimeS: curTime,
+              durationS: knownDuration,
+              fileSize: knownFilesize,
+            }).then((spawned: any) => {
+              if (spawned) {
+                proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
+                diagLog(`[PROACTIVE] Spawned disk prebuffer for msg ${parsed.messageId} at ct=${curTime.toFixed(1)}s`);
+              }
+            }).catch((e: any) => {
+              // Log errors — critical for debugging proactive prebuffer
+              console.error(`[PROACTIVE] cmd_report_playback_position FAILED:`, e);
+            });
+          }
         }
 
         // ── Only evict when SourceBuffer quota is ACTUALLY hit ──
@@ -2322,6 +2700,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
           // Skip eviction if a remove is already in progress
           if (_removeInProgress) return;
+
+          // Cancel independent prebuffer during BUFFER_FULL handling
+          if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+            independentPrebufferRef.current.abortController.abort();
+            independentPrebufferRef.current.active = false;
+          }
 
           // 1. Evict backward data behind playhead to free SourceBuffer byte quota.
           //    Keep up to 10min ahead (QUOTA_KEEP_AHEAD) — only evict the far-ahead tail
@@ -2441,15 +2825,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   if (dur > 0 && fLen > 0) {
                     const targetTime = Math.max(0, sbEndNow - AUDIO_SAFETY_MARGIN);
                     const rawByte = (targetTime / dur) * fLen;
-                    const alignedByte = Math.floor(rawByte / 188) * 188;
+                    const alignedByte = alignToTSSyncByte(rawByte, shadowCacheRef.current);
                     if (alignedByte > 0) {
-                      // Store the correct byte position for ioctl.seek().
-                      // The patched resumeTransmuxer uses ioctl.seek(resumeByte) instead
-                      // of origResume(), bypassing the broken _resumeFrom mechanism
-                      // (which gets reset to 0 during the suspend/resume cycle).
+                      // Store the correct byte position for the patched resumeTransmuxer.
+                      // The eviction resume path sets ioCtrl._resumeFrom = resumeByte
+                      // and calls origResume(), which does _internalSeek(resumeByte).
                       ioCtrl2._resumeFrom = alignedByte;
                       (window as any).__nobuf_evictionResumeByte = alignedByte;
-                      diagLog(`[MPEGTS-QUOTA] onEvictDone: _resumeFrom=${alignedByte} (target=${targetTime.toFixed(1)}s, SB-end=${sbEndNow.toFixed(1)}s, deterministic=${_evictNewSbEnd != null}) — resumeTransmuxer will ioctl.seek to this position`);
+                      diagLog(`[MPEGTS-QUOTA] onEvictDone: _resumeFrom=${alignedByte} (target=${targetTime.toFixed(1)}s, SB-end=${sbEndNow.toFixed(1)}s, deterministic=${_evictNewSbEnd != null}) — resumeTransmuxer will seek to this position`);
                     }
                   }
                 }
@@ -2457,7 +2840,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 // Resume download via the patched resumeTransmuxer.
                 // Set __nobuf_evictionResumePending so the patched resumeTransmuxer
                 // knows this is an eviction resume (not a lazyLoad resume) and performs
-                // insertDiscontinuity() + _dtsBaseInited=false + demuxer reset (NO seek)
+                // insertDiscontinuity() + demuxer reset (keep _dtsBase, NO seek)
                 // to avoid stale segment tracking from the pre-eviction range.
                 if (lc2) {
                   try {
@@ -2512,19 +2895,244 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             diagLog(`[MPEGTS-QUOTA] Aggressive cleanup CLEARED: ahead=${ahead.toFixed(1)}s < ${QUOTA_DANGER_DURATION}s, bufFull=${isBufferFull}`);
           }
 
-          // Resume download if paused but quota is OK.
-          // With lazyLoadMaxDuration=180, lazyLoad suspends when buffer >180s ahead,
-          // so if download is paused, it's either:
-          //   1. BUFFER_FULL that our suspendTransmuxer patch didn't recover from
-          //   2. A stale pause from an earlier BUFFER_FULL cycle
-          // In either case, if ahead < QUOTA_DANGER_DURATION and isBufferFull is false,
-          // we can safely resume. We don't resume during active aggressive cleanup to
-          // avoid oscillation (eviction is in progress, wait for it to finish).
-          if (isPaused && !_aggressiveCleanupActive && !_removeInProgress && !isBufferFull) {
-            diagLog(`[MPEGTS-QUOTA] Download PAUSED but quota OK (ahead=${ahead.toFixed(1)}s, totalBuf=${totalBuffered.toFixed(1)}s, bufFull=${isBufferFull}) → resuming`);
-            if (mseCtrl?._isBufferFull) mseCtrl._isBufferFull = false;
-            (window as any).__nobuf_bufferFullDetected = false;
-            resumeWithAutoRecovery(lc);
+          // ── SAFE RESUME FROM QUOTA GUARD (lazyLoad pause) ──
+          // The old auto-resume fought with lazyLoad: guard resumed → lazyLoad
+          // immediately re-suspended → _resumeFrom corrupted → byte-0 fetch →
+          // all audio dropped. That happened because the guard resumed when
+          // ahead >= lazyLoadMaxDuration, so lazyLoad immediately re-suspended.
+          //
+          // SAFE condition: resume ONLY when ahead < lazyLoadMaxDuration.
+          // At this point lazyLoad's own check (ahead >= lazyLoadMaxDuration)
+          // is FALSE, so it won't re-suspend. The resume sticks.
+          //
+          // Why the guard resumes instead of waiting for lazyLoad's native
+          // _resumeTransmuxerIfNeeded: lazyLoad's native resume fires when
+          // ahead < lazyLoadRecoverDuration (60s). With suspend at ahead≈115s
+          // and resume at ahead<60s, that's 55 seconds of frozen bars — the
+          // user sees both download and buffer bars stuck. The guard resumes
+          // earlier (ahead<90s) to reduce the gap to ~25s.
+          if (isPaused && !isBufferFull) {
+            const lazyLoadMax = lc?._config?.lazyLoadMaxDuration ?? 120;
+            const safeResumeAhead = Math.min(lazyLoadMax - 30, 90); // 30s below lazyLoadMax, max 90s
+
+            // ── SAFE-RESUME COOLDOWN (5 seconds) ──
+            // After a safe-resume, the shadow cache interceptor can serve ALL
+            // cached data instantly to the IOController, which feeds it through
+            // the demuxer→remuxer→SourceBuffer pipeline, filling the buffer
+            // past lazyLoadMax in one tick. lazyLoad then immediately re-suspends.
+            // Without a cooldown, the quota guard re-resumes on the next tick,
+            // creating a rapid resume→suspend→resume oscillation that:
+            //   - Opens/closes fetch requests rapidly (server overload)
+            //   - Causes _resumeFrom corruption (0) on each re-suspend
+            //   - Produces sync_byte errors from misaligned fetch-from-byte-0
+            // During the 5s cooldown, lazyLoad's natural resume mechanism
+            // (lazyLoadRecoverDuration=60s) handles timing without oscillation.
+            const SAFE_RESUME_COOLDOWN_MS = 5000;
+            const lastSafeResumeTime = (sourceBufferQuotaGuard as any)._lastSafeResumeTime || 0;
+            const safeResumeOnCooldown = (Date.now() - lastSafeResumeTime) < SAFE_RESUME_COOLDOWN_MS;
+
+            // Safety net: if buffer critically low, resume regardless.
+            // This catches cases where lazyLoad's timeupdate listener
+            // somehow misses the threshold.
+            if (ahead < 15) {
+              if (safeResumeOnCooldown) {
+                diagLog(`[MPEGTS-QUOTA] CRITICAL: ahead=${ahead.toFixed(1)}s < 15s but safe-resume COOLDOWN active (${((SAFE_RESUME_COOLDOWN_MS - (Date.now() - lastSafeResumeTime)) / 1000).toFixed(1)}s remaining) — deferring to lazyLoad`);
+              } else {
+              // Cancel independent prebuffer — IOController is resuming
+              if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+                diagLog(`[INDEPENDENT-PREBUFFER] Cancelling (downloaded ${independentPrebufferRef.current.downloadedBytes} bytes) — IOController resuming (emergency)`);
+                independentPrebufferRef.current.abortController.abort();
+                independentPrebufferRef.current.active = false;
+                independentPrebufferRef.current.abortController = null;
+              }
+              diagLog(`[MPEGTS-QUOTA] CRITICAL: ahead=${ahead.toFixed(1)}s < 15s — emergency resume`);
+              // ── PART B: Save _resumeFrom before resume, defend against immediate re-suspend ──
+              const ioCtrlPreResume = engine._transmuxer?._controller?._ioctl;
+              const preResumeFrom = ioCtrlPreResume?._resumeFrom ?? -1;
+              (sourceBufferQuotaGuard as any)._lastSafeResumeTime = Date.now();
+              lc.resumeTransmuxer();
+              // ── Pause shadow cache interceptor for 5s after emergency resume ──
+              // This prevents the cache from instantly flooding the IOController
+              // with 30+MB of cached data, which would overshoot lazyLoadMax and
+              // cause an immediate re-suspend. Let the network serve data slowly.
+              const _scEmergency = shadowCacheRef.current;
+              if (_scEmergency) _scEmergency._interceptorPauseUntil = Date.now() + 5000;
+              // Defensive re-check: cache-served data can push buffer past lazyLoadMax
+              // within one tick, causing an immediate re-suspend. IOController.pause()
+              // then computes _resumeFrom = _currentRange.to + 1 = 0 (corruption).
+              if (lc._paused === true && preResumeFrom > 0) {
+                const ioCtrlPostResume = engine._transmuxer?._controller?._ioctl;
+                const corruptedResumeFrom = ioCtrlPostResume?._resumeFrom ?? -1;
+                if (ioCtrlPostResume && (corruptedResumeFrom === 0 || corruptedResumeFrom === -1)) {
+                  const correctedByte = alignToTSSyncByte(preResumeFrom, shadowCacheRef.current);
+                  ioCtrlPostResume._resumeFrom = correctedByte;
+                  diagLog(`[MPEGTS-QUOTA] EMERGENCY-RESUME: immediate re-suspend detected! _resumeFrom corrupted (${corruptedResumeFrom}) — RESTORED to ${correctedByte} (pre-resume value=${preResumeFrom})`);
+                }
+              }
+              }
+            } else if (ahead < safeResumeAhead) {
+              if (safeResumeOnCooldown) {
+                // On cooldown — don't resume. LazyLoad's natural mechanism will
+                // handle the resume when the buffer drops below lazyLoadRecoverDuration.
+                const lastLazyLog = (window as any).__nobuf_lastLazyLogTs || 0;
+                const now = Date.now();
+                if (now - lastLazyLog > 5000) {
+                  diagLog(`[MPEGTS-QUOTA] SAFE-RESUME on COOLDOWN: ahead=${ahead.toFixed(1)}s < ${safeResumeAhead}s but cooldown active (${((SAFE_RESUME_COOLDOWN_MS - (now - lastSafeResumeTime)) / 1000).toFixed(1)}s remaining) — deferring to lazyLoad`);
+                  (window as any).__nobuf_lastLazyLogTs = now;
+                }
+              } else {
+              // SAFE: ahead < lazyLoadMaxDuration → lazyLoad won't re-suspend
+              // Cancel independent prebuffer — IOController is resuming
+              if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+                diagLog(`[INDEPENDENT-PREBUFFER] Cancelling (downloaded ${independentPrebufferRef.current.downloadedBytes} bytes) — IOController resuming`);
+                independentPrebufferRef.current.abortController.abort();
+                independentPrebufferRef.current.active = false;
+                independentPrebufferRef.current.abortController = null;
+              }
+              diagLog(`[MPEGTS-QUOTA] SAFE-RESUME: ahead=${ahead.toFixed(1)}s < ${safeResumeAhead}s threshold (lazyLoadMax=${lazyLoadMax}). Download resuming — lazyLoad won't re-suspend.`);
+              // ── PART B: Save _resumeFrom before resume, defend against immediate re-suspend ──
+              // The log says "lazyLoad won't re-suspend" but that's WRONG when cache-served
+              // data fills the buffer past lazyLoadMax within one tick. The shadow cache
+              // interceptor can feed chunks synchronously during _internalSeek, pushing
+              // ahead past lazyLoadMax before our tick ends.
+              const ioCtrlPreResume = engine._transmuxer?._controller?._ioctl;
+              const preResumeFrom = ioCtrlPreResume?._resumeFrom ?? -1;
+              (sourceBufferQuotaGuard as any)._lastSafeResumeTime = Date.now();
+              lc.resumeTransmuxer();
+              // ── Pause shadow cache interceptor for 5s after safe-resume ──
+              // This prevents the cache from instantly flooding the IOController
+              // with 30+MB of cached data, which would overshoot lazyLoadMax and
+              // cause an immediate re-suspend. Let the network serve data slowly,
+              // giving lazyLoad time to naturally suspend before buffer exceeds
+              // lazyLoadMax.
+              const _scSafe = shadowCacheRef.current;
+              if (_scSafe) _scSafe._interceptorPauseUntil = Date.now() + 5000;
+              // Defensive re-check: if the player is immediately paused again
+              // (lc._paused becomes true), the correct _resumeFrom was the pre-resume
+              // value. IOController.pause() will have corrupted it to 0.
+              if (lc._paused === true && preResumeFrom > 0) {
+                const ioCtrlPostResume = engine._transmuxer?._controller?._ioctl;
+                const corruptedResumeFrom = ioCtrlPostResume?._resumeFrom ?? -1;
+                if (ioCtrlPostResume && (corruptedResumeFrom === 0 || corruptedResumeFrom === -1)) {
+                  const correctedByte = alignToTSSyncByte(preResumeFrom, shadowCacheRef.current);
+                  ioCtrlPostResume._resumeFrom = correctedByte;
+                  diagLog(`[MPEGTS-QUOTA] SAFE-RESUME: immediate re-suspend detected! _resumeFrom corrupted (${corruptedResumeFrom}) — RESTORED to ${correctedByte} (pre-resume value=${preResumeFrom})`);
+                }
+              }
+              }
+            } else {
+              // Not safe to resume yet — lazyLoad would immediately re-suspend.
+              // Throttle logging to once per 5s.
+              const lastLazyLog = (window as any).__nobuf_lastLazyLogTs || 0;
+              const now = Date.now();
+              if (now - lastLazyLog > 5000) {
+                diagLog(`[MPEGTS-QUOTA] Download PAUSED by lazyLoad (ahead=${ahead.toFixed(1)}s) — will safe-resume when ahead < ${safeResumeAhead}s (lazyLoadMax=${lazyLoadMax})`);
+                (window as any).__nobuf_lastLazyLogTs = now;
+              }
+
+              // ── INDEPENDENT PREBUFFER: continue downloading to shadow cache ──
+              // When lazyLoad pauses the IOController, the shadow cache stops growing
+              // because it's a passive observer. Start an independent fetch to continue
+              // filling the shadow cache — the green bar reflects cache growth.
+              // The fetch interceptor (forwardAndSiphon) automatically stores chunks.
+              if (!independentPrebufferRef.current.active) {
+                const ioCtrl = engine._transmuxer?._controller?._ioctl;
+                const resumeFromByte = ioCtrl?._resumeFrom ?? -1;
+                const currentRangeTo = ioCtrl?._currentRange?.to ?? -1;
+                // Prefer the shadow cache's furthest contiguous byte over the
+                // IOController's _resumeFrom — avoids re-downloading bytes the
+                // cache already has (e.g., cache ends at 97.5MB but _resumeFrom
+                // is 96.9MB → start from 97.5MB instead of re-fetching 0.6MB).
+                const cacheEndByte = shadowCacheRef.current
+                  ? shadowCacheRef.current.cachedUpTo(resumeFromByte >= 0 ? resumeFromByte : 0)
+                  : -1;
+                let startByte: number;
+                if (cacheEndByte >= 0 && cacheEndByte > resumeFromByte) {
+                  startByte = cacheEndByte + 1;  // +1: cachedUpTo returns inclusive end
+                } else {
+                  startByte = resumeFromByte >= 0 ? resumeFromByte : (currentRangeTo >= 0 ? currentRangeTo + 1 : -1);
+                }
+
+                if (startByte >= 0 && startByte < (state.current.fileLength || 0)) {
+                  // Align to 188-byte TS packet boundary and verify 0x47 sync byte
+                  const alignedStart = alignToTSSyncByte(startByte, shadowCacheRef.current);
+                  const abortCtrl = new AbortController();
+                  independentPrebufferRef.current = {
+                    abortController: abortCtrl,
+                    active: true,
+                    startByte: alignedStart,
+                    downloadedBytes: 0,
+                  };
+
+                  // Cap the prebuffer download to PREBUFFER_CAP_BYTES so we don't download
+                  // the entire remainder of the file (which evicts all cache entries and crashes).
+                  const fileLen = state.current.fileLength || 0;
+                  const endByte = Math.min(alignedStart + PREBUFFER_CAP_BYTES, fileLen > 0 ? fileLen - 1 : alignedStart + PREBUFFER_CAP_BYTES);
+
+                  diagLog(`[INDEPENDENT-PREBUFFER] Starting: byte=${alignedStart}-${endByte} (cap=${PREBUFFER_CAP_BYTES/(1024*1024)}MB, ioCtrl._resumeFrom=${resumeFromByte}, cacheEnd=${cacheEndByte}, _currentRange.to=${currentRangeTo})`);
+
+                  // Fetch through the interceptor — it siphons to shadow cache automatically
+                  const fetchUrl = streamUrl; // The /stream endpoint URL (captured in closure)
+                  fetch(fetchUrl, {
+                    headers: { Range: `bytes=${alignedStart}-${endByte}` },
+                    signal: abortCtrl.signal,
+                  }).then(async (response) => {
+                    if (!response.ok || !response.body) {
+                      diagLog(`[INDEPENDENT-PREBUFFER] Response not OK: status=${response.status}`);
+                      independentPrebufferRef.current.active = false;
+                      return;
+                    }
+                    const reader = response.body.getReader();
+                    let capReached = false;
+                    let cacheFull = false;
+                    try {
+                      while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        // Data is already siphoned to shadow cache by the fetch interceptor's forwardAndSiphon()
+                        // We just need to consume the stream to keep it flowing
+                        independentPrebufferRef.current.downloadedBytes += value.length;
+
+                        // ── Runtime cap check: stop if we've downloaded more than the cap ──
+                        if (independentPrebufferRef.current.downloadedBytes > PREBUFFER_CAP_BYTES) {
+                          capReached = true;
+                          diagLog(`[INDEPENDENT-PREBUFFER] Cap reached: downloaded ${independentPrebufferRef.current.downloadedBytes} bytes > ${PREBUFFER_CAP_BYTES} — stopping`);
+                          break;
+                        }
+
+                        // ── Cache-full check: stop if shadow cache is ≥90% full ──
+                        const cache = shadowCacheRef.current;
+                        if (cache) {
+                          const stats = cache.getStats();
+                          if (stats.totalMB >= stats.maxMB * 0.9) {
+                            cacheFull = true;
+                            diagLog(`[INDEPENDENT-PREBUFFER] Shadow cache full: ${stats.totalMB}/${stats.maxMB}MB (≥90%) — stopping`);
+                            break;
+                          }
+                        }
+                      }
+                      const reason = capReached ? ' (cap reached)' : cacheFull ? ' (cache full)' : '';
+                      diagLog(`[INDEPENDENT-PREBUFFER] Completed${reason}: downloaded ${independentPrebufferRef.current.downloadedBytes} bytes from start=${alignedStart}`);
+                    } catch (e: any) {
+                      if (e.name === 'AbortError') {
+                        diagLog(`[INDEPENDENT-PREBUFFER] Aborted after ${independentPrebufferRef.current.downloadedBytes} bytes — IOController resuming`);
+                      } else {
+                        diagLog(`[INDEPENDENT-PREBUFFER] Read error: ${e.message}`);
+                      }
+                    } finally {
+                      independentPrebufferRef.current.active = false;
+                      independentPrebufferRef.current.abortController = null;
+                    }
+                  }).catch((e: any) => {
+                    if (e.name !== 'AbortError') {
+                      diagLog(`[INDEPENDENT-PREBUFFER] Fetch error: ${e.message}`);
+                    }
+                    independentPrebufferRef.current.active = false;
+                    independentPrebufferRef.current.abortController = null;
+                  });
+                }
+              }
+            }
           }
         }
       };
@@ -2606,6 +3214,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  after the target time.
    */
   const _mpegtsUnbufferedSeek = (timeSeconds: number, duration: number) => {
+    // Cancel independent prebuffer — seek changes the download position
+    if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
+      diagLog(`[INDEPENDENT-PREBUFFER] Cancelling on seek (downloaded ${independentPrebufferRef.current.downloadedBytes} bytes)`);
+      independentPrebufferRef.current.abortController.abort();
+      independentPrebufferRef.current.active = false;
+      independentPrebufferRef.current.abortController = null;
+    }
+    // Mark user seek in progress — allows _onIOSeeked to fire insertDiscontinuity
+    // (which is correct for user seeks, but wrong for lazyLoad resume/Early-EOF reconnect)
+    (window as any).__nobuf_userSeekInProgress = true;
+    try {
     const video = videoRef.current;
     const player = mpegtsPlayerRef.current;
     if (!video || !player) {
@@ -2795,6 +3414,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       diagLog(`[MPEGTS] Unbuffered seek failed: ${e.message}`);
       video.currentTime = timeSeconds;
     }
+    } finally {
+      // Clear user seek flag — after this point, _onIOSeeked should NOT
+      // fire insertDiscontinuity (lazyLoad resume and Early-EOF reconnect
+      // have continuous DTS, not a discontinuity)
+      (window as any).__nobuf_userSeekInProgress = false;
+    }
   };
 
   /** Last-resort: recreate mpegts.js player for seek when IOController is null.
@@ -2841,7 +3466,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         stashInitialSize: 1024 * 1024,
         lazyLoad: true,                // 2 min ahead — prevents SourceBuffer quota overflow
         lazyLoadMaxDuration: 120,      // 2 min ahead — MUST be < SourceBuffer quota (~150s)
-        lazyLoadRecoverDuration: 30,   // Resume 30s before buffer end
+        lazyLoadRecoverDuration: 60,   // Resume 60s before buffer end
         seekType: 'range',
         autoCleanupSourceBuffer: true,
         autoCleanupMaxBackwardDuration: 600,  // 10 min behind

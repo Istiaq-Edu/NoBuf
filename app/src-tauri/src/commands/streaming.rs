@@ -523,3 +523,331 @@ pub async fn cmd_get_cache_total_size(
     scan_dir(&cache_dir, &mut total);
     Ok(total)
 }
+
+/// Report the current playback position so the backend can proactively
+/// download ahead to disk cache. This ensures that when the MSE player
+/// resumes (lazyLoad or after eviction), data is already on disk and can
+/// be served instantly via CACHE-PREFIX without Telegram network latency.
+///
+/// The frontend calls this every 10s during playback. The backend:
+///   1. Approximates the current byte position from playback time
+///   2. Checks what's already cached on disk
+///   3. Spawns a proactive download task for gaps ahead of the playhead
+///   4. Skips if a download is already running for this message
+#[tauri::command]
+pub async fn cmd_report_playback_position(
+    message_id: i32,
+    folder_id: i64,
+    current_time_s: f64,
+    duration_s: f64,
+    file_size: u64,
+    state: State<'_, TelegramState>,
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<bool, String> {
+    if duration_s <= 0.0 || file_size == 0 {
+        return Ok(false);
+    }
+
+    // Approximate current byte position (CBR assumption for TS files)
+    let ratio = (current_time_s / duration_s).clamp(0.0, 1.0);
+    let current_byte = (ratio * file_size as f64) as u64;
+
+    // Don't start if a proactive prebuffer is already running for this message.
+    // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
+    // download is tracked there too — it would always return true during playback,
+    // preventing the proactive prebuffer from ever starting.
+    let proactive_key = format!("proactive-{}", message_id);
+    if state.cancelled_transfers.read().await.contains(&proactive_key) {
+        // Was cancelled — clear the flag so we can try again
+        state.cancelled_transfers.write().await.remove(&proactive_key);
+    }
+    // Use a separate tracker just for proactive tasks
+    if cache_state.has_proactive_task(message_id).await {
+        return Ok(false);
+    }
+
+    // Don't start if already fully cached
+    if let Some(meta) = cache_state.load_meta(message_id) {
+        if meta.is_complete() {
+            return Ok(false);
+        }
+    }
+
+    // Check if there are uncached gaps ahead of current position
+    let cached_ranges = cache_state.load_meta(message_id)
+        .map(|m| m.cached_ranges.clone())
+        .unwrap_or_default();
+
+    // Only care about gaps from current_byte onward
+    let ahead_gaps: Vec<(u64, u64)> = find_gaps(&cached_ranges, file_size)
+        .into_iter()
+        .filter(|(start, end)| *end >= current_byte)
+        .map(|(start, end)| (start.max(current_byte), end))
+        .collect();
+
+    if ahead_gaps.is_empty() {
+        return Ok(false); // Nothing to download ahead
+    }
+
+    let total_ahead_bytes: u64 = ahead_gaps.iter()
+        .map(|(s, e)| e - s + 1)
+        .sum();
+
+    // Only start if there's meaningful work (>2MB ahead)
+    if total_ahead_bytes < 2 * 1024 * 1024 {
+        return Ok(false);
+    }
+
+    log::info!(
+        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — spawning proactive download",
+        message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len()
+    );
+
+    let client = { state.client.lock().await.clone() }
+        .ok_or("Not connected")?;
+
+    let cache_mgr = cache_state.inner().clone();
+    let tg_state = Arc::new(state.inner().clone());
+
+    cache_mgr.track_proactive(message_id).await;
+
+    tokio::spawn(async move {
+        let result = proactive_prebuffer_download(
+            message_id, folder_id, current_byte, client, tg_state, cache_mgr.clone(),
+        ).await;
+
+        cache_mgr.untrack_proactive(message_id).await;
+
+        match result {
+            Ok(downloaded) => {
+                if downloaded > 0 {
+                    log::info!("[PROACTIVE] msg {}: downloaded {} bytes to disk cache", message_id, downloaded);
+                }
+            }
+            Err(e) => log::warn!("[PROACTIVE] msg {}: download failed: {}", message_id, e),
+        }
+    });
+
+    Ok(true)
+}
+
+/// Stop any proactive prebuffer download for a message (called when
+/// playback stops or switches to a different file).
+#[tauri::command]
+pub async fn cmd_stop_proactive_prebuffer(
+    message_id: i32,
+    state: State<'_, TelegramState>,
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<bool, String> {
+    let transfer_id = format!("proactive-{}", message_id);
+    state.cancelled_transfers.write().await.insert(transfer_id);
+    cache_state.untrack_proactive(message_id).await;
+    log::info!("[PROACTIVE] msg {}: stopped", message_id);
+    Ok(true)
+}
+
+/// Proactive prebuffer download task — downloads from `start_byte` to
+/// `file_end` to disk cache, filling gaps ahead of the playhead.
+/// Modelled after `background_cache_download` but starts from a specific
+/// byte position (not the beginning of the file).
+async fn proactive_prebuffer_download(
+    message_id: i32,
+    folder_id: i64,
+    start_byte: u64,
+    client: grammers_client::Client,
+    state: Arc<TelegramState>,
+    cache_mgr: StreamCacheManager,
+) -> Result<u64, String> {
+    let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
+    let messages = client
+        .get_messages_by_id(&peer, &[message_id])
+        .await
+        .map_err(|e| format!("Failed to fetch message: {}", e))?;
+    let message = messages
+        .into_iter()
+        .next()
+        .ok_or("Message not found")?
+        .ok_or("Message is empty")?;
+
+    let media = message.media().ok_or("No media on message")?;
+
+    // Extract total size
+    let total_size: u64 = match &message.raw {
+        tl::enums::Message::Message(m) => match &m.media {
+            Some(tl::enums::MessageMedia::Document(md)) => md
+                .document
+                .as_ref()
+                .and_then(|d| match d {
+                    tl::enums::Document::Document(doc) => Some(doc.size as u64),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    };
+
+    if total_size == 0 {
+        return Err("Could not determine file size".into());
+    }
+
+    // Check what's already cached
+    let existing_meta = cache_mgr.load_meta(message_id);
+    let cached_ranges = existing_meta
+        .as_ref()
+        .map(|m| m.cached_ranges.clone())
+        .unwrap_or_default();
+
+    // Find gaps from start_byte to file end
+    let all_gaps = find_gaps(&cached_ranges, total_size);
+    let ahead_gaps: Vec<(u64, u64)> = all_gaps
+        .into_iter()
+        .filter(|(gap_start, gap_end)| *gap_end >= start_byte)
+        .map(|(gap_start, gap_end)| (gap_start.max(start_byte), gap_end))
+        .collect();
+
+    if ahead_gaps.is_empty() {
+        return Ok(0); // Already cached ahead
+    }
+
+    let filename = match &media {
+        Media::Document(d) => d.name().to_string(),
+        _ => format!("{}.ts", message_id),
+    };
+    let mime_type = crate::server::mime_type_from_media(&media);
+
+    let mut cache_file = cache_mgr.open_data_file_write(message_id)
+        .map_err(|e| format!("Failed to open cache file: {}", e))?;
+
+    let chunk_size: i32 = 512 * 1024;
+    let transfer_id = format!("proactive-{}", message_id);
+    let mut total_downloaded: u64 = 0;
+
+    // Get DownloadPool for parallel gap-filling
+    let pool_clone = { state.download_pool.lock().await.clone() };
+
+    for (gap_start, gap_end) in ahead_gaps {
+        let gap_size = gap_end - gap_start + 1;
+
+        // Check cancellation
+        if state.cancelled_transfers.read().await.contains(&transfer_id) {
+            log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+            return Ok(total_downloaded);
+        }
+
+        // Use parallel download for large gaps when DownloadPool is available
+        if let Some(ref pool) = pool_clone {
+            if gap_size > 1024 * 1024 {
+                log::info!(
+                    "[PROACTIVE] msg {}: parallel download gap {}-{} ({:.1}MB)",
+                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
+                );
+
+                let data = pool.download_range(&media, gap_start, gap_end, total_size).await
+                    .map_err(|e| format!("Parallel gap download error: {}", e))?;
+
+                cache_file
+                    .seek(SeekFrom::Start(gap_start))
+                    .map_err(|e| format!("Seek error: {}", e))?;
+                cache_file
+                    .write_all(&data)
+                    .map_err(|e| format!("Write error: {}", e))?;
+
+                total_downloaded += data.len() as u64;
+
+                // Update meta
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                    message_id,
+                    folder_id,
+                    total_size,
+                    filename: filename.clone(),
+                    cached_ranges: Vec::new(),
+                    mime_type: mime_type.clone(),
+                });
+                meta.cached_ranges.push((gap_start, gap_end));
+                merge_ranges(&mut meta.cached_ranges);
+                let _ = cache_mgr.save_meta(&meta);
+
+                continue;
+            }
+        }
+
+        // Sequential iter_download for small gaps or when pool unavailable
+        let skip_chunks = gap_start / chunk_size as u64;
+        let skip_bytes = gap_start % chunk_size as u64;
+
+        let mut iter = client
+            .iter_download(&media)
+            .chunk_size(chunk_size)
+            .skip_chunks(skip_chunks as i32);
+
+        let mut offset = gap_start;
+        let mut first_chunk = true;
+
+        while let Ok(Some(chunk_result)) = {
+            let _permit = state.download_semaphore.acquire().await.unwrap();
+            iter.next().await
+        } {
+            // Check cancellation
+            if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+                return Ok(total_downloaded);
+            }
+
+            let chunk = chunk_result;
+
+            let chunk_slice: &[u8] = if first_chunk && skip_bytes > 0 {
+                let discard = skip_bytes.min(chunk.len() as u64) as usize;
+                first_chunk = false;
+                &chunk[discard..]
+            } else {
+                first_chunk = false;
+                &chunk
+            };
+
+            let remaining_in_gap = (gap_end - offset + 1) as usize;
+            let to_write = chunk_slice.len().min(remaining_in_gap);
+
+            cache_file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| format!("Seek error: {}", e))?;
+            cache_file
+                .write_all(&chunk_slice[..to_write])
+                .map_err(|e| format!("Write error: {}", e))?;
+
+            offset += to_write as u64;
+            total_downloaded += to_write as u64;
+
+            // Update meta every 4MB (8 chunks × 512KB)
+            if offset % (4 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                    message_id,
+                    folder_id,
+                    total_size,
+                    filename: filename.clone(),
+                    cached_ranges: Vec::new(),
+                    mime_type: mime_type.clone(),
+                });
+                meta.cached_ranges.push((gap_start, offset - 1));
+                merge_ranges(&mut meta.cached_ranges);
+                let _ = cache_mgr.save_meta(&meta);
+            }
+
+            // Throttle: same as background_cache_download
+            let dl_limit_kb = state.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+            if dl_limit_kb > 0 {
+                let sleep_ms = (to_write as u64 * 1000) / (dl_limit_kb * 1024);
+                let sleep_ms = sleep_ms.min(2000);
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            }
+
+            if offset > gap_end {
+                break;
+            }
+        }
+    }
+
+    Ok(total_downloaded)
+}

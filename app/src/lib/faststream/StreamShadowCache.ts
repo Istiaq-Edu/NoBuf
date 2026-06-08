@@ -58,12 +58,27 @@ export interface ByteRange {
 /** Max bytes to serve in a single HIT response. 30MB ≈ 60s at 4Mbps — safe for SourceBuffer. */
 const MAX_HIT_SERVE_BYTES = 30 * 1024 * 1024;
 
+/** Max bytes to siphon into cache while the interceptor is paused.
+ *  After safe-resume, the interceptor pauses for several seconds so the
+ *  IOController fetches from the network at a rate-limited pace. But
+ *  forwardAndSiphon still siphons ALL response data into cache, which
+ *  can flood the cache with far-ahead data that evicts near-playhead data.
+ *  When the pause expires and the cache serves a HIT, it instantly fills
+ *  the SourceBuffer past lazyLoadMax → immediate re-suspend → _resumeFrom
+ *  corruption. Capping the siphon to 30MB keeps the cache from accumulating
+ *  too much far-ahead data during the pause window. */
+const INTERCEPTOR_PAUSE_SIPHON_LIMIT = 30 * 1024 * 1024; // 30MB
+
 export class StreamShadowCache {
   private entries: ByteRange[] = [];  // sorted by start, non-overlapping, merged
   private _totalBytes: number = 0;
   readonly maxBytes: number;
   private _fileLength: number = 0;
   private _urlKey: string = '';   // substring to match stream URLs, e.g. "/stream/3574767635/3"
+  /** Timestamp until which the fetch interceptor should skip interception.
+   *  Set after safe-resume so IOController fetches from network (rate-limited)
+   *  instead of being instantly flooded with cached data. */
+  public _interceptorPauseUntil: number = 0;
 
   /** Current total bytes stored in cache. */
   get totalBytes(): number { return this._totalBytes; }
@@ -356,6 +371,20 @@ export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
       return originalFetch!.call(window, input, init);
     }
 
+    // ── Interceptor pause check ──
+    // After safe-resume, the interceptor is paused for ~5s so the IOController
+    // fetches from the network at a rate-limited pace, giving lazyLoad time to
+    // naturally suspend before the buffer exceeds lazyLoadMax. Without this,
+    // the cache feeds 30+MB instantly → buffer overshoots → immediate re-suspend.
+    if (Date.now() < shadowCache._interceptorPauseUntil) {
+      // Still paused — let the request go to network, but BOUND the siphon
+      // to INTERCEPTOR_PAUSE_SIPHON_LIMIT bytes. Without this cap, the cache
+      // gets flooded with far-ahead data that evicts near-playhead entries;
+      // when the pause expires the cache serves a massive HIT → SourceBuffer
+      // overshoots lazyLoadMax → immediate re-suspend → _resumeFrom corruption.
+      return forwardAndSiphon(input, init, 0, INTERCEPTOR_PAUSE_SIPHON_LIMIT);
+    }
+
     // ── Extract Range header ──
     const rangeInfo = extractRangeHeader(init?.headers);
     if (!rangeInfo) {
@@ -450,7 +479,8 @@ function createCacheResponse(from: number, to: number, data: Uint8Array, fileLen
 function forwardAndSiphon(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
-  startByte: number
+  startByte: number,
+  siphonLimit: number = Infinity
 ): Promise<Response> {
   return originalFetch!.call(window, input, init).then((response) => {
     if (!response.body || !shadowCache) return response;
@@ -458,6 +488,7 @@ function forwardAndSiphon(
     const serverReader = response.body.getReader();
     let bytePos = startByte;
     let serverDone = false;
+    let bytesSiphoned = 0;  // Track how many bytes have been siphoned into cache
 
     const playerStream = new ReadableStream({
       async pull(controller) {
@@ -478,16 +509,25 @@ function forwardAndSiphon(
             ? result.value
             : new Uint8Array(result.value);
 
-          // Enqueue to player
+          // Enqueue to player (ALWAYS forward, regardless of siphon limit)
           controller.enqueue(chunk.slice());
 
-          // Siphon to cache — put() calls evict() internally to stay within budget
-          // (evict trims from start = oldest byte offsets = data we no longer need)
-          try {
-            if (shadowCache) {
-              shadowCache.put(bytePos, chunk.slice());
-            }
-          } catch { /* cache errors are non-fatal */ }
+          // Siphon to cache — respect siphonLimit to prevent cache flooding
+          // during interceptor pause. When paused, the IOController still
+          // needs the data (forwarded above), but we cap how much goes into
+          // the cache so far-ahead data doesn't evict near-playhead entries.
+          if (bytesSiphoned < siphonLimit) {
+            const remaining = siphonLimit - bytesSiphoned;
+            const chunkToSiphon = chunk.length <= remaining
+              ? chunk.slice()          // whole chunk fits within limit
+              : chunk.slice(0, remaining); // truncate to limit boundary
+            try {
+              if (shadowCache) {
+                shadowCache.put(bytePos, chunkToSiphon);
+              }
+            } catch { /* cache errors are non-fatal */ }
+            bytesSiphoned += chunkToSiphon.length;
+          }
           bytePos += chunk.length;
 
         } catch (e) {

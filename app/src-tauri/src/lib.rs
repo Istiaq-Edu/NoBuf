@@ -410,6 +410,9 @@ pub fn run() {
             commands::cmd_start_auto_sync,
             commands::cmd_probe_duration,
             commands::cmd_get_cache_total_size,
+            commands::cmd_report_playback_position,
+            commands::cmd_stop_proactive_prebuffer,
+            commands::cmd_set_speed_limits,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
