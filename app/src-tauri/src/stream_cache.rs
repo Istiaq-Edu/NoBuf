@@ -208,6 +208,8 @@ pub struct StreamCacheManager {
     cache_dir: PathBuf,
     /// Active background cache tasks: message_id
     active_tasks: Arc<Mutex<Vec<i32>>>,
+    /// Active proactive prebuffer tasks: message_id (separate from active_tasks)
+    proactive_tasks: Arc<Mutex<Vec<i32>>>,
     /// Per-message locks to serialize meta read-modify-write operations
     /// between player reports and download updates (prevents race conditions)
     meta_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
@@ -264,6 +266,7 @@ impl StreamCacheManager {
         Ok(Self {
             cache_dir,
             active_tasks: Arc::new(Mutex::new(Vec::new())),
+            proactive_tasks: Arc::new(Mutex::new(Vec::new())),
             meta_locks: Arc::new(Mutex::new(HashMap::new())),
             streaming_active: Arc::new(std::sync::Mutex::new(Vec::new())),
             active_downloads: Arc::new(Mutex::new(HashMap::new())),
@@ -898,6 +901,22 @@ impl StreamCacheManager {
     /// Check if a message has an active background task
     pub async fn has_active_task(&self, message_id: i32) -> bool {
         self.active_tasks.lock().await.contains(&message_id)
+    }
+
+    /// Track a proactive prebuffer task (separate from active_tasks which
+    /// is shared with /stream coordinator — we need an independent tracker)
+    pub async fn track_proactive(&self, message_id: i32) {
+        self.proactive_tasks.lock().await.push(message_id);
+    }
+
+    /// Untrack a proactive prebuffer task
+    pub async fn untrack_proactive(&self, message_id: i32) {
+        self.proactive_tasks.lock().await.retain(|&id| id != message_id);
+    }
+
+    /// Check if a message has an active proactive prebuffer task
+    pub async fn has_proactive_task(&self, message_id: i32) -> bool {
+        self.proactive_tasks.lock().await.contains(&message_id)
     }
 
     /// Track that a message is currently being streamed (Actix response active).
