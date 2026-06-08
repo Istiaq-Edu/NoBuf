@@ -178,36 +178,33 @@ export class StreamShadowCache {
   }
 
   /** Evict entries to stay under maxBytes. Evicts oldest (lowest byte offset) first.
-   *  Also splits a single oversized entry if it exceeds the budget. */
+   *  Also trims oversized entries from the start — NEVER clears everything. */
   private evict(): void {
-    // If a single entry exceeds the budget, trim it from the start
-    if (this.entries.length === 1 && this._totalBytes > this.maxBytes) {
+    // Trim entries from the start (lowest byte offset = oldest data) until under budget.
+    // We trim rather than clear to preserve data at higher byte offsets (which is
+    // what the player needs after eviction resume).
+    while (this._totalBytes > this.maxBytes && this.entries.length > 0) {
       const entry = this.entries[0];
       const baseLength = entry.dataLength ?? entry.data.length;
       const excess = this._totalBytes - this.maxBytes;
       const trimBytes = Math.min(excess, baseLength);
       if (trimBytes >= baseLength) {
-        // Entire entry would be removed — just clear it
-        this.entries = [];
-        this._totalBytes = 0;
-        return;
+        // Remove entire first entry
+        this.entries.shift();
+        this._totalBytes -= baseLength;
+      } else {
+        // Trim from the start (drop oldest bytes) — zero-copy via dataOffset
+        const baseOffset = entry.dataOffset ?? 0;
+        this.entries[0] = {
+          start: entry.start + trimBytes,
+          end: entry.end,
+          data: entry.data,
+          dataOffset: baseOffset + trimBytes,
+          dataLength: baseLength - trimBytes,
+        };
+        this._totalBytes -= trimBytes;
+        break;  // trimmed enough
       }
-      // Trim from the start (drop oldest bytes) — zero-copy via dataOffset
-      const baseOffset = entry.dataOffset ?? 0;
-      this.entries[0] = {
-        start: entry.start + trimBytes,
-        end: entry.end,
-        data: entry.data,
-        dataOffset: baseOffset + trimBytes,
-        dataLength: baseLength - trimBytes,
-      };
-      this._totalBytes -= trimBytes;
-      return;
-    }
-    // Normal eviction: remove oldest entries until under budget
-    while (this._totalBytes > this.maxBytes && this.entries.length > 0) {
-      const removed = this.entries.shift()!;
-      this._totalBytes -= removed.dataLength ?? removed.data.length;
     }
   }
 
@@ -484,9 +481,10 @@ function forwardAndSiphon(
           // Enqueue to player
           controller.enqueue(chunk.slice());
 
-          // Siphon to cache (only if under budget — avoids unbounded growth)
+          // Siphon to cache — put() calls evict() internally to stay within budget
+          // (evict trims from start = oldest byte offsets = data we no longer need)
           try {
-            if (shadowCache && shadowCache.totalBytes < shadowCache.maxBytes) {
+            if (shadowCache) {
               shadowCache.put(bytePos, chunk.slice());
             }
           } catch { /* cache errors are non-fatal */ }

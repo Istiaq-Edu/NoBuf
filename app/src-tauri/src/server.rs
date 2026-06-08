@@ -3437,7 +3437,7 @@ async fn fmp4_metadata(
                     let tail_end = m.total_size.saturating_sub(1);
                     let tail_size = tail_end - tail_start + 1;
 
-                    log::info!("[FMP4-META] msg {} tail not cached — downloading last {}MB from Telegram for PTS duration", message_id, tail_size / (1024*1024));
+                    log::info!("[FMP4-META] msg {} tail not cached — downloading last {}KB from Telegram for PTS duration", message_id, tail_size / 1024);
 
                     // Try to get the Telegram client and media for this message
                     let mut tail_pts_duration: Option<f64> = None;
