@@ -1538,11 +1538,36 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const streamUrl = `${parsed.baseUrl}/stream/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
     const metaUrl = `${parsed.baseUrl}/fmp4/metadata/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
 
+    // ── SPAWN PROACTIVE PREBUFFER IMMEDIATELY ──
+    // Start downloading to disk cache BEFORE anything else — before fetching
+    // /fmp4/metadata/, before creating the mpegts.js player. This eliminates
+    // the chicken-and-egg deadlock where /stream polls disk cache but the
+    // prebuffer hasn't started yet. By the time mpegts.js makes its first
+    // Range request to /stream, data is already on disk or being downloaded.
+    const knownFilesize = state.current.fileLength > 0 ? state.current.fileLength : undefined;
+    if (knownFilesize && parseInt(parsed.messageId) > 0) {
+      diagLog(`[PROACTIVE] IMMEDIATE spawn: msg=${parsed.messageId} folder=${parsed.folderId} size=${knownFilesize} (duration unknown, will be reported later)`);
+      invoke('cmd_report_playback_position', {
+        messageId: parseInt(parsed.messageId),
+        folderId: parseInt(parsed.folderId),
+        currentTimeS: 0,
+        durationS: 0,  // Unknown — backend will start from byte 0
+        fileSize: knownFilesize,
+        isPlayerDownloading: false,
+      }).then((spawned: any) => {
+        if (spawned) {
+          proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
+          diagLog(`[PROACTIVE] Immediate spawn succeeded for msg ${parsed.messageId}`);
+        }
+      }).catch((e: any) => {
+        console.error(`[PROACTIVE] Immediate spawn FAILED:`, e);
+      });
+    }
+
     // Get known duration. For TS files, Telegram doesn't provide video duration
     // in the document attributes, so file?.duration is typically undefined.
     // We MUST fetch from /fmp4/metadata/ which estimates duration from bitrate+filesize.
     let knownDuration: number | undefined = file?.duration ? file.duration : undefined;
-    const knownFilesize = state.current.fileLength > 0 ? state.current.fileLength : undefined;
 
     if (!knownDuration) {
       try {
@@ -1590,16 +1615,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                                      // is >120s ahead, but resumes 30s before buffer end. This balances
                                      // continuous download with memory efficiency. BUFFER_FULL (SourceBuffer
                                      // quota) also triggers suspend, handled by our quota guard with eviction.
-      lazyLoadMaxDuration: 120,      // Suspend when buffer >120s ahead; resume via lazyLoadRecoverDuration.
-                                     // Previous 9999 allowed unbounded buffering → excessive memory usage.
+      lazyLoadMaxDuration: Math.round(120 * (video.playbackRate || 1)),  // Scaled by playbackRate: at 2x speed, buffer drains 2x faster → need 240s ahead.
+                                     // Base 120s at 1x. Previous 9999 allowed unbounded buffering → excessive memory usage.
                                      // Previous 120 caused re-suspend after BUFFER_FULL recovery:
                                      // recovery fills buffer to ~155s ahead, lazyLoad sees ahead>120,
                                      // immediately re-suspends → download stops for 90+ seconds.
-                                     // 180 gives enough headroom after BUFFER_FULL recovery to avoid
-                                     // immediate re-suspend, while still capping memory growth.
-      lazyLoadRecoverDuration: 60,   // Resume 60s before buffer end — gives download time to refill
-                                     // before buffer runs out. 30s was too aggressive — buffer
-                                     // could drain before download catches up.
+                                     // Dynamically updated by quota guard on rate change.
+      lazyLoadRecoverDuration: Math.round(60 * (video.playbackRate || 1)),  // Resume scaled-60s before buffer end — at 2x need 120s real buffer
+                                     // for download to refill before it drains. 30s was too aggressive.
+                                     // Dynamically updated by quota guard on rate change.
       seekType: 'range',             // Use HTTP Range for seeking (our server supports it)
       autoCleanupSourceBuffer: true, // Evict backward data when quota approached
                                      // 10 min behind (user's specified window).
@@ -2075,16 +2099,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // Suspends at 10 min ahead, resumes when playhead nears buffer end.
           // This prevents SourceBuffer quota overflow (the #1 crash cause).
           lc._config.lazyLoad = true;
-          lc._config.lazyLoadMaxDuration = 120;      // Suspend when buffer >120s ahead; resume via lazyLoadRecoverDuration
-                                                     // Previous 9999 allowed unbounded buffering → excessive memory usage.
-                                                     // BUFFER_FULL (SourceBuffer quota) also triggers suspend, handled by quota guard.
-          lc._config.lazyLoadRecoverDuration = 60;  // Resume 60s before buffer end
+          lc._config.lazyLoadMaxDuration = Math.round(120 * (video.playbackRate || 1));  // Scaled by playbackRate: at 2x, need 240s ahead
+                                                     // Base 120s at 1x. Dynamically updated by quota guard on rate change.
+          lc._config.lazyLoadRecoverDuration = Math.round(60 * (video.playbackRate || 1));  // Scaled by playbackRate: at 2x, need 120s recover
 
           // 10 min behind playhead (user's specified window).
           lc._config.autoCleanupMaxBackwardDuration = 600;  // 10 min behind
           lc._config.autoCleanupMinBackwardDuration = 300;   // start cleanup when >5 min behind
 
-          diagLog(`[MPEGTS] Buffer window: 10min behind + continuous ahead, lazyLoad=ON (maxDuration=120, recoverDuration=60, safeResumeAt=90, quota-guard-managed), _onIOSeeked=no-op (manual insertDiscontinuity)`);
+          diagLog(`[MPEGTS] Buffer window: 10min behind + continuous ahead, lazyLoad=ON (maxDuration=${lc._config.lazyLoadMaxDuration}, recoverDuration=${lc._config.lazyLoadRecoverDuration}, rate=${video.playbackRate || 1}x, quota-guard-managed), _onIOSeeked=no-op (manual insertDiscontinuity)`);
         }
       };
       adjustBufferForSpeed(); // set initial values
@@ -2524,8 +2547,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // re-suspends on BUFFER_FULL.
       //
       // Uses setInterval(100ms) for fast response at high speed.
-      const QUOTA_DANGER_DURATION = 150;  // heuristic for "quota pressure relieved" threshold
-      const QUOTA_KEEP_AHEAD = 120;       // keep 2 min ahead — SourceBuffer can't hold 10min
+      // Scale quota guard thresholds by playbackRate: at 2x speed, buffer drains 2x faster,
+      // so we need proportionally more ahead to prevent underruns. Base values are for 1x.
+      // These are recomputed on every 100ms tick inside sourceBufferQuotaGuard for instant rate response.
+      const BASE_QUOTA_DANGER_DURATION = 150;  // base heuristic for "quota pressure relieved" threshold (at 1x)
+      const BASE_QUOTA_KEEP_AHEAD = 120;      // base: keep 2 min ahead at 1x — SourceBuffer can't hold 10min
       // NOTE: With ~270s SourceBuffer quota at 4Mbps, 10min ahead (600s ≈ 300MB) is 
       // impossible. Keep 120s ahead in SB, rest stays in shadow cache for re-download.
       // NOTE: Proactive eviction was removed — lazyLoadMaxDuration=180 handles ahead
@@ -2569,6 +2595,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const isPaused = lc?._paused === true;
         const ioCtrl = engine._transmuxer?._controller?._ioctl;
         const resumeFrom = ioCtrl?._resumeFrom ?? -1;
+
+        // ── Scale lazyLoad + quota thresholds by playbackRate (smooth white bar at high speed) ──
+        // At 2x speed, buffer drains 2x faster → need 2x more ahead to prevent underruns.
+        // This runs every 100ms tick, so it reacts instantly to rate changes.
+        const currentRate = video.playbackRate || 1;
+        const QUOTA_DANGER_DURATION = Math.round(BASE_QUOTA_DANGER_DURATION * currentRate);
+        const QUOTA_KEEP_AHEAD = Math.round(BASE_QUOTA_KEEP_AHEAD * currentRate);
+        if (lc?._config) {
+          const expectedLazyMax = Math.round(120 * currentRate);
+          if (lc._config.lazyLoadMaxDuration !== expectedLazyMax) {
+            lc._config.lazyLoadMaxDuration = expectedLazyMax;
+            lc._config.lazyLoadRecoverDuration = Math.round(60 * currentRate);
+            diagLog(`[MPEGTS] Playback rate ${currentRate}x: lazyLoadMax=${expectedLazyMax}s, lazyLoadRecover=${lc._config.lazyLoadRecoverDuration}s, quotaDanger=${QUOTA_DANGER_DURATION}s, quotaKeep=${QUOTA_KEEP_AHEAD}s`);
+          }
+        }
 
         // ── PART B: Defensive _resumeFrom===0 corruption guard ──
         // On every quota guard tick, check if _resumeFrom got corrupted to 0
@@ -2659,17 +2700,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Every 10s, tell the backend where we're watching so it can proactively
         // download ahead to disk cache. When lazyLoad resumes, the /stream endpoint
         // serves from cache (CACHE-PREFIX) instead of fetching from Telegram.
-        if (knownDuration && knownFilesize && !video.paused) {
+        // NOTE: We do NOT gate on !video.paused — the green bar (disk cache) should
+        // keep downloading to completion even when the video is paused. Only the
+        // white bar (IOController) stops when paused; the proactive prebuffer runs
+        // independently as a background task.
+        if (knownDuration && knownFilesize) {
           const _now = Date.now();
           if (!(sourceBufferQuotaGuard as any)._lastProactiveReport || _now - (sourceBufferQuotaGuard as any)._lastProactiveReport > 10000) {
             (sourceBufferQuotaGuard as any)._lastProactiveReport = _now;
-            diagLog(`[PROACTIVE] Reporting position: msg=${parsed.messageId} folder=${parsed.folderId} ct=${curTime.toFixed(1)}s dur=${knownDuration.toFixed(1)}s size=${knownFilesize}`);
+            // isPlayerDownloading: ALWAYS false now — the /stream endpoint only reads
+            // from disk cache (never downloads from Telegram). The proactive prebuffer
+            // is the sole Telegram downloader, so it always uses parallel pool.
+            const isPlayerDownloading = false;
+            diagLog(`[PROACTIVE] Reporting position: msg=${parsed.messageId} folder=${parsed.folderId} ct=${curTime.toFixed(1)}s dur=${knownDuration.toFixed(1)}s size=${knownFilesize} isPlayerDownloading=${isPlayerDownloading}`);
             invoke('cmd_report_playback_position', {
               messageId: parseInt(parsed.messageId),
               folderId: parseInt(parsed.folderId),
               currentTimeS: curTime,
               durationS: knownDuration,
               fileSize: knownFilesize,
+              isPlayerDownloading,
             }).then((spawned: any) => {
               if (spawned) {
                 proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
@@ -2708,10 +2758,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
 
           // 1. Evict backward data behind playhead to free SourceBuffer byte quota.
-          //    Keep up to 10min ahead (QUOTA_KEEP_AHEAD) — only evict the far-ahead tail
+          //    Keep up to QUOTA_KEEP_AHEAD (scaled by playbackRate) — only evict the far-ahead tail
           //    if the buffer extends beyond that AND we need more quota room.
           const evictBefore = curTime;  // evict EVERYTHING behind playhead
-          const evictAfter = curTime + QUOTA_KEEP_AHEAD;  // only evict beyond 10min ahead
+          const evictAfter = curTime + QUOTA_KEEP_AHEAD;  // only evict beyond keep-ahead window (scaled by rate)
           // Get SourceBuffers via standard MSE API.
           // mpegts.js MSEController._sourceBuffers is {video: sb, audio: sb} object NOT array!
           // The correct path is getObject() → MediaSource → sourceBuffers (SourceBufferList).
