@@ -919,6 +919,19 @@ impl StreamCacheManager {
         self.proactive_tasks.lock().await.contains(&message_id)
     }
 
+    /// Check if any download (proactive prebuffer OR coordinator-registered) is
+    /// running for a message. Used by /stream cache-poll to detect when no
+    /// downloader exists and fall back to Telegram quickly (5s instead of 30s).
+    pub async fn has_active_download_for_msg(&self, message_id: i32) -> bool {
+        // Check proactive prebuffer first
+        if self.proactive_tasks.lock().await.contains(&message_id) {
+            return true;
+        }
+        // Check coordinator-registered downloads
+        let downloads = self.active_downloads.lock().await;
+        downloads.contains_key(&message_id)
+    }
+
     /// Track that a message is currently being streamed (Actix response active).
     /// Synchronous so it can be used in Drop guards.
     pub fn track_streaming(&self, message_id: i32) {

@@ -2,22 +2,18 @@ use actix_web::{get, head, web, App, HttpServer, HttpRequest, HttpResponse, Resp
 use actix_cors::Cors;
 use crate::commands::TelegramState;
 use crate::commands::utils::resolve_peer;
-use crate::download_pool::StreamChunk;
 use crate::hls;
 use crate::hls::manifest::extract_video_attrs_from_raw_msg;
 use crate::ts_demux::{TsDemuxer, extract_stream_info, scan_keyframes_chunked, scan_keyframes_flush, KeyframeScanState, VideoCodec, PesFrame, TsStreamInfo};
 use crate::fmp4::{build_init_segment, build_media_segment};
 use grammers_client::types::Media;
-use grammers_client::Client;
 use grammers_tl_types as tl;
-use tokio::sync::Semaphore;
 use tokio::process::Command as TokioCommand;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::collections::HashMap;
-use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached, MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE};
+use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom, Read};
 
 /// Detect TS packet size from cached file data.
@@ -298,318 +294,9 @@ impl Drop for DownloadGuard {
     }
 }
 
-/// Drop-guard that spawns a background continuation task when the Actix response
-/// ends due to client disconnect. This keeps the Telegram download going so
-/// subsequent overlapping range requests find cached data instead of starting
-/// new downloads (fixes native video player backend overload).
-///
-/// Key design: continuation tasks ARE registered with the coordinator so new
-/// player requests can discover and subscribe to them. Progress is broadcast
-/// via the coordinator's watch channel so subscribers know when data is
-/// available in cache. This prevents duplicate downloads and allows the
-/// continuation to skip throttling when a player is actively subscribed.
-/// Decide whether a continuation background download should be spawned.
-/// Returns (should_continue, remaining_bytes, continuation_start_offset, file_end_byte).
-///
-/// This is the pure logic extracted from ContinuationGuard::drop for testability.
-/// The decision depends on:
-/// - `total_file_size`: full file size (not just the request range end)
-/// - `start_byte`: where the HTTP request range started
-/// - `bytes_sent`: how many bytes were actually streamed before the response ended
-///
-/// The continuation downloads from `start_byte + bytes_sent` to `total_file_size - 1`,
-/// not just to the request's `end_byte`. This is critical for pre-buffer requests:
-/// after serving a 5MB range, we must continue downloading to the full file end
-/// so segments beyond the pre-buffer range can be served from cache.
-fn continuation_should_run(total_file_size: u64, start_byte: u64, bytes_sent: u64) -> (bool, u64, u64, u64) {
-    // Defensive: bail out if we can't calculate remaining meaningfully.
-    // total_file_size == 0 means unknown file size. If start_byte >=
-    // total_file_size, the range was beyond the file — no continuation.
-    if total_file_size == 0 || start_byte >= total_file_size {
-        return (false, 0, 0, 0);
-    }
-
-    // Calculate remaining bytes in the FILE (not just the request range).
-    // sent is always <= total_file_size - start_byte because we only
-    // stream data within [start_byte, total_file_size-1], so no underflow.
-    let remaining = (total_file_size - start_byte) - bytes_sent;
-
-    // Only continue if there's meaningful data left (>2MB) and
-    // the download wasn't trivially short. Small remaining data (<2MB)
-    // doesn't warrant a background task — it will be requested
-    // again quickly if needed, and spawning a task for <2MB
-    // creates coordinator noise without meaningful benefit.
-    if remaining < 2 * 1024 * 1024 || bytes_sent == 0 {
-        return (false, remaining, start_byte + bytes_sent, total_file_size - 1);
-    }
-
-    let current_offset = start_byte + bytes_sent;
-    let file_end = total_file_size - 1;
-    (true, remaining, current_offset, file_end)
-}
-
-struct ContinuationGuard {
-    cache_mgr: Option<StreamCacheManager>,
-    message_id: i32,
-    start_byte: u64,
-    /// End byte of the HTTP request range (e.g., 5242880 for a 5MB pre-buffer).
-    /// Used for coordinator registration matching.
-    request_end_byte: u64,
-    /// Total file size — the continuation downloads to this boundary,
-    /// not just to the request's end_byte. This is critical for
-    /// pre-buffer requests: after serving a 5MB range, we must
-    /// continue downloading to the full file end so segments beyond
-    /// the pre-buffer range can be served from cache.
-    total_file_size: u64,
-    bytes_sent: Arc<AtomicU64>,
-    /// Data needed to create a new iter_download for the continuation
-    client: Option<Client>,
-    media: Media,
-    cache_folder_id: i64,
-    cache_filename: String,
-    mime_stream: String,
-    download_semaphore: Arc<Semaphore>,
-    speed_limit_kb: u64,
-}
-
-impl Drop for ContinuationGuard {
-    fn drop(&mut self) {
-        if let Some(ref cm) = self.cache_mgr {
-            let sent = self.bytes_sent.load(Ordering::Relaxed);
-            let (should_continue, remaining, current_offset, file_end) =
-                continuation_should_run(self.total_file_size, self.start_byte, sent);
-
-            if !should_continue {
-                return;
-            }
-
-            let msg_id = self.message_id;
-            let cache_mgr_clone = cm.clone();
-            let client_opt = self.client.take();
-            let media_clone = self.media.clone();
-            let folder_id = self.cache_folder_id;
-            let filename = self.cache_filename.clone();
-            let mime = self.mime_stream.clone();
-            let semaphore = self.download_semaphore.clone();
-            let limit_kb = self.speed_limit_kb;
-            let total_size = self.total_file_size; // For CacheMeta recovery
-
-            log::info!(
-                "[CONTINUATION] Evaluating background download for msg {} range {}-{} (request was {}-{}, sent {}, remaining {})",
-                msg_id, current_offset, file_end, self.start_byte, self.request_end_byte, sent, remaining
-            );
-
-            tokio::spawn(async move {
-                // CRITICAL: Check if there's a covering download already active.
-                // If another SEQUENTIAL download covers our continuation range,
-                // it will cache the data anyway — no need for a wasteful duplicate.
-                if cache_mgr_clone.find_best_covering_download(msg_id, current_offset, file_end).await.is_some() {
-                    log::info!(
-                        "[CONTINUATION] Skipping for msg {} — covering download exists, it will cache the data",
-                        msg_id
-                    );
-                    return;
-                }
-
-                // Register continuation covering the ENTIRE file range (0→file_end),
-                // not just current_offset→file_end. This ensures that requests for
-                // segments that straddle the prebuffer→continuation boundary (e.g.
-                // seg 2 at 4997040-7495183 where prebuffer ended at 5242880) will
-                // find this download and subscribe to it. The continuation's
-                // progress_rx will show progress >= current_offset immediately,
-                // so subscribers will know bytes 0→current_offset are on disk.
-                let cont_register_start = 0u64;
-                // Register continuation with initial_progress=current_offset.
-                // This initializes the watch channel to current_offset (not 0),
-                // eliminating the race condition where subscribers read progress=0
-                // before the update_download_progress call broadcasts current_offset.
-                // Subscribers immediately see bytes 0→current_offset as on disk.
-                let registered = cache_mgr_clone.register_download(msg_id, cont_register_start, file_end, true, current_offset).await;
-                let cont_start_byte = if registered.is_some() { cont_register_start } else { current_offset };
-
-                // Note: No need for a separate update_download_progress call —
-                // the watch channel is already initialized with current_offset.
-                // The separate broadcast was causing a race condition where
-                // subscribers could read start_byte=0 before the update arrived.
-
-                let client = match client_opt {
-                    Some(c) => c,
-                    None => {
-                        log::warn!("[CONTINUATION] No client available for msg {}", msg_id);
-                        return;
-                    }
-                };
-
-                let chunks_to_skip = (current_offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
-                let bytes_to_discard = current_offset % TELEGRAM_CHUNK_SIZE as u64;
-
-                let download_iter = client.iter_download(&media_clone)
-                    .chunk_size(TELEGRAM_CHUNK_SIZE)
-                    .skip_chunks(chunks_to_skip);
-
-                // Open cache file for writing
-                let mut cache_file = match cache_mgr_clone.open_data_file_write(msg_id) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::error!("[CONTINUATION] Failed to open cache file for msg {}: {}", msg_id, e);
-                        return;
-                    }
-                };
-
-                let mut offset = current_offset;
-                let mut first_chunk = true;
-                let mut bytes_total: u64 = 0;
-                let mut pending_ranges: Vec<(u64, u64)> = Vec::new(); // Batched meta save
-                let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
-                let mut iter = download_iter;
-
-                loop {
-                    // Check timeout — stop after 120 seconds regardless
-                    if tokio::time::Instant::now() >= timeout {
-                        log::info!("[CONTINUATION] Timeout reached for msg {}, stopping at offset {}", msg_id, offset);
-                        break;
-                    }
-
-                    // Re-check covering download periodically — if a player-facing
-                    // SEQUENTIAL download started and covers our range, stop the
-                    // continuation (the player download will cache data faster).
-                    // Exclude continuation downloads (is_continuation flag) so we
-                    // don't find ourselves and loop infinitely.
-                    if bytes_total > 0 && bytes_total % (4 * 1024 * 1024) == 0 {
-                        let covering = cache_mgr_clone.find_best_covering_download(msg_id, offset, file_end).await;
-                        if covering.is_some() && !covering.unwrap().is_continuation {
-                            log::info!(
-                                "[CONTINUATION] Stopping for msg {} — player-facing covering download appeared at offset {}",
-                                msg_id, offset
-                            );
-                            break;
-                        }
-                    }
-
-                    // Acquire semaphore before hitting Telegram API
-                    let _permit = semaphore.acquire().await.unwrap();
-                    match iter.next().await.transpose() {
-                        Some(Ok(bytes)) => {
-                            let mut chunk_data = bytes;
-                            if first_chunk && bytes_to_discard > 0 {
-                                let discard = bytes_to_discard.min(chunk_data.len() as u64) as usize;
-                                chunk_data = chunk_data[discard..].to_vec();
-                                first_chunk = false;
-                            }
-
-                            let remaining_bytes = file_end - offset + 1;
-                            let final_data = if chunk_data.len() as u64 > remaining_bytes {
-                                chunk_data[..remaining_bytes as usize].to_vec()
-                            } else {
-                                chunk_data
-                            };
-
-                            let bytes_in_chunk = final_data.len() as u64;
-                            let chunk_range_end = offset + bytes_in_chunk - 1;
-
-                            // Cache-skip optimization: check if this range is already
-                            // cached (from a previous download or another continuation).
-                            // If cached, skip writing to avoid duplicate meta entries.
-                            let _lock = cache_mgr_clone.lock_meta(msg_id).await;
-                            let meta = cache_mgr_clone.load_meta(msg_id);
-                            let already_cached = meta.as_ref()
-                                .map(|m| is_range_cached(&m.cached_ranges, offset, chunk_range_end))
-                                .unwrap_or(false);
-                            drop(_lock);
-
-                            if !already_cached {
-                                // Write to cache file
-                                let _ = cache_file.seek(SeekFrom::Start(offset));
-                                let _ = cache_file.write_all(&final_data);
-
-                                // Accumulate range for batched meta save.
-                                // Instead of saving meta on every chunk (expensive
-                                // sync_all + rename on Windows), accumulate ranges
-                                // and flush every 4MB to reduce I/O overhead.
-                                pending_ranges.push((offset, chunk_range_end));
-                                if pending_ranges.len() >= 8 || chunk_range_end >= file_end {
-                                    let _lock = cache_mgr_clone.lock_meta(msg_id).await;
-                                    let mut meta = match cache_mgr_clone.load_meta(msg_id) {
-                                        Some(m) => m,
-                                        None => {
-                                            log::warn!("[CONTINUATION] Meta missing for msg {}, creating recovery", msg_id);
-                                            CacheMeta {
-                                                message_id: msg_id,
-                                                folder_id,
-                                                total_size,
-                                                filename: filename.clone(),
-                                                cached_ranges: Vec::new(),
-                                                mime_type: mime.clone(),
-                                            }
-                                        }
-                                    };
-                                    meta.cached_ranges.extend(pending_ranges.drain(..));
-                                    merge_ranges(&mut meta.cached_ranges);
-                                    if let Err(e) = cache_mgr_clone.save_meta(&meta) {
-                                        log::warn!("[CONTINUATION] Failed to save meta for msg {}: {}", msg_id, e);
-                                    }
-                                    drop(_lock);
-                                }
-                            } else {
-                                log::debug!("[CONTINUATION] Skipping cached range {}-{} for msg {}", offset, chunk_range_end, msg_id);
-                            }
-
-                            offset += bytes_in_chunk;
-                            bytes_total += bytes_in_chunk;
-
-                            // Broadcast progress to coordinator so subscribed
-                            // player requests know data is available in cache.
-                            cache_mgr_clone.update_download_progress(msg_id, cont_start_byte, chunk_range_end).await;
-
-                            // Throttle only when no player is subscribed.
-                            // If the coordinator has subscribers watching our
-                            // progress channel, skip throttling — the player
-                            // needs data fast and is actively waiting.
-                            if limit_kb > 0 && registered.is_none() {
-                                let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
-                                let sleep_ms = sleep_ms.min(2000);
-                                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                            }
-
-                            if chunk_range_end >= file_end {
-                                log::info!("[CONTINUATION] Completed background download for msg {} up to offset {}", msg_id, offset);
-                                break;
-                            }
-                        }
-                        None => {
-                            log::info!("[CONTINUATION] Download iterator exhausted for msg {}", msg_id);
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            log::error!("[CONTINUATION] Download error for msg {}: {}", msg_id, e);
-                            break;
-                        }
-                    }
-                }
-                log::info!("[CONTINUATION] Background task ended for msg {}, downloaded {} bytes, final offset {}", msg_id, bytes_total, offset);
-
-                // Flush any remaining pending meta ranges before unregister.
-                if !pending_ranges.is_empty() {
-                    let _lock = cache_mgr_clone.lock_meta(msg_id).await;
-                    let mut meta = cache_mgr_clone.load_meta(msg_id);
-                    if let Some(ref mut m) = meta {
-                        m.cached_ranges.extend(pending_ranges);
-                        merge_ranges(&mut m.cached_ranges);
-                        if let Err(e) = cache_mgr_clone.save_meta(m) {
-                            log::warn!("[CONTINUATION] Final meta flush failed for msg {}: {}", msg_id, e);
-                        }
-                    }
-                    drop(_lock);
-                }
-
-                // Unregister from coordinator so it doesn't show stale entries.
-                if registered.is_some() {
-                    cache_mgr_clone.unregister_download(msg_id, cont_start_byte, file_end).await;
-                }
-            });
-        }
-    }
-}
+// ContinuationGuard removed — the proactive prebuffer is now the ONLY path
+// that downloads from Telegram. /stream reads exclusively from disk cache
+// and polls when data isn't available yet. See the disk-cache poll loop below.
 
 /// Holds the per-session streaming token for Actix validation
 pub(crate) struct StreamTokenData {
@@ -819,10 +506,8 @@ async fn stream_media(
             None
         };
 
-    let cache_mgr_opt: Option<StreamCacheManager> =
-        (**cache).as_ref().map(|cm| cm.clone());
-
-    
+    // cache_mgr_opt was here — now replaced by cache_mgr_for_stream created
+    // inside the streaming path (no longer needed at function scope).
 
     let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
     let cache_filename = match &media {
@@ -958,7 +643,6 @@ async fn stream_media(
                 let subscriber_mime = mime.clone();
                 let subscriber_size = size;
                 let subscriber_msg = message_id;
-                let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
 
                 let subscriber_stream = async_stream::stream! {
                 // Track streaming activity so cmd_delete_cache refuses to delete
@@ -1095,12 +779,8 @@ async fn stream_media(
                         }
                     }
 
-                    // Throttle (same logic as SEQUENTIAL download)
-                    if limit_kb > 0 {
-                        let sleep_ms = (chunk_size as u64 * 1000) / (limit_kb * 1024);
-                        let sleep_ms = sleep_ms.min(2000);
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    }
+                    // No throttle needed — subscriber reads from disk cache,
+                    // not from Telegram (the proactive prebuffer handles downloads).
 
                     if bytes_remaining == 0 {
                         break;
@@ -1135,57 +815,19 @@ async fn stream_media(
             }
             } else {
                 // Progress too far from needed offset — skip subscription.
-                // Check if we can start a new targeted download. If max concurrent
-                // is already reached, return 503 Retry-After instead of "proceeding
-                // unregistered" — this prevents the download cascade where unregistered
-                // downloads waste bandwidth without coordinator visibility.
-                let active_count = cache_mgr.active_download_count(message_id).await;
-                if active_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
-                    let retry_seconds = (distance / (500 * 1024)).max(2).min(30); // Estimate: 500KB/s download speed
-                    log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription (distance={} > 10MB), max concurrent ({}) reached, returning 503 Retry-After:{}s",
-                        message_id, start_byte, end_byte, distance, active_count, retry_seconds);
-                    return HttpResponse::ServiceUnavailable()
-                        .insert_header(("Retry-After", retry_seconds.to_string()))
-                        .insert_header(("X-Reason", "download-busy"))
-                        .body("Max concurrent downloads reached for this file — retry after data is cached");
-                }
-                log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription to {}-{} (progress={}, distance={} > 10MB), starting targeted SEQUENTIAL download",
+                // Fall through to disk-cache poll loop below (no Telegram
+                // download needed — the proactive prebuffer handles that).
+                log::info!("[PREBUFFER] COORDINATOR: msg {} range {}-{} skipping subscription to {}-{} (progress={}, distance={} > 10MB), falling through to cache-poll",
                     message_id, start_byte, end_byte, dl.start_byte, dl.end_byte, current_progress, distance);
-                // Fall through to SEQUENTIAL download section below
             }
         }
     }
 
-    // No covering download found AND max concurrent downloads reached —
-    // return HTTP 503 Retry-After. This eliminates the "proceed unregistered"
-    // cascade where downloads waste bandwidth without coordinator visibility.
-    // The browser will retry the request after the specified delay, and by then
-    // the data should be cached (the active downloads will have progressed).
-    if let Some(ref cache_mgr) = **cache {
-        let active_count = cache_mgr.active_download_count(message_id).await;
-        if active_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
-            // Estimate retry time based on download progress distance.
-            // If a covering/nearest download exists, calculate how long until it reaches our offset.
-            // Conservative estimate: 500KB/s Telegram download speed.
-            let retry_seconds = if let Some(nearest) = cache_mgr.find_nearest_download(message_id, start_byte).await {
-                let progress = *nearest.progress_rx.borrow();
-                let distance = start_byte.saturating_sub(progress);
-                (distance / (500 * 1024)).max(2).min(30)
-            } else {
-                5 // No download found — give it 5 seconds for one to start
-            };
-
-            log::info!("[PREBUFFER] COORDINATOR_LIMIT: msg {} range {}-{} max concurrent ({}) reached, returning 503 Retry-After:{}s",
-                message_id, start_byte, end_byte, active_count, retry_seconds);
-            return HttpResponse::ServiceUnavailable()
-                .insert_header(("Retry-After", retry_seconds.to_string()))
-                .insert_header(("X-Reason", "download-busy"))
-                .body("Max concurrent downloads reached — retry after data is cached");
-        }
-    }
-
-    // No active download covers our range — proceed with new SEQUENTIAL download
-                // No active download covers our range — proceed with new SEQUENTIAL download
+    // No active download covers our range — proceed with disk-cache poll.
+    // Unlike the old architecture, we do NOT start a Telegram download here.
+    // The proactive prebuffer is the ONLY path that downloads from Telegram.
+    // /stream reads exclusively from disk cache, polling when data isn't
+    // available yet (with a 30s Telegram fallback as a safety net).
 
     let client_guard = { data.client.lock().await.clone() };
     let client = match client_guard {
@@ -1193,167 +835,30 @@ async fn stream_media(
         None => return HttpResponse::ServiceUnavailable().body("Telegram client not connected"),
     };
 
-    // === STREAMING PATH ===
-    // NOTE: Parallel streaming via DownloadPool is disabled for the player-facing
-    // HTTP response because out-of-order/corrupted chunk delivery causes
-    // CHUNK_DEMUXER_ERROR in the MSE player. Sequential single-connection
-    // streaming is used instead, which guarantees in-order, correct data.
-    // The DownloadPool is still available for background cache gap filling
-    // (streaming.rs) where data correctness can be validated independently.
-    let use_parallel = false; // Disabled until parallel stream data correctness is verified
-    let _pool_guard = { data.download_pool.lock().await.clone() }; // Available when parallel is re-enabled
+    // === DISK-CACHE POLL STREAMING PATH ===
+    // /stream reads ONLY from disk cache. When data isn't cached yet,
+    // it polls every 100ms waiting for the proactive prebuffer to download
+    // it. After 30s timeout without cache data, falls back to Telegram
+    // download as a safety net (prevents player from hanging forever
+    // if the proactive prebuffer fails or isn't running).
 
-    if use_parallel {
-        let pool = _pool_guard.unwrap();
-        log::info!("[PREBUFFER] PARALLEL: msg {} range {}-{} ({} bytes) using {} workers",
-            message_id, start_byte, end_byte, content_length, 3);
+    log::info!("[PREBUFFER] CACHE-POLL: msg {} range {}-{} ({} bytes) polling disk cache",
+        message_id, start_byte, end_byte, content_length);
 
-        let mut rx = pool.stream_range(
-            &media, start_byte, end_byte, size, data.download_semaphore.clone(),
-        );
+    // Clone cache_mgr for use inside the async_stream block.
+    let cache_mgr_for_stream = (**cache).as_ref().map(|cm| cm.clone());
 
-        let stream = async_stream::stream! {
-            // Track streaming activity so cmd_delete_cache refuses to delete
-            // files while this stream is active (Bug #11 fix).
-            let _stream_guard = if let Some(ref cache_mgr) = cache_mgr_opt {
-                cache_mgr.track_streaming(message_id);
-                StreamingGuard {
-                    cache_mgr: Some(cache_mgr.clone()),
-                    message_id,
-                }
-            } else {
-                StreamingGuard { cache_mgr: None, message_id }
-            };
-
-            let mut bytes_sent: u64 = 0;
-            #[allow(unused_assignments)]
-            let mut current_offset = start_byte; // Set from chunk offsets in parallel mode
-            let mut cache_file_mut = cache_file_opt;
-
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    Ok(StreamChunk { offset, data: chunk_data }) => {
-                        // Use the offset from the chunk (reorder buffer guarantees
-                        // in-order delivery, but offset field provides correctness)
-                        current_offset = offset;
-                        let remaining = content_length - bytes_sent;
-                        if remaining == 0 { break; }
-
-                        // The chunk might be larger than remaining (last chunk)
-                        let final_data = if chunk_data.len() as u64 > remaining {
-                            chunk_data[..remaining as usize].to_vec()
-                        } else {
-                            chunk_data
-                        };
-
-                        let bytes_in_chunk = final_data.len() as u64;
-                        let chunk_range_end = current_offset + bytes_in_chunk - 1;
-
-                        // 1) Write to cache file at the correct offset
-                        if let Some(ref mut cache_file) = cache_file_mut {
-                            let _ = cache_file.seek(SeekFrom::Start(current_offset));
-                            let _ = cache_file.write_all(&final_data);
-                        }
-
-                        // 2) Update meta
-                        if let Some(ref cache_mgr) = cache_mgr_opt {
-                            let _lock = cache_mgr.lock_meta(message_id).await;
-                            let mut meta = match cache_mgr.load_meta(message_id) {
-                                Some(m) => m,
-                                None => {
-                                    CacheMeta {
-                                        message_id,
-                                        folder_id: cache_folder_id,
-                                        total_size: size,
-                                        filename: cache_filename.clone(),
-                                        cached_ranges: Vec::new(),
-                                        mime_type: mime_stream.clone(),
-                                    }
-                                }
-                            };
-                            meta.cached_ranges.push((current_offset, chunk_range_end));
-                            merge_ranges(&mut meta.cached_ranges);
-                            if let Err(e) = cache_mgr.save_meta(&meta) {
-                                log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
-                            }
-                        }
-
-                        bytes_sent += bytes_in_chunk;
-
-                        // Rewrite PAT/PMT for TS files — same fix as SEQUENTIAL path
-                        let chunk_start_byte = current_offset;
-                        let mut yield_data = final_data;
-                        if let Some(ref cache_mgr) = cache_mgr_opt {
-                            let data_path = cache_mgr.data_path(message_id);
-                            rewrite_ts_stream_in_buf(&mut yield_data, chunk_start_byte, cache_mgr, message_id, Some(&data_path));
-                        }
-
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
-
-                        // Throttle
-                        let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
-                        if limit_kb > 0 {
-                            let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
-                            let sleep_ms = sleep_ms.min(2000);
-                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                        }
-
-                        if bytes_sent >= content_length { break; }
-                    }
-                    Err(e) => {
-                        log::error!("[PREBUFFER] Parallel stream error for msg {}: {}", message_id, e);
-                        break;
-                    }
-                }
-            }
-        };
-
-        if is_partial {
-            HttpResponse::PartialContent()
-                .insert_header(("Content-Type", mime))
-                .insert_header(("Content-Length", content_length.to_string()))
-                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
-                .insert_header(("Accept-Ranges", "bytes"))
-                .insert_header(("Connection", "keep-alive"))
-                .insert_header(("X-Download-Mode", "parallel"))
-                .streaming(stream)
-        } else {
-            HttpResponse::Ok()
-                .insert_header(("Content-Type", mime))
-                .insert_header(("Content-Length", size.to_string()))
-                .insert_header(("Accept-Ranges", "bytes"))
-                .insert_header(("X-Download-Mode", "parallel"))
-                .streaming(stream)
-        }
-    } else {
-        // === FALLBACK: Single-connection streaming via iter_download ===
-        // Used for small ranges (<1MB) or when DownloadPool is not available.
-        log::info!("[PREBUFFER] SEQUENTIAL: msg {} range {}-{} using single connection",
-            message_id, start_byte, end_byte);
-
-        // Clone cache_mgr for use inside the async_stream block —
-        // register_download and guards must live inside the stream
-        // so they're only dropped when the stream itself is dropped (Bug #10 fix).
-        let cache_mgr_for_stream = (**cache).as_ref().map(|cm| cm.clone());
-
-        let chunks_to_skip = (start_byte / TELEGRAM_CHUNK_SIZE as u64) as i32;
-        let bytes_to_discard = start_byte % TELEGRAM_CHUNK_SIZE as u64;
-
-        let download_iter = client.iter_download(&media)
-            .chunk_size(TELEGRAM_CHUNK_SIZE)
-            .skip_chunks(chunks_to_skip);
-
-        // Track bytes_sent across the stream boundary so ContinuationGuard
-        // can determine how far the download got and whether to continue.
-        let bytes_sent_atomic = Arc::new(AtomicU64::new(0));
+    // Prepare data needed for the Telegram fallback (30s timeout safety net).
+    // Only used if the proactive prebuffer fails to deliver data in time.
+    let client_clone = client.clone();
+    let media_clone = media.clone();
+    let semaphore_clone = data.download_semaphore.clone();
 
     let stream = async_stream::stream! {
         // ── CACHE PREFIX: Serve already-cached bytes instantly from disk ──
         // mpegts.js always requests range X-EOF, so the full range is rarely cached.
         // But there's often a contiguous cached prefix from a previous lazyLoad cycle.
-        // Yield those bytes immediately (no Telegram download needed) before
-        // starting the Telegram download for the uncached remainder.
-        // This makes the green buffer bar meaningful — cached data is actually reused.
+        // Yield those bytes immediately before starting the poll loop.
         let mut effective_start_byte = start_byte;
         if let Some(ref cm) = cache_mgr_for_stream {
             let _lock = cm.lock_meta(message_id).await;
@@ -1370,7 +875,7 @@ async fn stream_media(
                     let prefix_end = cached_end.min(end_byte);
                     let prefix_len = prefix_end - start_byte + 1;
                     if prefix_len > 0 && prefix_len < (end_byte - start_byte + 1) {
-                        // Partial cache hit: serve prefix from disk, then Telegram for remainder
+                        // Partial cache hit: serve prefix from disk, then poll for remainder
                         let cache_path = cm.data_path(message_id);
                         match (|| -> std::io::Result<Vec<u8>> {
                             let mut file = std::fs::File::open(&cache_path)?;
@@ -1382,13 +887,13 @@ async fn stream_media(
                         })() {
                             Ok(mut buf) => {
                                 rewrite_ts_stream_in_buf(&mut buf, start_byte, cm, message_id, Some(&cache_path));
-                                log::info!("[PREBUFFER] CACHE-PREFIX: msg {} served {}-{} ({}B from disk cache), remainder {}-{} from Telegram",
+                                log::info!("[PREBUFFER] CACHE-PREFIX: msg {} served {}-{} ({}B from disk cache), remainder {}-{} from poll",
                                     message_id, start_byte, prefix_end, prefix_len, prefix_end + 1, end_byte);
                                 yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
                                 effective_start_byte = prefix_end + 1;
                             }
                             Err(e) => {
-                                log::warn!("[PREBUFFER] CACHE-PREFIX read failed for msg {}: {}, serving full range from Telegram", message_id, e);
+                                log::warn!("[PREBUFFER] CACHE-PREFIX read failed for msg {}: {}, polling for data", message_id, e);
                             }
                         }
                     }
@@ -1400,11 +905,6 @@ async fn stream_media(
         // files while this stream is active (Bug #11 fix — same pattern as
         // Bug #10: guard must live inside stream block to persist for the
         // entire streaming lifetime, not just the function scope).
-        // If we served a cache prefix above, we must skip that many bytes
-        // from the Telegram download to avoid sending duplicate data.
-        let bytes_to_skip_from_dl = (effective_start_byte - start_byte) as usize;
-        let mut bytes_skipped = 0usize;
-
         let _stream_guard = if let Some(ref cm) = cache_mgr_for_stream {
             cm.track_streaming(message_id);
             StreamingGuard {
@@ -1415,284 +915,295 @@ async fn stream_media(
             StreamingGuard { cache_mgr: None, message_id }
         };
 
-        // Register this download with the coordinator so overlapping requests
-        // can subscribe instead of spawning duplicates (Bug #6 fix).
-        // MUST be inside the stream block so the registration persists for
-        // the entire streaming lifetime — not just the function scope.
-        // Bug #15 fix: register_download now returns Option — if the
-        // MAX_CONCURRENT_DOWNLOADS limit is reached (shouldn't happen since
-        // we checked above), just proceed without registration.
-        let _registered = if let Some(ref cm) = cache_mgr_for_stream {
-            cm.register_download(message_id, start_byte, end_byte, false, start_byte).await.is_some()
+        // ── DISK-CACHE POLL LOOP ──
+        // Poll disk cache every 100ms waiting for proactive prebuffer to
+        // download data. If data doesn't appear within 30s, fall back to
+        // Telegram download as a safety net (prevents player from hanging
+        // forever if the proactive prebuffer fails or isn't running).
+        //
+        // ARCHITECTURE: /stream reads ONLY from disk cache. The proactive
+        // prebuffer is the ONLY path that downloads from Telegram. This
+        // eliminates FLOOD_PREMIUM_WAIT caused by the white bar (player's
+        // IOController) competing with the green bar (proactive prebuffer)
+        // for Telegram bandwidth.
+        let mut read_offset = effective_start_byte;
+        let mut bytes_sent: u64 = effective_start_byte - start_byte;
+        let mut wait_elapsed_ms: u64 = 0;
+        const POLL_INTERVAL_MS: u64 = 100;
+        const FALLBACK_TIMEOUT_MS: u64 = 30000;
+
+        // If there's no cache manager at all, skip the poll loop entirely
+        // and go directly to the Telegram fallback.
+        // If there's no cache meta but a proactive download IS running,
+        // don't skip — the prebuffer will create meta and start writing data
+        // within milliseconds. Waiting avoids a competing Telegram connection.
+        // Only skip poll (use Telegram bootstrap) when there's truly nothing
+        // downloading this message.
+        let has_active_download = if let Some(ref cache_mgr) = cache_mgr_for_stream {
+            cache_mgr.has_active_download_for_msg(message_id).await
         } else {
             false
         };
-
-        // Drop-guard that unregisters the download from the coordinator when
-        // the Actix response ends. Only created if the download was actually
-        // registered (Bug #15: may not be registered if limit was reached).
-        // Lives inside the stream so it's dropped when the stream is dropped,
-        // not when stream_media() returns (Bug #10 fix).
-        // Bug #13 fix: stores start_byte and end_byte so the specific download
-        // can be removed from Vec<ActiveDownload> without affecting other
-        // concurrent downloads for the same message.
-        let _download_guard = if _registered {
-            Some(DownloadGuard {
-                cache_mgr: cache_mgr_for_stream.clone(),
-                message_id,
-                start_byte,
-                end_byte,
-            })
-        } else {
-            None
+        let skip_poll = cache_mgr_for_stream.is_none() || {
+            if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let meta = cache_mgr.load_meta(message_id);
+                drop(_lock);
+                // No meta AND no active download → truly fresh, need bootstrap
+                meta.is_none() && !has_active_download
+            } else {
+                true
+            }
         };
 
-        // Drop-guard that spawns a background continuation task when the
-        // Actix response ends (client disconnect). This keeps downloading
-        // data to the cache so subsequent overlapping range requests find
-        // cached data instead of starting new Telegram downloads.
-        // Only created if we have a cache_mgr, a client, and the range is
-        // large enough (>1MB) to warrant background continuation.
-        let _continuation_guard = if cache_mgr_for_stream.is_some() && content_length > 1024 * 1024 {
-            Some(ContinuationGuard {
-                cache_mgr: cache_mgr_for_stream.clone(),
-                message_id,
-                start_byte,
-                request_end_byte: end_byte,
-                total_file_size: size,
-                bytes_sent: bytes_sent_atomic.clone(),
-                client: Some(client.clone()),
-                media: media.clone(),
-                cache_folder_id,
-                cache_filename: cache_filename.clone(),
-                mime_stream: mime_stream.clone(),
-                download_semaphore: data.download_semaphore.clone(),
-                speed_limit_kb: data.prebuffer_speed_limit_kb.load(Ordering::Relaxed),
-            })
-        } else {
-            None
-        };
+        if skip_poll {
+            log::info!("[STREAM-CACHE-POLL] msg {}: no disk cache exists — using Telegram download directly (bootstrap)", message_id);
+        }
 
-        let mut bytes_sent: u64 = 0;
-        let mut first_chunk = true;
-        let mut iter = download_iter;
-        let mut current_offset = start_byte;
-        let mut cache_file_mut = cache_file_opt;
+        while !skip_poll && bytes_sent < content_length {
+            // Check disk cache for current offset
+            if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let meta = cache_mgr.load_meta(message_id);
+                drop(_lock);
 
-        while let Some(chunk) = {
-            // Acquire the global semaphore before hitting Telegram's API —
-            // serializes with cmd_download_file to prevent FLOOD_WAIT
-            let _permit = data.download_semaphore.acquire().await.unwrap();
-            iter.next().await.transpose()
-        } {
-            match chunk {
-                Ok(bytes) => {
-                    let remaining = content_length - bytes_sent;
-                    if remaining == 0 {
-                        break;
-                    }
-
-                    let mut chunk_data = bytes;
-
-                    // On first chunk, discard leading bytes to align with start_byte
-                    if first_chunk && bytes_to_discard > 0 {
-                        let discard = bytes_to_discard.min(chunk_data.len() as u64) as usize;
-                        chunk_data = chunk_data[discard..].to_vec();
-                        first_chunk = false;
-                    }
-
-                    // If we served a cache prefix above, skip those bytes from
-                    // the Telegram download to avoid sending duplicate data to the client.
-                    // The Telegram download starts from start_byte (the original request),
-                    // but we've already sent bytes [start_byte, effective_start_byte) from disk.
-                    if bytes_skipped < bytes_to_skip_from_dl {
-                        let skip_remaining = bytes_to_skip_from_dl - bytes_skipped;
-                        if chunk_data.len() <= skip_remaining {
-                            // Entire chunk is in the already-sent prefix — skip it entirely
-                            bytes_skipped += chunk_data.len();
-                            current_offset += chunk_data.len() as u64;
-                            continue;
-                        } else {
-                            // Partial skip — discard the prefix portion of this chunk
-                            chunk_data = chunk_data[skip_remaining..].to_vec();
-                            bytes_skipped += skip_remaining;
-                            // Adjust current_offset: it tracks what we've sent to client,
-                            // but the prefix bytes were already yielded from cache.
-                            // current_offset should reflect the Telegram download position
-                            // minus what we've already sent from cache.
-                        }
-                    }
-
-                    let is_last = chunk_data.len() as u64 > remaining;
-                    let final_data = if is_last {
-                        chunk_data[..remaining as usize].to_vec()
-                    } else {
-                        chunk_data
-                    };
-
-                    let bytes_in_chunk = final_data.len() as u64;
-                    let chunk_range_end = current_offset + bytes_in_chunk - 1;
-
-                    // 1) Write data to cache file (seek+write is atomic, no lock needed)
-                    if let Some(ref mut cache_file) = cache_file_mut {
-                        let _ = cache_file.seek(SeekFrom::Start(current_offset));
-                        let _ = cache_file.write_all(&final_data);
-                    }
-
-                    // 2) Update meta with per-message lock (serialized with
-                    //    cmd_report_cached_ranges and other streaming requests)
-                    if let Some(ref cache_mgr) = cache_mgr_opt {
-                        let _lock = cache_mgr.lock_meta(message_id).await;
-                        let mut meta = match cache_mgr.load_meta(message_id) {
-                            Some(m) => m,
-                            None => {
-                                // Meta file temporarily unreadable (filesystem cache,
-                                // antivirus scan, save_meta race). Retry 3 times
-                                // with increasing delays before creating recovery meta.
-                                // NEVER lose all existing ranges by creating empty
-                                // cached_ranges — always try to recover from data file.
-                                log::warn!("[PREBUFFER] Meta load returned None for msg {}, retrying", message_id);
-                                let mut recovered = None;
-                                for (attempt, delay_ms) in [(1, 20), (2, 50), (3, 100)] {
-                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                                    if let Some(m) = cache_mgr.load_meta(message_id) {
-                                        log::info!("[PREBUFFER] Meta recovered for msg {} on attempt {}", message_id, attempt);
-                                        recovered = Some(m);
-                                        break;
+                if let Some(meta) = meta {
+                    // Find cached range that covers read_offset
+                    if let Some(&(_, range_end)) = meta.cached_ranges.iter()
+                        .find(|(s, e)| *s <= read_offset && *e >= read_offset)
+                    {
+                        // Read from disk: read_offset to min(range_end, end_byte)
+                        let read_end = range_end.min(end_byte);
+                        let read_len = (read_end - read_offset + 1) as usize;
+                        let data_path = cache_mgr.data_path(message_id);
+                        match std::fs::File::open(&data_path) {
+                            Ok(mut f) => {
+                                use std::io::Read;
+                                if f.seek(SeekFrom::Start(read_offset)).is_ok() {
+                                    let mut buf = vec![0u8; read_len];
+                                    match f.read_exact(&mut buf) {
+                                        Ok(()) => {
+                                            rewrite_ts_stream_in_buf(&mut buf, read_offset, cache_mgr, message_id, Some(&data_path));
+                                            if wait_elapsed_ms > 0 {
+                                                log::info!("[STREAM-CACHE-WAIT] cache-ready at offset {} for msg {}, waited {}ms",
+                                                    read_offset, message_id, wait_elapsed_ms);
+                                                wait_elapsed_ms = 0;
+                                            }
+                                            yield Ok::<_, actix_web::Error>(web::Bytes::from(buf));
+                                            bytes_sent += read_len as u64;
+                                            read_offset = read_end + 1;
+                                            continue;
+                                        }
+                                        Err(_) => {} // Fall through to poll wait
                                     }
                                 }
-                                match recovered {
+                            }
+                            Err(_) => {} // Fall through to poll wait
+                        }
+                    }
+                }
+            }
+
+            // Data not cached yet — wait for proactive prebuffer to download it
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            wait_elapsed_ms += POLL_INTERVAL_MS;
+
+            // Log waiting status periodically (every 2 seconds)
+            if wait_elapsed_ms > 0 && wait_elapsed_ms % 2000 == 0 {
+                log::info!("[STREAM-CACHE-WAIT] waiting for cache at offset {} for msg {}, elapsed {}ms",
+                    read_offset, message_id, wait_elapsed_ms);
+            }
+
+            // Check if a proactive prebuffer download is actually running.
+            // If NO download exists for this message, the cache-poll will wait
+            // forever — fall back to Telegram quickly (5s instead of 30s).
+            let has_active_download = if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                cache_mgr.has_active_download_for_msg(message_id).await
+            } else {
+                false
+            };
+            if !has_active_download && wait_elapsed_ms >= 5000 {
+                log::warn!("[STREAM-CACHE-WAIT] msg {}: no proactive prebuffer running and 5s elapsed, falling back to Telegram",
+                    message_id);
+                break;
+            }
+
+            // Safety timeout: if data doesn't appear in 30s, fall back to Telegram
+            if wait_elapsed_ms >= FALLBACK_TIMEOUT_MS {
+                log::warn!("[STREAM-CACHE-WAIT] msg {}: 30s timeout waiting for cache at offset {}, falling back to Telegram",
+                    message_id, read_offset);
+                break; // Exit poll loop, enter Telegram fallback below
+            }
+        }
+
+        // ── TELEGRAM FALLBACK ──
+        // If the poll loop timed out (30s without cache data) OR there's no
+        // cache manager at all, download remaining data directly from Telegram.
+        // This is a safety net for when the proactive prebuffer fails or
+        // isn't running — prevents the player from hanging forever.
+        if bytes_sent < content_length {
+            let fallback_start = read_offset;
+            let fallback_remaining = content_length - bytes_sent;
+            log::info!("[STREAM-FALLBACK] msg {} falling back to Telegram download from offset {}, {} bytes remaining",
+                message_id, fallback_start, fallback_remaining);
+
+            let chunks_to_skip = (fallback_start / TELEGRAM_CHUNK_SIZE as u64) as i32;
+            let bytes_to_discard_from_chunk = fallback_start % TELEGRAM_CHUNK_SIZE as u64;
+
+            let download_iter = client_clone.iter_download(&media_clone)
+                .chunk_size(TELEGRAM_CHUNK_SIZE)
+                .skip_chunks(chunks_to_skip);
+
+            // Register this fallback download with the coordinator so
+            // overlapping requests can subscribe instead of duplicating.
+            let _registered = if let Some(ref cm) = cache_mgr_for_stream {
+                cm.register_download(message_id, fallback_start, end_byte, false, fallback_start).await.is_some()
+            } else {
+                false
+            };
+
+            // Drop-guard that unregisters the download from the coordinator
+            // when the stream ends (Bug #10, #13, #15 fixes).
+            let _download_guard = if _registered {
+                Some(DownloadGuard {
+                    cache_mgr: cache_mgr_for_stream.clone(),
+                    message_id,
+                    start_byte: fallback_start,
+                    end_byte,
+                })
+            } else {
+                None
+            };
+
+            let mut cache_file_mut = cache_file_opt;
+            let mut first_chunk = true;
+            let mut current_offset = fallback_start;
+            let mut iter = download_iter;
+            let mut pending_ranges: Vec<(u64, u64)> = Vec::new();
+
+            while let Some(chunk) = {
+                // Acquire the global semaphore before hitting Telegram's API —
+                // serializes with cmd_download_file to prevent FLOOD_WAIT
+                let _permit = semaphore_clone.acquire().await.unwrap();
+                iter.next().await.transpose()
+            } {
+                match chunk {
+                    Ok(bytes) => {
+                        let remaining = content_length - bytes_sent;
+                        if remaining == 0 { break; }
+
+                        let mut chunk_data = bytes;
+
+                        // On first chunk, discard leading bytes to align with fallback_start
+                        if first_chunk && bytes_to_discard_from_chunk > 0 {
+                            let discard = bytes_to_discard_from_chunk.min(chunk_data.len() as u64) as usize;
+                            chunk_data = chunk_data[discard..].to_vec();
+                            first_chunk = false;
+                        }
+
+                        let is_last = chunk_data.len() as u64 > remaining;
+                        let final_data = if is_last {
+                            chunk_data[..remaining as usize].to_vec()
+                        } else {
+                            chunk_data
+                        };
+
+                        let bytes_in_chunk = final_data.len() as u64;
+                        let chunk_range_end = current_offset + bytes_in_chunk - 1;
+
+                        // 1) Write data to cache file
+                        if let Some(ref mut cache_file) = cache_file_mut {
+                            let _ = cache_file.seek(SeekFrom::Start(current_offset));
+                            let _ = cache_file.write_all(&final_data);
+                        }
+
+                        // 2) Update meta with per-message lock (batched for efficiency)
+                        if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                            pending_ranges.push((current_offset, chunk_range_end));
+                            // Flush meta every 4MB or on last chunk
+                            if pending_ranges.len() >= 8 || is_last || chunk_range_end >= end_byte {
+                                let _lock = cache_mgr.lock_meta(message_id).await;
+                                let mut meta = match cache_mgr.load_meta(message_id) {
                                     Some(m) => m,
                                     None => {
-                                        // All retries failed. Create recovery meta that
-                                        // preserves as much info as possible. On Windows,
-                                        // files can enter "pending delete" state where
-                                        // the directory entry is gone but open handles
-                                        // remain valid — use the open cache file handle
-                                        // as a fallback for file size detection.
-                                        let data_path = cache_mgr.data_path(message_id);
-                                        let data_exists = data_path.exists();
-                                        let fs_data_size = if data_exists {
-                                            std::fs::metadata(&data_path)
-                                                .map(|m| m.len()).unwrap_or(0)
-                                        } else { 0 };
-                                        // Fallback: open handle metadata (handles
-                                        // Windows "pending delete" where directory
-                                        // entry is gone but handle is still valid)
-                                        let handle_data_size = cache_file_mut
-                                            .as_ref()
-                                            .and_then(|f| f.metadata().ok())
-                                            .map(|m| m.len())
-                                            .unwrap_or(0);
-                                        let _data_size = fs_data_size.max(handle_data_size);
-                                        log::warn!("[PREBUFFER] Meta recovery for msg {}: data_file_exists={}, fs_data_size={}, handle_data_size={}, total_size={}", 
-                                            message_id, data_exists, fs_data_size, handle_data_size, size);
-                                        // Bug #8 fix: DO NOT claim (0, data_size-1) is cached.
-                                        // The .dat file may be sparse (only partially downloaded
-                                        // from previous sessions). Over-claiming causes the
-                                        // player to read zero-filled data from uncached regions,
-                                        // which corrupts MSE playback.
-                                        // Instead, start with empty cached_ranges and let the
-                                        // normal chunk writes populate the correct ranges.
-                                        let recovery_ranges = Vec::new();
                                         CacheMeta {
                                             message_id,
                                             folder_id: cache_folder_id,
                                             total_size: size,
                                             filename: cache_filename.clone(),
-                                            cached_ranges: recovery_ranges,
+                                            cached_ranges: Vec::new(),
                                             mime_type: mime_stream.clone(),
                                         }
                                     }
+                                };
+                                meta.cached_ranges.extend(pending_ranges.drain(..));
+                                merge_ranges(&mut meta.cached_ranges);
+                                if let Err(e) = cache_mgr.save_meta(&meta) {
+                                    log::warn!("[STREAM-FALLBACK] Failed to save meta for msg {}: {}", message_id, e);
                                 }
+                                drop(_lock);
                             }
-                        };
-                        meta.cached_ranges.push((current_offset, chunk_range_end));
-                        merge_ranges(&mut meta.cached_ranges);
-                        if let Err(e) = cache_mgr.save_meta(&meta) {
-                            log::warn!("[PREBUFFER] Failed to save meta for msg {}: {}", message_id, e);
+                            // Broadcast progress to coordinator subscribers
+                            if _registered {
+                                cache_mgr.update_download_progress(message_id, fallback_start, chunk_range_end).await;
+                            }
                         }
-                        // Per-chunk ADD log is too verbose for large videos — commented out
-                        // log::info!("[PREBUFFER] ADD: msg {} range {}-{} written to cache, meta ranges: {:?}",
-                        //     message_id, current_offset, chunk_range_end, meta.cached_ranges);
-                        // Broadcast progress to subscribers (Bug #6 coordinator)
-                        // Bug #13 fix: pass start_byte so update_download_progress
-                        // can find the correct download in Vec<ActiveDownload>
-                        // Bug #15 fix: only update progress if registered
-                        if _registered {
-                            cache_mgr.update_download_progress(message_id, start_byte, chunk_range_end).await;
+
+                        current_offset += bytes_in_chunk;
+                        bytes_sent += bytes_in_chunk;
+
+                        // Rewrite TS data before yielding (same as HIT path)
+                        let chunk_start_byte = current_offset - bytes_in_chunk;
+                        let mut yield_data = final_data;
+                        if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                            let data_path = cache_mgr.data_path(message_id);
+                            rewrite_ts_stream_in_buf(&mut yield_data, chunk_start_byte, cache_mgr, message_id, Some(&data_path));
                         }
+
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
+
+                        if is_last { break; }
                     }
-
-                    current_offset += bytes_in_chunk;
-                    bytes_sent += bytes_in_chunk;
-                    bytes_sent_atomic.store(bytes_sent, Ordering::Relaxed);
-
-                    // Rewrite init_prefix and inline PAT/PMT if this chunk covers
-                    // TS file data. The HIT path already applies rewriting when
-                    // reading from cache, but the SEQUENTIAL (MISS) path downloads
-                    // raw data from Telegram and writes it to cache WITHOUT rewriting.
-                    // This means the raw data (with PMT PID 0x0FFF and stream_type 0x15)
-                    // reaches the client. Mediabunny can't parse stream_type 0x15
-                    // (AAC LATM), so the transmuxer fails to produce audio segments.
-                    // The fix: rewrite the chunk data BEFORE yielding to the client.
-                    // The cache file still stores raw data (for HIT path rewriting).
-                    // Note: rewrite_ts_stream_in_buf is safe on already-rewritten data
-                    // — it won't double-rewrite (patterns won't match on rewritten bytes).
-                    let chunk_start_byte = current_offset - bytes_in_chunk;
-                    let mut yield_data = final_data;
-                    if let Some(ref cache_mgr) = cache_mgr_opt {
-                        let data_path = cache_mgr.data_path(message_id);
-                        rewrite_ts_stream_in_buf(&mut yield_data, chunk_start_byte, cache_mgr, message_id, Some(&data_path));
-                    }
-
-                    yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
-
-                    // Throttle: sleep after chunk release to enforce prebuffer speed limit
-                    // Semaphore is already released (yield point), so download task can
-                    // use the connection during this sleep window.
-                    let limit_kb = data.prebuffer_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
-                    if limit_kb > 0 {
-                        // 512KB chunk at limit_kb KB/s → sleep_ms = bytes * 1000 / (limit_kb * 1024)
-                        let sleep_ms = (bytes_in_chunk * 1000) / (limit_kb * 1024);
-                        let sleep_ms = sleep_ms.min(2000); // Cap to prevent excessive delays on tiny chunks
-                        // log::info!("[THROTTLE-DBG][PREBUFFER] msg={}, chunk_bytes={}, limit_kb={}/s, sleep_ms={}, offset={}", 
-                        //     message_id, bytes_in_chunk, limit_kb, sleep_ms, current_offset);
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    } else {
-                        // log::info!("[THROTTLE-DBG][PREBUFFER] msg={}, unlimited (limit_kb=0), no throttle sleep, offset={}", 
-                        //     message_id, current_offset);
-                    }
-
-                    if is_last {
+                    Err(e) => {
+                        log::error!("[STREAM-FALLBACK] Download error for msg {}: {}", message_id, e);
                         break;
                     }
                 }
-                Err(e) => {
-                    log::error!("[PREBUFFER] Stream error for msg {}: {}", message_id, e);
-                    break;
+            }
+
+            // Flush any remaining pending meta ranges
+            if !pending_ranges.is_empty() {
+                if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                    let _lock = cache_mgr.lock_meta(message_id).await;
+                    if let Some(mut meta) = cache_mgr.load_meta(message_id) {
+                        meta.cached_ranges.extend(pending_ranges);
+                        merge_ranges(&mut meta.cached_ranges);
+                        if let Err(e) = cache_mgr.save_meta(&meta) {
+                            log::warn!("[STREAM-FALLBACK] Final meta flush failed for msg {}: {}", message_id, e);
+                        }
+                    }
+                    drop(_lock);
                 }
             }
         }
     };
 
-        if is_partial {
-            HttpResponse::PartialContent()
-                .insert_header(("Content-Type", mime))
-                .insert_header(("Content-Length", content_length.to_string()))
-                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
-                .insert_header(("Accept-Ranges", "bytes"))
-                .insert_header(("Connection", "keep-alive"))
-                .insert_header(("X-Download-Mode", "sequential"))
-                .streaming(stream)
-        } else {
-            HttpResponse::Ok()
-                .insert_header(("Content-Type", mime))
-                .insert_header(("Content-Length", size.to_string()))
-                .insert_header(("Accept-Ranges", "bytes"))
-                .insert_header(("X-Download-Mode", "sequential"))
-                .streaming(stream)
-        }
+    if is_partial {
+        HttpResponse::PartialContent()
+            .insert_header(("Content-Type", mime))
+            .insert_header(("Content-Length", content_length.to_string()))
+            .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
+            .insert_header(("Accept-Ranges", "bytes"))
+            .insert_header(("Connection", "keep-alive"))
+            .insert_header(("X-Download-Mode", "cache-poll"))
+            .streaming(stream)
+    } else {
+        HttpResponse::Ok()
+            .insert_header(("Content-Type", mime))
+            .insert_header(("Content-Length", size.to_string()))
+            .insert_header(("Accept-Ranges", "bytes"))
+            .insert_header(("X-Download-Mode", "cache-poll"))
+            .streaming(stream)
     }
 }
 
@@ -4097,175 +3608,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod continuation_tests {
-    use super::continuation_should_run;
-
-    // === continuation_should_run tests ===
-    // These test the pure decision logic extracted from ContinuationGuard::drop.
-    // The function decides whether a background continuation download should be
-    // spawned after the HTTP response ends, based on how much data remains
-    // in the file beyond what was already served.
-
-    /// Pre-buffer scenario: 5MB served on a 1.3GB file.
-    /// This is THE critical bug case — old logic used request end_byte (5242880)
-    /// instead of total_file_size (1313957192), so remaining=0 after serving
-    /// all 5MB, and no continuation was spawned. New logic correctly calculates
-    /// remaining ≈ 1.3GB and spawns continuation from byte 5242881 to file end.
-    #[test]
-    fn continuation_prebuffer_5mb_on_large_file() {
-        let total_file_size: u64 = 1_313_957_192; // 1.3GB .ts file
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 5_242_881; // 5MB pre-buffer served completely
-
-        let (should, remaining, offset, file_end) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(should, "5MB pre-buffer on 1.3GB file MUST trigger continuation");
-        assert_eq!(remaining, total_file_size - bytes_sent, "remaining = total - sent");
-        assert_eq!(offset, bytes_sent, "continuation starts at sent boundary");
-        assert_eq!(file_end, total_file_size - 1, "continuation downloads to file end");
-    }
-
-    /// Full file request completed: all bytes served, remaining=0, no continuation.
-    #[test]
-    fn continuation_full_file_completed() {
-        let total_file_size: u64 = 10_000_000;
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 10_000_000;
-
-        let (should, remaining, _, _) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(!should, "Full file served — no continuation needed");
-        assert_eq!(remaining, 0);
-    }
-
-    /// Mid-stream disconnect: client disconnects at 3MB of 1.3GB file.
-    /// Remaining ≈ 1.27GB > 2MB → continuation spawned from 3MB onwards.
-    #[test]
-    fn continuation_mid_stream_disconnect() {
-        let total_file_size: u64 = 1_313_957_192;
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 3_000_000;
-
-        let (should, remaining, offset, file_end) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(should, "Mid-stream disconnect must trigger continuation");
-        assert_eq!(remaining, total_file_size - bytes_sent);
-        assert_eq!(offset, bytes_sent);
-        assert_eq!(file_end, total_file_size - 1);
-    }
-
-    /// Zero bytes sent: trivially short download, don't spawn continuation.
-    #[test]
-    fn continuation_zero_bytes_sent() {
-        let (should, _, _, _) = continuation_should_run(1_000_000_000, 0, 0);
-        assert!(!should, "Zero bytes sent — no continuation");
-    }
-
-    /// Small remaining (<2MB): not worth spawning a background task.
-    #[test]
-    fn continuation_small_remaining() {
-        let total_file_size: u64 = 3_000_000; // 3MB file
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 1_500_000; // 1.5MB sent, 1.5MB remaining
-
-        let (should, remaining, _, _) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(!should, "Remaining <2MB — no continuation");
-        assert_eq!(remaining, 1_500_000);
-    }
-
-    /// Exactly 2MB remaining: boundary case — should continue (check is strict <).
-    #[test]
-    fn continuation_exactly_2mb_remaining() {
-        let two_mb = 2 * 1024 * 1024;
-        let total_file_size: u64 = two_mb + 5_000_000; // 7MB file
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 5_000_000; // 5MB sent, exactly 2MB remaining
-
-        let (should, remaining, _, _) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(should, "Exactly 2MB remaining passes the >=2MB threshold, so continuation is spawned");
-        assert_eq!(remaining, two_mb);
-    }
-
-    /// Just above 2MB remaining: should continue.
-    #[test]
-    fn continuation_just_above_2mb_remaining() {
-        let two_mb = 2 * 1024 * 1024;
-        let total_file_size: u64 = two_mb + 5_000_000 + 1;
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = 5_000_000;
-
-        let (should, remaining, _, _) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(should, "Remaining >2MB — should continue");
-        assert_eq!(remaining, two_mb + 1);
-    }
-
-    /// total_file_size == 0: defensive bail out.
-    #[test]
-    fn continuation_zero_file_size() {
-        let (should, remaining, _, _) = continuation_should_run(0, 0, 0);
-        assert!(!should, "Zero file size — bail out");
-        assert_eq!(remaining, 0);
-    }
-
-    /// start_byte >= total_file_size: range beyond file end, bail out.
-    #[test]
-    fn continuation_start_beyond_file() {
-        let (should, _, _, _) = continuation_should_run(1_000_000, 1_500_000, 0);
-        assert!(!should, "start_byte > total_file_size — bail out");
-    }
-
-    /// start_byte == total_file_size: exactly at end, bail out.
-    #[test]
-    fn continuation_start_at_file_end() {
-        let (should, _, _, _) = continuation_should_run(1_000_000, 1_000_000, 0);
-        assert!(!should, "start_byte == total_file_size — bail out");
-    }
-
-    /// Range request not starting at 0: pre-buffer was Range: bytes=1000000-6242880.
-    /// After serving 5242881 bytes, continuation starts at 1000000+5242881=6242881
-    /// and goes to file end.
-    #[test]
-    fn continuation_nonzero_start_byte() {
-        let total_file_size: u64 = 1_313_957_192;
-        let start_byte: u64 = 1_000_000;
-        let bytes_sent: u64 = 5_242_881;
-
-        let (should, remaining, offset, file_end) =
-            continuation_should_run(total_file_size, start_byte, bytes_sent);
-
-        assert!(should);
-        assert_eq!(remaining, total_file_size - start_byte - bytes_sent);
-        assert_eq!(offset, start_byte + bytes_sent);
-        assert_eq!(file_end, total_file_size - 1);
-    }
-
-    /// Old bug regression test: request end_byte was used instead of total_file_size.
-    /// Simulates the OLD behavior where remaining = (end_byte - start_byte + 1) - sent.
-    /// For pre-buffer (0-5242880, 5242881 sent), old remaining = 0 → no continuation.
-    /// New remaining = (total_file_size - start_byte) - sent ≈ 1.3GB → continuation.
-    #[test]
-    fn regression_old_remaining_vs_new_remaining() {
-        let total_file_size: u64 = 1_313_957_192;
-        let request_end_byte: u64 = 5_242_880;
-        let start_byte: u64 = 0;
-        let bytes_sent: u64 = request_end_byte + 1; // All 5MB served
-
-        // OLD calculation (bug): remaining = (end_byte - start_byte + 1) - sent = 0
-        let old_remaining = (request_end_byte - start_byte + 1) - bytes_sent;
-        assert_eq!(old_remaining, 0, "OLD: remaining = 0 after serving all pre-buffer → no continuation (BUG)");
-
-        // NEW calculation (fix): remaining = (total_file_size - start_byte) - sent ≈ 1.3GB
-        let (_, new_remaining, _, _) = continuation_should_run(total_file_size, start_byte, bytes_sent);
-        assert!(new_remaining > 2 * 1024 * 1024, "NEW: remaining >> 2MB → continuation spawned (FIXED)");
-    }
-}
+// Continuation tests removed — ContinuationGuard and continuation_should_run
+// have been removed. The proactive prebuffer is now the ONLY path that
+// downloads from Telegram; /stream reads exclusively from disk cache.

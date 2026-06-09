@@ -154,7 +154,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
-    speed,
+    speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
     pausePrefetch,
     resumePrefetch,
     seekTo,
@@ -306,8 +306,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // Poll cache status for green bar — updates every 500ms for near-realtime feel.
   // Merges disk cache ranges (from backend) with shadow cache ranges (from JS memory)
+  // Also computes the GREEN BAR download speed (actual Telegram download speed),
+  // not the white bar speed (which is now just local disk reads).
+  const greenBarSpeedHistoryRef = useRef<{ bytes: number; time: number }[]>([]);
+  const [greenBarSpeed, setGreenBarSpeed] = useState(0);
+
   useEffect(() => {
     let active = true;
+    let lastCachedBytes = 0;
     const poll = async () => {
       while (active) {
         try {
@@ -315,6 +321,33 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
+
+            // ── Green bar download speed (actual Telegram speed) ──
+            // Compute from cached_bytes delta over time, using a 5-second sliding window
+            const now = Date.now();
+            const cachedBytes: number = status.cached_bytes ?? 0;
+            if (lastCachedBytes > 0 && cachedBytes > lastCachedBytes) {
+              const delta = cachedBytes - lastCachedBytes;
+              const hist = greenBarSpeedHistoryRef.current;
+              hist.push({ bytes: delta, time: now });
+              // Keep last 5 seconds of history
+              while (hist.length > 0 && hist[0].time < now - 5000) hist.shift();
+              if (hist.length >= 2) {
+                const totalBytes = hist.reduce((s, e) => s + e.bytes, 0);
+                const dt = (hist[hist.length - 1].time - hist[0].time) / 1000;
+                if (dt > 0.3) {
+                  setGreenBarSpeed(totalBytes / dt);
+                }
+              }
+            }
+            if (cachedBytes > 0) lastCachedBytes = cachedBytes;
+            // Reset speed when cache is complete (no more downloading)
+            if (status.is_complete) {
+              setGreenBarSpeed(0);
+              lastCachedBytes = 0;
+              greenBarSpeedHistoryRef.current = [];
+            }
+
             // Update session cache tracker via ref (avoids re-triggering this effect)
             const cs = cacheSessionRef.current;
             if (cs.getCacheInfo(file.id) && status.percentage > 0) {
@@ -324,12 +357,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           // Build ranges from BOTH backend + shadow cache, regardless of status
           const dur = durRef.current || 0;
           const ranges: [number, number][] = [];
+
           // Backend ranges (disk cache)
           if (status?.cached_ranges && status.total_bytes > 0 && dur > 0) {
             for (const [s, e] of status.cached_ranges as [number, number][]) {
               ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
           }
+
           // Shadow cache ranges (JS-side byte cache, always fresh)
           if (dur > 0) {
             try {
@@ -1368,9 +1403,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                     />
                   </div>
 
-                  {/* Download speed from Telegram */}
+                  {/* Download speed from Telegram (green bar / proactive prebuffer) */}
                   <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {speed > 0 ? formatSpeed(speed) : '—'}
+                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
                   </span>
                 </div>
               );
