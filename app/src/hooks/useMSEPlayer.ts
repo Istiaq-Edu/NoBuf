@@ -35,7 +35,7 @@ import { StreamShadowCache, installStreamCacheInterceptor, uninstallStreamCacheI
  * @param cache - The StreamShadowCache instance (may be null)
  * @returns The best TS-sync-byte-aligned position
  */
-function alignToTSSyncByte(bytePos: number, cache: StreamShadowCache | null): number {
+export function alignToTSSyncByte(bytePos: number, cache: StreamShadowCache | null): number {
   // Step 1: Round down to 188-byte boundary
   let aligned = Math.floor(bytePos / 188) * 188;
   if (aligned < 0) aligned = 0;
@@ -126,7 +126,7 @@ function alignToTSSyncByte(bytePos: number, cache: StreamShadowCache | null): nu
  *
  * @returns The correct byte position to resume from, or -1 if computation fails
  */
-function computeResumeByte(
+export function computeResumeByte(
   bufEnd: number,
   duration: number,
   fileLength: number,
@@ -2519,25 +2519,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               }
               origResume();
               // ── Post-resume verification (eviction path) ──
-              // Same root cause as lazyLoad: _resumeFrom may be stale.
-              // Verify _currentRange.from is not behind bufferEnd.
+              // For eviction, onEvictDone already computed the deterministic resume byte
+              // (SB-end - AUDIO_SAFETY_MARGIN) and stored it in __nobuf_evictionResumeByte.
+              // We must verify the IOController actually resumed near that byte.
+              // DO NOT use the current bufferEnd here: it is still pre-eviction (or has
+              // already been re-filled), so computeResumeByte(bufEnd, ..., false) would
+              // jump far ahead of the eviction cut point and create a white-bar gap.
               {
                 const ioCtrlPost = engine._transmuxer?._controller?._ioctl;
-                if (ioCtrlPost?._currentRange) {
-                  const videoEl = (player as any)?._media_element as HTMLVideoElement | undefined;
-                  const sb = videoEl?.buffered;
-                  const bufEnd = sb?.length ? sb.end(sb.length - 1) : 0;
+                if (ioCtrlPost?._currentRange && resumeByte > 0) {
                   const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
                   const fLen = state.current.fileLength || 0;
                   const seekFromByte = ioCtrlPost._currentRange.from;
-                  if (dur > 0 && fLen > 0 && seekFromByte >= 0 && bufEnd > 0) {
+                  if (dur > 0 && fLen > 0 && seekFromByte >= 0) {
                     const seekFromTime = (seekFromByte / fLen) * dur;
-                    if (seekFromTime < bufEnd - 5) {
-                      const correctByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, false);
-                      if (correctByte > 0) {
-                        ioCtrlPost.seek(correctByte);
-                        diagLog(`[MPEGTS] resumeTransmuxer (eviction): POST-RESUME seek from ${seekFromByte} (${seekFromTime.toFixed(1)}s < bufEnd=${bufEnd.toFixed(1)}s) → ${correctByte}`);
-                      }
+                    const resumeTime = (resumeByte / fLen) * dur;
+                    // If the IOController's current range is far behind the eviction
+                    // resume target, correct it. A small gap is allowed because the
+                    // IOController may align to the next 188-byte boundary.
+                    if (seekFromTime < resumeTime - 10) {
+                      ioCtrlPost.seek(resumeByte);
+                      diagLog(`[MPEGTS] resumeTransmuxer (eviction): POST-RESUME correction from ${seekFromByte} (${seekFromTime.toFixed(1)}s) → ${resumeByte} (${resumeTime.toFixed(1)}s)`);
                     }
                   }
                 }
@@ -2655,20 +2657,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             const savedCurrentRangeTo = ioCtrlBefore?._currentRange?.to ?? -1;
             const savedStashByteStart = ioCtrlBefore?._stashByteStart ?? 0;
 
-            // Compute correct preSuspendByte from SourceBuffer's actual end time.
-            // This is the byte position AFTER the last buffered frame, which is where
-            // the next download should start. Using bufferEnd is more reliable than
-            // _currentRange.to because the SourceBuffer knows the actual end of data.
-            const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
-            const fLen = state.current.fileLength || 0;
-            let preSuspendByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, true);
-            // Fallback: if we can't compute from bufferEnd, use IOController state
-            if (preSuspendByte <= 0) {
-              preSuspendByte = ioCtrlBefore?._stashUsed !== 0
-                ? savedStashByteStart
-                : (savedCurrentRangeTo >= 0 ? savedCurrentRangeTo + 1 : (savedResumeFrom > 0 ? savedResumeFrom : -1));
-            }
-
             // ── One-shot lazyLoad suspend skip (after eviction/lazyLoad resume) ──
             // After any resume, ahead ≈ lazyLoadMax, so lazyLoad would
             // immediately re-suspend. The resume path sets the
@@ -2704,6 +2692,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             if (lcConfig?.__nobuf_skipNextLazySuspend === true) {
               delete lcConfig.__nobuf_skipNextLazySuspend;
               diagLog(`[MPEGTS] __nobuf_skipNextLazySuspend cleared (BUFFER_FULL suspend — must honor)`);
+            }
+
+            // Compute correct preSuspendByte from SourceBuffer's actual end time.
+            // This is the byte position AFTER the last buffered frame, which is where
+            // the next download should start. Using bufferEnd is more reliable than
+            // _currentRange.to because the SourceBuffer knows the actual end of data.
+            // NOTE: computed only when we are actually going to suspend — when pacing
+            // or the one-shot skip suppresses the suspend, this work is unnecessary and
+            // avoids spamming the TS sync-byte alignment logs.
+            const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
+            const fLen = state.current.fileLength || 0;
+            let preSuspendByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, true);
+            // Fallback: if we can't compute from bufferEnd, use IOController state
+            if (preSuspendByte <= 0) {
+              preSuspendByte = ioCtrlBefore?._stashUsed !== 0
+                ? savedStashByteStart
+                : (savedCurrentRangeTo >= 0 ? savedCurrentRangeTo + 1 : (savedResumeFrom > 0 ? savedResumeFrom : -1));
             }
 
             origSuspend();
@@ -5715,6 +5720,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     return new Promise((resolve) => {
       const timer = window.setInterval(() => {
+        if (cancelledRef.current) {
+          window.clearInterval(timer);
+          if (!resolved) {
+            resolved = true;
+            setIsColdStartBuffering(false);
+            diagLog('[MPEGTS] Cold-start buffer gate cancelled');
+            resolve(false);
+          }
+          return;
+        }
+
         const now = Date.now();
         const elapsed = now - startTime;
         const currentRun = cache.cachedRunFrom(0);
