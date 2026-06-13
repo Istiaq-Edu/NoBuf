@@ -174,6 +174,18 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     coldStartProgress,
   } = player;
 
+  // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
+  // snap off the moment the buffer gate completes.
+  const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
+  useEffect(() => {
+    if (isColdStartBuffering) {
+      setShowColdStartOverlay(true);
+    } else if (showColdStartOverlay) {
+      const timer = window.setTimeout(() => setShowColdStartOverlay(false), 300);
+      return () => window.clearTimeout(timer);
+    }
+  }, [isColdStartBuffering, showColdStartOverlay]);
+
   // Native playback fallback: when MSE/HLS fails (e.g., codec not supported),
   // the player falls back to native <video> using streamUrl directly.
   // Only show error if there's an actual error from the player, not just
@@ -1203,8 +1215,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           </div>
         )}
         {/* Cold-start optimization overlay — shown only while the TS buffer gate fills */}
-        {isColdStartBuffering && !err && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300">
+        {showColdStartOverlay && !err && (
+          <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${isColdStartBuffering ? 'opacity-100' : 'opacity-0'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">
               <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
               <div className="text-center">
