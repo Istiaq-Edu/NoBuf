@@ -130,6 +130,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     isTransmuxer: msePlayer.isTransmuxer,
     isTransmuxerActive: msePlayer.isTransmuxerActive,
     keyframeIndexReady: msePlayer.keyframeIndexReady,
+    isColdStartBuffering: msePlayer.isColdStartBuffering,
+    coldStartProgress: msePlayer.coldStartProgress,
     getMoovBuffer: msePlayer.getMoovBuffer,
     getFirstChunk: msePlayer.getFirstChunk,
     getInitSegments: msePlayer.getInitSegments,
@@ -168,6 +170,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     isTransmuxer,
     isTransmuxerActive: _isTransmuxerActive,
     keyframeIndexReady: _keyframeIndexReady,
+    isColdStartBuffering,
+    coldStartProgress,
   } = player;
 
   // Native playback fallback: when MSE/HLS fails (e.g., codec not supported),
@@ -355,24 +359,25 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             }
           }
           // Build ranges from BOTH backend + shadow cache, regardless of status
-          const dur = durRef.current || 0;
+          // Use real duration if available, fall back to estimate for green bar calculation
+          const durForBar = durRef.current || (window as any).__nobuf_estimateDuration || 0;
           const ranges: [number, number][] = [];
 
           // Backend ranges (disk cache)
-          if (status?.cached_ranges && status.total_bytes > 0 && dur > 0) {
+          if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
             for (const [s, e] of status.cached_ranges as [number, number][]) {
               ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
           }
 
           // Shadow cache ranges (JS-side byte cache, always fresh)
-          if (dur > 0) {
+          if (durForBar > 0) {
             try {
               const scMod = shadowCacheModRef.current || await import('../../lib/faststream/StreamShadowCache');
               shadowCacheModRef.current = scMod;
               const sc = scMod.getShadowCache();
               if (sc && sc.fileLength > 0) {
-                const byteDurRatio = dur / sc.fileLength;
+                const byteDurRatio = durForBar / sc.fileLength;
                 for (const entry of sc.entryRanges) {
                   ranges.push([
                     entry.start * byteDurRatio,
@@ -613,6 +618,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       // (3) file.size bitrate estimate (last resort, often wrong for TS)
       if (!isFinite(v.duration) && file) {
         let knownDuration = 0;
+        const isEstimateSource = !file.duration && !(window as any).__nobuf_ptsDuration;
         if (file.duration && file.duration > 0 && isFinite(file.duration)) {
           knownDuration = file.duration;
         }
@@ -624,8 +630,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         }
         if (knownDuration > 0) {
           console.log('[Player] MPEGTS: overriding Infinity duration to', knownDuration.toFixed(1), 's (source:', file.duration ? 'Telegram' : (window as any).__nobuf_ptsDuration ? 'PTS-tail' : '4Mbps-estimate', ')');
-          setDur(knownDuration);
-          durRef.current = knownDuration;
+          if (isEstimateSource) {
+            // 4Mbps estimate — DO NOT show in UI (user wants 0 until real PTS arrives).
+            // Keep the estimate in __nobuf_estimateDuration for seek bar range
+            // calculation, but leave dur state at 0.
+            (window as any).__nobuf_durationIsEstimate = true;
+            (window as any).__nobuf_estimateDuration = knownDuration;
+            // setDur stays at 0 — UI shows "0:00 / 0:00" until real PTS
+            // durRef.current stays at 0 — shrink guard won't block real PTS
+          } else {
+            (window as any).__nobuf_durationIsEstimate = false;
+            setDur(knownDuration);
+            durRef.current = knownDuration;
+          }
         }
       } else {
         // For remux URLs in piped mode: video.duration is unreliable (empty_moov = ~3s).
@@ -758,10 +775,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // NEVER let duration shrink below the metadata-provided known duration.
         const knownMetaDur = (file?.duration && file.duration > 0 && isFinite(file.duration))
           ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
-        // NEVER let duration shrink below what we already know (durRef).
-        // After BUFFER_FULL eviction + resumeTransmuxer, MSE may recalculate
-        // duration from SourceBuffer content only → temporary shrink.
-        const floorDur = Math.max(knownMetaDur, durRef.current);
+        // ── Shrink guard floor calculation ──
+        // - knownMetaDur (Telegram or real PTS) is always authoritative
+        // - durRef.current is authoritative UNLESS it was set from a 4Mbps estimate
+        //   (marked via __nobuf_durationIsEstimate). When durRef is an estimate,
+        //   the real PTS must be able to replace it even if smaller.
+        // - When no authoritative source exists, use the 4Mbps estimate as a soft
+        //   floor to protect against buffer-only recalculations (e.g., 153s).
+        const isDurRefEstimate = !!(window as any).__nobuf_durationIsEstimate;
+        // When durRef.current was set from the 4Mbps estimate (before PTS arrived),
+        // it can be LARGER than the real PTS. Once __nobuf_durationIsEstimate is
+        // cleared (PTS available), durRef.current still holds the stale estimate.
+        // Using it as a floor would block the real PTS from being accepted.
+        // Fix: treat durRef.current as an estimate floor if it matches the stored
+        // estimate, even after the flag is cleared.
+        const durRefIsStaleEstimate = !isDurRefEstimate
+          && (window as any).__nobuf_estimateDuration > 0
+          && Math.abs(durRef.current - (window as any).__nobuf_estimateDuration) < 1;
+        const durRefFloor = (isDurRefEstimate || durRefIsStaleEstimate) ? 0 : durRef.current;
+        const estimateFloor = (knownMetaDur <= 0 && durRefFloor <= 0) ? ((window as any).__nobuf_estimateDuration || 0) : 0;
+        const floorDur = Math.max(knownMetaDur, durRefFloor, estimateFloor);
         const safeDur = (floorDur > 0 && clampedDur < floorDur) ? floorDur : clampedDur;
         if (!isRemux || safeDur > durRef.current) {
           if (safeDur !== v.duration) {
@@ -771,11 +804,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           console.log('[Player] durationchange:', safeDur, 's (was:', durRef.current, ')');
           setDur(safeDur);
           durRef.current = safeDur;
+          // Real PTS replaced the estimate — clear estimate flags
+          if ((window as any).__nobuf_ptsDuration > 0 && Math.abs(safeDur - (window as any).__nobuf_ptsDuration) / (window as any).__nobuf_ptsDuration < 0.01) {
+            (window as any).__nobuf_durationIsEstimate = false;
+          }
         }
       } else if (!isFinite(v.duration) && file) {
         // mpegts.js may report Infinity — override from metadata
         // Priority: (1) Telegram metadata, (2) PTS-based, (3) 4Mbps estimate
         let knownDuration = 0;
+        const isEstimateSource = !file.duration && !(window as any).__nobuf_ptsDuration;
         if (file.duration && file.duration > 0 && isFinite(file.duration)) {
           knownDuration = file.duration;
         }
@@ -787,8 +825,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         }
         if (knownDuration > 0 && durRef.current !== knownDuration) {
           console.log('[Player] durationchange Infinity → override:', knownDuration.toFixed(1), 's (source:', file.duration ? 'Telegram' : (window as any).__nobuf_ptsDuration ? 'PTS-tail' : '4Mbps', ')');
-          setDur(knownDuration);
-          durRef.current = knownDuration;
+          if (isEstimateSource) {
+            // 4Mbps estimate — DO NOT show in UI (user wants 0 until real PTS).
+            (window as any).__nobuf_durationIsEstimate = true;
+            (window as any).__nobuf_estimateDuration = knownDuration;
+            // setDur stays at 0 — UI shows "0:00 / 0:00" until real PTS
+            // durRef.current stays at 0 — shrink guard won't block real PTS
+          } else {
+            (window as any).__nobuf_durationIsEstimate = false;
+            setDur(knownDuration);
+            durRef.current = knownDuration;
+          }
         }
       }
     };
@@ -1153,6 +1200,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+          </div>
+        )}
+        {/* Cold-start optimization overlay — shown only while the TS buffer gate fills */}
+        {isColdStartBuffering && !err && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300">
+            <div className="flex flex-col items-center gap-4 max-w-md px-6">
+              <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
+              <div className="text-center">
+                <div className="text-white text-lg font-semibold mb-1">Optimizing video for No Buffer playback</div>
+                <div className="text-white/60 text-sm font-mono">
+                  {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+                </div>
+              </div>
+              <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-nobuf-primary rounded-full transition-all duration-300"
+                  style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
+                />
+              </div>
+            </div>
           </div>
         )}
       </div>
