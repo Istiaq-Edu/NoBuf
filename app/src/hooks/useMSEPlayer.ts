@@ -1410,7 +1410,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       if (format === 'ts') {
         diagLog(`[MSE] Detected ${format} format — waiting for cold-start buffer before initializing mpegts.js player, fileLength=${state.current.fileLength}`);
-        await waitForColdStartBuffer(format);
+        await waitForColdStartBuffer(format, url);
         await initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
         return;
       }
@@ -5703,14 +5703,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // bytes from the start of the file before attaching the mpegts.js player.
   // Returns true if the overlay was shown and the gate completed, false if the
   // cache was already warm enough to skip the overlay.
-  const waitForColdStartBuffer = useCallback(async (format: DetectedFormat): Promise<boolean> => {
+  const waitForColdStartBuffer = useCallback(async (format: DetectedFormat, url: string): Promise<boolean> => {
     if (format !== 'ts') return false;
-    const cache = shadowCacheRef.current;
     const fileLength = state.current.fileLength;
-    if (!cache || fileLength <= 0) return false;
+    if (fileLength <= 0) return false;
 
-    const run = cache.cachedRunFrom(0);
-    if (run && run.end >= MIN_COLD_START_BUFFER_BYTES - 1) {
+    // The shadow cache is created inside initTransmuxerPlayer, which runs AFTER
+    // this gate. To make the gate meaningful, we must create it now so that the
+    // first /stream fetches are cached and we can observe real progress.
+    let cache = shadowCacheRef.current;
+    if (!cache) {
+      cache = new StreamShadowCache(300 * 1024 * 1024);
+      shadowCacheRef.current = cache;
+    }
+    const urlKey = new URL(url).pathname;
+    cache.reset(urlKey, fileLength);
+    installStreamCacheInterceptor(cache);
+
+    const initialRun = cache.cachedRunFrom(0);
+    if (initialRun && initialRun.end >= MIN_COLD_START_BUFFER_BYTES - 1) {
       return false; // warm enough — skip overlay
     }
 
@@ -5718,8 +5729,31 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const startTime = Date.now();
     let resolved = false;
 
+    // Helper to pull the next uncached chunk into the shadow cache via /stream.
+    // The interceptor stores the bytes, so the polling loop sees real progress.
+    const fetchNextChunk = async (fromByte: number): Promise<number> => {
+      const chunkSize = 1024 * 1024; // 1MB pulls so the progress bar moves smoothly
+      const toByte = Math.min(fromByte + chunkSize - 1, fileLength - 1);
+      try {
+        if (cancelledRef.current) return fromByte;
+        const resp = await fetch(url, {
+          headers: { Range: `bytes=${fromByte}-${toByte}` },
+        });
+        if (!resp.ok && resp.status !== 206) return fromByte;
+        const buf = await resp.arrayBuffer();
+        // The interceptor already cached the bytes; this call is just to advance.
+        return fromByte + buf.byteLength;
+      } catch (e: any) {
+        diagLog(`[MPEGTS] Cold-start chunk fetch failed at ${fromByte}: ${e.message}`);
+        return fromByte;
+      }
+    };
+
+    let nextFetchByte = initialRun ? initialRun.end + 1 : 0;
+    let fetching = false;
+
     return new Promise((resolve) => {
-      const timer = window.setInterval(() => {
+      const timer = window.setInterval(async () => {
         if (cancelledRef.current) {
           window.clearInterval(timer);
           if (!resolved) {
@@ -5733,7 +5767,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
         const now = Date.now();
         const elapsed = now - startTime;
-        const currentRun = cache.cachedRunFrom(0);
+        const currentRun = cache!.cachedRunFrom(0);
         const bytes = currentRun ? currentRun.end + 1 : 0;
         const duration = mpegtsDurationRef.current || state.current.duration || (fileLength / 4_000_000) * 8 || 1;
         const bufferedTime = bytes > 0 && fileLength > 0
@@ -5753,6 +5787,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             setIsColdStartBuffering(false);
             diagLog(`[MPEGTS] Cold-start buffer gate ${byteReady ? 'passed by bytes' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s`);
             resolve(true);
+          }
+          return;
+        }
+
+        // Fire an async fetch for the next chunk if we have not reached the goal.
+        // Only one fetch at a time; the interval just checks/reschedules.
+        if (!fetching && nextFetchByte < MIN_COLD_START_BUFFER_BYTES && nextFetchByte < fileLength) {
+          fetching = true;
+          try {
+            const fetchByte = nextFetchByte;
+            nextFetchByte = await fetchNextChunk(fetchByte);
+          } finally {
+            fetching = false;
           }
         }
       }, 250);
