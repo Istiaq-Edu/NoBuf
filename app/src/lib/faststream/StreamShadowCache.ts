@@ -213,6 +213,21 @@ export class StreamShadowCache {
   }
 
   /**
+   * Return the end of the last cached range that ends strictly before `byte`.
+   * Useful for resuming downloads so we can keep the on-disk cache contiguous
+   * instead of jumping ahead and leaving a fragmented white-bar gap.
+   */
+  rangeEndBefore(byte: number): number | null {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const entry = this.entries[i];
+      if (entry.end < byte) {
+        return entry.end;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Get cached bytes for range [from, to].
    * Returns null if the range is not fully cached in a single contiguous entry.
    */
