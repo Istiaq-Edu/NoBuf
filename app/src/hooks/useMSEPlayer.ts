@@ -2877,13 +2877,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // when bufferedEnd >= currentTime + lazyLoadMaxDuration. We only
             // suppress the immediate re-suspend after an authorized resume via the
             // skip flag. BUFFER_FULL suspends are always honored.
+            //
+            // CRITICAL: mpegts.js's lazyLoad uses the internal transmuxer endDTS
+            // for the buffered position, which can be tens of seconds ahead of what
+            // has actually been appended to the SourceBuffer. If we suspend based
+            // on endDTS alone, the IOController pauses while the video element only
+            // has ~90-110 s of real buffer. The progressive resume then wakes it
+            // immediately, and we get a tight resume/suspend fight (67-c/68-c).
+            // Fix: only allow the actual pause when the *real* SourceBuffer ahead
+            // has reached the lazyLoad ceiling (default 120 s). When the real
+            // buffer is below that, keep the IOController running so it fills to the
+            // real target before pausing.
             const isBufferFullSuspend = mseCtrlPre?._isBufferFull === true;
-            if (lcConfig?.__nobuf_skipNextLazySuspend === true && !isBufferFullSuspend) {
-              delete lcConfig.__nobuf_skipNextLazySuspend;
-              return; // suppress the immediate re-suspend after a resume
+            const lazyLoadMax = lcConfig?.lazyLoadMaxDuration ?? 120;
+            const isRealBufferBelowCeiling = ahead < lazyLoadMax;
+            const isSkipFlag = lcConfig?.__nobuf_skipNextLazySuspend === true;
+            if (!isBufferFullSuspend && (isRealBufferBelowCeiling || isSkipFlag)) {
+              if (isSkipFlag) {
+                delete lcConfig.__nobuf_skipNextLazySuspend;
+              }
+              return; // suppress the premature suspend (and/or the immediate re-suspend)
             }
-            // The skip flag is cleared above so the next suspend attempt will
-            // actually pause the IOController.
 
             // Only log real suspends (BUFFER_FULL). LazyLoad suppression is expected
             // and happens hundreds of times per minute.
