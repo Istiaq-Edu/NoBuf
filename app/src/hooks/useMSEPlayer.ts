@@ -185,56 +185,8 @@ export function computeResumeByte(
 export interface ByteTimeSample {
   time: number;
   byte: number;
-  bitrate?: number; // local bitrate (bytes/sec) between this sample and the previous one
 }
 
-/**
- * Estimate the local encoded bitrate at the current playback position using
- * observed byte-to-time samples.
- *
- * Why this matters: the continuous interceptor cap paces download at
- * bitrate * playbackRate. If we use the global average bitrate for a VBR TS
- * stream, the pacing rate can be too high during low-bitrate segments, causing
- * the SourceBuffer to grow past the target ahead and triggering repeated
- * eviction loops.
- *
- * Falls back to the global linear bitrate when there are not enough samples.
- *
- * @param samples Observed (time, byte, bitrate) pairs from the IOController
- * @param fallbackDuration Total duration (for linear fallback)
- * @param fallbackFileLength Total file length (for linear fallback)
- * @returns Bitrate in bytes/second, or 0 if it cannot be determined
- */
-export function findBitrateForTime(
-  samples: ByteTimeSample[],
-  fallbackDuration: number,
-  fallbackFileLength: number
-): number {
-  if (!Array.isArray(samples) || samples.length < 2) {
-    return fallbackDuration > 0 && fallbackFileLength > 0
-      ? fallbackFileLength / fallbackDuration
-      : 0;
-  }
-  // Use the median bitrate of the most recent samples. The median is robust
-  // against single noisy samples caused by chunk alignment or transmuxer stalls.
-  const recent = samples.slice(-5);
-  const bitrates = recent
-    .map((s) => s.bitrate)
-    .filter((b): b is number => b !== undefined && b > 0);
-  if (bitrates.length > 0) {
-    bitrates.sort((a, b) => a - b);
-    return bitrates[Math.floor(bitrates.length / 2)];
-  }
-  // Fallback: compute from the last two samples if bitrate field is missing
-  const last = samples[samples.length - 1];
-  const prev = samples[samples.length - 2];
-  if (last.time > prev.time && last.byte > prev.byte) {
-    return (last.byte - prev.byte) / (last.time - prev.time);
-  }
-  return fallbackDuration > 0 && fallbackFileLength > 0
-    ? fallbackFileLength / fallbackDuration
-    : 0;
-}
 
 /**
  * Find the byte position for a target media time using observed byte-to-time samples.
@@ -543,9 +495,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const transmuxerRef = useRef<MediabunnyTransmuxer | MuxJsTsTransmuxer | null>(null);
   const mpegtsPlayerRef = useRef<any>(null); // mpegts.js player instance for TS files
   const shadowCacheRef = useRef<StreamShadowCache | null>(null); // JS-side byte cache for instant seeks
-  const byteTimeSamplesRef = useRef<Array<{ time: number; byte: number; bitrate: number }>>([]); // accurate byte-to-time samples for VBR resume
+  const byteTimeSamplesRef = useRef<Array<ByteTimeSample>>([]); // accurate byte-to-time samples for VBR resume
 
-  // Helper to record byte-to-time samples for accurate VBR resume after eviction
+  // Helper to record byte-to-time samples for accurate VBR resume.
+  // Note: only (time, byte) is stored; pacing uses the global average bitrate
+  // because the IOController download byte can run far ahead of the actual
+  // SourceBuffer end, which would yield an inflated local bitrate.
   const recordByteTimeSample = useCallback((time: number, byte: number) => {
     if (time <= 0 || byte <= 0) return;
     const samples = byteTimeSamplesRef.current;
@@ -556,9 +511,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // only add if time or byte changed meaningfully
       if (Math.abs(last.time - time) < 0.5 && Math.abs(last.byte - byte) < 188 * 100) return;
     }
-    const last = samples[samples.length - 1];
-    const bitrate = last ? (byte - last.byte) / Math.max(0.001, time - last.time) : 0;
-    samples.push({ time, byte, bitrate });
+    samples.push({ time, byte });
     // keep last 120 samples (~2min of history)
     if (samples.length > 120) samples.splice(0, samples.length - 120);
   }, []);
@@ -3173,10 +3126,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const capLimitByte = findByteForTime(capTargetTime, byteTimeSamplesRef.current, capDuration, capFileLength);
           if (capLimitByte > 0) {
             capSc._interceptorServeLimitByte = capLimitByte;
-            // Use the local encoded bitrate from observed samples for VBR TS streams.
-            // Global average bitrate overestimates during low-bitrate segments, which
-            // makes the pacing rate too high and lets the buffer grow past the target.
-            const bitrate = findBitrateForTime(byteTimeSamplesRef.current, capDuration, capFileLength);
+            // Use the global average bitrate for pacing. The local-sample bitrate
+            // was an attempt to handle VBR segments, but it was based on the
+            // IOController download byte, which can be far ahead of the actual
+            // SourceBuffer end. That produced absurd rates (e.g., 6 GB/s) and
+            // let the buffer overshoot. The average bitrate is what the player
+            // actually consumes over time, so pacing at this rate keeps the
+            // buffer steady on average. lazyLoadMaxDuration still acts as the hard
+            // ceiling above 120 s.
+            const bitrate = capDuration > 0 && capFileLength > 0 ? capFileLength / capDuration : 0;
             // Pacing only applies beyond the serve limit. When ahead is below target,
             // requests are before the limit → full speed. When ahead is above target,
             // pace at or slightly below consumption to drain the excess.
