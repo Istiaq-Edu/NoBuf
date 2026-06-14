@@ -481,7 +481,13 @@ export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
       }
       if (to > limitByte) {
         console.log(`[SHADOW-CACHE] LIMIT-FORWARD: bytes ${from}-${to} extends beyond serveLimit=${limitByte} — pacing=${pacingBps > 0 ? (pacingBps/1048576).toFixed(2)+'MB/s' : 'OFF'}`);
-        return forwardAndSiphon(input, init, from, Infinity, pacingBps);
+        // Truncate the request to the serve limit so the player (and cache) cannot
+        // pull data past the intended window. Use a finite siphon limit too.
+        const limitedInit = init ? { ...init } : {};
+        const limitedHeaders = new Headers(init?.headers || {});
+        limitedHeaders.set('Range', `bytes=${from}-${limitByte}`);
+        limitedInit.headers = limitedHeaders;
+        return forwardAndSiphon(input, limitedInit, from, limitByte - from + 1, pacingBps);
       }
       // Range is within the limit — proceed with normal cache check below
     }
