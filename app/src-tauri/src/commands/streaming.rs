@@ -14,6 +14,11 @@ pub struct StreamConfig {
     pub port: u16,
 }
 
+/// Maximum media seconds the proactive prebuffer should stay ahead of the playhead
+/// at 1× playback speed. The actual window is multiplied by the current playback rate
+/// (so at 2× we keep twice as much ahead) and capped at 240 s to avoid flooding the disk cache.
+const PROACTIVE_MAX_AHEAD_BASE_SECONDS: f64 = 180.0;
+
 /// Returned to the frontend so it can construct stream URLs dynamically
 #[derive(serde::Serialize)]
 pub struct StreamInfo {
@@ -363,8 +368,9 @@ async fn background_cache_download(
     let chunk_size: i32 = 512 * 1024;
     let transfer_id = format!("bg-cache-{}", message_id);
 
-    // Get DownloadPool for parallel gap-filling of large gaps (>1MB)
-    let pool_clone = { state.download_pool.lock().await.clone() };
+    // Always use sequential iter_download — Telegram triggers FLOOD_PREMIUM_WAIT
+    // on parallel connections (same approach as .mp4 streaming).
+    let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
 
     for (gap_start, gap_end) in gaps {
         let gap_size = gap_end - gap_start + 1;
@@ -375,41 +381,7 @@ async fn background_cache_download(
             return Ok(());
         }
 
-        // Use parallel download for large gaps when DownloadPool is available
-        if let Some(ref pool) = pool_clone {
-            if gap_size > 1024 * 1024 {
-                log::info!("Background cache {}: parallel download gap {}-{} ({:.1}MB)",
-                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0));
-
-                let data = pool.download_range(&media, gap_start, gap_end, total_size).await
-                    .map_err(|e| format!("Parallel gap download error: {}", e))?;
-
-                cache_file
-                    .seek(SeekFrom::Start(gap_start))
-                    .map_err(|e| format!("Seek error: {}", e))?;
-                cache_file
-                    .write_all(&data)
-                    .map_err(|e| format!("Write error: {}", e))?;
-
-                // Update meta (serialized via per-message lock)
-                let _lock = cache_mgr.lock_meta(message_id).await;
-                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                    message_id,
-                    folder_id,
-                    total_size,
-                    filename: filename.clone(),
-                    cached_ranges: Vec::new(),
-                    mime_type: mime_type.clone(),
-                });
-                meta.cached_ranges.push((gap_start, gap_end));
-                merge_ranges(&mut meta.cached_ranges);
-                let _ = cache_mgr.save_meta(&meta);
-
-                continue; // Skip sequential download for this gap
-            }
-        }
-
-        // Sequential iter_download for small gaps or when pool unavailable
+        // Sequential iter_download for all gaps (no parallel pool)
         let skip_chunks = gap_start / chunk_size as u64;
         let skip_bytes = gap_start % chunk_size as u64;
 
@@ -542,6 +514,7 @@ pub async fn cmd_report_playback_position(
     duration_s: f64,
     file_size: u64,
     is_player_downloading: bool,
+    playback_rate: f64,
     state: State<'_, TelegramState>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
@@ -563,17 +536,42 @@ pub async fn cmd_report_playback_position(
         0u64
     };
 
+    // Store the latest target so a running proactive task can slide its window.
+    state.proactive_targets.write().await.insert(
+        message_id,
+        (current_byte, duration_s, playback_rate, file_size)
+    );
+
     // Don't start if a proactive prebuffer is already running for this message.
     // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
     // download is tracked there too — it would always return true during playback,
     // preventing the proactive prebuffer from ever starting.
+    if cache_state.has_proactive_task(message_id).await {
+        return Ok(false); // target updated; existing task will use it
+    }
+
+    // Clear any previous cancellation so a new task can start after stop.
     let proactive_key = format!("proactive-{}", message_id);
     if state.cancelled_transfers.read().await.contains(&proactive_key) {
-        // Was cancelled — clear the flag so we can try again
         state.cancelled_transfers.write().await.remove(&proactive_key);
     }
-    // Use a separate tracker just for proactive tasks
-    if cache_state.has_proactive_task(message_id).await {
+
+    // COLD-START GUARD: Don't start the proactive prebuffer until /stream's
+    // bootstrap has written some data to cache. On cold start, /stream downloads
+    // directly from Telegram (bootstrap path). If the proactive starts simultaneously,
+    // both compete for the same Telegram connection — wasteful and slower.
+    // Once cache meta exists with cached ranges, /stream's bootstrap has delivered
+    // data and the proactive can safely start filling gaps ahead of the playhead.
+    if let Some(meta) = cache_state.load_meta(message_id) {
+        if meta.cached_ranges.is_empty() {
+            log::info!("[PROACTIVE] msg {}: cache meta exists but no ranges yet — /stream bootstrap still running, deferring proactive", message_id);
+            return Ok(false);
+        }
+    } else {
+        // No cache meta at all — /stream bootstrap hasn't even created the file yet.
+        // The proactive would start downloading from Telegram on the same connection,
+        // competing with /stream's bootstrap. Defer until /stream has written some data.
+        log::info!("[PROACTIVE] msg {}: no cache meta — /stream bootstrap not started yet, deferring proactive", message_id);
         return Ok(false);
     }
 
@@ -589,11 +587,30 @@ pub async fn cmd_report_playback_position(
         .map(|m| m.cached_ranges.clone())
         .unwrap_or_default();
 
-    // Only care about gaps from current_byte onward
+    // Cap the proactive window so it scales with playback speed but never races
+    // far ahead of the in-memory buffer. The in-memory ceiling is also scaled by
+    // playbackRate on the frontend (capped by the SourceBuffer quota). Keep the
+    // disk cache a little further ahead so the IOController can resume smoothly.
+    let effective_rate = playback_rate.max(0.25).min(8.0);
+    let bytes_per_second = if duration_s > 0.0 {
+        file_size as f64 / duration_s
+    } else {
+        0.0
+    };
+    let max_ahead_byte = if bytes_per_second > 0.0 {
+        let window_seconds = (PROACTIVE_MAX_AHEAD_BASE_SECONDS * effective_rate).min(240.0);
+        (current_byte as f64 + bytes_per_second * window_seconds).min(file_size as f64) as u64
+    } else {
+        // Duration unknown — use a conservative 100 MB fallback window
+        (current_byte + 100 * 1024 * 1024).min(file_size)
+    };
+
+    // Only care about gaps from current_byte onward, capped at max_ahead_byte
     let ahead_gaps: Vec<(u64, u64)> = find_gaps(&cached_ranges, file_size)
         .into_iter()
         .filter(|(start, end)| *end >= current_byte)
-        .map(|(start, end)| (start.max(current_byte), end))
+        .map(|(start, end)| (start.max(current_byte), end.min(max_ahead_byte)))
+        .filter(|(start, end)| *start <= *end)
         .collect();
 
     if ahead_gaps.is_empty() {
@@ -610,8 +627,8 @@ pub async fn cmd_report_playback_position(
     }
 
     log::info!(
-        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — spawning proactive download",
-        message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len()
+        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — window capped to byte {} — spawning proactive download",
+        message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len(), max_ahead_byte
     );
 
     let client = { state.client.lock().await.clone() }
@@ -624,7 +641,7 @@ pub async fn cmd_report_playback_position(
 
     tokio::spawn(async move {
         let result = proactive_prebuffer_download(
-            message_id, folder_id, current_byte, client, tg_state, cache_mgr.clone(),
+            message_id, folder_id, current_byte, max_ahead_byte, client, tg_state, cache_mgr.clone(),
         ).await;
 
         cache_mgr.untrack_proactive(message_id).await;
@@ -665,6 +682,7 @@ async fn proactive_prebuffer_download(
     message_id: i32,
     folder_id: i64,
     start_byte: u64,
+    max_ahead_byte: u64,
     client: grammers_client::Client,
     state: Arc<TelegramState>,
     cache_mgr: StreamCacheManager,
@@ -753,17 +771,9 @@ async fn proactive_prebuffer_download(
         .map(|m| m.cached_ranges.clone())
         .unwrap_or_default();
 
-    // Find gaps from start_byte to file end
-    let all_gaps = find_gaps(&cached_ranges, total_size);
-    let ahead_gaps: Vec<(u64, u64)> = all_gaps
-        .into_iter()
-        .filter(|(gap_start, gap_end)| *gap_end >= start_byte)
-        .map(|(gap_start, gap_end)| (gap_start.max(start_byte), gap_end))
-        .collect();
-
-    if ahead_gaps.is_empty() {
-        return Ok(0); // Already cached ahead
-    }
+    // Allow the window to slide as the playhead advances while the task runs.
+    let mut start_byte = start_byte;
+    let mut max_ahead_byte = max_ahead_byte;
 
     let filename = match &media {
         Media::Document(d) => d.name().to_string(),
@@ -777,53 +787,69 @@ async fn proactive_prebuffer_download(
     let chunk_size: i32 = 512 * 1024;
     let mut total_downloaded: u64 = 0;
 
-    // Get DownloadPool for parallel gap-filling
-    let pool_clone = { state.download_pool.lock().await.clone() };
+    // NEVER use DownloadPool for streaming — Telegram triggers FLOOD_PREMIUM_WAIT
+    // on ANY parallel downloads from the same account. Always use sequential
+    // iter_download via the main client (same approach as .mp4 streaming).
+    // The pool exists for non-streaming downloads only.
+    let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
 
-    // Check whether the player's IOController is actively downloading.
-    // When active, /stream already uses a Telegram connection — using the
-    // DownloadPool (3 workers) on top of that would create 4 concurrent
-    // connections from the same account, triggering FLOOD_PREMIUM_WAIT on
-    // The /stream endpoint now reads ONLY from disk cache (never downloads
-    // from Telegram). The proactive prebuffer is the SOLE Telegram downloader,
-    // so it always uses the parallel pool for maximum speed.
-    // player_actively_downloading is kept for diagnostics but is always false.
-    let player_active = state.player_actively_downloading.load(std::sync::atomic::Ordering::Relaxed);
-
-    // Cold-start detection: if less than 10MB is cached for this message,
-    // the video is likely fresh (just opened). Starting 3 pool workers
-    // simultaneously on a fresh video causes FLOOD_PREMIUM_WAIT because
-    // Telegram rate-limits at the account level. Use sequential download
-    // for the first 50MB so the white bar gets data immediately, then
-    // switch to parallel pool for the remainder.
     let already_cached_bytes: u64 = cached_ranges.iter().map(|(s, e)| e - s + 1).sum();
-    let is_cold_start = already_cached_bytes < 10 * 1024 * 1024; // < 10MB cached
-    const COLD_START_SEQUENTIAL_LIMIT: u64 = 50 * 1024 * 1024; // 50MB before switching to parallel
-    let mut cold_start_sequential_bytes: u64 = 0;
-    let mut switched_to_parallel = false;
 
-    // Re-process gaps: after cold-start sequential phase, recalculate gaps
-    // and process the remainder with parallel pool.
+    // Download all gaps sequentially (one Telegram connection).
+    // Re-check gaps periodically as the cache grows from /stream too.
+    // The window slides forward as the frontend reports new playhead positions.
+    let mut idle_cycles: u32 = 0;
+    const MAX_IDLE_CYCLES: u32 = 15; // ~30s idle before exiting
     loop {
-        // (Re)load cached ranges — they may have changed after sequential download
+        // Check cancellation
+        if state.cancelled_transfers.read().await.contains(&transfer_id) {
+            log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+            return Ok(total_downloaded);
+        }
+
+        // Re-read latest target from frontend position reports so the window
+        // slides as the playhead advances, instead of being a one-shot fixed window.
+        let (latest_current_byte, latest_duration_s, latest_rate, _latest_file_size) = {
+            let targets = state.proactive_targets.read().await;
+            targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
+        };
+
+        let effective_rate = latest_rate.max(0.25).min(8.0);
+        let computed_max_ahead_byte = if latest_duration_s > 0.0 {
+            let bps = total_size as f64 / latest_duration_s;
+            let window_seconds = (PROACTIVE_MAX_AHEAD_BASE_SECONDS * effective_rate).min(240.0);
+            (latest_current_byte as f64 + bps * window_seconds).min(total_size as f64) as u64
+        } else {
+            (latest_current_byte + 100 * 1024 * 1024).min(total_size)
+        };
+
+        // Only slide the window forward, never backward.
+        if latest_current_byte > start_byte {
+            start_byte = latest_current_byte;
+        }
+        if computed_max_ahead_byte > max_ahead_byte {
+            max_ahead_byte = computed_max_ahead_byte;
+        }
+
         let current_meta = cache_mgr.load_meta(message_id);
         let current_ranges = current_meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
         let ahead_gaps: Vec<(u64, u64)> = find_gaps(&current_ranges, total_size)
             .into_iter()
-            .filter(|(start, end)| *end >= start_byte)
-            .map(|(start, end)| (start.max(start_byte), end))
+            .filter(|(gap_start, gap_end)| *gap_end >= start_byte)
+            .map(|(gap_start, gap_end)| (gap_start.max(start_byte), gap_end.min(max_ahead_byte)))
+            .filter(|(start, end)| *start <= *end)
             .collect();
 
         if ahead_gaps.is_empty() {
-            break; // All gaps filled
+            idle_cycles += 1;
+            if idle_cycles >= MAX_IDLE_CYCLES {
+                log::info!("[PROACTIVE] msg {}: no gaps ahead for {} cycles, exiting", message_id, idle_cycles);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            continue;
         }
-
-        // After cold-start sequential phase, switch to parallel for all subsequent gaps
-        let use_sequential_for_this_gap = is_cold_start && !switched_to_parallel;
-
-        // Flag to break out of the for-loop when cold-start sequential phase
-        // reaches COLD_START_SEQUENTIAL_LIMIT and must hand off to parallel pool.
-        let mut break_for_loop = false;
+        idle_cycles = 0;
 
         for (gap_start, gap_end) in ahead_gaps {
             let gap_size = gap_end - gap_start + 1;
@@ -833,99 +859,13 @@ async fn proactive_prebuffer_download(
                 return Ok(total_downloaded);
             }
 
-            // Use parallel download for large gaps when DownloadPool is available
-            // AND we're not in cold-start mode for this gap.
-            if let Some(ref pool) = pool_clone {
-                if gap_size > 1024 * 1024 && !player_active && !use_sequential_for_this_gap {
-                    log::info!(
-                        "[PROACTIVE] msg {}: PARALLEL download gap {}-{} ({:.1}MB) — IOController paused, using pool",
-                        message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
-                    );
-                    // Break large gaps into segments for incremental meta updates
-                    // This lets the green bar show continuous progress instead of stalling
-                    let segment_size: u64 = 50 * 1024 * 1024; // 50MB segments
-                    let mut seg_start = gap_start;
-                    while seg_start <= gap_end {
-                        // Check cancellation between segments
-                        if state.cancelled_transfers.read().await.contains(&transfer_id) {
-                            log::info!("[PROACTIVE] msg {}: cancelled during segment download", message_id);
-                            return Ok(total_downloaded);
-                        }
-                        let seg_end = (seg_start + segment_size - 1).min(gap_end);
-                        // Retry segment download with exponential backoff for network resilience
-                        let mut seg_attempt = 0u32;
-                        const MAX_SEG_RETRIES: u32 = 5;
-                        let data = loop {
-                            match pool.download_range(&media, seg_start, seg_end, total_size).await {
-                                Ok(d) => break d,
-                                Err(e) => {
-                                    seg_attempt += 1;
-                                    if seg_attempt >= MAX_SEG_RETRIES {
-                                        log::warn!(
-                                            "[PROACTIVE] msg {}: segment {}-{} failed after {} retries: {}. Skipping gap.",
-                                            message_id, seg_start, seg_end, MAX_SEG_RETRIES, e
-                                        );
-                                        break Vec::new(); // Skip this gap, move on
-                                    }
-                                    let delay = (2000u64 * 2u64.pow(seg_attempt - 1)).min(60_000);
-                                    log::warn!(
-                                        "[PROACTIVE] msg {}: segment {}-{} attempt {}/{} failed: {}. Retry in {}ms",
-                                        message_id, seg_start, seg_end, seg_attempt, MAX_SEG_RETRIES, e, delay
-                                    );
-                                    // Check cancellation during retry wait
-                                    if state.cancelled_transfers.read().await.contains(&transfer_id) {
-                                        return Ok(total_downloaded);
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                                }
-                            }
-                        };
-                        if data.is_empty() {
-                            break; // Skip to next gap after exhausting retries
-                        }
-                        cache_file
-                            .seek(SeekFrom::Start(seg_start))
-                            .map_err(|e| format!("Seek error: {}", e))?;
-                        cache_file
-                            .write_all(&data)
-                            .map_err(|e| format!("Write error: {}", e))?;
-                        total_downloaded += data.len() as u64;
-                        // Update meta after each segment — green bar shows incremental progress
-                        let _lock = cache_mgr.lock_meta(message_id).await;
-                        let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                            message_id,
-                            folder_id,
-                            total_size,
-                            filename: filename.clone(),
-                            cached_ranges: Vec::new(),
-                            mime_type: mime_type.clone(),
-                        });
-                        meta.cached_ranges.push((seg_start, seg_end));
-                        merge_ranges(&mut meta.cached_ranges);
-                        let _ = cache_mgr.save_meta(&meta);
-                        drop(_lock);
-                        seg_start = seg_end + 1;
-                    }
-                    continue;
-                }
-            }
-
-            // Sequential iter_download for small gaps, when pool unavailable,
-            // OR when the player's IOController is actively downloading
-            // (player_active=true → skip parallel pool to avoid FLOOD_PREMIUM_WAIT),
-            // OR during cold-start (avoid 3 simultaneous connections).
-            if gap_size > 1024 * 1024 && (player_active || use_sequential_for_this_gap) {
-                if use_sequential_for_this_gap {
-                    log::info!(
-                        "[PROACTIVE] msg {}: COLD-START SEQUENTIAL download gap {}-{} ({:.1}MB) — single connection to avoid FLOOD_PREMIUM_WAIT",
-                        message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
-                    );
-                } else {
-                    log::info!(
-                        "[PROACTIVE] msg {}: SEQUENTIAL download gap {}-{} ({:.1}MB) — IOController active, avoiding pool to prevent FLOOD",
-                        message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
-                    );
-                }
+            // Always use sequential iter_download — same approach as .mp4 streaming.
+            // Telegram triggers FLOOD_PREMIUM_WAIT on parallel connections.
+            if gap_size > 1024 * 1024 {
+                log::info!(
+                    "[PROACTIVE] msg {}: SEQUENTIAL download gap {}-{} ({:.1}MB)",
+                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
+                );
             }
             let skip_bytes = gap_start % chunk_size as u64;
             let mut offset = gap_start;
@@ -988,11 +928,6 @@ async fn proactive_prebuffer_download(
                         offset += to_write as u64;
                         total_downloaded += to_write as u64;
 
-                        // Track sequential bytes during cold-start phase
-                        if use_sequential_for_this_gap {
-                            cold_start_sequential_bytes += to_write as u64;
-                        }
-
                         // Update meta every 4MB (8 chunks × 512KB)
                         if offset % (4 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
                             let _lock = cache_mgr.lock_meta(message_id).await;
@@ -1007,37 +942,6 @@ async fn proactive_prebuffer_download(
                             meta.cached_ranges.push((gap_start, offset - 1));
                             merge_ranges(&mut meta.cached_ranges);
                             let _ = cache_mgr.save_meta(&meta);
-                        }
-
-                        // Cold-start ramp-up: after downloading COLD_START_SEQUENTIAL_LIMIT
-                        // bytes sequentially, switch to parallel pool for the remainder.
-                        if use_sequential_for_this_gap
-                            && cold_start_sequential_bytes >= COLD_START_SEQUENTIAL_LIMIT
-                        {
-                            // Flush meta so the parallel phase sees what's cached
-                            let _lock = cache_mgr.lock_meta(message_id).await;
-                            let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                                message_id,
-                                folder_id,
-                                total_size,
-                                filename: filename.clone(),
-                                cached_ranges: Vec::new(),
-                                mime_type: mime_type.clone(),
-                            });
-                            meta.cached_ranges.push((gap_start, offset - 1));
-                            merge_ranges(&mut meta.cached_ranges);
-                            let _ = cache_mgr.save_meta(&meta);
-                            drop(_lock);
-
-                            switched_to_parallel = true;
-                            break_for_loop = true;
-                            log::info!(
-                                "[PROACTIVE] msg {}: cold-start sequential limit ({:.1}MB) reached at offset {}. Switching to parallel pool.",
-                                message_id,
-                                COLD_START_SEQUENTIAL_LIMIT as f64 / (1024.0 * 1024.0),
-                                offset
-                            );
-                            break; // Break sequential chunk loop → outer loops will recalculate
                         }
 
                         if offset > gap_end {
@@ -1068,23 +972,6 @@ async fn proactive_prebuffer_download(
                         need_new_iter = true; // Recreate iterator from current offset
                     }
                 }
-            }
-
-            // After cold-start sequential phase reaches the byte limit,
-            // break out of the for-loop so the outer loop recalculates gaps
-            // and processes the remainder with the parallel pool.
-            if break_for_loop {
-                break;
-            }
-
-            // If a cold-start gap was fully downloaded sequentially (didn't hit
-            // the byte limit), mark the transition for subsequent gaps.
-            if use_sequential_for_this_gap && !switched_to_parallel {
-                switched_to_parallel = true;
-                log::info!(
-                    "[PROACTIVE] msg {}: cold-start gap fully downloaded sequentially, subsequent gaps will use parallel pool",
-                    message_id
-                );
             }
         }
     }

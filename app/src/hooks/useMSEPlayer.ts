@@ -1723,13 +1723,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // prebuffer hasn't started yet. By the time mpegts.js makes its first
     // Range request to /stream, data is already on disk or being downloaded.
     const knownFilesize = state.current.fileLength > 0 ? state.current.fileLength : undefined;
+    const estimatedDurationS = knownFilesize ? (knownFilesize / 4_000_000) * 8 : 0;
     if (knownFilesize && parseInt(parsed.messageId) > 0) {
-      diagLog(`[PROACTIVE] IMMEDIATE spawn: msg=${parsed.messageId} folder=${parsed.folderId} size=${knownFilesize} (duration unknown, will be reported later)`);
+      diagLog(`[PROACTIVE] IMMEDIATE spawn: msg=${parsed.messageId} folder=${parsed.folderId} size=${knownFilesize} (estimated duration=${estimatedDurationS.toFixed(1)}s)`);
       invoke('cmd_report_playback_position', {
         messageId: parseInt(parsed.messageId),
         folderId: parseInt(parsed.folderId),
         currentTimeS: 0,
-        durationS: 0,  // Unknown — backend will start from byte 0
+        durationS: estimatedDurationS,
         fileSize: knownFilesize,
         isPlayerDownloading: false,
         playbackRate: 1,
@@ -2617,9 +2618,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // correct byte position. origResume() → IOController.resume() →
               // _internalSeek(_resumeFrom) will use this value.
               const ioCtrl = loadingCtrl._ioctl || (player as any)?._player_engine?._transmuxer?._controller?._ioctl;
+              const ioCtrlWasPaused = ioCtrl?._paused ?? false;
               if (resumeByte > 0 && ioCtrl) {
                 ioCtrl._resumeFrom = resumeByte;
-                diagLog(`[MPEGTS] Eviction resume: set ioCtrl._resumeFrom=${resumeByte}, calling origResume()`);
+                diagLog(`[MPEGTS] Eviction resume: set ioCtrl._resumeFrom=${resumeByte}, ioCtrl._paused=${ioCtrlWasPaused}, calling origResume()`);
               } else {
                 diagLog(`[MPEGTS] Eviction resume: resumeByte=${resumeByte}, ioCtrl=${ioCtrl ? 'available' : 'null'}, calling origResume()`);
               }
@@ -2657,15 +2659,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               }
               origResume();
               // ── Post-resume verification (eviction path) ──
-              // For eviction, onEvictDone already computed the deterministic resume byte
-              // (SB-end - AUDIO_SAFETY_MARGIN) and stored it in __nobuf_evictionResumeByte.
-              // We must verify the IOController actually resumed near that byte.
-              // DO NOT use the current bufferEnd here: it is still pre-eviction (or has
-              // already been re-filled), so computeResumeByte(bufEnd, ..., false) would
-              // jump far ahead of the eviction cut point and create a white-bar gap.
+              // Only run if the IOController was actually paused and we just resumed it.
+              // If the IOController was already running, the correction seek below can
+              // fight the current download and create a resume loop.
               {
                 const ioCtrlPost = engine._transmuxer?._controller?._ioctl;
-                if (ioCtrlPost?._currentRange && resumeByte > 0) {
+                if (ioCtrlWasPaused && ioCtrlPost?._currentRange && resumeByte > 0) {
                   const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
                   const fLen = state.current.fileLength || 0;
                   const seekFromByte = ioCtrlPost._currentRange.from;
@@ -3383,12 +3382,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   }
                 }
 
-                // Resume download via the patched resumeTransmuxer.
-                // Set __nobuf_evictionResumePending so the patched resumeTransmuxer
-                // knows this is an eviction resume (not a lazyLoad resume) and performs
-                // insertDiscontinuity() + demuxer reset (keep _dtsBase, NO seek)
-                // to avoid stale segment tracking from the pre-eviction range.
-                if (lc2) {
+                // Resume download via the patched resumeTransmuxer only if the loader is
+                // actually paused. After a seek the IOController may already be running,
+                // in which case calling resumeTransmuxer() is a no-op that still triggers
+                // insertDiscontinuity() + demuxer reset and can corrupt the pipeline.
+                if (lc2 && (lc2._paused || ioCtrl2?._paused)) {
                   try {
                     (window as any).__nobuf_evictionResumePending = true;
                     // Authorize resume (gate checked by outer resumeTransmuxer wrapper)
@@ -3397,6 +3395,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   } catch (e: any) {
                     diagLog(`[MPEGTS-QUOTA] onEvictDone resumeTransmuxer failed: ${e.message}`);
                   }
+                } else {
+                  diagLog(`[MPEGTS-QUOTA] onEvictDone: loader not paused, skipping resume`);
                 }
 
                 // Clear aggressive flag if eviction brought us below danger threshold
@@ -4005,6 +4005,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Invalidate any pending nuclear recovery's restartAfterClear
       // so it won't resume from the old byte offset after this seek.
       (window as any).__nobuf_nuclearGeneration = ((window as any).__nobuf_nuclearGeneration || 0) + 1;
+      // Byte-time samples are tied to the old byte stream. After a seek, using them
+      // to convert buffer times back to bytes will return stale/wrong byte offsets,
+      // which corrupts eviction resume and serve-limit calculations. Start fresh.
+      byteTimeSamplesRef.current = [];
 
       // 2. Reset demuxer and remuxer for clean state after flush
       const tController = engine._transmuxer?._controller;
@@ -4124,7 +4128,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const loadingCtrl = engine?._loading_controller;
         if (loadingCtrl && loadingCtrl._paused) {
           diagLog('[MPEGTS] Resuming LoadingController after seek (was paused)');
+          // The patched resumeTransmuxer requires explicit authorization.
+          const lcConfig = loadingCtrl._config;
+          if (lcConfig) lcConfig.__nobuf_resumeAuthorized = true;
           loadingCtrl.resumeTransmuxer();
+          if (lcConfig) lcConfig.__nobuf_resumeAuthorized = false;
         }
       } else {
         // IOController may be null if LoadingController destroyed it.
@@ -6076,20 +6084,38 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const startTime = Date.now();
     let resolved = false;
 
-    // Helper to pull the next uncached chunk into the shadow cache via /stream.
-    // The interceptor stores the bytes, so the polling loop sees real progress.
+    // Helper to pull the remaining cold-start target into the shadow cache via /stream.
+    // Use one open-ended streaming request so the server pipelines the 512KB Telegram
+    // chunks over a single HTTP connection instead of paying per-request overhead for
+    // many small 1MB fetches. The interceptor siphons bytes as they arrive, so the
+    // polling loop still sees real progress every 250ms.
     const fetchNextChunk = async (fromByte: number): Promise<number> => {
-      const chunkSize = 1024 * 1024; // 1MB pulls so the progress bar moves smoothly
-      const toByte = Math.min(fromByte + chunkSize - 1, fileLength - 1);
+      const targetEnd = Math.min(MIN_COLD_START_BUFFER_BYTES - 1, fileLength - 1);
+      if (fromByte >= targetEnd) return fromByte;
+      const toByte = targetEnd;
       try {
         if (cancelledRef.current) return fromByte;
         const resp = await fetch(url, {
           headers: { Range: `bytes=${fromByte}-${toByte}` },
         });
         if (!resp.ok && resp.status !== 206) return fromByte;
-        const buf = await resp.arrayBuffer();
-        // The interceptor already cached the bytes; this call is just to advance.
-        return fromByte + buf.byteLength;
+        // Read the response as a stream. The interceptor already caches each chunk
+        // as it passes through, so the cache polling loop stays live. We just track
+        // how much we consumed so the next fetch resumes from the right byte if the
+        // connection is interrupted.
+        const reader = resp.body?.getReader();
+        if (!reader) return fromByte;
+        let received = 0;
+        while (true) {
+          if (cancelledRef.current) {
+            reader.cancel().catch(() => {});
+            return fromByte + received;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          received += value?.byteLength || 0;
+        }
+        return fromByte + received;
       } catch (e: any) {
         diagLog(`[MPEGTS] Cold-start chunk fetch failed at ${fromByte}: ${e.message}`);
         return fromByte;

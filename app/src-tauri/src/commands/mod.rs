@@ -53,6 +53,11 @@ pub struct TelegramState {
     /// segments) to yield Telegram bandwidth and avoid FLOOD_PREMIUM_WAIT.
     /// When false (IOController paused), proactive prebuffer runs at full speed.
     pub player_actively_downloading: Arc<AtomicBool>,
+    /// Latest proactive prebuffer target for each message. Updated by
+    /// cmd_report_playback_position so the prebuffer task can slide its window
+    /// as the playhead advances instead of being a one-shot fixed-window download.
+    /// (current_byte, duration_s, playback_rate, file_size)
+    pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
 }
 
 pub mod auth;

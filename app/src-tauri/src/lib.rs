@@ -249,6 +249,7 @@ pub fn run() {
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
