@@ -2713,7 +2713,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 const bufEnd = sb?.length ? sb.end(sb.length - 1) : 0;
                 const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
                 const fLen = state.current.fileLength || 0;
-                const correctByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, !isEvictionResume);
+                let correctByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, !isEvictionResume);
+
+                // VBR-safe disk-cache continuity: computeResumeByte uses global linear bitrate,
+                // which is wrong for VBR. For TS files the actual byte at bufEnd can be far behind
+                // the linear estimate. If we resume from the linear byte, we skip ahead of the
+                // contiguous disk cache and leave a white-bar gap in the seek bar / shadow cache.
+                // Instead, resume from the end of the cached range that precedes the linear byte,
+                // minus a small overlap so the SourceBuffer still merges.
+                if (correctByte > 0 && shadowCacheRef.current && !isEvictionResume) {
+                  const diskCacheEnd = shadowCacheRef.current.rangeEndBefore(correctByte);
+                  if (diskCacheEnd != null && diskCacheEnd < correctByte) {
+                    const bytesPerSecond = fLen / (dur || 1);
+                    const overlapBytes = Math.floor(5 * bytesPerSecond);
+                    const candidate = Math.max(0, diskCacheEnd - overlapBytes);
+                    const alignedCandidate = alignToTSSyncByte(candidate, shadowCacheRef.current);
+                    if (alignedCandidate > 0 && alignedCandidate < correctByte) {
+                      diagLog(`[MPEGTS] resumeTransmuxer: VBR cache-continuity override ${correctByte} \u2192 ${alignedCandidate} (diskCacheEnd=${diskCacheEnd}, overlap=${overlapBytes}B)`);
+                      correctByte = alignedCandidate;
+                    }
+                  }
+                }
 
                 if (correctByte > 0 && ioCtrl) {
                   const staleResumeFrom = ioCtrl._resumeFrom ?? -1;
@@ -2723,7 +2743,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                     ? ((staleResumeFrom / fLen2) * dur2).toFixed(1) : '?';
                   const correctTime = dur2 > 0 && fLen2 > 0
                     ? ((correctByte / fLen2) * dur2).toFixed(1) : '?';
-                  diagLog(`[MPEGTS] resumeTransmuxer: _resumeFrom=${staleResumeFrom} (${staleTime}s) → ${correctByte} (${correctTime}s) at bufEnd=${bufEnd.toFixed(1)}s`);
+                  diagLog(`[MPEGTS] resumeTransmuxer: _resumeFrom=${staleResumeFrom} (${staleTime}s) \u2192 ${correctByte} (${correctTime}s) at bufEnd=${bufEnd.toFixed(1)}s`);
                   ioCtrl._resumeFrom = correctByte;
                 }
               }
