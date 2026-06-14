@@ -185,6 +185,55 @@ export function computeResumeByte(
 export interface ByteTimeSample {
   time: number;
   byte: number;
+  bitrate?: number; // local bitrate (bytes/sec) between this sample and the previous one
+}
+
+/**
+ * Estimate the local encoded bitrate at the current playback position using
+ * observed byte-to-time samples.
+ *
+ * Why this matters: the continuous interceptor cap paces download at
+ * bitrate * playbackRate. If we use the global average bitrate for a VBR TS
+ * stream, the pacing rate can be too high during low-bitrate segments, causing
+ * the SourceBuffer to grow past the target ahead and triggering repeated
+ * eviction loops.
+ *
+ * Falls back to the global linear bitrate when there are not enough samples.
+ *
+ * @param samples Observed (time, byte, bitrate) pairs from the IOController
+ * @param fallbackDuration Total duration (for linear fallback)
+ * @param fallbackFileLength Total file length (for linear fallback)
+ * @returns Bitrate in bytes/second, or 0 if it cannot be determined
+ */
+export function findBitrateForTime(
+  samples: ByteTimeSample[],
+  fallbackDuration: number,
+  fallbackFileLength: number
+): number {
+  if (!Array.isArray(samples) || samples.length < 2) {
+    return fallbackDuration > 0 && fallbackFileLength > 0
+      ? fallbackFileLength / fallbackDuration
+      : 0;
+  }
+  // Use the median bitrate of the most recent samples. The median is robust
+  // against single noisy samples caused by chunk alignment or transmuxer stalls.
+  const recent = samples.slice(-5);
+  const bitrates = recent
+    .map((s) => s.bitrate)
+    .filter((b): b is number => b !== undefined && b > 0);
+  if (bitrates.length > 0) {
+    bitrates.sort((a, b) => a - b);
+    return bitrates[Math.floor(bitrates.length / 2)];
+  }
+  // Fallback: compute from the last two samples if bitrate field is missing
+  const last = samples[samples.length - 1];
+  const prev = samples[samples.length - 2];
+  if (last.time > prev.time && last.byte > prev.byte) {
+    return (last.byte - prev.byte) / (last.time - prev.time);
+  }
+  return fallbackDuration > 0 && fallbackFileLength > 0
+    ? fallbackFileLength / fallbackDuration
+    : 0;
 }
 
 /**
@@ -2813,26 +2862,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             const mseCtrlPre = (player as any)?._player_engine?._msectrl;
             const lcConfig = loadingCtrl?._config;
 
-            // ── Pacing-aware lazyLoad suppress ──
-            // When the quota guard has set _pacingBps > 0, data arrives at a
-            // controlled rate via forwardAndSiphon pacing. lazyLoad suspend is
-            // unnecessary because pacing itself prevents SourceBuffer overflow.
-            // Suppressing lazyLoad here keeps the white bar moving linearly.
-            // BUFFER_FULL suspends are still honored — they indicate a real
-            // quota problem that pacing alone can't fix.
-            const pacingActive = (shadowCacheRef.current?._pacingBps ?? 0) > 0;
+            // ── PART C: Do NOT suppress lazyLoad when the interceptor is pacing ──
+            // Previous versions suppressed lazyLoad whenever _pacingBps > 0, which
+            // made the interceptor the sole authority for keeping the buffer ahead.
+            // That is wrong on VBR files and while paused/stalled: the pacing rate
+            // is only an estimate, and if the transmuxer has already buffered data,
+            // the SourceBuffer keeps growing and the quota guard starts repeatedly
+            // evicting the tail (the loop seen in 66-c.md). The eviction loop then
+            // resets the demuxer every second, which can stall playback and makes
+            // the white bar fluctuate.
+            //
+            // Fix: let lazyLoad do its job. The interceptor paces download, but
+            // lazyLoad is the hard ceiling that actually pauses the IOController
+            // when bufferedEnd >= currentTime + lazyLoadMaxDuration. We only
+            // suppress the immediate re-suspend after an authorized resume via the
+            // skip flag. BUFFER_FULL suspends are always honored.
             const isBufferFullSuspend = mseCtrlPre?._isBufferFull === true;
-            if ((pacingActive || lcConfig?.__nobuf_skipNextLazySuspend === true) && !isBufferFullSuspend) {
-              if (lcConfig?.__nobuf_skipNextLazySuspend === true) {
-                delete lcConfig.__nobuf_skipNextLazySuspend;
-              }
-              return; // Do NOT call origSuspend() and do NOT spam logs
-            }
-            // If flag is set but this IS a BUFFER_FULL suspend, clear the flag and
-            // fall through — BUFFER_FULL suspends must always be honored.
-            if (lcConfig?.__nobuf_skipNextLazySuspend === true) {
+            if (lcConfig?.__nobuf_skipNextLazySuspend === true && !isBufferFullSuspend) {
               delete lcConfig.__nobuf_skipNextLazySuspend;
+              return; // suppress the immediate re-suspend after a resume
             }
+            // The skip flag is cleared above so the next suspend attempt will
+            // actually pause the IOController.
 
             // Only log real suspends (BUFFER_FULL). LazyLoad suppression is expected
             // and happens hundreds of times per minute.
@@ -3108,7 +3159,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const capLimitByte = findByteForTime(capTargetTime, byteTimeSamplesRef.current, capDuration, capFileLength);
           if (capLimitByte > 0) {
             capSc._interceptorServeLimitByte = capLimitByte;
-            const bitrate = capFileLength / capDuration;
+            // Use the local encoded bitrate from observed samples for VBR TS streams.
+            // Global average bitrate overestimates during low-bitrate segments, which
+            // makes the pacing rate too high and lets the buffer grow past the target.
+            const bitrate = findBitrateForTime(byteTimeSamplesRef.current, capDuration, capFileLength);
             // Pacing only applies beyond the serve limit. When ahead is below target,
             // requests are before the limit → full speed. When ahead is above target,
             // pace at or slightly below consumption to drain the excess.

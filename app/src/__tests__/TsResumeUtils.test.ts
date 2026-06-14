@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { StreamShadowCache } from '../lib/faststream/StreamShadowCache';
-import { alignToTSSyncByte, computeResumeByte, findByteForTime, ByteTimeSample } from '../hooks/useMSEPlayer';
+import { alignToTSSyncByte, computeResumeByte, findByteForTime, findBitrateForTime, ByteTimeSample } from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -122,5 +122,39 @@ describe('findByteForTime', () => {
   it('returns 0 for targetTime <= 0', () => {
     expect(findByteForTime(0, samples, duration, fileLength)).toBe(0);
     expect(findByteForTime(-10, samples, duration, fileLength)).toBe(0);
+  });
+});
+
+describe('findBitrateForTime', () => {
+  it('uses the median bitrate of recent samples', () => {
+    const samples: ByteTimeSample[] = [
+      { time: 0, byte: 0, bitrate: 1_000_000 },
+      { time: 100, byte: 100_000_000, bitrate: 1_000_000 },
+      { time: 200, byte: 300_000_000, bitrate: 2_000_000 },
+      { time: 300, byte: 500_000_000, bitrate: 2_000_000 },
+      { time: 400, byte: 600_000_000, bitrate: 1_000_000 },
+      { time: 500, byte: 700_000_000, bitrate: 2_000_000 },
+    ];
+    // Recent 5 bitrates: [1_000_000, 2_000_000, 2_000_000, 1_000_000, 2_000_000]
+    // sorted -> [1_000_000, 1_000_000, 2_000_000, 2_000_000, 2_000_000], median = 2_000_000
+    expect(findBitrateForTime(samples, duration, fileLength)).toBe(2_000_000);
+  });
+
+  it('computes bitrate from last two samples when bitrate field is missing', () => {
+    const samples: ByteTimeSample[] = [
+      { time: 0, byte: 0 },
+      { time: 100, byte: 100_000_000 },
+    ];
+    // 100MB / 100s = 1MB/s
+    expect(findBitrateForTime(samples, duration, fileLength)).toBe(1_000_000);
+  });
+
+  it('falls back to global average bitrate when not enough samples', () => {
+    const bitrate = findBitrateForTime([], duration, fileLength);
+    expect(bitrate).toBe(fileLength / duration);
+  });
+
+  it('returns 0 fallback when no duration/fileLength provided', () => {
+    expect(findBitrateForTime([], 0, 0)).toBe(0);
   });
 });
