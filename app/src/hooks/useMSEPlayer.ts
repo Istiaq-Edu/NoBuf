@@ -2639,7 +2639,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   const durEvict = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
                   const fLenEvict = state.current.fileLength || 0;
                   const lcEvict2 = (player as any)?._player_engine?._loading_controller;
-                  const MAX_SERVE_AHEAD_SECONDS = 150;
+                  const MAX_SERVE_AHEAD_SECONDS = 180;
                   const targetAheadEvict = Math.min(lcEvict2?._config?.lazyLoadMaxDuration ?? 120, MAX_SERVE_AHEAD_SECONDS);
                   const limitTimeEvict = (engine._media_element?.currentTime ?? 0) + targetAheadEvict;
                   const limitByteEvict = findByteForTime(limitTimeEvict, byteTimeSamplesRef.current, durEvict, fLenEvict)
@@ -2740,9 +2740,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 if (_scLazy) {
                   const bytesPerSecond = (state.current.fileLength || 0) / (state.current.duration || 1);
                   const lcLazy2 = (player as any)?._player_engine?._loading_controller;
-                  // Cap serve limit at SourceBuffer quota (~150s of content).
-                  // lazyLoadMax may be 480s at 4x, but SourceBuffer can only hold ~150s.
-                  const MAX_SERVE_AHEAD_SECONDS = 150;
+                  // Cap serve limit at SourceBuffer quota (~180s of content).
+                  // lazyLoadMax may be 480s at 4x, but SourceBuffer can only hold ~180s.
+                  const MAX_SERVE_AHEAD_SECONDS = 180;
                   const targetAhead = Math.min(lcLazy2?._config?.lazyLoadMaxDuration ?? 120, MAX_SERVE_AHEAD_SECONDS);
                   const limitTime = (engine._media_element?.currentTime ?? 0) + targetAhead;
                   const limitByte = Math.floor(limitTime * bytesPerSecond);
@@ -3533,7 +3533,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const _scSafePre = shadowCacheRef.current;
               if (_scSafePre) {
                 const bytesPerSecondPre = (state.current.fileLength || 0) / (state.current.duration || 1);
-                const MAX_SERVE_AHEAD_SECONDS_SAFE = 150;
+                const MAX_SERVE_AHEAD_SECONDS_SAFE = 180;
                 const targetAheadPre = Math.min(lazyLoadMax, MAX_SERVE_AHEAD_SECONDS_SAFE);
                 const limitTimePre = (engine._media_element?.currentTime ?? 0) + targetAheadPre;
                 const limitBytePre = Math.floor(limitTimePre * bytesPerSecondPre);
@@ -3588,7 +3588,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const _scEmergencyPre = shadowCacheRef.current;
               if (_scEmergencyPre) {
                 const bytesPerSecondEmerg = (state.current.fileLength || 0) / (state.current.duration || 1);
-                const MAX_SERVE_AHEAD_SECONDS_EMERG = 150;
+                const MAX_SERVE_AHEAD_SECONDS_EMERG = 180;
                 const targetAheadEmerg = Math.min(lc?._config?.lazyLoadMaxDuration ?? 120, MAX_SERVE_AHEAD_SECONDS_EMERG);
                 const limitTimeEmerg = (engine._media_element?.currentTime ?? 0) + targetAheadEmerg;
                 const limitByteEmerg = Math.floor(limitTimeEmerg * bytesPerSecondEmerg);
@@ -3651,7 +3651,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const _scSafePre = shadowCacheRef.current;
               if (_scSafePre) {
                 const bytesPerSecondPre = (state.current.fileLength || 0) / (state.current.duration || 1);
-                const MAX_SERVE_AHEAD_SECONDS_SAFE = 150;
+                const MAX_SERVE_AHEAD_SECONDS_SAFE = 180;
                 const targetAheadPre = Math.min(lazyLoadMax, MAX_SERVE_AHEAD_SECONDS_SAFE);
                 const limitTimePre = (engine._media_element?.currentTime ?? 0) + targetAheadPre;
                 const limitBytePre = Math.floor(limitTimePre * bytesPerSecondPre);
