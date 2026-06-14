@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { StreamShadowCache } from '../lib/faststream/StreamShadowCache';
-import { alignToTSSyncByte, computeResumeByte } from '../hooks/useMSEPlayer';
+import { alignToTSSyncByte, computeResumeByte, findByteForTime, ByteTimeSample } from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -80,5 +80,47 @@ describe('alignToTSSyncByte', () => {
   it('returns 0 for negative byte positions', () => {
     const cache = makeCacheWithSyncByte(0, 0, 999_999);
     expect(alignToTSSyncByte(-100, cache)).toBe(0);
+  });
+});
+
+describe('findByteForTime', () => {
+  // Simulate a VBR file: first half is low bitrate (1 Mbps), second half is high bitrate (4 Mbps).
+  // Duration 2000s, fileLength 1_000_000_000 bytes.
+  const samples: ByteTimeSample[] = [
+    { time: 100, byte: 50_000_000 },   // 1 Mbps region
+    { time: 500, byte: 250_000_000 },    // 1 Mbps region
+    { time: 1000, byte: 500_000_000 },   // 1 Mbps region (up to 1 Gbps? no, 1 Mbps)
+    { time: 1500, byte: 750_000_000 },   // 4 Mbps region
+    { time: 1900, byte: 950_000_000 },   // 4 Mbps region
+  ];
+
+  it('interpolates between observed samples', () => {
+    // At 300s, we are between 100s/50MB and 500s/250MB. Local bitrate = 200MB/400s = 500KB/s.
+    const byte = findByteForTime(300, samples, duration, fileLength);
+    const expected = 50_000_000 + (300 - 100) * 500_000;
+    expect(byte).toBe(Math.floor(expected));
+  });
+
+  it('uses local bitrate instead of wrong global average for VBR', () => {
+    const vbrSamples: ByteTimeSample[] = [
+      { time: 100, byte: 10_000_000 },   // 100 KB/s
+      { time: 500, byte: 50_000_000 },    // 100 KB/s
+      { time: 1000, byte: 300_000_000 },  // 500 KB/s
+      { time: 1500, byte: 800_000_000 },  // 1 MB/s
+    ];
+    // At 1200s, global average would give 600MB, but local (between 1000s/300MB and 1500s/800MB) is 500KB/s -> 500MB.
+    const byte = findByteForTime(1200, vbrSamples, duration, fileLength);
+    expect(byte).toBe(500_000_000);
+  });
+
+  it('falls back to linear mapping when not enough samples', () => {
+    const byte = findByteForTime(500, [], duration, fileLength);
+    const expected = Math.floor((500 / duration) * fileLength);
+    expect(byte).toBe(expected);
+  });
+
+  it('returns 0 for targetTime <= 0', () => {
+    expect(findByteForTime(0, samples, duration, fileLength)).toBe(0);
+    expect(findByteForTime(-10, samples, duration, fileLength)).toBe(0);
   });
 });
