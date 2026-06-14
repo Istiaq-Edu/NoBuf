@@ -131,15 +131,16 @@ export function computeResumeByte(
   duration: number,
   fileLength: number,
   cache: StreamShadowCache | null,
-  undershoot?: boolean
+  undershoot?: boolean,
+  samples?: ByteTimeSample[]
 ): number {
   if (bufEnd <= 0 || duration <= 0 || fileLength <= 0) return -1;
 
-  // Step 1: Convert bufferEnd time → approximate byte position
-  // This is the ONLY source of truth. The SourceBuffer knows exactly
-  // where its data ends. We must resume FROM this position, not from
-  // some arbitrary cache end position.
-  let byte = Math.floor((bufEnd / duration) * fileLength);
+  // Step 1: Convert bufferEnd time → approximate byte position.
+  // Use VBR samples when available; otherwise fall back to global linear bitrate.
+  let byte = (samples && samples.length >= 2)
+    ? findByteForTime(bufEnd, samples, duration, fileLength)
+    : Math.floor((bufEnd / duration) * fileLength);
 
   // Step 1b: Undershoot for lazyLoad resume.
   // Due to VBR, the actual PTS at the computed byte position can be 3-5s
@@ -1731,6 +1732,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         durationS: 0,  // Unknown — backend will start from byte 0
         fileSize: knownFilesize,
         isPlayerDownloading: false,
+        playbackRate: 1,
       }).then((spawned: any) => {
         if (spawned) {
           proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
@@ -2007,10 +2009,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   await (window as any).__TAURI_INTERNALS__.invoke('cmd_report_playback_position', {
                     messageId: parseInt(parsed.messageId),
                     folderId: parseInt(parsed.folderId),
-                    currentTimeSecs: video.currentTime || 0,
+                    currentTimeS: video.currentTime || 0,
                     durationS: metaDur,
                     fileSize: knownFilesize || 0,
                     isPlayerDownloading: false,
+                    playbackRate: video.playbackRate || 1,
                   });
                 } catch (_e: any) { /* non-critical */ }
               }
@@ -2395,8 +2398,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         };
       }
 
-      // ── SourceBuffer config — 10 min memory window ──
-      // User's architecture: 10 min behind + 10 min ahead of playhead.
+      // ── SourceBuffer config — 180s ahead / 60s behind memory window ──
+      // User's architecture: 180s ahead / 60s behind playhead.
       // Playback speed does NOT change this.
       // Disk cache holds the rest. SourceBuffer eviction handles quota.
       const adjustBufferForSpeed = () => {
@@ -2622,7 +2625,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               }
               // Set one-shot skip flag so the next lazyLoad suspend (NOT BUFFER_FULL)
               // is skipped after eviction resume. Without this, lazyLoad immediately
-              // re-suspends because ahead ≈ 120s ≈ lazyLoadMax=120, creating an instant
+              // re-suspends because ahead ≈ 180s ≈ lazyLoadMax=180, creating an instant
               // suspend loop. The flag is checked in our patched suspendTransmuxer and
               // cleared after skipping exactly one lazyLoad suspend.
               const lc2 = (player as any)?._player_engine?._loading_controller;
@@ -2696,7 +2699,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 const bufEnd = sb?.length ? sb.end(sb.length - 1) : 0;
                 const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
                 const fLen = state.current.fileLength || 0;
-                let correctByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, !isEvictionResume);
+                let correctByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, !isEvictionResume, byteTimeSamplesRef.current);
 
                 // VBR-safe disk-cache continuity: computeResumeByte uses global linear bitrate,
                 // which is wrong for VBR. For TS files the actual byte at bufEnd can be far behind
@@ -2869,7 +2872,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // avoids spamming the TS sync-byte alignment logs.
             const dur = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || 0;
             const fLen = state.current.fileLength || 0;
-            let preSuspendByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, true);
+            let preSuspendByte = computeResumeByte(bufEnd, dur, fLen, shadowCacheRef.current, true, byteTimeSamplesRef.current);
             // Fallback: if we can't compute from bufferEnd, use IOController state
             if (preSuspendByte <= 0) {
               preSuspendByte = ioCtrlBefore?._stashUsed !== 0
@@ -3092,7 +3095,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const bufEnd = sb?.length ? sb.end(sb.length - 1) : 0;
           const correctedByte = computeResumeByte(
             bufEnd > 0 ? bufEnd : curTime,  // fallback to currentTime if no bufEnd
-            dur, fLen, shadowCacheRef.current, true
+            dur, fLen, shadowCacheRef.current, true, byteTimeSamplesRef.current
           );
           if (correctedByte > 0 && ioCtrl) {
             // Only log once per corruption event (not every 100ms tick)
@@ -3191,6 +3194,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               durationS: knownDuration,
               fileSize: knownFilesize,
               isPlayerDownloading,
+              playbackRate: video.playbackRate || 1,
             }).then((spawned: any) => {
               if (spawned) {
                 proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
@@ -3813,9 +3817,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       quotaGuardHandlerRef.current = sourceBufferQuotaGuard;
       video.addEventListener('timeupdate', sourceBufferQuotaGuard); // also on timeupdate for coverage
 
-      // ── Shadow cache trim: keep ±10 min of raw bytes around playhead ──
-      // At 4Mbps, ±10min = ±300MB each side. Cache budget (300MB) may trim
-      // to ±5min at high bitrate, but the eviction handles this naturally.
+      // ── Shadow cache trim: keep roughly 60s ahead / 60s behind of raw bytes around playhead ──
+      // This is a soft cap; the 300MB absolute limit also applies.
+      // At 4Mbps, 60s behind + 180s ahead = 240MB, well within the 300MB cache budget.
+      // The exact window size is enforced by sourceBufferQuotaGuard; the shadow cache
+      // keeps a generous linear window around the playhead so cached seeks can be instant.
       let lastTrimByte = -1;
       const trimShadowCache = () => {
         const cache = shadowCacheRef.current;
@@ -3843,7 +3849,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // fires when playhead approaches buffer end (within 30s), so download
       // auto-resumes after playback consumes enough buffer. No DTS patches
       // needed — BUFFER_FULL is a hard stop, not a graceful resume point.
-      diagLog('[MPEGTS] Lazy-load buffer mode (lazyLoadMax=120, BUFFER_FULL handled by quota guard)');
+      diagLog('[MPEGTS] Lazy-load buffer mode (lazyLoadMax=180, BUFFER_FULL handled by quota guard)');
 
       return true;
 
@@ -4203,13 +4209,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         enableWorker: false,
         enableStashBuffer: true,
         stashInitialSize: 1024 * 1024,
-        lazyLoad: true,                // 2 min ahead — prevents SourceBuffer quota overflow
-        lazyLoadMaxDuration: 120,      // 2 min ahead — MUST be < SourceBuffer quota (~150s)
-        lazyLoadRecoverDuration: 60,   // Resume 60s before buffer end
+        lazyLoad: true,                // 180s ahead — fixed by adjustBufferForSpeed
+        lazyLoadMaxDuration: 180,      // 180s ahead per 180s/60s policy
+        lazyLoadRecoverDuration: 120,  // Resume 120s before buffer end
         seekType: 'range',
-        autoCleanupSourceBuffer: true,
-        autoCleanupMaxBackwardDuration: 600,  // 10 min behind
-        autoCleanupMinBackwardDuration: 300,
+        autoCleanupSourceBuffer: false,  // We manage the 60s behind window ourselves
+        autoCleanupMaxBackwardDuration: 60,
+        autoCleanupMinBackwardDuration: 60,
         accurateSeek: false,
       });
 
@@ -5408,7 +5414,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // IOController.seek() reliable — the old fetch stream is cleanly killed before
     // the new Range request opens. With lazyLoad enabled, the new Range request
     // is also self-limiting: mpegts.js pauses the download after buffering
-    // lazyLoadMaxDuration seconds (~30s ≈ 15MB) instead of downloading the
+    // lazyLoadMaxDuration seconds (recoverDuration) before the buffer end.
     // entire file tail from seek point to EOF.
     if (mpegtsPlayerRef.current && formatRef.current === 'ts') {
       const dur = state.current.duration || mpegtsDurationRef.current;
