@@ -3473,6 +3473,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             //   - ahead below target: faster rate (build buffer)
             const _scPacing = shadowCacheRef.current;
             if (_scPacing && _scPacing._playerElement && _scPacing._duration > 0 && (state.current.fileLength || 0) > 0) {
+              // ── Pacing-aware guard: do not resume immediately at the ceiling ──
+              // Without this guard, removing the lazyLoad suppression causes the
+              // progressive resume to wake the IOController every tick while the
+              // buffer is still above lazyLoadMax - 10s. lazyLoad then suspends
+              // again, and we get a tight resume/suspend fight. Wait until the
+              // buffer drains a small margin below the ceiling before resuming with
+              // pacing. The continuous cap keeps the serve limit/pacing updated
+              // while we wait.
+              const resumeThreshold = Math.max(15, lazyLoadMax - 10);
+              if (ahead >= resumeThreshold) {
+                const now = Date.now();
+                const lastNearCeilingLog = (sourceBufferQuotaGuard as any).__nobuf_lastNearCeilingLogTs || 0;
+                if (now - lastNearCeilingLog > 5000) {
+                  diagLog(`[MPEGTS-QUOTA] PROGRESSIVE-RESUME: deferring (ahead=${ahead.toFixed(1)}s >= ${resumeThreshold}s threshold) — let lazyLoad drain`);
+                  (sourceBufferQuotaGuard as any).__nobuf_lastNearCeilingLogTs = now;
+                }
+              } else {
               const bitrate = (state.current.fileLength || 0) / _scPacing._duration;
               const rate = video.playbackRate || 1;
               // Pacing multiplier: 1× maintains current buffer, slightly above
@@ -3526,9 +3543,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 if (ioCtrlPostResume && (corruptedResumeFrom === 0 || corruptedResumeFrom === -1)) {
                   const correctedByte = alignToTSSyncByte(preResumeFrom, shadowCacheRef.current);
                   ioCtrlPostResume._resumeFrom = correctedByte;
-                  diagLog(`[MPEGTS-QUOTA] PROGRESSIVE-RESUME: immediate re-suspend! _resumeFrom restored to ${correctedByte}`);
+                  diagLog(`[MPEGTS-QUOTA] PROGRESSIVE-RESUME: immediate re-suspend detected! _resumeFrom restored to ${correctedByte}`);
                 }
               }
+            }
             } else {
               // ── Fallback: no pacing available (missing player/duration data) ──
               // Use the old safe-resume logic with drain wait.
