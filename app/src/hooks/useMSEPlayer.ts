@@ -1542,8 +1542,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       if (format === 'ts') {
         diagLog(`[MSE] Detected ${format} format — waiting for cold-start buffer before initializing mpegts.js player, fileLength=${state.current.fileLength}`);
-        await waitForColdStartBuffer(format, url);
-        await initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
+        const coldStartOverlayShown = await waitForColdStartBuffer(format, url);
+        await initTransmuxerPlayer(url, mediaSource, blobUrl!, format, coldStartOverlayShown);
         return;
       }
 
@@ -1639,7 +1639,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     _url: string,
     _mediaSource: MediaSource,
     _blobUrl: string,
-    parsed: { baseUrl: string; folderId: string; messageId: string; token: string }
+    parsed: { baseUrl: string; folderId: string; messageId: string; token: string },
+    coldStartOverlayShown: boolean = false
   ): Promise<boolean> => {
     const video = videoRef.current;
     if (!video) {
@@ -2047,12 +2048,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // After MEDIA_INFO, the SourceBuffer may have only ~0.3s of data.
       // FastStreamPlayer auto-plays (v.autoplay + v.play on loadedmetadata),
       // so the video may already be playing when we get here. The gate is a
-      // safety net — it ensures ≥5s of buffer exists. If autoplay already
-      // started, player.play() is a no-op. If it didn't, we start playback
-      // only when there's enough buffer for smooth startup.
-      // 5s provides runway for download pipeline ramp-up at ~2x realtime.
-      const STARTUP_BUFFER_GATE_SECONDS = 5;
-      const STARTUP_BUFFER_GATE_TIMEOUT_MS = 15000; // Max wait before playing anyway
+      // safety net — it ensures enough buffer exists before hiding the overlay.
+      // When the cold-start overlay was shown, we wait for 10s (matching the
+      // overlay promise) so the user doesn't see buffering right after the gate.
+      // When the overlay was skipped (warm cache), 5s is enough.
+      const STARTUP_BUFFER_GATE_SECONDS = coldStartOverlayShown ? 10 : 5;
+      const STARTUP_BUFFER_GATE_TIMEOUT_MS = coldStartOverlayShown ? 30000 : 15000;
       const videoEl = videoRef.current || (player as any)?._media_element as HTMLVideoElement | undefined;
       if (videoEl) {
         const gateStart = Date.now();
@@ -2082,6 +2083,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         };
         await checkBuffer();
       }
+
+      // Cold-start overlay (if shown) stays visible until the real buffer is ready.
+      setIsColdStartBuffering(false);
 
       // Gate passed — start playback now.
       await player.play();
@@ -4296,7 +4300,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    * Initialize the transmuxer player for TS content via mpegts.js.
    * Non-TS formats are routed to native playback in the main setup flow.
    */
-  const initTransmuxerPlayer = async (url: string, mediaSource: MediaSource, blobUrl: string, format: DetectedFormat) => {
+  const initTransmuxerPlayer = async (url: string, mediaSource: MediaSource, blobUrl: string, format: DetectedFormat, coldStartOverlayShown: boolean = false) => {
     if (format !== 'ts') {
       diagLog(`[MSE] initTransmuxerPlayer called for non-TS format ${format} — native fallback`);
       setUseNative(true);
@@ -4311,7 +4315,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const parsed = parseStreamUrl(url);
     if (parsed) {
       diagLog(`[MSE] TS format — using mpegts.js player`);
-      const mpegtsSuccess = await _initMpegtsPlayer(url, mediaSource, blobUrl, parsed);
+      const mpegtsSuccess = await _initMpegtsPlayer(url, mediaSource, blobUrl, parsed, coldStartOverlayShown);
       if (mpegtsSuccess) return;
       diagLog('[MSE] mpegts.js failed — switching to native remux playback');
 
@@ -6131,7 +6135,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           window.clearInterval(timer);
           if (!resolved) {
             resolved = true;
-            setIsColdStartBuffering(false);
             diagLog(`[MPEGTS] Cold-start buffer gate ${byteReady ? 'passed by bytes' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s`);
             resolve(true);
           }
