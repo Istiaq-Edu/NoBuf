@@ -244,47 +244,47 @@ export function findByteForTime(
   return Math.floor(lower.byte + ratio * (upper.byte - lower.byte));
 }
 
-/**
- * MSE (Media Source Extensions) player hook using FastStream's approach.
-
-  // Step 1b: Undershoot for lazyLoad resume.
-  // Due to VBR, the actual PTS at the computed byte position can be 3-5s
-  // AHEAD of bufEnd. Without undershoot, this creates a SourceBuffer gap
-  // (white bar) between the existing data ending at bufEnd and the new
-  // data starting at the PTS of the resume byte.
-  //
-  // By undershooting ~5s, the new data starts BEFORE bufEnd, creating an
-  // OVERLAP with existing SourceBuffer data. Chrome merges overlapping
-  // appends into one continuous range → no white bar gap.
-  //
-  // This is SAFE because:
-  //   - insertDiscontinuity() resets _nextDts=undefined → dtsCorrection=0
-  //     for the first frame → accepted (not dropped)
-  //   - Demuxer FULL RESET clears stale PES queues, PCR state → no corruption
-  //
-  // History: v1 used 10s undershoot WITHOUT insertDiscontinuity → stale
-  // _nextDts caused dtsCorrection=-3s → ALL frames dropped. That failure
-  // was NOT caused by undershoot itself, but by the missing insertDiscontinuity.
-  // With insertDiscontinuity, undershoot works correctly.
-  if (undershoot) {
-    const bytesPerSecond = fileLength / duration;
-    const UNDERSHOOT_SECONDS = 5;
-    byte = Math.max(0, byte - Math.floor(UNDERSHOOT_SECONDS * bytesPerSecond));
+export function findTimeForByte(
+  targetByte: number,
+  samples: ByteTimeSample[],
+  fallbackDuration: number,
+  fallbackFileLength: number
+): number {
+  if (targetByte <= 0) return 0;
+  if (!Array.isArray(samples) || samples.length < 2) {
+    if (fallbackDuration > 0 && fallbackFileLength > 0) {
+      return Math.floor((targetByte / fallbackFileLength) * fallbackDuration);
+    }
+    return 0;
   }
-
-  byte = Math.floor(byte / 188) * 188;  // TS packet alignment
-
-  // DO NOT bump byte to cacheEnd. The shadow cache may have prebuffered
-  // data far ahead of bufEnd (e.g., bufEnd=158s but cache goes to 317s).
-  // Starting from cacheEnd would skip 160s of content that the SourceBuffer
-  // needs, producing a massive DTS gap → decode error → player death.
-  // The /stream endpoint already uses CACHE-PREFIX to serve cached data
-  // fast, so there's no benefit to jumping ahead.
-
-  // Step 2: Verify 0x47 TS sync byte at the aligned position
-  byte = alignToTSSyncByte(byte, cache);
-
-  return byte;
+  let lower = samples[0];
+  let upper = samples[samples.length - 1];
+  for (let i = 0; i < samples.length - 1; i++) {
+    if (samples[i].byte <= targetByte && samples[i + 1].byte >= targetByte) {
+      lower = samples[i];
+      upper = samples[i + 1];
+      break;
+    }
+  }
+  if (!lower || !upper) {
+    if (fallbackDuration > 0 && fallbackFileLength > 0) {
+      return Math.floor((targetByte / fallbackFileLength) * fallbackDuration);
+    }
+    return 0;
+  }
+  const localBitrate = upper.byte > lower.byte
+    ? (upper.time - lower.time) / (upper.byte - lower.byte)
+    : 0;
+  if (targetByte <= lower.byte) {
+    return Math.max(0, lower.time + Math.floor((targetByte - lower.byte) * (localBitrate || 0)));
+  }
+  if (targetByte >= upper.byte) {
+    return Math.max(0, upper.time + Math.floor((targetByte - upper.byte) * (localBitrate || 0)));
+  }
+  const bDiff = upper.byte - lower.byte;
+  if (bDiff <= 0) return lower.time;
+  const ratio = (targetByte - lower.byte) / bDiff;
+  return Math.floor(lower.time + ratio * (upper.time - lower.time));
 }
 
 /**
@@ -1776,28 +1776,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       enableStashBuffer: true,       // Buffer for smooth playback
       stashInitialSize: 2048 * 1024, // 2MB initial stash — faster ramp-up for VOD startup
       lazyLoad: true,                // ENABLED: registers timeupdate listener for auto-resume.
-                                     // lazyLoadMaxDuration=120 means lazyLoad suspends when buffer
-                                     // is >120s ahead, but resumes 30s before buffer end. This balances
-                                     // continuous download with memory efficiency. BUFFER_FULL (SourceBuffer
-                                     // quota) also triggers suspend, handled by our quota guard with eviction.
-      lazyLoadMaxDuration: Math.round(120 * (video.playbackRate || 1)),  // Scaled by playbackRate: at 2x speed, buffer drains 2x faster → need 240s ahead.
-                                     // Base 120s at 1x. Previous 9999 allowed unbounded buffering → excessive memory usage.
-                                     // Previous 120 caused re-suspend after BUFFER_FULL recovery:
-                                     // recovery fills buffer to ~155s ahead, lazyLoad sees ahead>120,
-                                     // immediately re-suspends → download stops for 90+ seconds.
-                                     // Dynamically updated by quota guard on rate change.
-      lazyLoadRecoverDuration: Math.round(60 * (video.playbackRate || 1)),  // Resume scaled-60s before buffer end — at 2x need 120s real buffer
-                                     // for download to refill before it drains. 30s was too aggressive.
-                                     // Dynamically updated by quota guard on rate change.
+                                     // Fixed 180s ahead target (not scaled by playbackRate).
+                                     // BUFFER_FULL (SourceBuffer quota) handled by our quota guard.
+      lazyLoadMaxDuration: 180,      // 180s ahead, fixed media time.
+      lazyLoadRecoverDuration: 120,  // Resume when buffer drops to 120s ahead (60s safety margin).
       seekType: 'range',             // Use HTTP Range for seeking (our server supports it)
-      autoCleanupSourceBuffer: true, // Evict backward data when quota approached
-                                     // 10 min behind (user's specified window).
-      autoCleanupMaxBackwardDuration: 600,  // 10 min behind
-      autoCleanupMinBackwardDuration: 300,  // start cleanup when >5 min behind
+      autoCleanupSourceBuffer: false, // Disable mpegts.js native cleanup; we manage the 60s behind window in quota guard.
       accurateSeek: false,           // Let mpegts.js seek to nearest keyframe for speed
     });
 
-    // Store player ref for cleanup
+
     mpegtsPlayerRef.current = player;
 
     // ── Shadow cache: JS-side byte cache for instant seeks ──
@@ -2413,24 +2401,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const adjustBufferForSpeed = () => {
         const lc = (player as any)?._player_engine?._loading_controller;
         if (lc?._config) {
-          // ENABLE lazyLoad — mpegts.js manages backpressure naturally.
-          // Suspends at 10 min ahead, resumes when playhead nears buffer end.
-          // This prevents SourceBuffer quota overflow (the #1 crash cause).
+          // Fixed 180s ahead / 60s behind. Only pacing bitrate scales with playbackRate.
           lc._config.lazyLoad = true;
-          lc._config.lazyLoadMaxDuration = Math.round(120 * (video.playbackRate || 1));  // Scaled by playbackRate: at 2x, need 240s ahead
-                                                     // Base 120s at 1x. Dynamically updated by quota guard on rate change.
-          lc._config.lazyLoadRecoverDuration = Math.round(60 * (video.playbackRate || 1));  // Scaled by playbackRate: at 2x, need 120s recover
+          lc._config.lazyLoadMaxDuration = 180;
+          lc._config.lazyLoadRecoverDuration = 120;
+          lc._config.autoCleanupSourceBuffer = false;
 
-          // 10 min behind playhead (user's specified window).
-          lc._config.autoCleanupMaxBackwardDuration = 600;  // 10 min behind
-          lc._config.autoCleanupMinBackwardDuration = 300;   // start cleanup when >5 min behind
-
-          diagLog(`[MPEGTS] Buffer window: 10min behind + continuous ahead, lazyLoad=ON (maxDuration=${lc._config.lazyLoadMaxDuration}, recoverDuration=${lc._config.lazyLoadRecoverDuration}, rate=${video.playbackRate || 1}x, quota-guard-managed), _onIOSeeked=no-op (prevent runaway loop)`);
+          diagLog(`[MPEGTS] Buffer window: 180s ahead, 60s behind, lazyLoad=ON (maxDuration=180, recoverDuration=120, rate=${video.playbackRate || 1}x, quota-guard-managed), _onIOSeeked=no-op (prevent runaway loop)`);
         }
       };
       adjustBufferForSpeed(); // set initial values
 
-      // ── Monkey-patch LoadingController.resumeTransmuxer ──
+
       // ROOT CAUSE of "Dropping audio frame" spam + prebuffer pausing forever:
       // When lazyLoad resumes via _resumeTransmuxerIfNeeded, it calls
       // resumeTransmuxer() → resume() → _internalSeek(_resumeFrom).
