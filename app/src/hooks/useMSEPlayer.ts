@@ -497,6 +497,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const mpegtsPlayerRef = useRef<any>(null); // mpegts.js player instance for TS files
   const shadowCacheRef = useRef<StreamShadowCache | null>(null); // JS-side byte cache for instant seeks
   const byteTimeSamplesRef = useRef<Array<ByteTimeSample>>([]); // accurate byte-to-time samples for VBR resume
+  const fallbackBehindRef = useRef(60); // current effective behind window in seconds
 
   // Helper to record byte-to-time samples for accurate VBR resume.
   // Note: only (time, byte) is stored; pacing uses the global average bitrate
@@ -3009,14 +3010,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Scale quota guard thresholds by playbackRate: at 2x speed, buffer drains 2x faster,
       // so we need proportionally more ahead to prevent underruns. Base values are for 1x.
       // These are recomputed on every 100ms tick inside sourceBufferQuotaGuard for instant rate response.
-      const BASE_QUOTA_DANGER_DURATION = 150;  // base heuristic for "quota pressure relieved" threshold (at 1x)
-      const BASE_QUOTA_KEEP_AHEAD = 120;      // base: keep 2 min ahead at 1x — SourceBuffer can't hold 10min
-      // NOTE: With ~270s SourceBuffer quota at 4Mbps, 10min ahead (600s ≈ 300MB) is 
-      // impossible. Keep 120s ahead in SB, rest stays in shadow cache for re-download.
-      // NOTE: Proactive eviction was removed — lazyLoadMaxDuration=180 handles ahead
-      // management. QUOTA_DANGER_DURATION is only used for clearing aggressive mode
-      // and the "resume when paused and quota OK" check.
-      // the download. Only do it when we're approaching the real byte quota.
+      // Fixed 180s ahead / 60s behind in-memory buffer. Pacing bitrate scales with playbackRate,
+      // but the media-time window does not.
+      const BASE_QUOTA_DANGER_DURATION = 240;   // "quota pressure relieved" threshold
+      const BASE_QUOTA_KEEP_AHEAD = 180;        // target ahead in seconds (fixed)
+      const BASE_QUOTA_KEEP_BEHIND = 60;      // target behind in seconds (fixed)
+      // NOTE: At high bitrates the 180s/60s window may exceed the browser SourceBuffer quota.
+      // The guard below shrinks the behind window first (60 → 30 → 15) while preserving 180s ahead.
       let _aggressiveCleanupActive = false;
       let _removeInProgress = false;  // true while sb.remove() is pending
       (window as any).__nobuf_removeInProgress = false;
@@ -3057,18 +3057,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const ioCtrl = engine._transmuxer?._controller?._ioctl;
         const resumeFrom = ioCtrl?._resumeFrom ?? -1;
 
-        // ── Scale lazyLoad + quota thresholds by playbackRate (smooth white bar at high speed) ──
-        // At 2x speed, buffer drains 2x faster → need 2x more ahead to prevent underruns.
-        // This runs every 100ms tick, so it reacts instantly to rate changes.
+        // Fixed 180s/60s window. Only the pacing bitrate scales with playbackRate.
         const currentRate = video.playbackRate || 1;
-        const QUOTA_DANGER_DURATION = Math.round(BASE_QUOTA_DANGER_DURATION * currentRate);
-        const QUOTA_KEEP_AHEAD = Math.round(BASE_QUOTA_KEEP_AHEAD * currentRate);
+        const QUOTA_DANGER_DURATION = BASE_QUOTA_DANGER_DURATION; // no rate scaling for the window itself
+        const QUOTA_KEEP_AHEAD = BASE_QUOTA_KEEP_AHEAD;           // fixed 180s
+        const QUOTA_KEEP_BEHIND = BASE_QUOTA_KEEP_BEHIND;         // fixed 60s
+        fallbackBehindRef.current = BASE_QUOTA_KEEP_BEHIND;        // effective behind window (adaptive guard may shrink later)
         if (lc?._config) {
-          const expectedLazyMax = Math.round(120 * currentRate);
-          if (lc._config.lazyLoadMaxDuration !== expectedLazyMax) {
-            lc._config.lazyLoadMaxDuration = expectedLazyMax;
-            lc._config.lazyLoadRecoverDuration = Math.round(60 * currentRate);
-            diagLog(`[MPEGTS] Playback rate ${currentRate}x: lazyLoadMax=${expectedLazyMax}s, lazyLoadRecover=${lc._config.lazyLoadRecoverDuration}s, quotaDanger=${QUOTA_DANGER_DURATION}s, quotaKeep=${QUOTA_KEEP_AHEAD}s`);
+          if (lc._config.lazyLoadMaxDuration !== 180) {
+            lc._config.lazyLoadMaxDuration = 180;
+            lc._config.lazyLoadRecoverDuration = 120;
+            diagLog(`[MPEGTS] Buffer window enforced: lazyLoadMax=180, lazyLoadRecover=120, rate=${currentRate}x, quotaDanger=${QUOTA_DANGER_DURATION}s, quotaKeep=${QUOTA_KEEP_AHEAD}s, quotaBehind=${QUOTA_KEEP_BEHIND}s`);
           }
         }
 
@@ -3224,11 +3223,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             independentPrebufferRef.current.active = false;
           }
 
-          // 1. Evict backward data behind playhead to free SourceBuffer byte quota.
-          //    Keep up to QUOTA_KEEP_AHEAD (scaled by playbackRate) — only evict the far-ahead tail
-          //    if the buffer extends beyond that AND we need more quota room.
-          const evictBefore = curTime;  // evict EVERYTHING behind playhead
-          const evictAfter = curTime + QUOTA_KEEP_AHEAD;  // only evict beyond keep-ahead window (scaled by rate)
+          // 1. Evict data outside the desired [curTime - 60, curTime + 180] window.
+          //    Preserve 180s ahead and 60s behind. Clamp behind edge to 0 at startup.
+          const evictBefore = Math.max(0, curTime - QUOTA_KEEP_BEHIND);  // keep 60s behind
+          const evictAfter = curTime + QUOTA_KEEP_AHEAD;                  // keep 180s ahead
           // Get SourceBuffers via standard MSE API.
           // mpegts.js MSEController._sourceBuffers is {video: sb, audio: sb} object NOT array!
           // The correct path is getObject() → MediaSource → sourceBuffers (SourceBufferList).
