@@ -3096,6 +3096,32 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
         }
 
+        // ── Continuous interceptor cap: keep IOController at QUOTA_KEEP_AHEAD ──
+        // Without an updated serve limit, the IOController downloads far ahead after
+        // the initial lazyLoad resume, the SourceBuffer fills, and the browser silently
+        // evicts from the beginning — causing the white bar to shrink / fluctuate.
+        const capSc = shadowCacheRef.current;
+        const capDuration = mpegtsDurationRef.current || (window as any).__nobuf_ptsDuration || state.current.duration || 0;
+        const capFileLength = state.current.fileLength || 0;
+        if (capSc && capDuration > 0 && capFileLength > 0) {
+          const capTargetTime = curTime + QUOTA_KEEP_AHEAD;
+          const capLimitByte = findByteForTime(capTargetTime, byteTimeSamplesRef.current, capDuration, capFileLength);
+          if (capLimitByte > 0) {
+            capSc._interceptorServeLimitByte = capLimitByte;
+            const bitrate = capFileLength / capDuration;
+            // Pacing only applies beyond the serve limit. When ahead is below target,
+            // requests are before the limit → full speed. When ahead is above target,
+            // pace at or slightly below consumption to drain the excess.
+            if (ahead > QUOTA_KEEP_AHEAD) {
+              capSc._pacingBps = bitrate * currentRate * 0.95;
+            } else if (ahead > QUOTA_KEEP_AHEAD * 0.75) {
+              capSc._pacingBps = bitrate * currentRate * 1.0;
+            } else {
+              capSc._pacingBps = 0;
+            }
+          }
+        }
+
         // ── HEAVY DEBUG: periodic state dump every ~5s ──
         // Logs download state, buffer state, shadow cache state
         const now = performance.now();
@@ -3143,10 +3169,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
         }
 
-        // ── Only evict when SourceBuffer quota is ACTUALLY hit ──
-        // Proactive eviction at ahead>150 causes remove() spam that's slower
-        // than BUFFER_FULL eviction. Only evict on actual BUFFER_FULL.
-        const needsEviction = isBufferFull;
+        // ── Evict when SourceBuffer is full OR when the ahead cap is exceeded ──
+        // If we only react to BUFFER_FULL, the browser silently evicts from the
+        // beginning first, making the white bar shrink from the left. Evict the
+        // ahead tail proactively before the browser has to.
+        const needsEviction = isBufferFull || (ahead > QUOTA_KEEP_AHEAD + 10);
 
         if (needsEviction) {
           // ── Under quota pressure OR BUFFER_FULL ──
