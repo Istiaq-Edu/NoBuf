@@ -3883,7 +3883,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  decode makes it work well enough. The video will show the nearest keyframe
    *  after the target time.
    */
-  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number) => {
+  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number, isCacheHit?: boolean) => {
     // Cancel independent prebuffer — seek changes the download position
     if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
       diagLog('[INDEPENDENT-PREBUFFER] Cancelling seek prebuffer');
@@ -3961,7 +3961,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // We also step back ~10 packets (~1880 bytes) so TSDemuxer has room to
     // find PAT/PMT + the nearest keyframe before the target time.
     const TS_PACKET_SIZE = 188;
-    const RAW_BYTE_OFFSET = Math.floor((timeSeconds / duration) * filesize);
+    const seekByteFromIndex = (byteTimeSamplesRef.current?.length ?? 0) > 0
+      ? findByteForTime(timeSeconds, byteTimeSamplesRef.current, duration, filesize)
+      : -1;
+    const RAW_BYTE_OFFSET = seekByteFromIndex >= 0
+      ? seekByteFromIndex
+      : Math.floor((timeSeconds / duration) * filesize);
     const ALIGNED_BYTE_OFFSET = Math.max(0,
       Math.floor(RAW_BYTE_OFFSET / TS_PACKET_SIZE) * TS_PACKET_SIZE
       - TS_PACKET_SIZE * 10  // step back ~10 packets for PAT/PMT + keyframe
@@ -4088,6 +4093,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       if (ioctl) {
         diagLog(`[MPEGTS] IOController.seek(${byteOffset})`);
         ioctl.seek(byteOffset);
+
+        // Burst from disk cache when the forward 180s are already cached.
+        // Disable interceptor pacing and set a serve limit so the shadow cache
+        // saturates the SourceBuffer instantly without overshooting.
+        if (isCacheHit && shadowCacheRef.current) {
+          const sc = shadowCacheRef.current;
+          sc._pacingBps = 0; // full speed from disk cache
+          const serveLimitByte = findByteForTime(
+            Math.min(timeSeconds + 180, duration),
+            byteTimeSamplesRef.current,
+            duration,
+            filesize
+          );
+          if (serveLimitByte > 0) {
+            sc._interceptorServeLimitByte = serveLimitByte;
+          }
+          diagLog(`[MPEGTS] Seek to cached range: pacing disabled, serve limit byte=${serveLimitByte}`);
+        }
 
         // 4. Resume LoadingController if paused (BUFFER_FULL or initial load).
         //    After seek, LoadingController may still think it's paused.
@@ -5403,16 +5426,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return false;
       })();
 
-      // Also check shadow cache — if the byte range is cached, the server will
-      // serve it instantly via CACHE-PREFIX, so the seek will be fast even
-      // though it's "unbuffered" in the SourceBuffer sense.
-      const isCacheHit = (() => {
-        if (isBuffered) return true;  // already buffered = instant
-        const cache = shadowCacheRef.current;
-        if (!cache || cache.fileLength <= 0 || dur <= 0) return false;
-        const approxByte = Math.floor((clamped / dur) * cache.fileLength);
-        return cache.hasByte(approxByte);
-      })();
+      // Disk-cached range check: forward 180s from seek target must be cached.
+      // Uses the VBR byte/time index for accurate byte offsets instead of a
+      // linear estimate, so the seek lands precisely and the interceptor can
+      // burst the entire 180s window instantly.
+      const isSeekToCachedRange = (targetTime: number) => {
+        const fileLen = state.current.fileLength || 0;
+        const duration = mpegtsDurationRef.current || state.current.duration || 0;
+        if (!shadowCacheRef.current || fileLen === 0 || duration === 0) return false;
+        const startByte = findByteForTime(targetTime, byteTimeSamplesRef.current, duration, fileLen);
+        const endByte = findByteForTime(
+          Math.min(targetTime + 180, duration),
+          byteTimeSamplesRef.current,
+          duration,
+          fileLen
+        );
+        const endByteClamped = Math.min(endByte, fileLen - 1);
+        if (endByteClamped <= startByte || endByteClamped <= 0) return false;
+        const run = shadowCacheRef.current.cachedRunFrom(startByte);
+        return run !== null && run.end >= endByteClamped;
+      };
+
+      const isCacheHit = !isBuffered && isSeekToCachedRange(clamped);
 
       if (isBuffered) {
         // Buffered seek — just set currentTime (mpegts.js handles it)
@@ -5425,12 +5460,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Suppress loading spinner for cache-hit seeks.
         diagLog(`[MPEGTS] Cache-hit seek to ${clamped.toFixed(1)}s (disk cached, suppressing spinner)`);
         suppressLoadingSpinnerRef.current = true;
-        await _mpegtsUnbufferedSeek(clamped, dur);
+        await _mpegtsUnbufferedSeek(clamped, dur, isCacheHit);
         // Auto-clear suppress after 3s (safety net)
         setTimeout(() => { suppressLoadingSpinnerRef.current = false; }, 3000);
       } else {
         // Unbuffered seek — data must be fetched from Telegram (slow)
-        await _mpegtsUnbufferedSeek(clamped, dur);
+        await _mpegtsUnbufferedSeek(clamped, dur, false);
       }
       return;
     }
