@@ -477,6 +477,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // so rapid clicks/arrow-key skips only trigger the LAST position, reducing wasteful
   // overlapping downloads on unbuffered parts
   const seekDebounceTimerRef = useRef<number | null>(null);
+  const mpegtsUnbufferedSeekGenerationRef = useRef<number>(0);
   const SEEK_DEBOUNCE_MS = 500; // MP4/MKV — 500ms debounce for unbuffered seeks
   const SEEK_DEBOUNCE_MS_TS = 2000; // DEPRECATED: Only used by mux.js fallback. The fMP4 pipeline uses SEEK_DEBOUNCE_MS (500ms). // TS format — longer debounce because getKeyPacket is slow (prevent concurrent seeks during drag)
   // Track when the last unbuffered seek was actually executed (instant or debounce expired).
@@ -3847,16 +3848,59 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  decode makes it work well enough. The video will show the nearest keyframe
    *  after the target time.
    */
-  const _mpegtsUnbufferedSeek = (timeSeconds: number, duration: number) => {
+  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number) => {
     // Cancel independent prebuffer — seek changes the download position
     if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
-      diagLog(`[INDEPENDENT-PREBUFFER] Cancelling on seek (downloaded ${independentPrebufferRef.current.downloadedBytes} bytes)`);
+      diagLog('[INDEPENDENT-PREBUFFER] Cancelling seek prebuffer');
       independentPrebufferRef.current.abortController.abort();
       independentPrebufferRef.current.active = false;
       independentPrebufferRef.current.abortController = null;
     }
+
+    // Serialize on any pending MSE remove/append. mpegts.js MSEController.flush()
+    // calls sb.abort(), which throws if the SourceBuffer is running an asynchronous
+    // remove() (e.g. from the quota guard). Skipping the flush leaves the old buffer
+    // behind the seek point, which then collides with new data and causes the
+    // "SourceBuffer full, cannot free space" QuotaExceededError seen in 69-c.md.
+    const enginePre = (mpegtsPlayerRef.current as any)?._player_engine;
+    const mseCtrl = enginePre?._mse_controller;
+    const ms = mseCtrl?.getObject?.();
+    const sbs = ms?.sourceBuffers;
+    if (sbs && sbs.length > 0) {
+      const waiters: Promise<void>[] = [];
+      for (let i = 0; i < sbs.length; i++) {
+        const sb = sbs[i];
+        if (sb.updating) {
+          waiters.push(new Promise<void>(resolve => {
+            const onDone = () => {
+              sb.removeEventListener('updateend', onDone);
+              sb.removeEventListener('error', onDone);
+              sb.removeEventListener('abort', onDone);
+              resolve();
+            };
+            sb.addEventListener('updateend', onDone);
+            sb.addEventListener('error', onDone);
+            sb.addEventListener('abort', onDone);
+          }));
+        }
+      }
+      if (waiters.length > 0) {
+        diagLog(`[MPEGTS] Unbuffered seek: waiting for ${waiters.length} SourceBuffer update(s) before flush`);
+        await Promise.all(waiters.map(p => Promise.race([
+          p,
+          new Promise<void>(resolve => setTimeout(() => {
+            diagLog('[MPEGTS] Unbuffered seek: SourceBuffer update wait timed out (3s) — proceeding with flush');
+            resolve();
+          }, 3000))])));
+      }
+    }
+
     // Mark user seek in progress — allows _onIOSeeked to fire insertDiscontinuity
-    // (which is correct for user seeks, but wrong for lazyLoad resume/Early-EOF reconnect)
+    // (which is correct for user seeks, but wrong for lazyLoad resume/Early-EOF reconnect).
+    // Use a generation counter so an earlier seek that finishes after a later seek does
+    // not clear the flag for the later seek.
+    mpegtsUnbufferedSeekGenerationRef.current = (mpegtsUnbufferedSeekGenerationRef.current || 0) + 1;
+    const seekGen = mpegtsUnbufferedSeekGenerationRef.current;
     (window as any).__nobuf_userSeekInProgress = true;
     try {
     const video = videoRef.current;
@@ -4051,8 +4095,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     } finally {
       // Clear user seek flag — after this point, _onIOSeeked should NOT
       // fire insertDiscontinuity (lazyLoad resume and Early-EOF reconnect
-      // have continuous DTS, not a discontinuity)
-      (window as any).__nobuf_userSeekInProgress = false;
+      // have continuous DTS, not a discontinuity). Only clear if this is still
+      // the most recent seek generation, otherwise a later seek needs the flag.
+      if (mpegtsUnbufferedSeekGenerationRef.current === seekGen) {
+        (window as any).__nobuf_userSeekInProgress = false;
+      }
     }
   };
 
@@ -5290,7 +5337,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // only the LAST position in the rapid-fire window actually executes.
   // This prevents overlapping downloads from arrow-key spam while keeping
   // deliberate single-clicks feeling instant.
-  const seekTo = useCallback((timeSeconds: number) => {
+  const seekTo = useCallback(async (timeSeconds: number) => {
     if (!streamUrl || useNative) return;
     if (state.current.fileLength <= 0 || !isFinite(timeSeconds) || timeSeconds < 0) return;
 
@@ -5343,12 +5390,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Suppress loading spinner for cache-hit seeks.
         diagLog(`[MPEGTS] Cache-hit seek to ${clamped.toFixed(1)}s (disk cached, suppressing spinner)`);
         suppressLoadingSpinnerRef.current = true;
-        _mpegtsUnbufferedSeek(clamped, dur);
+        await _mpegtsUnbufferedSeek(clamped, dur);
         // Auto-clear suppress after 3s (safety net)
         setTimeout(() => { suppressLoadingSpinnerRef.current = false; }, 3000);
       } else {
         // Unbuffered seek — data must be fetched from Telegram (slow)
-        _mpegtsUnbufferedSeek(clamped, dur);
+        await _mpegtsUnbufferedSeek(clamped, dur);
       }
       return;
     }
