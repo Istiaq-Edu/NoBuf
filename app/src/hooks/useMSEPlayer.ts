@@ -3062,7 +3062,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const QUOTA_DANGER_DURATION = BASE_QUOTA_DANGER_DURATION; // no rate scaling for the window itself
         const QUOTA_KEEP_AHEAD = BASE_QUOTA_KEEP_AHEAD;           // fixed 180s
         const QUOTA_KEEP_BEHIND = BASE_QUOTA_KEEP_BEHIND;         // fixed 60s
-        fallbackBehindRef.current = BASE_QUOTA_KEEP_BEHIND;        // effective behind window (adaptive guard may shrink later)
+        // Safe byte budget: empirical Chrome MSE ceiling for the combined source buffer.
+        const SAFE_SOURCE_BUFFER_BUDGET_BYTES = 250 * 1024 * 1024; // 250 MB
+        const globalBitrateBps = (state.current.fileLength && mpegtsDurationRef.current)
+          ? state.current.fileLength / mpegtsDurationRef.current
+          : (state.current.fileLength && state.current.duration)
+            ? state.current.fileLength / state.current.duration
+            : 0;
         if (lc?._config) {
           if (lc._config.lazyLoadMaxDuration !== 180) {
             lc._config.lazyLoadMaxDuration = 180;
@@ -3223,9 +3229,29 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             independentPrebufferRef.current.active = false;
           }
 
-          // 1. Evict data outside the desired [curTime - 60, curTime + 180] window.
-          //    Preserve 180s ahead and 60s behind. Clamp behind edge to 0 at startup.
-          const evictBefore = Math.max(0, curTime - QUOTA_KEEP_BEHIND);  // keep 60s behind
+          // High-bitrate fallback: if the full 180s/60s window exceeds the browser's
+          // likely MSE budget, keep 180s ahead and shrink the behind window first.
+          let effectiveKeepBehind = fallbackBehindRef.current;
+          if (globalBitrateBps > 0) {
+            const totalWindowSeconds = QUOTA_KEEP_AHEAD + QUOTA_KEEP_BEHIND; // 240
+            const totalWindowBytes = totalWindowSeconds * globalBitrateBps;
+            if (totalWindowBytes > SAFE_SOURCE_BUFFER_BUDGET_BYTES) {
+              const aheadBytes = QUOTA_KEEP_AHEAD * globalBitrateBps;
+              const remainingBudget = Math.max(0, SAFE_SOURCE_BUFFER_BUDGET_BYTES - aheadBytes);
+              const maxBehindSeconds = Math.floor(remainingBudget / globalBitrateBps);
+              if (maxBehindSeconds < 60) {
+                effectiveKeepBehind = Math.max(15, Math.min(30, maxBehindSeconds)); // 60 → 30 → 15
+              }
+              if (effectiveKeepBehind !== fallbackBehindRef.current) {
+                diagLog(`[MPEGTS] High-bitrate fallback: behind window ${fallbackBehindRef.current}s → ${effectiveKeepBehind}s (bitrate ${(globalBitrateBps/8/1024).toFixed(1)} KB/s)`);
+              }
+            }
+          }
+          fallbackBehindRef.current = effectiveKeepBehind;
+
+          // 1. Evict data outside the desired [curTime - effectiveKeepBehind, curTime + 180] window.
+          //    Preserve 180s ahead and effectiveKeepBehind behind. Clamp behind edge to 0 at startup.
+          const evictBefore = Math.max(0, curTime - effectiveKeepBehind);  // keep effective behind
           const evictAfter = curTime + QUOTA_KEEP_AHEAD;                  // keep 180s ahead
           // Get SourceBuffers via standard MSE API.
           // mpegts.js MSEController._sourceBuffers is {video: sb, audio: sb} object NOT array!
@@ -3393,6 +3419,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   onEvictDone();
                 }
               }, 2000);
+            }
+          }
+
+          // If we still hit QuotaExceededError, aggressively shrink behind further.
+          if (isBufferFull) {
+            const nextBehind = effectiveKeepBehind > 30 ? 30 : (effectiveKeepBehind > 15 ? 15 : 0);
+            if (nextBehind < effectiveKeepBehind) {
+              diagLog(`[MPEGTS] QuotaExceededError fallback: shrink behind ${effectiveKeepBehind}s → ${nextBehind}s`);
+              fallbackBehindRef.current = nextBehind;
             }
           }
 
