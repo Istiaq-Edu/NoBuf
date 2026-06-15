@@ -2082,7 +2082,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           });
         };
         await checkBuffer();
+        // The real SourceBuffer now has enough runway; hide the cold-start overlay.
+        // If the overlay was never shown (warm cache), this is a no-op.
+        setIsColdStartBuffering(false);
       }
+
+      // Always hide the overlay before attempting playback. If the gate ran, it already hid it.
+      setIsColdStartBuffering(false);
 
       // Gate passed — start playback now.
       await player.play();
@@ -6157,8 +6163,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           window.clearInterval(timer);
           if (!resolved) {
             resolved = true;
-            setIsColdStartBuffering(false);
-            diagLog(`[MPEGTS] Cold-start buffer gate ${byteReady ? 'passed by bytes' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s`);
+            // Do NOT hide the overlay here. The overlay represents real playback readiness,
+            // and mpegts.js is still transmuxing/loading after the byte target is reached.
+            // initTransmuxerPlayer will hide the overlay once the startup buffer gate passes.
+            diagLog(`[MPEGTS] Cold-start byte target ${byteReady ? 'passed' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s — overlay stays until real buffer ready`);
             resolve(true);
           }
           return;
