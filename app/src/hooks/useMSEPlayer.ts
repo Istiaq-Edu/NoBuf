@@ -1541,9 +1541,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       if (format === 'ts') {
-        diagLog(`[MSE] Detected ${format} format — waiting for cold-start buffer before initializing mpegts.js player, fileLength=${state.current.fileLength}`);
-        await waitForColdStartBuffer(format, url);
-        await initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
+        diagLog(`[MSE] Detected ${format} format — starting cold-start buffer + mpegts.js init in parallel, fileLength=${state.current.fileLength}`);
+        // Create the shadow cache once here so both parallel tasks share the same instance
+        // and the interceptor is installed before any /stream fetches are issued.
+        const urlKey = new URL(url).pathname;
+        if (!shadowCacheRef.current) {
+          shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
+        }
+        shadowCacheRef.current.reset(urlKey, state.current.fileLength);
+        installStreamCacheInterceptor(shadowCacheRef.current);
+        // Start mpegts.js immediately so it transmuxes the 5MB cold-start data as it
+        // arrives, instead of waiting for 5MB to finish before initializing. Playback is
+        // deferred until the cold-start byte target is met, so the overlay hides exactly
+        // when the video is ready to play.
+        let coldStartResolve: (() => void) | null = null;
+        const coldStartDeferred = new Promise<void>((resolve) => { coldStartResolve = resolve; });
+        const initPromise = initTransmuxerPlayer(url, mediaSource, blobUrl!, format, coldStartDeferred);
+        const coldStartPromise = waitForColdStartBuffer(format, url, coldStartResolve!);
+        await Promise.all([initPromise, coldStartPromise]);
         return;
       }
 
@@ -1639,7 +1654,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     _url: string,
     _mediaSource: MediaSource,
     _blobUrl: string,
-    parsed: { baseUrl: string; folderId: string; messageId: string; token: string }
+    parsed: { baseUrl: string; folderId: string; messageId: string; token: string },
+    coldStartDeferred?: Promise<void>
   ): Promise<boolean> => {
     const video = videoRef.current;
     if (!video) {
@@ -2082,13 +2098,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           });
         };
         await checkBuffer();
-        // The real SourceBuffer now has enough runway; hide the cold-start overlay.
-        // If the overlay was never shown (warm cache), this is a no-op.
-        setIsColdStartBuffering(false);
       }
 
-      // Always hide the overlay before attempting playback. If the gate ran, it already hid it.
-      setIsColdStartBuffering(false);
+      // Wait for the cold-start byte target before starting playback and hiding the overlay.
+      // mpegts.js was initialized in parallel, so the startup gate should already have passed.
+      if (coldStartDeferred) {
+        await coldStartDeferred;
+        if (cancelledRef.current) return false;
+        setIsColdStartBuffering(false);
+      }
 
       // Gate passed — start playback now.
       await player.play();
@@ -4310,7 +4328,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    * Initialize the transmuxer player for TS content via mpegts.js.
    * Non-TS formats are routed to native playback in the main setup flow.
    */
-  const initTransmuxerPlayer = async (url: string, mediaSource: MediaSource, blobUrl: string, format: DetectedFormat) => {
+  const initTransmuxerPlayer = async (url: string, mediaSource: MediaSource, blobUrl: string, format: DetectedFormat, coldStartDeferred?: Promise<void>) => {
     if (format !== 'ts') {
       diagLog(`[MSE] initTransmuxerPlayer called for non-TS format ${format} — native fallback`);
       setUseNative(true);
@@ -4325,7 +4343,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const parsed = parseStreamUrl(url);
     if (parsed) {
       diagLog(`[MSE] TS format — using mpegts.js player`);
-      const mpegtsSuccess = await _initMpegtsPlayer(url, mediaSource, blobUrl, parsed);
+      const mpegtsSuccess = await _initMpegtsPlayer(url, mediaSource, blobUrl, parsed, coldStartDeferred);
       if (mpegtsSuccess) return;
       diagLog('[MSE] mpegts.js failed — switching to native remux playback');
 
@@ -6061,10 +6079,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   };
 
   // Cold-start buffer gate: wait until the shadow cache has enough contiguous
-  // bytes from the start of the file before attaching the mpegts.js player.
-  // Returns true if the overlay was shown and the gate completed, false if the
-  // cache was already warm enough to skip the overlay.
-  const waitForColdStartBuffer = useCallback(async (format: DetectedFormat, url: string): Promise<boolean> => {
+  // bytes from the start of the file. mpegts.js is initialized in parallel, so
+  // it transmuxes the incoming bytes as the cold-start fetches. When the byte
+  // target is reached, we resolve the deferred promise so playback can begin.
+  const waitForColdStartBuffer = useCallback(async (format: DetectedFormat, url: string, coldStartResolve: () => void): Promise<boolean> => {
     if (format !== 'ts') return false;
     const fileLength = state.current.fileLength;
     if (fileLength <= 0) return false;
@@ -6137,6 +6155,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           window.clearInterval(timer);
           if (!resolved) {
             resolved = true;
+            // Always resolve the deferred so the parallel mpegts.js init doesn't hang.
+            // The player will check cancelledRef before actually playing.
+            coldStartResolve();
             setIsColdStartBuffering(false);
             diagLog('[MPEGTS] Cold-start buffer gate cancelled');
             resolve(false);
@@ -6163,10 +6184,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           window.clearInterval(timer);
           if (!resolved) {
             resolved = true;
-            // Do NOT hide the overlay here. The overlay represents real playback readiness,
-            // and mpegts.js is still transmuxing/loading after the byte target is reached.
-            // initTransmuxerPlayer will hide the overlay once the startup buffer gate passes.
-            diagLog(`[MPEGTS] Cold-start byte target ${byteReady ? 'passed' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s — overlay stays until real buffer ready`);
+            // The byte target is reached. Resolve the deferred so the parallel
+            // mpegts.js player can hide the overlay and start playback.
+            coldStartResolve();
+            diagLog(`[MPEGTS] Cold-start byte target ${byteReady ? 'passed' : timeReady ? 'passed by time' : 'timed out'}: ${bytes} bytes / ${bufferedTime.toFixed(1)}s — resolving playback deferred`);
             resolve(true);
           }
           return;
