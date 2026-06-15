@@ -1961,11 +1961,69 @@ fn rewrite_init_prefix_pids(init_prefix: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Ensure init prefix (PAT+PMT bytes) is cached for this message.
+/// Same as ensure_init_prefix but WITHOUT PMT PID rewriting.
+/// For mpegts.js direct playback, rewriting PMT PID (0x0FFF→0x1000) causes
+/// sync_byte corruption because the init-prefix declares a different PMT PID
+/// than the original stream data. mpegts.js handles any PMT PID natively.
+pub fn ensure_init_prefix_no_rewrite(
+    cache_mgr: &crate::stream_cache::StreamCacheManager,
+    message_id: i32,
+    data_path: &std::path::Path,
+    ts_packet_size: u64,
+    is_m2ts: bool,
+) -> Vec<u8> {
+    // Check if init_prefix is already cached and non-empty
+    if let Some(cached) = cache_mgr.get_init_prefix(message_id) {
+        if !cached.is_empty() {
+            log::info!("[HLS-INIT] Using cached init prefix for msg {}: {} bytes", message_id, cached.len());
+            return cached;
+        }
+    }
+
+    // Try to extract PAT+PMT from file WITHOUT rewriting
+    if let Some((pat_pmt_buf, _, original_pmt_pid)) = extract_pat_pmt(data_path, ts_packet_size, 8192) {
+        if !pat_pmt_buf.is_empty() && pat_pmt_buf[0] == 0x47 {
+            let init_prefix_raw = if is_m2ts {
+                strip_m2ts_prefix_from_buf(&pat_pmt_buf)
+            } else {
+                pat_pmt_buf.clone()
+            };
+            if !init_prefix_raw.is_empty() {
+                // NO REWRITE — keep original PMT PID intact for mpegts.js compatibility
+                cache_mgr.cache_init_prefix(message_id, init_prefix_raw.clone());
+                log::info!("[HLS-INIT] Cached init prefix (NO-REWRITE) for msg {}: {} bytes, m2ts={}, original_pmt_pid=0x{:04X}",
+                    message_id, init_prefix_raw.len(), is_m2ts, original_pmt_pid);
+                return init_prefix_raw;
+            }
+        }
+    }
+
+    // Fall back to reading raw bytes from file (first 2 packets) — no rewrite
+    let init_size = ts_packet_size * INIT_SEGMENT_PACKETS;
+    if let Ok(raw_buf) = read_range_from_disk(data_path, 0, init_size - 1) {
+        if !raw_buf.is_empty() && raw_buf[0] == 0x47 {
+            let init_prefix_raw = if is_m2ts {
+                strip_m2ts_prefix_from_buf(&raw_buf)
+            } else {
+                raw_buf
+            };
+            if !init_prefix_raw.is_empty() {
+                cache_mgr.cache_init_prefix(message_id, init_prefix_raw.clone());
+                log::info!("[HLS-INIT] Cached init prefix (NO-REWRITE, raw fallback) for msg {}: {} bytes",
+                    message_id, init_prefix_raw.len());
+                return init_prefix_raw;
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Ensure init prefix (PAT+PMT bytes) is cached for this message."
 /// If already cached, returns it immediately. If not, extracts from
 /// the data file, rewrites PMT PID if needed (0x0FFF → 0x1000),
-/// and caches the result for future segment requests.
-/// Returns empty Vec if the file isn't available yet.
+/// and caches the result for future segment requests."
+/// Returns empty Vec if the file isn't available yet."
 pub fn ensure_init_prefix(
     cache_mgr: &crate::stream_cache::StreamCacheManager,
     message_id: i32,
@@ -2166,7 +2224,7 @@ fn extract_pat_pmt(path: &std::path::Path, packet_size: u64, scan_bytes: usize) 
                                 let program_pid = (((buf[prog_offset + 2] & 0x1f) as u16) << 8) | (buf[prog_offset + 3] as u16);
                                 if program_number != 0 {
                                     pmt_pid = Some(program_pid);
-                                    log::debug!("[HLS-EXTRACT-PAT] Found PMT PID=0x{:04x} at packet {}, offset={}", program_pid, i, offset);
+                                    log::info!("[HLS-EXTRACT-PAT] Found PMT PID=0x{:04x} program_number={} at packet {}, offset={}, prog_offset={}", program_pid, program_number, i, offset, prog_offset);
                                 }
                             }
                         }
@@ -2428,11 +2486,11 @@ mod tests {
                 "Data start must be 188-aligned, got {}", range.data_start);
         }
 
-        // Content length = init prefix + data bytes (self-contained segment)
+        // Content length = raw data bytes (init prefix is prepended by the HLS segment handler)
         for range in &ranges {
             let data_len = range.data_end - range.data_start + 1;
-            assert_eq!(range.content_length, init_size + data_len,
-                "Content length should be init prefix + data for segment {}", range.index);
+            assert_eq!(range.content_length, data_len,
+                "Content length should be raw data bytes for segment {}", range.index);
         }
     }
 
@@ -2460,11 +2518,11 @@ mod tests {
                 "Data start must be 192-aligned, got {}", range.data_start);
         }
 
-        // Content length = init prefix + data bytes (self-contained segment)
+        // Content length = raw data bytes (init prefix is prepended by the HLS segment handler)
         for range in &ranges {
             let data_len = range.data_end - range.data_start + 1;
-            assert_eq!(range.content_length, init_size + data_len,
-                "Content length should be init prefix + data for segment {}", range.index);
+            assert_eq!(range.content_length, data_len,
+                "Content length should be raw data bytes for segment {}", range.index);
         }
     }
 

@@ -68,7 +68,7 @@ fn rewrite_ts_stream_in_buf(
             // Init_prefix not cached — try on-the-fly extraction from data file
             if let Some(path) = data_path {
                 if let Some((ts_packet_size, is_m2ts)) = detect_ts_packet_size(path) {
-                    let extracted = hls::manifest::ensure_init_prefix(cache_mgr, message_id, path, ts_packet_size, is_m2ts);
+                    let extracted = hls::manifest::ensure_init_prefix_no_rewrite(cache_mgr, message_id, path, ts_packet_size, is_m2ts);
                     if !extracted.is_empty() {
                         log::info!("[PREBUFFER] On-the-fly init_prefix extraction for msg {}: {} bytes, ts_packet_size={}, is_m2ts={}",
                             message_id, extracted.len(), ts_packet_size, is_m2ts);
@@ -97,157 +97,105 @@ fn rewrite_ts_stream_in_buf(
         }
     }
 
-    // Step 3: Rewrite inline PAT/PMT packets throughout the buffer (beyond init_prefix).
-    // Scan for TS sync bytes (0x47) at 188-byte-aligned positions relative to the
-    // file start. Skip packets within the init_prefix range (already rewritten in Step 2).
-    // For each PAT packet (PID 0x0000), rewrite PMT PID declaration 0x0FFF→0x1000.
-    // For each PMT packet (PID 0x0FFF), rewrite TS header PID 0x0FFF→0x1000 and
-    // stream_type 0x15→0x0F.
-    let ps: usize = 188;
-    let file_offset_mod = buf_start % ps as u64;
-    let first_pkt_offset = if file_offset_mod == 0 { 0 } else { ps - file_offset_mod as usize };
-    let init_prefix_end_pkt = (prefix_len as usize + ps - 1) / ps; // Packet index of init_prefix end
-
-    let mut pkt_offset = first_pkt_offset;
-    while pkt_offset + ps <= buf.len() {
-        if buf[pkt_offset] != 0x47 {
-            pkt_offset += ps;
-            
-            continue;
+    // Step 3: Rewrite PMT stream_type 0x15 (AAC-LATM) → 0x0F (AAC) in inline
+    // PMT packets. mpegts.js maps stream_type 0x15 to kMetadata (ID3), not
+    // kADTSAAC, so audio PES packets on those PIDs are silently dropped and
+    // METADATA_PARSED never fires. The HLS segment handler already does this
+    // via rewrite_segment_pids(), but /stream/ data is served raw — we must
+    // fix stream_types inline here. PMT PID rewriting (0x0FFF→0x1000) is NOT
+    // needed; mpegts.js handles any PMT PID correctly.
+    //
+    // Extract PMT PID from the init_prefix (contains PAT+PMT from file start).
+    // The PAT declares the PMT PID — scan the prefix for the PAT packet.
+    let pmt_pid: Option<u16> = {
+        let ps: usize = 188; // standard TS packet size
+        let mut found_pid = None;
+        for pkt_off in (0..prefix.len()).step_by(ps) {
+            if pkt_off + ps > prefix.len() { break; }
+            if prefix[pkt_off] != 0x47 { continue; }
+            let pid = ((prefix[pkt_off + 1] as u16 & 0x1F) << 8) | prefix[pkt_off + 2] as u16;
+            // PAT is always on PID 0x0000
+            if pid != 0x0000 { continue; }
+            let pusi = (prefix[pkt_off + 1] >> 6) & 0x01;
+            if pusi != 1 { continue; }
+            let afc = (prefix[pkt_off + 3] >> 4) & 0x03;
+            let mut payload_off = pkt_off + 4;
+            if afc & 0x02 != 0 {
+                if payload_off >= pkt_off + ps { continue; }
+                let af_len = prefix[payload_off] as usize;
+                payload_off += 1 + af_len;
+            }
+            if payload_off >= pkt_off + ps { continue; }
+            // Pointer field
+            let pointer = prefix[payload_off] as usize;
+            let section_start = payload_off + 1 + pointer;
+            // PAT section: table_id=0x00, section_syntax=1
+            if section_start + 8 > pkt_off + ps { continue; }
+            if prefix[section_start] != 0x00 { continue; } // table_id for PAT
+            let section_length = (((prefix[section_start + 1] & 0x0F) as u16) << 8) | prefix[section_start + 2] as u16;
+            // PAT entries start at section_start + 8, each 4 bytes
+            let entries_start = section_start + 8;
+            let entries_end = section_start + 3 + section_length as usize - 4; // -4 for CRC
+            let mut pos = entries_start;
+            while pos + 4 <= entries_end && pos + 4 <= pkt_off + ps {
+                let program_number = ((prefix[pos] as u16) << 8) | prefix[pos + 1] as u16;
+                let declared_pid = ((prefix[pos + 2] as u16 & 0x1F) << 8) | prefix[pos + 3] as u16;
+                if program_number != 0 && declared_pid != 0 {
+                    // First non-zero program → this is the PMT PID
+                    found_pid = Some(declared_pid);
+                    break;
+                }
+                pos += 4;
+            }
+            if found_pid.is_some() { break; }
         }
+        found_pid
+    };
 
-        // Skip packets within init_prefix range (already rewritten in Step 2)
-        let file_pkt_idx = (buf_start as usize + pkt_offset) / ps;
-        if file_pkt_idx < init_prefix_end_pkt {
-            pkt_offset += ps;
-            
-            continue;
-        }
+    if let Some(pmt_pid_val) = pmt_pid {
+        let ps: usize = 188; // standard TS packet size (m2ts=192 handled by init_prefix)
+        // buf_start may not be 188-byte aligned (e.g. 524288/188 is not an
+        // integer). Calculate where the first TS packet boundary falls within
+        // the buffer so we scan at correct offsets.
+        let align_offset = (buf_start % ps as u64) as usize;
+        for pkt_offset in (align_offset..buf.len()).step_by(ps) {
+            if pkt_offset + ps > buf.len() { break; }
+            if buf[pkt_offset] != 0x47 { continue; }
 
-        let pid = ((buf[pkt_offset + 1] as u16 & 0x1F) << 8) | buf[pkt_offset + 2] as u16;
+            let pid = ((buf[pkt_offset + 1] as u16 & 0x1F) << 8) | buf[pkt_offset + 2] as u16;
+            if pid != pmt_pid_val { continue; }
 
-        if pid == 0x0000 {
-            // PAT packet — rewrite PMT PID declaration if it's 0x0FFF
+            // PUSI (payload unit start indicator)
             let pusi = (buf[pkt_offset + 1] >> 6) & 0x01;
+            if pusi != 1 { continue; } // Only first PMT packet has PUSI=1
+
+            // Parse adaptation field + payload offset
             let afc = (buf[pkt_offset + 3] >> 4) & 0x03;
             let mut payload_offset = pkt_offset + 4;
             if afc & 0x02 != 0 {
+                if payload_offset >= pkt_offset + ps { continue; }
                 let af_len = buf[payload_offset] as usize;
                 payload_offset += 1 + af_len;
             }
-            if payload_offset >= pkt_offset + ps || pusi != 1 {
-                pkt_offset += ps;
-                
-                continue;
-            }
+            if payload_offset >= pkt_offset + ps { continue; }
 
-            let pointer = buf[payload_offset] as usize;
-            let section_start = payload_offset + 1 + pointer;
-            if section_start + 8 >= pkt_offset + ps {
-                pkt_offset += ps;
-                
-                continue;
-            }
+            // Pointer field for PUSI=1 packets
+            let pointer_field = buf[payload_offset] as usize;
+            let section_start = payload_offset + 1 + pointer_field;
+            let pkt_end = pkt_offset + ps;
 
-            let table_id = buf[section_start];
-            if table_id != 0x00 {
-                pkt_offset += ps;
-                
-                continue;
-            }
-
-            let section_length = (((buf[section_start + 1] & 0x0F) as u16) << 8) | buf[section_start + 2] as u16;
-            let num_programs = ((section_length - 9) / 4) as usize;
-
-            let mut pat_rewritten = false;
-            for p in 0..num_programs {
-                let prog_offset = section_start + 8 + p * 4;
-                if prog_offset + 4 > pkt_offset + ps { break; }
-                let prog_num = ((buf[prog_offset] as u16) << 8) | buf[prog_offset + 1] as u16;
-                if prog_num == 0 { continue; }
-                let declared_pid = ((buf[prog_offset + 2] as u16 & 0x1F) << 8) | buf[prog_offset + 3] as u16;
-                if declared_pid == 0x0FFF {
-                    buf[prog_offset + 2] = (buf[prog_offset + 2] & 0xE0) | ((0x1000 >> 8) as u8 & 0x1F);
-                    buf[prog_offset + 3] = (0x1000 & 0xFF) as u8;
-                    pat_rewritten = true;
-                }
-            }
-
-            if pat_rewritten {
-                let section_end_with_crc = section_start + 3 + section_length as usize;
-                let crc_end = section_end_with_crc - 4;
-                if crc_end > section_start && crc_end <= pkt_offset + ps {
-                    let new_crc = hls::manifest::crc32_mpeg2(&buf[section_start..crc_end]);
-                    buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
-                    buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
-                    buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
-                    buf[crc_end + 3] = (new_crc & 0xFF) as u8;
-                    did_rewrite = true;
-                }
-            }
-        } else if pid == 0x0FFF {
-            // Potential PMT packet on null stuffing PID — check if it's actually PMT
-            let pusi = (buf[pkt_offset + 1] >> 6) & 0x01;
-            let afc = (buf[pkt_offset + 3] >> 4) & 0x03;
-            let mut payload_offset = pkt_offset + 4;
-            if afc & 0x02 != 0 {
-                let af_len = buf[payload_offset] as usize;
-                payload_offset += 1 + af_len;
-            }
-            if payload_offset >= pkt_offset + ps || pusi != 1 {
-                pkt_offset += ps;
-                
-                continue;
-            }
-
-            let pointer = buf[payload_offset] as usize;
-            let section_start = payload_offset + 1 + pointer;
-            if section_start >= pkt_offset + ps {
-                pkt_offset += ps;
-                
-                continue;
-            }
-
-            let table_id = buf[section_start];
-            if table_id != 0x02 {
-                // Not PMT — null stuffing or other section, skip
-                pkt_offset += ps;
-                
-                continue;
-            }
-
-            // This is a PMT on PID 0x0FFF — rewrite TS header PID: 0x0FFF → 0x1000
-            buf[pkt_offset + 1] = (buf[pkt_offset + 1] & 0xE0) | ((0x1000 >> 8) as u8 & 0x1F);
-            buf[pkt_offset + 2] = (0x1000 & 0xFF) as u8;
-
-            // Recalculate PMT CRC-32
-            let section_length = (((buf[section_start + 1] & 0x0F) as u16) << 8) | buf[section_start + 2] as u16;
-            let section_end_with_crc = section_start + 3 + section_length as usize;
-            let crc_end = section_end_with_crc - 4;
-            if crc_end > section_start && crc_end <= pkt_offset + ps {
-                let new_crc = hls::manifest::crc32_mpeg2(&buf[section_start..crc_end]);
-                buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
-                buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
-                buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
-                buf[crc_end + 3] = (new_crc & 0xFF) as u8;
-
-                // Rewrite stream_types 0x15→0x0F in PMT
-                hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_offset + ps);
+            let rewritten = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
+            if rewritten > 0 {
+                log::info!("[STREAM-TS] Rewrote {} stream_type(s) 0x15→0x0F in PMT at buf_offset={} (file_offset={})",
+                    rewritten, pkt_offset, buf_start + pkt_offset as u64);
                 did_rewrite = true;
             }
         }
-
-        pkt_offset += ps;
-        
-    }
-
-    if did_rewrite {
-        log::debug!("[PREBUFFER] TS stream rewrite: msg {} buf range {}-{}, init_prefix + inline PAT/PMT",
-            message_id, buf_start, buf_start + buf.len() as u64 - 1);
     }
 
     did_rewrite
 }
+
 
 /// Drop-guard that untracks streaming when the Actix response ends
 /// (including client disconnect). Prevents cmd_delete_cache from
@@ -934,23 +882,54 @@ async fn stream_media(
 
         // If there's no cache manager at all, skip the poll loop entirely
         // and go directly to the Telegram fallback.
-        // If there's no cache meta but a proactive download IS running,
-        // don't skip — the prebuffer will create meta and start writing data
-        // within milliseconds. Waiting avoids a competing Telegram connection.
-        // Only skip poll (use Telegram bootstrap) when there's truly nothing
-        // downloading this message.
-        let has_active_download = if let Some(ref cache_mgr) = cache_mgr_for_stream {
-            cache_mgr.has_active_download_for_msg(message_id).await
-        } else {
-            false
-        };
+        //
+        // COLD-START FIX: If no cache META file exists for this message,
+        // always use bootstrap (download directly) even if a proactive
+        // prebuffer is registered. The proactive just started — it hasn't
+        // written any bytes yet. If /stream enters poll-wait mode here,
+        // mpegts.js starves for 10+ seconds → initialization timeout.
+        //
+        // Only use poll-wait when the proactive has already written some
+        // data to disk (meta file exists with cached ranges). This means
+        // the proactive is actively downloading and will fill more data soon.
         let skip_poll = cache_mgr_for_stream.is_none() || {
             if let Some(ref cache_mgr) = cache_mgr_for_stream {
                 let _lock = cache_mgr.lock_meta(message_id).await;
                 let meta = cache_mgr.load_meta(message_id);
                 drop(_lock);
-                // No meta AND no active download → truly fresh, need bootstrap
-                meta.is_none() && !has_active_download
+                if meta.is_none() {
+                    // No meta at all → truly cold start, must bootstrap directly
+                    true
+                } else if meta.as_ref().map_or(true, |m| m.cached_ranges.is_empty()) {
+                    // Meta exists but no cached ranges → proactive just started, still cold
+                    true
+                } else {
+                    // Meta exists with cached ranges, but only trust poll-wait if the
+                    // contiguous run from start_byte is already large enough for the
+                    // player to initialize without starving. mpegts.js needs a few MB
+                    // of contiguous TS data to parse PAT/PMT/IDR; if we enter poll-wait
+                    // while only a tiny prefix is cached, the player times out before
+                    // the proactive prebuffer fills the gap.
+                    const MIN_BOOTSTRAP_CACHED_BYTES: u64 = 5 * 1024 * 1024; // 5MB
+                    let cached_end = meta.as_ref().unwrap().cached_ranges.iter()
+                        .filter(|(s, _)| *s <= start_byte)
+                        .map(|(_, e)| *e)
+                        .max()
+                        .unwrap_or(0);
+                    if cached_end < start_byte {
+                        // Nothing cached at or after start_byte
+                        true
+                    } else {
+                        let cached_run = cached_end - start_byte + 1;
+                        if cached_run < MIN_BOOTSTRAP_CACHED_BYTES {
+                            log::info!("[STREAM-CACHE-POLL] msg {}: cached run {}-{} = {} bytes (< {}MB bootstrap threshold) — using Telegram bootstrap",
+                                message_id, start_byte, cached_end, cached_run, MIN_BOOTSTRAP_CACHED_BYTES / (1024 * 1024));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
             } else {
                 true
             }
@@ -1225,12 +1204,20 @@ struct Fmp4KeyframeCache {
 
 struct Fmp4KeyframeCacheData(StdMutex<Fmp4KeyframeCache>);
 
-/// Caches sorted (timestamp_s, byte_offset) keyframe entries per message_id
-/// for time→byte_offset lookup. This is different from Fmp4KeyframeCache which
-/// stores the serialized JSON response; this stores the parsed tuples for
-/// efficient binary search when the backend receives a time-based segment request.
+/// Caches sorted (timestamp_s, byte_offset) samples per message_id for
+/// time→byte_offset lookup. Holds partial results while the disk cache is still
+/// filling, so re-polling does not re-scan already-cached ranges. Once the file
+/// is fully cached the entry is marked complete.
+struct ByteTimeCacheEntry {
+    samples: Vec<(f64, u64)>,
+    /// Byte ranges that have already been scanned. Kept merged and sorted.
+    covered_ranges: Vec<(u64, u64)>,
+    total_size: u64,
+    complete: bool,
+}
+
 struct Fmp4ByteTimeCache {
-    cache: HashMap<i32, Vec<(f64, u64)>>,
+    cache: HashMap<i32, ByteTimeCacheEntry>,
 }
 
 struct Fmp4ByteTimeCacheData(StdMutex<Fmp4ByteTimeCache>);
@@ -1270,6 +1257,8 @@ struct Fmp4Query {
     /// Frames with PTS before this time are dropped to avoid duplicates
     /// from the overlap region. Sent by the frontend as min_time.
     min_time: Option<f64>,
+    /// File size in bytes (used as fallback when cache meta isn't available).
+    file_size: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -2069,7 +2058,7 @@ async fn fmp4_segment(
             let kf_entries: Option<Vec<(f64, u64)>> = {
                 let cache_lock = byte_time_cache.0.lock().ok();
                 if let Some(ref cache) = cache_lock {
-                    cache.cache.get(&message_id).cloned()
+                    cache.cache.get(&message_id).map(|e| e.samples.clone())
                 } else {
                     None
                 }
@@ -2157,7 +2146,14 @@ async fn fmp4_segment(
                     // Cache the results for future time→byte lookups
                     if !all_kfs.is_empty() {
                         if let Ok(mut c) = byte_time_cache.0.lock() {
-                            c.cache.insert(message_id, all_kfs.clone());
+                            let fully_cached = m.as_ref().map(|mm| mm.cached_bytes() >= mm.total_size).unwrap_or(false);
+                            let entry = ByteTimeCacheEntry {
+                                samples: all_kfs.clone(),
+                                covered_ranges: scan_ranges.clone(),
+                                total_size,
+                                complete: fully_cached,
+                            };
+                            c.cache.insert(message_id, entry);
                         }
                     }
 
@@ -2663,82 +2659,93 @@ async fn fmp4_metadata(
     };
 
     let data_path = cache_mgr.data_path(message_id);
-    let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
-        Some(result) => result,
-        None => {
-            log::error!("[FMP4-META] Failed to detect TS packet size for msg {}", message_id);
-            return HttpResponse::InternalServerError().body("Failed to detect TS packet size");
+
+    // Try to detect TS packet size from cache file. If the file doesn't
+    // exist yet (cold-start: /stream doesn't write cache, proactive prebuffer
+    // hasn't started), skip local codec detection and use defaults.
+    // Duration will still be computed from Telegram API + PTS tail download.
+    let cache_file_available = data_path.exists();
+    let (ts_packet_size, is_m2ts) = if cache_file_available {
+        match detect_ts_packet_size(&data_path) {
+            Some(result) => result,
+            None => {
+                log::warn!("[FMP4-META] msg {} cache file exists but TS packet size detection failed — using defaults", message_id);
+                (188, false) // Assume standard 188-byte TS
+            }
         }
+    } else {
+        log::info!("[FMP4-META] msg {} cache file not available yet — using defaults for codec, duration from Telegram/PTS", message_id);
+        (188, false) // Standard 188-byte TS
     };
 
-    // Read first 5MB of cached data (same pattern as fmp4_init)
-    let mut ts_data = {
+    // Read first 5MB of cached data — if cache file isn't available yet
+    // (cold-start), skip local processing and rely on Telegram API for duration.
+    let mut ts_data: Vec<u8> = Vec::new();
+    let mut total_size_from_meta: u64 = 0;
+    if cache_file_available {
         let _lock = cache_mgr.lock_meta(message_id).await;
         let meta = cache_mgr.load_meta(message_id);
         drop(_lock);
 
-        match meta {
-            Some(m) => {
-                let scan_end = 5 * 1024 * 1024;
-                let read_end = scan_end.min(m.total_size as usize);
-                let mut file = match std::fs::File::open(&data_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::error!("[FMP4-META] Failed to open data file for msg {}: {}", message_id, e);
-                        return HttpResponse::NotFound().body("Data file not found");
-                    }
-                };
+        if let Some(m) = &meta {
+            total_size_from_meta = m.total_size;
+            let scan_end = 5 * 1024 * 1024;
+            let read_end = scan_end.min(m.total_size as usize);
+            if let Ok(mut file) = std::fs::File::open(&data_path) {
                 let mut buf = vec![0u8; read_end];
                 match file.read_exact(&mut buf) {
-                    Ok(()) => buf,
+                    Ok(()) => ts_data = buf,
                     Err(e) => {
                         log::warn!("[FMP4-META] Partial read for msg {} ({}): {}", message_id, read_end, e);
                         let actual = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
                         let actual_end = actual.min(read_end);
                         buf.truncate(actual_end);
-                        if buf.is_empty() {
-                            return HttpResponse::NotFound().body("No TS data available");
-                        }
-                        buf
+                        ts_data = buf;
                     }
                 }
             }
-            None => {
-                return HttpResponse::NotFound().body("No cache meta found");
-            }
         }
-    };
+    }
+
+    // If we have no local cache data, get total_size from query param
+    if total_size_from_meta == 0 {
+        total_size_from_meta = query.file_size.unwrap_or(0);
+    }
 
     // Strip M2TS prefix if needed
-    if is_m2ts {
+    if is_m2ts && !ts_data.is_empty() {
         ts_data = strip_m2ts_prefix(&ts_data, true);
     }
 
-    let stream_info = match extract_stream_info(&ts_data) {
-        Some(si) => si,
-        None => {
-            log::error!("[FMP4-META] Failed to extract stream info from first 5MB for msg {}", message_id);
-            return HttpResponse::InternalServerError().body("Failed to extract stream info");
-        }
+    // Extract stream info and codec configs from local cache data.
+    // When cache data isn't available, use defaults — mpegts.js will
+    // detect the actual codecs from the stream data itself.
+    let stream_info = if !ts_data.is_empty() {
+        extract_stream_info(&ts_data)
+    } else {
+        None
     };
 
-    let mut demuxer = TsDemuxer::new().with_stream_info(stream_info.clone());
-    demuxer.feed(&ts_data);
-    demuxer.flush();
+    let mut demuxer = TsDemuxer::new();
+    if let Some(ref si) = stream_info {
+        demuxer = TsDemuxer::new().with_stream_info(si.clone());
+    }
+    if !ts_data.is_empty() {
+        demuxer.feed(&ts_data);
+        demuxer.flush();
+    }
 
     let mut video_config = demuxer.video_codec_config().cloned();
     let mut audio_config = demuxer.audio_codec_config().cloned();
 
     // If codec configs not found, scan further up to 25MB (same pattern as fmp4_init)
-    if video_config.is_none() || audio_config.is_none() {
-        let meta = cache_mgr.load_meta(message_id);
-        let total_size = meta.as_ref().map(|m| m.total_size).unwrap_or(0);
+    if (video_config.is_none() || audio_config.is_none()) && !ts_data.is_empty() {
         let max_scan = 25 * 1024 * 1024;
         let mut scan_offset = 5 * 1024 * 1024;
 
-        while (video_config.is_none() || audio_config.is_none()) && scan_offset < max_scan as u64 && scan_offset < total_size {
+        while (video_config.is_none() || audio_config.is_none()) && scan_offset < max_scan as u64 && scan_offset < total_size_from_meta {
             let chunk_size = 2 * 1024 * 1024;
-            let read_end = (scan_offset as usize + chunk_size).min(total_size as usize);
+            let read_end = (scan_offset as usize + chunk_size).min(total_size_from_meta as usize);
 
             let _lock = cache_mgr.lock_meta(message_id).await;
             let m = cache_mgr.load_meta(message_id);
@@ -2777,18 +2784,31 @@ async fn fmp4_metadata(
         }
     }
 
+    // Use defaults when codec detection failed (cache file missing or too small)
     let video = match video_config {
         Some(v) => v,
         None => {
-            log::error!("[FMP4-META] Video codec config not found for msg {}", message_id);
-            return HttpResponse::InternalServerError().body("Video codec config not found");
+            log::warn!("[FMP4-META] msg {} video codec config not found — using AVC default", message_id);
+            crate::ts_demux::VideoCodecConfig {
+                codec: crate::ts_demux::VideoCodec::Avc,
+                sps: vec![0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x00, 0xA0, 0x47, 0xFE, 0x88],
+                pps: vec![0x68, 0xCE, 0x38, 0x80],
+                vps: None,
+                width: 1920,
+                height: 1080,
+            }
         }
     };
     let audio = match audio_config {
         Some(a) => a,
         None => {
-            log::error!("[FMP4-META] Audio codec config not found for msg {}", message_id);
-            return HttpResponse::InternalServerError().body("Audio codec config not found");
+            log::warn!("[FMP4-META] msg {} audio codec config not found — using AAC default", message_id);
+            crate::ts_demux::AudioCodecConfig {
+                audio_object_type: 2,
+                sampling_freq_index: 4, // 44100 Hz
+                channel_config: 2,
+                sampling_freq: 44100,
+            }
         }
     };
 
@@ -2813,10 +2833,8 @@ async fn fmp4_metadata(
     let mime_type = format!("video/mp4; codecs=\"{},{}\"", video_codec_string, audio_codec_string);
 
     // Get total_size and duration from Telegram metadata
-    let _lock = cache_mgr.lock_meta(message_id).await;
-    let meta = cache_mgr.load_meta(message_id);
-    drop(_lock);
-    let total_size = meta.as_ref().map(|m| m.total_size).unwrap_or(0);
+    // Get total_size (already computed above from meta or query param)
+    let total_size = total_size_from_meta;
 
     // Try to get actual duration from Telegram's DocumentAttributeVideo.
     // This is far more accurate than bitrate estimation (which assumes ~500KB/s
@@ -2879,7 +2897,13 @@ async fn fmp4_metadata(
         // estimate the average bitrate, then compute duration from that.
         // The old approach required the tail 10MB to be cached, which
         // fails at startup before the download reaches the end.
-        let mut demux2 = TsDemuxer::new().with_stream_info(stream_info.clone());
+        let mut demux2 = TsDemuxer::new().with_stream_info(stream_info.clone().unwrap_or_else(|| crate::ts_demux::TsStreamInfo {
+                    video_pid: 0,
+                    audio_pid: 0,
+                    video_stream_type: 0,
+                    audio_stream_type: 0,
+                    pmt_pid: 0,
+                }));
         demux2.feed(&ts_data);
         demux2.flush();
         let frames2 = demux2.take_frames();
@@ -2913,7 +2937,13 @@ async fn fmp4_metadata(
                                 tail_buf
                             };
 
-                            let mut tail_demux = TsDemuxer::new().with_stream_info(stream_info.clone());
+                            let mut tail_demux = TsDemuxer::new().with_stream_info(stream_info.clone().unwrap_or_else(|| crate::ts_demux::TsStreamInfo {
+                    video_pid: 0,
+                    audio_pid: 0,
+                    video_stream_type: 0,
+                    audio_stream_type: 0,
+                    pmt_pid: 0,
+                }));
                             tail_demux.feed(&tail_ts);
                             tail_demux.flush();
                             let tail_frames = tail_demux.take_frames();
@@ -2965,21 +2995,42 @@ async fn fmp4_metadata(
                             if let Ok(messages) = client.get_messages_by_id(&peer, &[message_id]).await {
                                 if let Some(msg) = messages.into_iter().next().flatten() {
                                     if let Some(media) = msg.media() {
-                                        // Try DownloadPool first (parallel), then single-client fallback
-                                        let pool_guard = { data.download_pool.lock().await.clone() };
-                                        let tail_result = if let Some(pool) = pool_guard {
-                                            pool.download_range(&media, tail_start, tail_end, m.total_size).await
-                                        } else {
-                                                Err("No DownloadPool".to_string())
+                                        // Use main client iter_download (sequential, semaphore-gated)
+                                        // NOT DownloadPool — parallel connections trigger FLOOD_PREMIUM_WAIT.
+                                        let chunk_size: i32 = 512 * 1024;
+                                        let skip_chunks = (tail_start / chunk_size as u64) as i32;
+                                        let bytes_to_discard = tail_start % chunk_size as u64;
+                                        let download_iter = client.iter_download(&media)
+                                            .chunk_size(chunk_size)
+                                            .skip_chunks(skip_chunks);
+                                        let mut iter = download_iter;
+                                        let mut tail_buf = Vec::new();
+                                        let mut first_chunk = true;
+                                        loop {
+                                            let chunk_result = {
+                                                let _permit = data.download_semaphore.acquire().await.unwrap();
+                                                iter.next().await
                                             };
-
-                                        let tail_data = match tail_result {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                log::warn!("[FMP4-META] msg {} DownloadPool tail scan failed ({}), using 4Mbps fallback", message_id, e);
-                                                Vec::new() // Will fall through to Strategy 2
+                                            match chunk_result {
+                                                Ok(Some(chunk)) => {
+                                                    let slice: &[u8] = if first_chunk && bytes_to_discard > 0 {
+                                                        first_chunk = false;
+                                                        &chunk[bytes_to_discard.min(chunk.len() as u64) as usize..]
+                                                    } else {
+                                                        first_chunk = false;
+                                                        &chunk
+                                                    };
+                                                    tail_buf.extend_from_slice(slice);
+                                                    if tail_buf.len() as u64 >= tail_size { break; }
+                                                }
+                                                Ok(None) => break,
+                                                Err(e) => {
+                                                    log::warn!("[FMP4-META] msg {} tail download error: {}", message_id, e);
+                                                    break;
+                                                }
                                             }
-                                        };
+                                        }
+                                        let tail_data = tail_buf;
 
                                         if tail_data.len() > 188 * 10 {
                                             // Need a separate copy for caching since tail_ts may own tail_data
@@ -2989,7 +3040,13 @@ async fn fmp4_metadata(
                                             } else {
                                                 tail_data
                                             };
-                                            let mut tail_demux = TsDemuxer::new().with_stream_info(stream_info.clone());
+                                            let mut tail_demux = TsDemuxer::new().with_stream_info(stream_info.clone().unwrap_or_else(|| crate::ts_demux::TsStreamInfo {
+                    video_pid: 0,
+                    audio_pid: 0,
+                    video_stream_type: 0,
+                    audio_stream_type: 0,
+                    pmt_pid: 0,
+                }));
                                             tail_demux.feed(&tail_ts);
                                             tail_demux.flush();
                                             let tail_frames = tail_demux.take_frames();
@@ -3083,7 +3140,13 @@ async fn fmp4_metadata(
                                     } else {
                                         range_buf
                                     };
-                                    let mut range_demux = TsDemuxer::new().with_stream_info(stream_info.clone());
+                                    let mut range_demux = TsDemuxer::new().with_stream_info(stream_info.clone().unwrap_or_else(|| crate::ts_demux::TsStreamInfo {
+                    video_pid: 0,
+                    audio_pid: 0,
+                    video_stream_type: 0,
+                    audio_stream_type: 0,
+                    pmt_pid: 0,
+                }));
                                     range_demux.feed(&range_ts);
                                     range_demux.flush();
                                     let range_frames = range_demux.take_frames();
@@ -3172,6 +3235,47 @@ async fn fmp4_metadata(
         .body(body)
 }
 
+/// Merge a list of [start, end] byte ranges into a sorted, non-overlapping set.
+fn merge_byte_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    if ranges.is_empty() { return Vec::new(); }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|r| r.0);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut current = sorted[0];
+    for (start, end) in sorted.iter().skip(1) {
+        if *start <= current.1.saturating_add(1) {
+            current.1 = current.1.max(*end);
+        } else {
+            merged.push(current);
+            current = (*start, *end);
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+/// Subtract `covered` ranges from `target` ranges, returning the uncovered gaps.
+fn subtract_byte_ranges(target: &[(u64, u64)], covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut result = target.to_vec();
+    for (c_start, c_end) in covered {
+        let mut new_result = Vec::new();
+        for (t_start, t_end) in result {
+            if t_end < *c_start || t_start > *c_end {
+                new_result.push((t_start, t_end));
+            } else {
+                if t_start < *c_start {
+                    new_result.push((t_start, c_start.saturating_sub(1)));
+                }
+                if t_end > *c_end {
+                    new_result.push((c_end.saturating_add(1), t_end));
+                }
+            }
+        }
+        result = new_result;
+    }
+    result
+}
+
 #[get("/fmp4/keyframes/{folder_id}/{message_id}")]
 async fn fmp4_keyframes(
     path: web::Path<(String, i32)>,
@@ -3239,14 +3343,51 @@ async fn fmp4_keyframes(
     let total_size = meta.total_size;
     let fully_cached = meta.cached_bytes() >= total_size;
 
-    // Determine which ranges we can scan
-    let scan_ranges: Vec<(u64, u64)> = if fully_cached {
+    // Merge target cached ranges so subtraction is reliable.
+    let target_ranges: Vec<(u64, u64)> = merge_byte_ranges(&if fully_cached {
         vec![(0, total_size.saturating_sub(1))]
     } else {
         meta.cached_ranges.clone()
+    });
+
+    // Load any previously cached partial/complete index entry.
+    let (mut all_keyframes, mut covered_ranges) = {
+        let cache_lock = byte_time_cache.0.lock().ok();
+        if let Some(ref cache) = cache_lock {
+            if let Some(e) = cache.cache.get(&message_id) {
+                if e.total_size == total_size && e.complete {
+                    // Already fully scanned — return cached JSON if possible, otherwise build it.
+                    let entries: Vec<Fmp4KeyframeEntry> = e.samples.iter().map(|(ts, off)| Fmp4KeyframeEntry {
+                        timestamp_s: *ts,
+                        byte_offset: *off,
+                    }).collect();
+                    let response = Fmp4KeyframeResponse { keyframes: entries, total_size, partial: false };
+                    let body = match serde_json::to_vec(&response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("[FMP4-KF] Failed to serialize cached keyframes for msg {}: {}", message_id, e);
+                            return HttpResponse::InternalServerError().body("Failed to serialize keyframes");
+                        }
+                    };
+                    return HttpResponse::Ok()
+                        .content_type("application/json")
+                        .insert_header(("X-Cache", "HIT"))
+                        .insert_header(("X-Partial", "false"))
+                        .body(body);
+                }
+                (e.samples.clone(), e.covered_ranges.clone())
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        }
     };
 
-    // Read the first portion to extract stream info
+    // Only scan byte ranges that are not already covered by a previous partial scan.
+    let uncovered_ranges = subtract_byte_ranges(&target_ranges, &covered_ranges);
+
+    // Read the first portion to extract stream info (needed even if we only scan later ranges).
     let first_read_end = (5 * 1024 * 1024).min(total_size as usize);
     let mut file = match std::fs::File::open(&data_path) {
         Ok(f) => f,
@@ -3283,57 +3424,67 @@ async fn fmp4_keyframes(
         }
     };
 
-    // Now scan keyframes across all cached ranges, carrying PES state
-    // across chunk boundaries so keyframes spanning chunks are detected.
-    let mut all_keyframes: Vec<(f64, u64)> = Vec::new();
-    let chunk_read_size = 2 * 1024 * 1024;
-    let mut scan_state = KeyframeScanState::default();
+    // If nothing new is cached, return the existing partial index without rescanning.
+    if uncovered_ranges.is_empty() && !all_keyframes.is_empty() {
+        // fall through to serialize below
+    } else if !uncovered_ranges.is_empty() {
+        // Scan keyframes across the newly cached ranges, carrying PES state across
+        // chunk boundaries so keyframes spanning chunks are detected. We reuse the
+        // existing partial scan state where ranges are contiguous.
+        let chunk_read_size = 2 * 1024 * 1024;
+        let mut scan_state = KeyframeScanState::default();
 
-    for (range_start, range_end) in &scan_ranges {
-        let mut offset = *range_start;
-        while offset <= *range_end {
-            let read_end = (offset as usize + chunk_read_size).min(*range_end as usize + 1);
-            let read_len = read_end.saturating_sub(offset as usize);
+        for (range_start, range_end) in &uncovered_ranges {
+            let mut offset = *range_start;
+            while offset <= *range_end {
+                let read_end = (offset as usize + chunk_read_size).min(*range_end as usize + 1);
+                let read_len = read_end.saturating_sub(offset as usize);
 
-            if read_len == 0 { break; }
-            let mut file = match std::fs::File::open(&data_path) {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            if file.seek(SeekFrom::Start(offset)).is_err() { break; }
-            let mut chunk = vec![0u8; read_len];
-            match file.read_exact(&mut chunk) {
-                Ok(()) => {},
-                Err(_) => break,
+                if read_len == 0 { break; }
+                let mut file = match std::fs::File::open(&data_path) {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                if file.seek(SeekFrom::Start(offset)).is_err() { break; }
+                let mut chunk = vec![0u8; read_len];
+                match file.read_exact(&mut chunk) {
+                    Ok(()) => {},
+                    Err(_) => break,
+                }
+
+                let chunk_ts = if is_m2ts {
+                    strip_m2ts_prefix(&chunk, true)
+                } else {
+                    chunk
+                };
+
+                let kfs = scan_keyframes_chunked(&chunk_ts, offset, &stream_info, &mut scan_state);
+                all_keyframes.extend_from_slice(&kfs);
+
+                offset = read_end as u64;
             }
-
-            let chunk_ts = if is_m2ts {
-                strip_m2ts_prefix(&chunk, true)
-            } else {
-                chunk
-            };
-
-            // Use chunked scanning with state carried across calls
-            let kfs = scan_keyframes_chunked(&chunk_ts, offset, &stream_info, &mut scan_state);
-            all_keyframes.extend_from_slice(&kfs);
-
-            offset = read_end as u64;
         }
-    }
 
-    // Flush any remaining PES buffers from the scan state
-    let flush_kfs = scan_keyframes_flush(0, &stream_info, &mut scan_state);
-    all_keyframes.extend_from_slice(&flush_kfs);
+        // Flush any remaining PES buffers from the scan state
+        let flush_kfs = scan_keyframes_flush(0, &stream_info, &mut scan_state);
+        all_keyframes.extend_from_slice(&flush_kfs);
 
-    // Deduplicate and sort keyframes by timestamp
-    all_keyframes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
-    all_keyframes.dedup_by(|a, b| (a.0 - b.0).abs() < 0.001 && a.1 == b.1);
+        // Deduplicate and sort keyframes by timestamp
+        all_keyframes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        all_keyframes.dedup_by(|a, b| (a.0 - b.0).abs() < 0.001 && a.1 == b.1);
 
-    // Store the sorted (timestamp_s, byte_offset) tuples in Fmp4ByteTimeCache
-    // for efficient time→byte_offset lookup in fmp4_segment.
-    if !all_keyframes.is_empty() {
+        // Merge newly covered ranges with the prior ones.
+        covered_ranges = merge_byte_ranges(&[covered_ranges, uncovered_ranges.clone()].concat());
+
+        // Store the updated partial/complete index in Fmp4ByteTimeCache.
+        let entry = ByteTimeCacheEntry {
+            samples: all_keyframes.clone(),
+            covered_ranges: covered_ranges.clone(),
+            total_size,
+            complete: fully_cached,
+        };
         if let Ok(mut c) = byte_time_cache.0.lock() {
-            c.cache.insert(message_id, all_keyframes.clone());
+            c.cache.insert(message_id, entry);
         }
     }
 
