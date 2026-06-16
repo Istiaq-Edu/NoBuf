@@ -2067,14 +2067,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Mark that MSE pipeline is initialized (prevents MSE timeout)
       transmuxerInitInProgressRef.current = true;
 
-      // Start fetching data. FastStreamPlayer sets v.autoplay and calls
-      // v.play() on loadedmetadata/canplay — the video may start playing
-      // before our gate checks. The startup buffer gate calls player.play()
-      // as a safety net (idempotent — no-op if already playing). The gate
-      // ensures at least 5s of buffer exists before we consider playback
-      // "ready", which prevents early stalls if autoplay hasn't fired yet.
+      // Start fetching data. FastStreamPlayer sets v.autoplay and can call
+      // v.play() on loadedmetadata/canplay. mpegts.js will fire MEDIA_INFO once
+      // it has parsed the PAT/PMT, and playback starts immediately after that.
       player.load();
-      diagLog('[MPEGTS] Player loaded, startup buffer gate will control play()');
+      diagLog('[MPEGTS] Player loaded, playback starts at MEDIA_INFO');
       // ── Fetch ACTUAL duration from /fmp4/metadata in parallel ──
       // The player was created with an estimated duration. Now fetch the
       // real PTS-based duration from the backend (which downloads the file's
@@ -2485,13 +2482,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const adjustBufferForSpeed = () => {
         const lc = (player as any)?._player_engine?._loading_controller;
         if (lc?._config) {
-          // Fixed 180s ahead / 60s behind. Only pacing bitrate scales with playbackRate.
+          // Fixed 180s ahead / 120s recover. Playback speed does NOT change this window.
           lc._config.lazyLoad = true;
           lc._config.lazyLoadMaxDuration = 180;
           lc._config.lazyLoadRecoverDuration = 120;
-          lc._config.autoCleanupSourceBuffer = false;
+          // Keep native SourceBuffer cleanup enabled so the behind-window is evicted automatically.
+          lc._config.autoCleanupSourceBuffer = true;
+          lc._config.autoCleanupMaxBackwardDuration = 60;
+          lc._config.autoCleanupMinBackwardDuration = 30;
 
-          diagLog(`[MPEGTS] Buffer window: 180s ahead, 60s behind, lazyLoad=ON (maxDuration=180, recoverDuration=120, rate=${video.playbackRate || 1}x, quota-guard-managed), _onIOSeeked=no-op (prevent runaway loop)`);
+          diagLog(`[MPEGTS] Buffer window: 180s ahead, 60s behind, lazyLoad=ON (maxDuration=180, recoverDuration=120, rate=${video.playbackRate || 1}x, autoCleanupSourceBuffer=ON)`);
         }
       };
       adjustBufferForSpeed(); // set initial values
@@ -2866,22 +2866,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         enableWorker: false,
         enableStashBuffer: true,
         stashInitialSize: 1024 * 1024,
-        lazyLoad: true,                // 180s ahead — fixed by adjustBufferForSpeed
-        lazyLoadMaxDuration: 180,      // 180s ahead per 180s/60s policy
-        lazyLoadRecoverDuration: 120,  // Resume 120s before buffer end
+        lazyLoad: true,
+        lazyLoadMaxDuration: 180,
+        lazyLoadRecoverDuration: 120,
         seekType: 'range',
-        autoCleanupSourceBuffer: false,  // We manage the 60s behind window ourselves
+        customLoader: createChunkedFetchLoader(MpegtsPlayer),
+        shadowCache: shadowCacheRef.current,
+        autoCleanupSourceBuffer: true,
         autoCleanupMaxBackwardDuration: 60,
-        autoCleanupMinBackwardDuration: 60,
+        autoCleanupMinBackwardDuration: 30,
         accurateSeek: false,
-      });
+        } as any);
 
       newPlayer.attachMediaElement(video);
       mpegtsPlayerRef.current = newPlayer;
 
-      // ── No lazyLoad patches needed — continuous download mode ──
-      // With lazyLoad disabled, suspendTransmuxer only fires on BUFFER_FULL.
-      // No DTS capture/restore needed for BUFFER_FULL hard stops.
+      // The seek-recreated player uses the same custom loader as the initial player,
+      // so native lazyLoad and autoCleanupSourceBuffer manage the buffer window.
 
       newPlayer.on(MpegtsPlayer.Events.ERROR, (_type: string, detail: string) => {
         diagLog(`[MPEGTS] Recreated player error: ${detail}`);
