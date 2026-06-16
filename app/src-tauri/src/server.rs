@@ -1170,7 +1170,6 @@ async fn stream_media(
     if is_partial {
         HttpResponse::PartialContent()
             .insert_header(("Content-Type", mime))
-            .insert_header(("Content-Length", content_length.to_string()))
             .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
             .insert_header(("Accept-Ranges", "bytes"))
             .insert_header(("Connection", "keep-alive"))
@@ -1179,7 +1178,6 @@ async fn stream_media(
     } else {
         HttpResponse::Ok()
             .insert_header(("Content-Type", mime))
-            .insert_header(("Content-Length", size.to_string()))
             .insert_header(("Accept-Ranges", "bytes"))
             .insert_header(("X-Download-Mode", "cache-poll"))
             .streaming(stream)
@@ -3322,8 +3320,27 @@ async fn fmp4_keyframes(
     let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
         Some(result) => result,
         None => {
-            log::error!("[FMP4-KF] Failed to detect TS packet size for msg {}", message_id);
-            return HttpResponse::InternalServerError().body("Failed to detect TS packet size");
+            // The data file may not exist yet (cold start) or be too small for
+            // packet-size detection. Return an empty partial index so the
+            // frontend can fall back to linear byte mapping and retry later.
+            log::info!("[FMP4-KF] Data file not ready for msg {} — returning empty partial index", message_id);
+            let response = Fmp4KeyframeResponse {
+                keyframes: vec![],
+                total_size: 0,
+                partial: true,
+            };
+            return match serde_json::to_vec(&response) {
+                Ok(body) => HttpResponse::Ok()
+                    .content_type("application/json")
+                    .insert_header(("X-Cache", "MISS"))
+                    .insert_header(("X-Partial", "true"))
+                    .insert_header(("X-Reason", "data-not-ready"))
+                    .body(body),
+                Err(e) => {
+                    log::error!("[FMP4-KF] Failed to serialize empty partial response for msg {}: {}", message_id, e);
+                    HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+                }
+            };
         }
     };
 

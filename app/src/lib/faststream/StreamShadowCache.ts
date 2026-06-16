@@ -55,18 +55,26 @@ export interface ByteRange {
   dataLength?: number;  // number of valid bytes (data.length if omitted)
 }
 
-/** Max bytes to serve in a single HIT response. 30MB ≈ 60s at 4Mbps — safe for SourceBuffer. */
-const MAX_HIT_SERVE_BYTES = 30 * 1024 * 1024;
+/** Max bytes to serve in a single HIT response. Matches the largest resume chunk. */
+const MAX_HIT_SERVE_BYTES = alignChunkSize(10 * 1024 * 1024);
 
-/** Max bytes to siphon into cache while the interceptor is paused.
- *  After safe-resume, the interceptor pauses for several seconds so the
- *  IOController fetches from the network at a rate-limited pace. But
- *  forwardAndSiphon still siphons ALL response data into cache, which
- *  can flood the cache with far-ahead data that evicts near-playhead data.
- *  When the pause expires and the cache serves a HIT, it instantly fills
- *  the SourceBuffer past lazyLoadMax → immediate re-suspend → _resumeFrom
- *  too much far-ahead data during the pause window.
- *  (Note: _interceptorPauseUntil mechanism replaced by _interceptorServeLimitByte) */
+/** Max bytes to request from the server in one fetch. mpegts.js's native loader
+ *  opens with an open-ended (or full-file) range, but our backend serves streaming
+ *  responses via chunked transfer. Without a finite range, the loader treats the
+ *  first chunk (512KB) as the whole response and completes early. Capping the
+ *  request to an aligned 5MB for the first chunk and aligned 10MB for later chunks
+ *  gives the player a real block of data per HTTP response while keeping chunk
+ *  boundaries on 188-byte TS packet boundaries so the shadow cache stays contiguous
+ *  and mpegts.js does not drop partial packets at the end of each chunk. */
+const FIRST_CHUNK_MAX_BYTES = alignChunkSize(5 * 1024 * 1024);   // ~5MB, aligned to 188-byte TS packet
+const SUBSEQUENT_CHUNK_MAX_BYTES = alignChunkSize(10 * 1024 * 1024); // ~10MB, aligned to 188-byte TS packet
+
+/** Round a byte budget down to a multiple of the TS packet size (188). */
+function alignChunkSize(size: number): number {
+  return Math.floor(size / 188) * 188;
+}
+
+/** No hard siphon cap: the 300MB maxBytes limit is enforced by the cache itself. */
 
 export class StreamShadowCache {
   private entries: ByteRange[] = [];  // sorted by start, non-overlapping, merged
@@ -74,29 +82,6 @@ export class StreamShadowCache {
   readonly maxBytes: number;
   private _fileLength: number = 0;
   private _urlKey: string = '';   // substring to match stream URLs, e.g. "/stream/3574767635/3"
-  /** Timestamp until which the fetch interceptor should skip interception.
-   *  Set after safe-resume so IOController fetches from network (rate-limited)
-   *  instead of being instantly flooded with cached data. */
-  public _interceptorPauseUntil: number = 0;
-  /** Byte position limit: interceptor serves cache data only up to this byte.
-   *  Set after lazyLoad resume to prevent the interceptor from serving ALL
-   *  prebuffered data at once (which floods the SourceBuffer past lazyLoadMax
-   *  → immediate re-suspend → infinite loop). The limit is cleared when
-   *  lazyLoad naturally suspends or when the quota guard detects the buffer
-   *  has reached the target ahead. */
-  public _interceptorServeLimitByte: number = 0; // 0 = no limit
-  /** Player element reference for recomputing serve limit on Early EOF reconnect. */
-  public _playerElement: HTMLVideoElement | null = null;
-  /** Duration for recomputing serve limit on Early EOF reconnect. */
-  public _duration: number = 0;
-  /** lazyLoadMax for recomputing serve limit on Early EOF reconnect. */
-  public _lazyLoadMax: number = 120;
-  /** Dynamic pacing rate (bytes/sec) — set by quota guard, read by interceptor.
-   *  0 = no pacing (full speed). Positive = pace at this rate. */
-  public _pacingBps: number = 0;
-  /** Last pacing rate used by forwardAndSiphon (for anchor reset detection). */
-  public _lastPacingBps: number = 0;
-
   /** Current total bytes stored in cache. */
   get totalBytes(): number { return this._totalBytes; }
 
@@ -119,11 +104,6 @@ export class StreamShadowCache {
     this._totalBytes = 0;
     this._urlKey = urlKey;
     this._fileLength = fileLength;
-    this._pacingBps = 0;
-    this._lastPacingBps = 0;
-    this._interceptorServeLimitByte = 0;
-    this._interceptorPauseUntil = 0;
-    this._lazyLoadMax = 120;
   }
 
   /** Check if a specific byte offset is covered by cached entries. */
@@ -276,8 +256,8 @@ export class StreamShadowCache {
 
   /** Trim cache to keep only bytes within ±windowBytes around centerByte. */
   trimAround(centerByte: number, windowBytes: number): void {
-    const minByte = Math.max(0, centerByte - windowBytes);
-    const maxByte = centerByte + windowBytes;
+    const minByte = Math.max(0, Math.floor(centerByte - windowBytes));
+    const maxByte = Math.floor(centerByte + windowBytes);
     const newEntries: ByteRange[] = [];
     for (const entry of this.entries) {
       if (entry.end < minByte || entry.start > maxByte) {
@@ -393,6 +373,50 @@ function extractRangeHeader(headers: HeadersInit | undefined): { from: number; t
  *   - NO "chained" responses (serving cached + server data in one stream) —
  *     that causes abort crashes and DTS corruption
  */
+/**
+ * Rewrite an open-ended Range header (e.g. "bytes=0-" or no Range header) into a
+ * finite range so the server returns a real Content-Length response. mpegts.js
+ * opens with an open-ended range, and our backend's chunked subscriber responses
+ * otherwise look like an EOF to the loader.
+ *
+ * Returns a new init object with the capped Range header, and the effective
+ * [from, to] range. If the original request was already finite, it is returned
+ * unchanged.
+ */
+function capRequestRange(
+  init: RequestInit | undefined,
+  from: number,
+  toStr: string | null,
+  fileLength: number
+): { init: RequestInit | undefined; to: number } {
+  if (toStr !== null && toStr !== '') {
+    return { init, to: parseInt(toStr, 10) };
+  }
+
+  const chunkSize = from === 0 ? FIRST_CHUNK_MAX_BYTES : SUBSEQUENT_CHUNK_MAX_BYTES;
+  const to = Math.min(fileLength - 1, from + chunkSize - 1);
+  const rangeValue = `bytes=${from}-${to}`;
+
+  // Build new headers preserving everything else.
+  let headers: Headers;
+  if (init?.headers) {
+    if (typeof (init.headers as any).get === 'function') {
+      headers = new Headers(init.headers as Headers);
+      headers.set('Range', rangeValue);
+    } else if (Array.isArray(init.headers)) {
+      headers = new Headers(init.headers);
+      headers.set('Range', rangeValue);
+    } else {
+      headers = new Headers(init.headers as Record<string, string>);
+      headers.set('Range', rangeValue);
+    }
+  } else {
+    headers = new Headers({ Range: rangeValue });
+  }
+
+  return { init: { ...init, headers }, to };
+}
+
 export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
   if (originalFetch) return;  // already installed
   shadowCache = cache;
@@ -430,89 +454,44 @@ export function installStreamCacheInterceptor(cache: StreamShadowCache): void {
     const rangeInfo = extractRangeHeader(init?.headers);
     const from = rangeInfo ? rangeInfo.from : 0;
     const toStr = rangeInfo ? rangeInfo.toStr : null;
-    const to = toStr ? parseInt(toStr) : shadowCache.fileLength - 1;
-    const rangeSize = to - from + 1;
+    let to = toStr ? parseInt(toStr) : shadowCache.fileLength - 1;
 
-    // ── Interceptor serve limit check ──
-    // Replaced old _interceptorPauseUntil mechanism. The serve limit
-    // (_interceptorServeLimitByte) is more precise: it limits how many bytes
-    // AHEAD of currentTime the interceptor will serve from cache, preventing
-    // prebuffered data from flooding the SourceBuffer past lazyLoadMax.
-
-    if (!rangeInfo) {
-      // No Range header (shouldn't happen for mpegts.js — it always uses Range)
-      return forwardAndSiphon(input, init, 0);
+    // ── Cap open-ended ranges so the server returns a finite response ──
+    // mpegts.js opens with an open-ended range (e.g. "bytes=0-"). Our backend
+    // serves these via chunked transfer, and mpegts.js interprets the first 512KB
+    // chunk as the complete response, calling endOfStream prematurely. Capping
+    // to a finite range forces a real Content-Length response and lets the
+    // endOfStream guard resume for the next chunk.
+    let effectiveInit = init;
+    let effectiveTo = to;
+    if (toStr === null || toStr === '') {
+      const capped = capRequestRange(init, from, toStr, shadowCache.fileLength);
+      effectiveInit = capped.init;
+      effectiveTo = capped.to;
     }
-
-    // ── Interceptor serve limit check ──
-    // After lazyLoad resume, _interceptorServeLimitByte is set to prevent the
-    // interceptor from serving ALL prebuffered data at once (which floods the
-    // SourceBuffer past lazyLoadMax → immediate re-suspend → infinite loop).
-    // The limit is the byte position corresponding to ct + min(lazyLoadMax, 150).
-    //
-    // PACING: When the serve limit is active, we pace the data flow from the
-    // server so the white bar grows linearly instead of jumping instantly.
-    // The pacing rate = bitrate × playbackRate × PACING_MULTIPLIER.
-    // This keeps the buffer at a steady ~lazyLoadMax ahead of the playhead.
-    //
-    // IMPORTANT: We do NOT use Content-Length tricks to trigger Early EOF.
-    // Instead, when the serve limit truncates a response, we forward the
-    // request to the /stream endpoint with pacing.
-    let pacingBps = 0;  // pacing bytes per second; 0 = no pacing (full speed)
-    if (shadowCache._interceptorServeLimitByte > 0) {
-      const limitByte = shadowCache._interceptorServeLimitByte;
-
-      // Use dynamic pacing rate set by the quota guard.
-      // _pacingBps is updated every 100ms based on current buffer state:
-      //   - ahead near target: ~1× rate (maintain)
-      //   - ahead below target: higher rate (build buffer)
-      //   - ahead above target: ~1× rate (let consumption bring it down)
-      pacingBps = shadowCache._pacingBps || 0;
-
-      // Exception: near EOF — no pacing (burst to finish)
-      const remaining = (shadowCache.fileLength || 0) - from;
-      if (remaining < 5 * 1024 * 1024) {  // < 5MB remaining
-        pacingBps = 0;
-      }
-
-      if (from >= limitByte) {
-        console.log(`[SHADOW-CACHE] LIMIT-FORWARD: bytes ${from}-${to} beyond serveLimit=${limitByte} — pacing=${pacingBps > 0 ? (pacingBps/1048576).toFixed(2)+'MB/s' : 'OFF'}`);
-        return forwardAndSiphon(input, init, from, Infinity, pacingBps);
-      }
-      if (to > limitByte) {
-        console.log(`[SHADOW-CACHE] LIMIT-FORWARD: bytes ${from}-${to} extends beyond serveLimit=${limitByte} — pacing=${pacingBps > 0 ? (pacingBps/1048576).toFixed(2)+'MB/s' : 'OFF'}`);
-        // Truncate the request to the serve limit so the player (and cache) cannot
-        // pull data past the intended window. Use a finite siphon limit too.
-        const limitedInit = init ? { ...init } : {};
-        const limitedHeaders = new Headers(init?.headers || {});
-        limitedHeaders.set('Range', `bytes=${from}-${limitByte}`);
-        limitedInit.headers = limitedHeaders;
-        return forwardAndSiphon(input, limitedInit, from, limitByte - from + 1, pacingBps);
-      }
-      // Range is within the limit — proceed with normal cache check below
-    }
+    const effectiveRangeSize = effectiveTo - from + 1;
 
     // ── Check cache for FULL HIT only ──
     // Only serve from cache if:
     //   1. The entire requested range is cached contiguously
     //   2. The range size is ≤ 30MB (safe for SourceBuffer)
     // Otherwise, let the server handle it (server has CACHE-PREFIX for disk-cached data).
-    if (rangeSize <= MAX_HIT_SERVE_BYTES) {
+    if (effectiveRangeSize <= MAX_HIT_SERVE_BYTES) {
       const cachedEnd = shadowCache.cachedUpTo(from);
-      if (cachedEnd >= to) {
-        const cachedData = shadowCache.getRange(from, to);
+      if (cachedEnd >= effectiveTo) {
+        const cachedData = shadowCache.getRange(from, effectiveTo);
         if (cachedData) {
-          console.log(`[SHADOW-CACHE] HIT: bytes ${from}-${to} (${(rangeSize / 1048576).toFixed(1)}MB) served from memory`);
-          return createCacheResponse(from, to, cachedData, shadowCache.fileLength);
+          console.log(`[SHADOW-CACHE] HIT: bytes ${from}-${effectiveTo} (${(effectiveRangeSize / 1048576).toFixed(1)}MB) served from memory`);
+          return createCacheResponse(from, effectiveTo, cachedData, shadowCache.fileLength);
         }
       }
-    } else if (shadowCache.cachedUpTo(from) >= to) {
+    } else if (shadowCache.cachedUpTo(from) >= effectiveTo) {
       // Large range fully cached but too big for SourceBuffer — log and skip
-      console.log(`[SHADOW-CACHE] SKIP-HIT: bytes ${from}-${to} (${(rangeSize / 1048576).toFixed(1)}MB) fully cached but exceeds ${MAX_HIT_SERVE_BYTES / 1048576}MB cap — server will serve with CACHE-PREFIX`);
+      console.log(`[SHADOW-CACHE] SKIP-HIT: bytes ${from}-${effectiveTo} (${(effectiveRangeSize / 1048576).toFixed(1)}MB) fully cached but exceeds ${MAX_HIT_SERVE_BYTES / 1048576}MB cap — server will serve with CACHE-PREFIX`);
     }
 
     // ── Forward to server and siphon chunks to cache ──
-    return forwardAndSiphon(input, init, from);
+    return forwardAndSiphon(input, effectiveInit, from);
   };
 
   console.log('[SHADOW-CACHE] Fetch interceptor installed');
@@ -542,20 +521,7 @@ export function getShadowCache(): StreamShadowCache | null {
 function createCacheResponse(
   from: number, to: number, data: Uint8Array, fileLength: number
 ): Response {
-  // Yield cached bytes as a single ReadableStream chunk, then close.
-  // mpegts.js FetchStreamLoader._pump reads chunks from response.body.getReader().
-  // Content-Length MUST equal the actual data length — setting it to anything
-  // else causes either LOADING_COMPLETE (player dies) or Early EOF loops
-  // (UNRECOVERABLE → player dies). For limited responses, use forwardAndSiphon
-  // instead of this function.
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(data.slice());  // .slice() to give player its own buffer
-      controller.close();
-    }
-  });
-
-  return new Response(stream, {
+  return new Response(data.slice(), {
     status: 206,
     statusText: 'Partial Content',
     headers: {
@@ -580,9 +546,7 @@ function createCacheResponse(
 function forwardAndSiphon(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
-  startByte: number,
-  siphonLimit: number = Infinity,
-  initialPacingBps: number = 0  // 0 = no pacing (full speed); read from shadowCache._pacingBps dynamically
+  startByte: number
 ): Promise<Response> {
   return originalFetch!.call(window, input, init).then((response) => {
     if (!response.body || !shadowCache) return response;
@@ -590,9 +554,6 @@ function forwardAndSiphon(
     const serverReader = response.body.getReader();
     let bytePos = startByte;
     let serverDone = false;
-    let bytesSiphoned = 0;  // Track how many bytes have been siphoned into cache
-    let pacingAnchorTime = 0;  // Time reference for pacing (monotonic)
-    let pacingAnchorBytes = 0; // Bytes served at anchor time
 
     const playerStream = new ReadableStream({
       async pull(controller) {
@@ -613,66 +574,15 @@ function forwardAndSiphon(
             ? result.value
             : new Uint8Array(result.value);
 
-          // ── Dynamic pacing: read current rate from shadowCache._pacingBps ──
-          // The quota guard updates _pacingBps every 100ms based on buffer state.
-          // This allows the pacing rate to adapt dynamically during a long fetch:
-          //   - ahead below target → higher rate (build buffer)
-          //   - ahead at target → 1× rate (maintain)
-          //   - ahead above target → 1× rate (let consumption bring it down)
-          //   - _pacingBps = 0 → no pacing (full speed, e.g. initial startup)
-          const currentPacingBps = shadowCache?._pacingBps ?? initialPacingBps;
-          if (currentPacingBps > 0 && chunk.length > 0) {
-            const now = performance.now();
-            // Reset anchor when pacing rate changes significantly (>10%)
-            // to avoid delay miscalculation from stale anchor
-            const lastRate = (shadowCache as any)?._lastPacingBps ?? 0;
-            if (lastRate > 0 && Math.abs(currentPacingBps - lastRate) / lastRate > 0.1) {
-              pacingAnchorTime = 0;  // will be reset below
-            }
-            (shadowCache as any)._lastPacingBps = currentPacingBps;
-            if (pacingAnchorTime === 0) {
-              // First chunk or rate change — set anchor
-              pacingAnchorTime = now;
-              pacingAnchorBytes = 0;
-            }
-            // How many bytes should have been served by now?
-            const elapsedSec = (now - pacingAnchorTime) / 1000;
-            const targetBytes = elapsedSec * currentPacingBps;
-            const actualBytes = pacingAnchorBytes + chunk.length;
-
-            if (actualBytes > targetBytes) {
-              // We're ahead of schedule — delay to match pacing rate.
-              const overshootBytes = actualBytes - targetBytes;
-              const delayMs = (overshootBytes / currentPacingBps) * 1000;
-              // Cap delay at 2s to avoid stalling if chunk sizes vary wildly
-              const cappedDelay = Math.min(delayMs, 2000);
-              if (cappedDelay > 5) {  // skip tiny delays
-                await new Promise(r => setTimeout(r, cappedDelay));
-              }
-            }
-            // Update anchor after potential delay
-            pacingAnchorBytes = actualBytes;
-          }
-
-          // Enqueue to player (ALWAYS forward, regardless of siphon limit)
+          // Forward to player immediately at full speed.
           controller.enqueue(chunk.slice());
 
-          // Siphon to cache — respect siphonLimit to prevent cache flooding
-          // during interceptor pause. When paused, the IOController still
-          // needs the data (forwarded above), but we cap how much goes into
-          // the cache so far-ahead data doesn't evict near-playhead entries.
-          if (bytesSiphoned < siphonLimit) {
-            const remaining = siphonLimit - bytesSiphoned;
-            const chunkToSiphon = chunk.length <= remaining
-              ? chunk.slice()          // whole chunk fits within limit
-              : chunk.slice(0, remaining); // truncate to limit boundary
-            try {
-              if (shadowCache) {
-                shadowCache.put(bytePos, chunkToSiphon);
-              }
-            } catch { /* cache errors are non-fatal */ }
-            bytesSiphoned += chunkToSiphon.length;
-          }
+          // Siphon the same chunk to the shadow cache for future HITs.
+          try {
+            if (shadowCache) {
+              shadowCache.put(bytePos, chunk.slice());
+            }
+          } catch { /* cache errors are non-fatal */ }
           bytePos += chunk.length;
 
         } catch (e) {

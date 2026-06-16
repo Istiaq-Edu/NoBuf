@@ -14,11 +14,6 @@ pub struct StreamConfig {
     pub port: u16,
 }
 
-/// Maximum media seconds the proactive prebuffer should stay ahead of the playhead
-/// at 1× playback speed. The actual window is multiplied by the current playback rate
-/// (so at 2× we keep twice as much ahead) and capped at 240 s to avoid flooding the disk cache.
-const PROACTIVE_MAX_AHEAD_BASE_SECONDS: f64 = 180.0;
-
 /// Returned to the frontend so it can construct stream URLs dynamically
 #[derive(serde::Serialize)]
 pub struct StreamInfo {
@@ -373,7 +368,7 @@ async fn background_cache_download(
     let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
 
     for (gap_start, gap_end) in gaps {
-        let gap_size = gap_end - gap_start + 1;
+        let _gap_size = gap_end - gap_start + 1;
 
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&transfer_id) {
@@ -587,28 +582,16 @@ pub async fn cmd_report_playback_position(
         .map(|m| m.cached_ranges.clone())
         .unwrap_or_default();
 
-    // Cap the proactive window so it scales with playback speed but never races
-    // far ahead of the in-memory buffer. The in-memory ceiling is also scaled by
-    // playbackRate on the frontend (capped by the SourceBuffer quota). Keep the
-    // disk cache a little further ahead so the IOController can resume smoothly.
-    let effective_rate = playback_rate.max(0.25).min(8.0);
-    let bytes_per_second = if duration_s > 0.0 {
-        file_size as f64 / duration_s
-    } else {
-        0.0
-    };
-    let max_ahead_byte = if bytes_per_second > 0.0 {
-        let window_seconds = (PROACTIVE_MAX_AHEAD_BASE_SECONDS * effective_rate).min(240.0);
-        (current_byte as f64 + bytes_per_second * window_seconds).min(file_size as f64) as u64
-    } else {
-        // Duration unknown — use a conservative 100 MB fallback window
-        (current_byte + 100 * 1024 * 1024).min(file_size)
-    };
+    // Proactive prebuffer downloads the entire remaining file to disk cache (EOF),
+    // decoupled from the in-memory sliding window. It fills gaps from the playhead
+    // all the way to the end of the file, so lazyLoad / resume never stalls waiting
+    // for Telegram after the initial seek.
+    let max_ahead_byte = file_size;
 
     // Only care about gaps from current_byte onward, capped at max_ahead_byte
     let ahead_gaps: Vec<(u64, u64)> = find_gaps(&cached_ranges, file_size)
         .into_iter()
-        .filter(|(start, end)| *end >= current_byte)
+        .filter(|(_start, end)| *end >= current_byte)
         .map(|(start, end)| (start.max(current_byte), end.min(max_ahead_byte)))
         .filter(|(start, end)| *start <= *end)
         .collect();
@@ -627,7 +610,7 @@ pub async fn cmd_report_playback_position(
     }
 
     log::info!(
-        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — window capped to byte {} — spawning proactive download",
+        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — window to EOF (byte {}) — spawning proactive download",
         message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len(), max_ahead_byte
     );
 
@@ -793,8 +776,6 @@ async fn proactive_prebuffer_download(
     // The pool exists for non-streaming downloads only.
     let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
 
-    let already_cached_bytes: u64 = cached_ranges.iter().map(|(s, e)| e - s + 1).sum();
-
     // Download all gaps sequentially (one Telegram connection).
     // Re-check gaps periodically as the cache grows from /stream too.
     // The window slides forward as the frontend reports new playhead positions.
@@ -809,19 +790,14 @@ async fn proactive_prebuffer_download(
 
         // Re-read latest target from frontend position reports so the window
         // slides as the playhead advances, instead of being a one-shot fixed window.
-        let (latest_current_byte, latest_duration_s, latest_rate, _latest_file_size) = {
+        let (latest_current_byte, _latest_duration_s, _latest_rate, _latest_file_size) = {
             let targets = state.proactive_targets.read().await;
             targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
         };
 
-        let effective_rate = latest_rate.max(0.25).min(8.0);
-        let computed_max_ahead_byte = if latest_duration_s > 0.0 {
-            let bps = total_size as f64 / latest_duration_s;
-            let window_seconds = (PROACTIVE_MAX_AHEAD_BASE_SECONDS * effective_rate).min(240.0);
-            (latest_current_byte as f64 + bps * window_seconds).min(total_size as f64) as u64
-        } else {
-            (latest_current_byte + 100 * 1024 * 1024).min(total_size)
-        };
+        // Proactive prebuffer downloads the whole file to disk cache; the window is EOF.
+        // It is intentionally decoupled from the in-memory sliding window.
+        let computed_max_ahead_byte = total_size;
 
         // Only slide the window forward, never backward.
         if latest_current_byte > start_byte {
@@ -835,7 +811,7 @@ async fn proactive_prebuffer_download(
         let current_ranges = current_meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
         let ahead_gaps: Vec<(u64, u64)> = find_gaps(&current_ranges, total_size)
             .into_iter()
-            .filter(|(gap_start, gap_end)| *gap_end >= start_byte)
+            .filter(|(_gap_start, gap_end)| *gap_end >= start_byte)
             .map(|(gap_start, gap_end)| (gap_start.max(start_byte), gap_end.min(max_ahead_byte)))
             .filter(|(start, end)| *start <= *end)
             .collect();
