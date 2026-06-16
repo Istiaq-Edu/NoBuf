@@ -597,13 +597,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // triggers a re-render so thumbnail pipeline can pick up the index.
   const [keyframeIndexReady, setKeyframeIndexReady] = useState(false);
   // Cold-start overlay state: true while the first chunk is being pulled into
-  // the shadow cache. Playback starts at MEDIA_INFO, but the overlay stays
-  // visible until the byte target is reached or a timeout fires.
+  // the shadow cache. Playback now waits until the first 5MB are cached (or a
+  // timeout fires), and the overlay is hidden exactly when playback begins.
   const [isColdStartBuffering, setIsColdStartBuffering] = useState(false);
   const [coldStartProgress, setColdStartProgress] = useState<{ bytes: number; targetBytes: number }>({
     bytes: 0,
     targetBytes: MIN_COLD_START_BUFFER_BYTES,
   });
+  // Deferred promise resolved when the first 5MB is in the shadow cache (or timeout).
+  const coldStartDeferredRef = useRef<{ resolve: () => void; promise: Promise<void> } | null>(null);
   const isCompleteRef = useRef(false);
   // Once the download loop reaches fileLength, the backend has all data cached.
   // This ref never resets — even if a backward seek resets isComplete=false,
@@ -1688,11 +1690,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
         }
         shadowCacheRef.current.reset(urlKey, state.current.fileLength);
-        // Show the cold-start overlay while the first chunk is being pulled into
-        // the shadow cache. Playback starts at MEDIA_INFO underneath the overlay.
+        // Create a deferred promise that resolves when the first 5MB is in the shadow cache.
+        // Playback will not start until this promise resolves (or the timeout fires).
+        let coldStartResolve: () => void = () => {};
+        const coldStartPromise = new Promise<void>((resolve) => { coldStartResolve = resolve; });
+        coldStartDeferredRef.current = { resolve: coldStartResolve, promise: coldStartPromise };
+        // Show the cold-start overlay while the first chunk is being pulled into the shadow cache.
         setIsColdStartBuffering(true);
         setColdStartProgress({ bytes: 0, targetBytes: MIN_COLD_START_BUFFER_BYTES });
-        // Start mpegts.js immediately and begin playback as soon as media info is ready.
+        // Start mpegts.js immediately, but playback is gated on the first 5MB.
         const initPromise = initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
         await initPromise;
         return;
@@ -2158,10 +2164,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         });
       });
 
-      // Hide the cold-start overlay and start playback as soon as mpegts.js has
-      // identified the media streams. The backend chunk pipeline will keep
-      // downloading ahead of the playhead; we do not wait for an arbitrary 5s
-      // buffer or a 5MB byte target before showing the video.
+      // Start playback as soon as mpegts.js has identified the media streams AND
+      // the first 5MB is in the shadow cache (or the cold-start timeout fired).
+      // The overlay is hidden exactly when playback begins.
+      const coldStartDeferred = coldStartDeferredRef.current;
+      if (coldStartDeferred) {
+        await coldStartDeferred.promise;
+        setIsColdStartBuffering(false);
+      }
       await player.play();
 
       // Override duration: mpegts.js reports Infinity for TS files because
@@ -4768,6 +4778,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   // Cold-start overlay progress poller: keep the overlay visible until the first
   // aligned chunk is fully in the shadow cache, or until a timeout fires.
+  // Resolves coldStartDeferredRef when the gate is satisfied; playback is started
+  // by initTransmuxerPlayer after awaiting the same promise.
   useEffect(() => {
     if (!isColdStartBuffering) return;
     const startTime = Date.now();
@@ -4776,8 +4788,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const run = cache?.cachedRunFrom(0);
       const bytes = run ? Math.min(run.end + 1, MIN_COLD_START_BUFFER_BYTES) : 0;
       setColdStartProgress({ bytes, targetBytes: MIN_COLD_START_BUFFER_BYTES });
-      if (bytes >= MIN_COLD_START_BUFFER_BYTES || Date.now() - startTime >= COLD_START_TIMEOUT_MS) {
-        setIsColdStartBuffering(false);
+      const ready = bytes >= MIN_COLD_START_BUFFER_BYTES || Date.now() - startTime >= COLD_START_TIMEOUT_MS;
+      if (ready) {
+        coldStartDeferredRef.current?.resolve();
       }
     }, 250);
     return () => clearInterval(interval);
@@ -4786,6 +4799,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Reset cold-start overlay state when the stream changes or hook unmounts.
   useEffect(() => {
     return () => {
+      coldStartDeferredRef.current?.resolve();
+      coldStartDeferredRef.current = null;
       setIsColdStartBuffering(false);
       setColdStartProgress({ bytes: 0, targetBytes: MIN_COLD_START_BUFFER_BYTES });
     };
