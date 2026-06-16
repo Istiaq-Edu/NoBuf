@@ -39,6 +39,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
   const [rate, setRate] = useState(settings.playerSpeed);
+
+  // Reset playback speed to the (non-persistent) default every time a new video is opened.
+  useEffect(() => {
+    setRate(settings.playerSpeed);
+  }, [file.id, settings.playerSpeed]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -130,8 +135,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     isTransmuxer: msePlayer.isTransmuxer,
     isTransmuxerActive: msePlayer.isTransmuxerActive,
     keyframeIndexReady: msePlayer.keyframeIndexReady,
-    isColdStartBuffering: msePlayer.isColdStartBuffering,
     coldStartProgress: msePlayer.coldStartProgress,
+    isColdStartBuffering: msePlayer.isColdStartBuffering,
     getMoovBuffer: msePlayer.getMoovBuffer,
     getFirstChunk: msePlayer.getFirstChunk,
     getInitSegments: msePlayer.getInitSegments,
@@ -175,14 +180,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   } = player;
 
   // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
-  // snap off the moment the buffer gate completes.
+  // snap off the moment the buffer gate completes. Playback starts immediately
+  // underneath the overlay; the overlay is purely informational progress.
   const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
   useEffect(() => {
     if (isColdStartBuffering) {
       setShowColdStartOverlay(true);
     } else if (showColdStartOverlay) {
-      const timer = window.setTimeout(() => setShowColdStartOverlay(false), 300);
-      return () => window.clearTimeout(timer);
+      setShowColdStartOverlay(false);
     }
   }, [isColdStartBuffering, showColdStartOverlay]);
 
@@ -660,10 +665,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // For remux URLs in piped mode: video.duration is unreliable (empty_moov = ~3s).
         // If we already set a metadata-provided duration, don't let video.duration
         // overwrite it. For cached mode, video.duration is correct from faststart moov.
+        // For mpegts.js, if the only duration we have is the 4 Mbps estimate, keep
+        // the UI at 0:00 until the real PTS duration arrives.
         const isRemux = lastVideoSrc === playerRemuxUrl;
+        const realDuration = (file?.duration && file.duration > 0 && isFinite(file.duration))
+          ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
+        const isEstimate = (window as any).__nobuf_durationIsEstimate === true && realDuration <= 0;
         if (!isRemux || v.duration > durRef.current) {
-          setDur(v.duration);
-          durRef.current = v.duration;
+          if (isEstimate) {
+            (window as any).__nobuf_estimateDuration = v.duration;
+          } else {
+            setDur(v.duration);
+            durRef.current = v.duration;
+          }
         }
       }
       setVol(v.volume);
@@ -764,85 +778,67 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
     const onDurChange = () => {
-      // MSE streams may report Infinity at loadedmetadata then update via durationchange
-      // once MediaSource.duration is set (e.g., for transmuxer TS/MKV playback)
-      // or when mpegts.js sets mediaSource.duration after our explicit override.
+      if (!file) return;
+
+      // Authoritative duration sources (highest priority first):
+      // 1. Telegram metadata attached to the file object
+      // 2. PTS-based tail-scan duration reported by the backend
+      // The 4 Mbps filesize estimate is NEVER authoritative and must never be
+      // used as a floor for the real duration.
+      const realDuration = (file.duration && file.duration > 0 && isFinite(file.duration))
+        ? file.duration
+        : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
+
+      const isRemux = lastVideoSrc === playerRemuxUrl;
+
       if (isFinite(v.duration) && v.duration > 0) {
-        // ── Duration overflow guard ──
-        // mpegts.js DTS computation can produce garbage values (2^32/1000 ≈ 4294967s)
-        // when data flows after an abort. If the reported duration exceeds 1.5x the
-        // metadata-provided duration, it's a DTS overflow — clamp to metadata duration.
-        const knownMetaDurForClamp = (file?.duration && file.duration > 0 && isFinite(file.duration))
-          ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
-        const isOverflow = knownMetaDurForClamp > 0 && v.duration > knownMetaDurForClamp * 1.5;
-        const clampedDur = isOverflow ? knownMetaDurForClamp : v.duration;
-        // For remux URLs in piped mode: only accept LARGER duration values.
-        // Piped fMP4 may gradually discover more duration as fragments arrive,
-        // but should never overwrite the metadata-provided real duration with ~3s.
-        const isRemux = lastVideoSrc === playerRemuxUrl;
-        // ── Duration shrink guard (mpegts.js mode) ──
-        // After resumeTransmuxer patch (seek + insertDiscontinuity), the MSE controller
-        // may recalculate mediaSource.duration based on current buffer content only.
-        // E.g., buffer has 0-153s → duration becomes 153s instead of the real 2627s.
-        // NEVER let duration shrink below the metadata-provided known duration.
-        const knownMetaDur = (file?.duration && file.duration > 0 && isFinite(file.duration))
-          ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
-        // ── Shrink guard floor calculation ──
-        // - knownMetaDur (Telegram or real PTS) is always authoritative
-        // - durRef.current is authoritative UNLESS it was set from a 4Mbps estimate
-        //   (marked via __nobuf_durationIsEstimate). When durRef is an estimate,
-        //   the real PTS must be able to replace it even if smaller.
-        // - When no authoritative source exists, use the 4Mbps estimate as a soft
-        //   floor to protect against buffer-only recalculations (e.g., 153s).
-        const isDurRefEstimate = !!(window as any).__nobuf_durationIsEstimate;
-        // When durRef.current was set from the 4Mbps estimate (before PTS arrived),
-        // it can be LARGER than the real PTS. Once __nobuf_durationIsEstimate is
-        // cleared (PTS available), durRef.current still holds the stale estimate.
-        // Using it as a floor would block the real PTS from being accepted.
-        // Fix: treat durRef.current as an estimate floor if it matches the stored
-        // estimate, even after the flag is cleared.
-        const durRefIsStaleEstimate = !isDurRefEstimate
-          && (window as any).__nobuf_estimateDuration > 0
-          && Math.abs(durRef.current - (window as any).__nobuf_estimateDuration) < 1;
-        const durRefFloor = (isDurRefEstimate || durRefIsStaleEstimate) ? 0 : durRef.current;
-        const estimateFloor = (knownMetaDur <= 0 && durRefFloor <= 0) ? ((window as any).__nobuf_estimateDuration || 0) : 0;
-        const floorDur = Math.max(knownMetaDur, durRefFloor, estimateFloor);
-        const safeDur = (floorDur > 0 && clampedDur < floorDur) ? floorDur : clampedDur;
+        // Overflow guard: mpegts.js can report ~2^32/1000 ≈ 4294967s after aborts.
+        const isOverflow = realDuration > 0 && v.duration > realDuration * 1.5;
+        const clampedDur = isOverflow ? realDuration : v.duration;
+
+        // Real metadata/PTS duration is the hard floor. If mpegts.js recalculates
+        // duration from the current buffer only (e.g., 153s instead of 2073s),
+        // restore the authoritative value.
+        const safeDur = (realDuration > 0 && clampedDur < realDuration) ? realDuration : clampedDur;
+
         if (!isRemux || safeDur > durRef.current) {
+          const isEstimate = (window as any).__nobuf_durationIsEstimate === true;
+
           if (safeDur !== v.duration) {
-            console.warn('[Player] durationchange corrected:', v.duration, '→', safeDur,
-              '(known meta:', knownMetaDur, 'durRef:', durRef.current, ')');
+            console.warn('[Player] durationchange corrected:', v.duration, '→', safeDur, '(real:', realDuration, ')');
+          } else {
+            console.log('[Player] durationchange:', safeDur, 's (was:', durRef.current, ')');
           }
-          console.log('[Player] durationchange:', safeDur, 's (was:', durRef.current, ')');
-          setDur(safeDur);
-          durRef.current = safeDur;
-          // Real PTS replaced the estimate — clear estimate flags
-          if ((window as any).__nobuf_ptsDuration > 0 && Math.abs(safeDur - (window as any).__nobuf_ptsDuration) / (window as any).__nobuf_ptsDuration < 0.01) {
+
+          if (realDuration <= 0 && isEstimate) {
+            // Still only the 4 Mbps estimate: keep the UI at 0:00 until real PTS
+            // arrives, but store the estimate for the seek-bar range.
+            (window as any).__nobuf_estimateDuration = safeDur;
+          } else {
+            setDur(safeDur);
+            durRef.current = safeDur;
             (window as any).__nobuf_durationIsEstimate = false;
           }
         }
-      } else if (!isFinite(v.duration) && file) {
-        // mpegts.js may report Infinity — override from metadata
-        // Priority: (1) Telegram metadata, (2) PTS-based, (3) 4Mbps estimate
-        let knownDuration = 0;
-        const isEstimateSource = !file.duration && !(window as any).__nobuf_ptsDuration;
-        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
-          knownDuration = file.duration;
-        }
-        if (knownDuration <= 0 && (window as any).__nobuf_ptsDuration > 0) {
-          knownDuration = (window as any).__nobuf_ptsDuration; // PTS-based from tail scan
-        }
+      } else if (!isFinite(v.duration)) {
+        // mpegts.js reports Infinity before metadata arrives. Override from the
+        // best available source; fall back to the 4 Mbps estimate only if needed.
+        let knownDuration = realDuration;
+        let isEstimate = realDuration <= 0;
+
         if (knownDuration <= 0 && file.size > 0) {
           knownDuration = (file.size / 4_000_000) * 8; // unreliable for TS
+          isEstimate = true;
         }
-        if (knownDuration > 0 && durRef.current !== knownDuration) {
-          console.log('[Player] durationchange Infinity → override:', knownDuration.toFixed(1), 's (source:', file.duration ? 'Telegram' : (window as any).__nobuf_ptsDuration ? 'PTS-tail' : '4Mbps', ')');
-          if (isEstimateSource) {
-            // 4Mbps estimate — DO NOT show in UI (user wants 0 until real PTS).
+
+        if (knownDuration > 0) {
+          const source = isEstimate ? '4Mbps' : (file.duration ? 'Telegram' : 'PTS-tail');
+          console.log('[Player] durationchange Infinity → override:', knownDuration.toFixed(1), 's (source:', source, ')');
+
+          if (isEstimate) {
             (window as any).__nobuf_durationIsEstimate = true;
             (window as any).__nobuf_estimateDuration = knownDuration;
-            // setDur stays at 0 — UI shows "0:00 / 0:00" until real PTS
-            // durRef.current stays at 0 — shrink guard won't block real PTS
+            // Don't set durRef/setDur — wait for the real PTS duration.
           } else {
             (window as any).__nobuf_durationIsEstimate = false;
             setDur(knownDuration);
@@ -1214,7 +1210,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
         )}
-        {/* Cold-start optimization overlay — shown only while the TS buffer gate fills */}
+        {/* Cold-start optimization overlay — hidden as soon as the byte target is reached */}
         {showColdStartOverlay && !err && (
           <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${isColdStartBuffering ? 'opacity-100' : 'opacity-0'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">

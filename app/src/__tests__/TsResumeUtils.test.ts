@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { StreamShadowCache } from '../lib/faststream/StreamShadowCache';
-import { alignToTSSyncByte, computeResumeByte, findByteForTime, findTimeForByte, ByteTimeSample } from '../hooks/useMSEPlayer';
+import { alignToTSSyncByte, computeResumeByte, computeSlidingWindowSeconds, findByteForTime, findTimeForByte, ByteTimeSample } from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -123,6 +123,61 @@ describe('findByteForTime', () => {
     expect(findByteForTime(0, samples, duration, fileLength)).toBe(0);
     expect(findByteForTime(-10, samples, duration, fileLength)).toBe(0);
   });
+
+  it('falls back to linear mapping when samples are corrupted', () => {
+    const corruptedSamples: ByteTimeSample[] = [
+      { time: 100, byte: 50_000_000 },
+      { time: 200, byte: NaN },
+      { time: 300, byte: 150_000_000 },
+    ];
+    const byte = findByteForTime(250, corruptedSamples, duration, fileLength);
+    const expected = Math.floor((250 / duration) * fileLength);
+    expect(byte).toBe(expected);
+  });
+
+  it('falls back to linear mapping when extrapolation exceeds fileLength', () => {
+    const inflatedSamples: ByteTimeSample[] = [
+      { time: 100, byte: 50_000_000 },
+      { time: 500, byte: 10_000_000_000 }, // absurd byte > fileLength
+    ];
+    const byte = findByteForTime(600, inflatedSamples, duration, fileLength);
+    const expected = Math.floor((600 / duration) * fileLength);
+    expect(byte).toBe(expected);
+  });
+
+  it('returns 0 for non-finite targetTime', () => {
+    expect(findByteForTime(NaN, samples, duration, fileLength)).toBe(0);
+    expect(findByteForTime(Infinity, samples, duration, fileLength)).toBe(0);
+  });
+
+  it('falls back to linear for flat-region corruption (IOController paused at EOF)', () => {
+    // Two samples with a huge time gap but nearly the same byte: this is the
+    // corruption seen in 78-c.md where the IOController sat at EOF while the
+    // SourceBuffer kept processing data. Interpolation would otherwise claim
+    // mid-file times map to near-EOF bytes.
+    const flatSamples: ByteTimeSample[] = [
+      { time: 1500, byte: 750_000_000 },
+      { time: 2073, byte: 750_000_512 }, // only 512 bytes apart over 573s
+    ];
+    const byte = findByteForTime(1800, flatSamples, duration, fileLength);
+    const expected = Math.floor((1800 / duration) * fileLength);
+    expect(byte).toBe(expected);
+  });
+
+  it('clamps extrapolation beyond duration to EOF', () => {
+    const byte = findByteForTime(2500, samples, duration, fileLength);
+    expect(byte).toBe(fileLength);
+  });
+
+  it('falls back to linear when interpolation exceeds fileLength', () => {
+    const inflatedSamples: ByteTimeSample[] = [
+      { time: 100, byte: 50_000_000 },
+      { time: 500, byte: 1_200_000_000 }, // close to EOF already at 500s
+    ];
+    const byte = findByteForTime(600, inflatedSamples, duration, fileLength);
+    const expected = Math.floor((600 / duration) * fileLength);
+    expect(byte).toBe(expected);
+  });
 });
 
 describe('findTimeForByte', () => {
@@ -187,3 +242,51 @@ describe('computeResumeByte with backend samples', () => {
 });
 
 
+describe('computeSlidingWindowSeconds', () => {
+  it('returns target 180s/30s for the logged TS file bitrate (~5 Mbps)', () => {
+    // File: 1313957192 bytes / 2073s ≈ 5.07 Mbps
+    // 210s * 5.07 Mbps / 8 ≈ 133 MB, well under 250 MB
+    const bitrate = 1_313_957_192 / 2073;
+    const result = computeSlidingWindowSeconds(bitrate, 1);
+    expect(result.forward).toBe(180);
+    expect(result.backward).toBe(30);
+  });
+
+  it('returns target 180s/30s when budget is not exceeded', () => {
+    // 1 MB/s (8 Mbps) → 210 MB for 210s, well under 250 MB
+    const result = computeSlidingWindowSeconds(1_000_000, 1);
+    expect(result.forward).toBe(180);
+    expect(result.backward).toBe(30);
+  });
+
+  it('shrinks forward when budget is exceeded', () => {
+    // 3 MB/s → 210s = 630 MB, over 250 MB; budget ~83s so forward shrinks
+    const result = computeSlidingWindowSeconds(3_000_000, 1);
+    expect(result.forward).toBeLessThan(180);
+    expect(result.backward).toBeLessThanOrEqual(30);
+    expect(result.forward).toBeGreaterThanOrEqual(60);
+    expect(result.backward).toBeGreaterThanOrEqual(5);
+  });
+
+  it('falls back to safe defaults when bitrate is unknown', () => {
+    const result = computeSlidingWindowSeconds(0, 1);
+    expect(result.forward).toBe(60);
+    expect(result.backward).toBe(30);
+  });
+
+  it('caps forward at the budget and never drops below 0', () => {
+    // 50 MB/s — budget can only hold ~5s total, so forward is clamped down hard
+    const result = computeSlidingWindowSeconds(50_000_000, 1);
+    expect(result.forward).toBeGreaterThanOrEqual(0);
+    expect(result.backward).toBeGreaterThanOrEqual(0);
+    expect(result.forward + result.backward).toBeLessThanOrEqual(
+      Math.floor((250 * 1024 * 1024) / 50_000_000)
+    );
+  });
+
+  it('keeps at least 5s backward when the budget is tight', () => {
+    // 50 MB/s — total budget is ~5s; backward should floor to 5s before forward is clamped
+    const result = computeSlidingWindowSeconds(50_000_000, 1);
+    expect(result.backward).toBeGreaterThanOrEqual(5);
+  });
+});
