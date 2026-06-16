@@ -872,6 +872,17 @@ async fn proactive_prebuffer_download(
                     return Ok(total_downloaded);
                 }
 
+                // Yield to player-facing /stream downloads. The proactive prebuffer is
+                // lowest priority and should not compete with the player's own fetch.
+                while cache_mgr.active_download_count(message_id).await > 0 {
+                    log::info!("[PROACTIVE] msg {}: player-facing download active, yielding", message_id);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                        log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+                        return Ok(total_downloaded);
+                    }
+                }
+
                 let chunk_result = {
                     let _permit = state.download_semaphore.acquire().await.unwrap();
                     iter.next().await
