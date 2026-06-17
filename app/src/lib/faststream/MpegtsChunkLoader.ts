@@ -67,7 +67,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
       this._needStash = true;
 
       this._firstChunkSize = alignToPacket(this._config.firstChunkSize || 5 * 1024 * 1024);
-      this._chunkSize = alignToPacket(this._config.chunkSize || 10 * 1024 * 1024);
+      this._chunkSize = alignToPacket(this._config.chunkSize || 2 * 1024 * 1024);
       this._shadowCache = this._config.shadowCache || null;
     }
 
