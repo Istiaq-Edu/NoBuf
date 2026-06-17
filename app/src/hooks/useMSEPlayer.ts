@@ -2670,6 +2670,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return;
       }
 
+      // Move the video element's playhead to the target time so the UI and the
+      // browser's seeking behavior align with the new stream position. This must
+      // happen before the IOController seek so mpegts.js can pick up the new time.
+      video.currentTime = timeSeconds;
       // 1. Flush SourceBuffers — remove all buffered ranges for clean slate
       const mseCtrl = engine._mse_controller;
       if (mseCtrl) {

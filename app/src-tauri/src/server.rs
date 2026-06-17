@@ -993,11 +993,13 @@ async fn stream_media(
                     read_offset, message_id, wait_elapsed_ms);
             }
 
-            // Check if a proactive prebuffer download is actually running.
-            // If NO download exists for this message, the cache-poll will wait
-            // forever — fall back to Telegram quickly (5s instead of 30s).
+            // Check if a player-facing /stream download is actually running.
+            // Only count coordinator-registered downloads; do NOT wait for the
+            // proactive prebuffer task, because the prebuffer may be slow or
+            // far behind the current playhead. Waiting for it can deadlock the
+            // player when the user seeks.
             let has_active_download = if let Some(ref cache_mgr) = cache_mgr_for_stream {
-                cache_mgr.has_active_download_for_msg(message_id).await
+                cache_mgr.active_download_count(message_id).await > 0
             } else {
                 false
             };
