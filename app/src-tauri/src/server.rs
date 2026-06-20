@@ -4,7 +4,7 @@ use crate::commands::TelegramState;
 use crate::commands::utils::resolve_peer;
 use crate::hls;
 use crate::hls::manifest::extract_video_attrs_from_raw_msg;
-use crate::ts_demux::{TsDemuxer, extract_stream_info, scan_keyframes_chunked, scan_keyframes_flush, KeyframeScanState, VideoCodec, PesFrame, TsStreamInfo};
+use crate::ts_demux::{TsDemuxer, extract_stream_info, scan_keyframes_chunked, scan_keyframes_flush, scan_keyframes, KeyframeScanState, VideoCodec, PesFrame, TsStreamInfo};
 use crate::fmp4::{build_init_segment, build_media_segment};
 use grammers_client::types::Media;
 use grammers_tl_types as tl;
@@ -270,6 +270,38 @@ pub(crate) struct StreamQuery {
 /// 512 KB (MAX_CHUNK_SIZE in files.rs) and requires divisibility by 4 KB
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
+
+/// Minimum interval between upload.GetFile API calls on the main client.
+/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~6 req/s sustained. At 200ms
+/// interval, max rate = 5 req/s — safely under the threshold.
+/// This is a GLOBAL rate limit shared by all download paths (checked while
+/// holding the download_semaphore, so it's race-free).
+const MIN_API_CALL_INTERVAL_MS: u64 = 250;
+
+/// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
+/// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
+/// sequence atomic across concurrent callers (needed with Semaphore::new(2)).
+/// The download happens AFTER the mutex is released, so downloads overlap
+/// while API calls are perfectly spaced.
+pub async fn throttle_api_calls(rate_limiter: &tokio::sync::Mutex<u64>) {
+    let mut last = rate_limiter.lock().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let elapsed = now.saturating_sub(*last);
+    if *last > 0 && elapsed < MIN_API_CALL_INTERVAL_MS {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            MIN_API_CALL_INTERVAL_MS - elapsed,
+        )).await;
+    }
+    let now_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    *last = now_after;
+    // Mutex guard dropped here — next caller can enter
+}
 
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
@@ -1031,6 +1063,9 @@ async fn stream_media(
             let chunks_to_skip = (fallback_start / TELEGRAM_CHUNK_SIZE as u64) as i32;
             let bytes_to_discard_from_chunk = fallback_start % TELEGRAM_CHUNK_SIZE as u64;
 
+            // Acquire the global semaphore per-chunk — serializes with
+            // cmd_download_file to prevent FLOOD_WAIT. 2 permits allow
+            // /stream and proactive to run concurrently (1 each).
             let download_iter = client_clone.iter_download(&media_clone)
                 .chunk_size(TELEGRAM_CHUNK_SIZE)
                 .skip_chunks(chunks_to_skip);
@@ -1063,9 +1098,10 @@ async fn stream_media(
             let mut pending_ranges: Vec<(u64, u64)> = Vec::new();
 
             while let Some(chunk) = {
-                // Acquire the global semaphore before hitting Telegram's API —
-                // serializes with cmd_download_file to prevent FLOOD_WAIT
+                // Acquire the global semaphore — serializes all iter_download calls
                 let _permit = semaphore_clone.acquire().await.unwrap();
+                // Global rate limiter: ensures ≥200ms between upload.GetFile calls
+                throttle_api_calls(&data.rate_limiter).await;
                 iter.next().await.transpose()
             } {
                 match chunk {
@@ -1286,7 +1322,444 @@ struct Fmp4KeyframeResponse {
     partial: bool,
 }
 
-/// Strip 4-byte BDAV timestamp prefix from M2TS packets to produce standard 188-byte TS data.
+#[derive(serde::Serialize)]
+struct Fmp4KeyframeAtResponse {
+    timestamp_s: f64,
+    byte_offset: u64,
+    cached: bool,
+    fallback: bool,
+}
+
+/// Download a byte range from Telegram and save it to the disk cache.
+/// Returns the downloaded bytes on success.
+/// Uses the MAIN CLIENT with the session-level semaphore, NOT the DownloadPool.
+/// The DownloadPool has 3 separate TCP connections that bypass the main
+/// semaphore and cause FLOOD_PREMIUM_WAIT when combined with /stream requests.
+async fn download_and_cache_range(
+    message_id: i32,
+    start: u64,
+    end: u64,
+    total_size: u64,
+    media: &grammers_client::types::Media,
+    cache_mgr: &StreamCacheManager,
+    data: &web::Data<Arc<TelegramState>>,
+) -> Result<Vec<u8>, String> {
+    // Use the main client with session-level semaphore — same as /stream and
+    // FMP4-META tail download. This serializes all Telegram iter_download calls
+    // on the main client, preventing FLOOD_PREMIUM_WAIT.
+    let client = {
+        let guard = data.client.lock().await;
+        guard.clone()
+    };
+    let client = client.ok_or("Telegram client not available")?;
+
+    // Use try_acquire (non-blocking) — same as proactive. /stream has priority.
+    // If /stream is holding the permit, the keyframe fetch waits 200ms and retries.
+    // This prevents concurrent upload.GetFile calls that trigger FLOOD_PREMIUM_WAIT.
+    let _initial_permit = data.download_semaphore.acquire().await.unwrap();
+    drop(_initial_permit);
+
+    let chunk_size: i32 = 512 * 1024;
+    let skip_chunks = (start / chunk_size as u64) as i32;
+    let bytes_to_discard = start % chunk_size as u64;
+    let content_length = end - start + 1;
+
+    let download_iter = client.iter_download(media)
+        .chunk_size(chunk_size)
+        .skip_chunks(skip_chunks);
+
+    let mut iter = download_iter;
+    let mut downloaded = Vec::new();
+    let mut first_chunk = true;
+
+    loop {
+        let chunk_result = {
+            let _permit = data.download_semaphore.acquire().await.unwrap();
+            throttle_api_calls(&data.rate_limiter).await;
+            iter.next().await
+        };
+        match chunk_result {
+            Ok(Some(chunk)) => {
+                let slice: &[u8] = if first_chunk && bytes_to_discard > 0 {
+                    first_chunk = false;
+                    &chunk[bytes_to_discard.min(chunk.len() as u64) as usize..]
+                } else {
+                    first_chunk = false;
+                    &chunk
+                };
+                downloaded.extend_from_slice(slice);
+                if downloaded.len() as u64 >= content_length {
+                    downloaded.truncate(content_length as usize);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("iter_download error: {}", e)),
+        }
+    }
+
+    // Write to cache file
+    let mut file = cache_mgr.open_data_file_write(message_id).map_err(|e| format!("open data file: {}", e))?;
+    file.seek(SeekFrom::Start(start)).map_err(|e| format!("seek data file: {}", e))?;
+    file.write_all(&downloaded).map_err(|e| format!("write data file: {}", e))?;
+
+    // Update meta
+    let _lock = cache_mgr.lock_meta(message_id).await;
+    let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+        message_id,
+        folder_id: 0,
+        total_size,
+        filename: String::new(),
+        cached_ranges: Vec::new(),
+        mime_type: String::new(),
+    });
+    meta.cached_ranges.push((start, end));
+    merge_ranges(&mut meta.cached_ranges);
+    let _ = cache_mgr.save_meta(&meta);
+    drop(_lock);
+
+    Ok(downloaded)
+}
+
+/// Find the byte offset of the nearest video keyframe at or before `target_time_s`.
+/// First checks the cached keyframe index; if not covered, downloads a window
+/// from Telegram and scans it. Returns (timestamp_s, byte_offset, cached).
+async fn find_keyframe_at_or_before_time(
+    message_id: i32,
+    target_time_s: f64,
+    total_size: u64,
+    duration_s: f64,
+    is_m2ts: bool,
+    cache_mgr: &StreamCacheManager,
+    byte_time_cache: &Fmp4ByteTimeCacheData,
+    stream_info: &TsStreamInfo,
+    media: &grammers_client::types::Media,
+    data: &web::Data<Arc<TelegramState>>,
+) -> Option<(f64, u64, bool)> {
+    // Compute approximate byte first
+    let approx_byte = if duration_s > 0.0 && total_size > 0 {
+        ((target_time_s / duration_s).clamp(0.0, 1.0) * total_size as f64) as u64
+    } else {
+        0
+    }.min(total_size.saturating_sub(1));
+
+    // Only trust the cached keyframe index if the disk cache covers the region
+    // around the approximate target byte. Otherwise a sparse index (e.g. keyframes
+    // from the first 60s and the tail) could return a stale keyframe far from the
+    // seek target.
+    let cached_ranges = {
+        let _lock = cache_mgr.lock_meta(message_id).await;
+        cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default()
+    };
+    let coverage_window = 2 * 1024 * 1024; // 2MB
+    let cover_start = approx_byte.saturating_sub(coverage_window);
+    let cover_end = (approx_byte + coverage_window).min(total_size - 1);
+    let region_covered = cached_ranges.iter().any(|(s, e)| *s <= cover_start && *e >= cover_end);
+
+    if region_covered {
+        let cache_lock = byte_time_cache.0.lock().ok();
+        if let Some(ref c) = cache_lock {
+            if let Some(entry) = c.cache.get(&message_id) {
+                if entry.total_size == total_size {
+                    let idx = entry.samples.partition_point(|(ts, _)| *ts <= target_time_s);
+                    if idx > 0 {
+                        let (ts, off) = entry.samples[idx - 1];
+                        // Reject cached keyframes that are too far from the target.
+                        // The coverage guard only checks that the disk cache covers
+                        // the approximate byte region — it doesn't check that the
+                        // keyframe itself is close to the target time. A stale
+                        // keyframe from a previous seek's scan (e.g. 898s when
+                        // seeking to 1392s) can be returned if the disk cache
+                        // happens to cover the target region from the player's
+                        // own /stream download.
+                        if target_time_s - ts <= 30.0 {
+                            return Some((ts, off, true));
+                        }
+                        // Keyframe too far — fall through to download/scan
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Download/scan expanding windows. Use BACKWARD-BIASED windows:
+    //    search from the approximate byte backward, not symmetric. For VBR
+    //    video, the actual keyframe is almost always BEFORE the linear
+    //    estimate (higher bitrate early in the file), so the forward half
+    //    of a symmetric window is wasted.
+    let mut window_size: u64 = 4 * 1024 * 1024; // 4MB initial
+    let max_window: u64 = 256 * 1024 * 1024; // 256MB max (for extreme VBR offsets up to ~128MB forward)
+
+    while window_size <= max_window {
+        // Symmetric search: 50% backward, 50% forward.
+        let back = window_size / 2;
+        let forward = window_size / 2;
+        let alignment: u64 = if is_m2ts { 192 } else { 188 };
+        let start = (approx_byte.saturating_sub(back) / alignment) * alignment;
+        let end = (approx_byte + forward).min(total_size - 1);
+
+        // Try reading from disk cache FIRST — the proactive prebuffer may have
+        // already downloaded this region. Disk reads are instant (no Telegram
+        // API call, no rate limiting). Only download from Telegram if the disk
+        // cache doesn't have the data.
+        let chunk_data = {
+            let data_path = cache_mgr.data_path(message_id);
+            let _lock = cache_mgr.lock_meta(message_id).await;
+            let meta = cache_mgr.load_meta(message_id);
+            let cached = meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
+            let is_cached = cached.iter().any(|(s, e)| *s <= start && *e >= end);
+            drop(_lock);
+            if is_cached {
+                // Read from disk — instant, no API call
+                match std::fs::File::open(&data_path) {
+                    Ok(mut f) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let len = (end - start + 1) as usize;
+                        let mut buf = vec![0u8; len];
+                        if f.seek(SeekFrom::Start(start)).is_ok() && f.read_exact(&mut buf).is_ok() {
+                            buf
+                        } else {
+                            // Disk read failed — fall back to Telegram download
+                            match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
+                                Ok(d) => d,
+                                Err(_) => { window_size *= 2; continue; }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
+                            Ok(d) => d,
+                            Err(_) => { window_size *= 2; continue; }
+                        }
+                    }
+                }
+            } else {
+                // Not on disk — download from Telegram
+                match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
+                    Ok(d) => d,
+                    Err(_) => { window_size *= 2; continue; }
+                }
+            }
+        };
+        {
+            let ts_data = if is_m2ts { strip_m2ts_prefix(&chunk_data, true) } else { chunk_data };
+            let kfs = scan_keyframes(&ts_data, start, stream_info);
+
+                // Update the byte_time_cache with newly discovered keyframes
+                // so subsequent calls for nearby times hit the cache instead
+                // of downloading again (or returning stale sparse-index results).
+                if !kfs.is_empty() {
+                    if let Ok(mut cache) = byte_time_cache.0.lock() {
+                        let entry = cache.cache.entry(message_id).or_insert_with(|| ByteTimeCacheEntry {
+                            samples: Vec::new(),
+                            covered_ranges: Vec::new(),
+                            total_size,
+                            complete: false,
+                        });
+                        if entry.total_size == total_size {
+                            for &(ts, off) in &kfs {
+                                // Insert sorted, skip duplicates
+                                let pos = entry.samples.partition_point(|(t, _)| *t < ts);
+                                if pos < entry.samples.len() && entry.samples[pos].0 == ts {
+                                    continue;
+                                }
+                                entry.samples.insert(pos, (ts, off));
+                            }
+                            // M2 fix: update covered_ranges so /fmp4/keyframes
+                            // doesn't re-download already-scanned ranges.
+                            entry.covered_ranges.push((start, end));
+                            merge_ranges(&mut entry.covered_ranges);
+                        }
+                    }
+                }
+
+                let idx = kfs.partition_point(|(ts, _)| *ts <= target_time_s);
+                if idx > 0 {
+                    let (ts, off) = kfs[idx - 1];
+                    log::info!("[FMP4-KF-AT] Found keyframe for msg {} at {}s -> byte {} (window {}-{}, size {}MB)",
+                        message_id, ts, off, start, end, window_size / 1024 / 1024);
+                    return Some((ts, off, false));
+                }
+
+                log::info!("[FMP4-KF-AT] No keyframe <= {}s in window {}-{} for msg {}, expanding",
+                    target_time_s, start, end, message_id);
+        }
+
+        window_size *= 2;
+    }
+
+    None
+}
+
+/// Endpoint: GET /fmp4/keyframe-at/{folder_id}/{message_id}?time=...&duration=...&token=...
+/// Returns the byte offset of the nearest video keyframe at or before the requested time.
+/// If the keyframe is not already cached, the endpoint downloads a window from Telegram
+/// and scans it.
+#[get("/fmp4/keyframe-at/{folder_id}/{message_id}")]
+async fn fmp4_keyframe_at(
+    path: web::Path<(String, i32)>,
+    query: web::Query<Fmp4Query>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+    byte_time_cache: web::Data<Fmp4ByteTimeCacheData>,
+    stream_info_cache: web::Data<Fmp4StreamInfoCacheData>,
+) -> impl Responder {
+    let (_folder_id_str, message_id) = path.into_inner();
+
+    match &query.token {
+        Some(t) if t == &token_data.token => {},
+        _ => {
+            log::error!("[FMP4-KF-AT] Invalid or missing stream token for msg {}", message_id);
+            return HttpResponse::Forbidden().body("Invalid or missing stream token");
+        }
+    }
+
+    let target_time_s = query.time.unwrap_or(0.0).max(0.0);
+
+    let cache_mgr = match (**cache).as_ref() {
+        Some(cm) => cm.clone(),
+        None => {
+            log::error!("[FMP4-KF-AT] No cache manager for msg {}", message_id);
+            return HttpResponse::ServiceUnavailable().body("No cache manager");
+        }
+    };
+
+    let data_path = cache_mgr.data_path(message_id);
+    let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
+        Some(result) => result,
+        None => (188, false),
+    };
+
+    let _lock = cache_mgr.lock_meta(message_id).await;
+    let meta = cache_mgr.load_meta(message_id);
+    drop(_lock);
+
+    let total_size = match meta.as_ref() {
+        Some(m) => m.total_size,
+        None => {
+            log::error!("[FMP4-KF-AT] No cache meta for msg {}", message_id);
+            return HttpResponse::NotFound().body("No cache meta");
+        }
+    };
+
+    // Guard against total_size == 0 — would cause u64 underflow in
+    // total_size - 1 calculations below, leading to OOM/crash.
+    if total_size == 0 {
+        log::error!("[FMP4-KF-AT] total_size is 0 for msg {}", message_id);
+        return HttpResponse::NotFound().body("Invalid total_size");
+    }
+
+    // Resolve media for potential Telegram download
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None }).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // Duration: prefer query.duration, else fall back to 4Mbps estimate
+    let duration_s = query.duration.unwrap_or_else(|| {
+        if total_size > 0 {
+            (total_size as f64 * 8.0) / (4_000_000.0) // 4 Mbps in bits/s
+        } else {
+            0.0
+        }
+    });
+
+    // Get stream info (try cache first, then extract from first portion of file)
+    let stream_info = {
+        let cache_lock = stream_info_cache.0.lock().ok();
+        if let Some(ref c) = cache_lock {
+            if let Some(si) = c.cache.get(&message_id) {
+                Some(si.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let stream_info = match stream_info {
+        Some(si) => si,
+        None => {
+            // Read first 5MB from disk or Telegram
+            let first_end = (5 * 1024 * 1024).min(total_size as usize);
+            let first_data = if std::fs::metadata(&data_path).is_ok() {
+                let mut buf = vec![0u8; first_end];
+                if let Ok(mut f) = std::fs::File::open(&data_path) {
+                    let _ = f.read_exact(&mut buf);
+                    buf
+                } else {
+                    Vec::new()
+                }
+            } else {
+                match download_and_cache_range(message_id, 0, (first_end as u64 - 1).min(total_size - 1), total_size, &media, &cache_mgr, &data).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("[FMP4-KF-AT] Failed to download stream info for msg {}: {}", message_id, e);
+                        Vec::new()
+                    }
+                }
+            };
+
+            if first_data.is_empty() {
+                log::error!("[FMP4-KF-AT] No stream data available for msg {}", message_id);
+                return HttpResponse::NotFound().body("No stream data available");
+            }
+
+            let first_ts = if is_m2ts { strip_m2ts_prefix(&first_data, true) } else { first_data };
+            match extract_stream_info(&first_ts) {
+                Some(si) => {
+                    if let Ok(mut c) = stream_info_cache.0.lock() {
+                        c.cache.insert(message_id, si.clone());
+                    }
+                    si
+                }
+                None => {
+                    log::error!("[FMP4-KF-AT] Failed to extract stream info for msg {}", message_id);
+                    return HttpResponse::InternalServerError().body("Failed to extract stream info");
+                }
+            }
+        }
+    };
+
+    // Find the keyframe
+    match find_keyframe_at_or_before_time(message_id, target_time_s, total_size, duration_s, is_m2ts, &cache_mgr, &byte_time_cache, &stream_info, &media, &data).await {
+        Some((ts, off, cached)) => {
+            let response = Fmp4KeyframeAtResponse {
+                timestamp_s: ts,
+                byte_offset: off,
+                cached,
+                fallback: false,
+            };
+            HttpResponse::Ok().content_type("application/json").body(match serde_json::to_vec(&response) {
+                Ok(b) => b,
+                Err(e) => return HttpResponse::InternalServerError().body(format!("Failed to serialize: {}", e)),
+            })
+        }
+        None => {
+            // Fallback to linear estimate
+            let fallback_byte = if duration_s > 0.0 && total_size > 0 {
+                ((target_time_s / duration_s).clamp(0.0, 1.0) * total_size as f64) as u64
+            } else {
+                0
+            };
+            log::warn!("[FMP4-KF-AT] No keyframe found for msg {} at {}s, returning fallback byte {}",
+                message_id, target_time_s, fallback_byte);
+            let response = Fmp4KeyframeAtResponse {
+                timestamp_s: target_time_s,
+                byte_offset: fallback_byte,
+                cached: false,
+                fallback: true,
+            };
+            HttpResponse::Ok().content_type("application/json").body(match serde_json::to_vec(&response) {
+                Ok(b) => b,
+                Err(e) => return HttpResponse::InternalServerError().body(format!("Failed to serialize: {}", e)),
+            })
+        }
+    }
+}
+
 /// If is_m2ts is false, returns the data unchanged (as a new Vec).
 /// If is_m2ts is true, extracts bytes [4..192] from every 192-byte packet.
 fn strip_m2ts_prefix(data: &[u8], is_m2ts: bool) -> Vec<u8> {
@@ -2995,11 +3468,19 @@ async fn fmp4_metadata(
                             if let Ok(messages) = client.get_messages_by_id(&peer, &[message_id]).await {
                                 if let Some(msg) = messages.into_iter().next().flatten() {
                                     if let Some(media) = msg.media() {
-                                        // Use main client iter_download (sequential, semaphore-gated)
+                                        // Use main client iter_download (sequential, session-level semaphore-gated)
                                         // NOT DownloadPool — parallel connections trigger FLOOD_PREMIUM_WAIT.
                                         let chunk_size: i32 = 512 * 1024;
                                         let skip_chunks = (tail_start / chunk_size as u64) as i32;
                                         let bytes_to_discard = tail_start % chunk_size as u64;
+                                        // Use blocking acquire — the tail download is CRITICAL for PTS duration.
+                                        // Without it, all linear byte estimates use the wrong duration (4Mbps
+                                        // estimate instead of real PTS), causing seeks to land 27% off target.
+                                        // The tail is only 512KB (1 chunk), so it holds the permit briefly.
+                                        let _tail_permit = data.download_semaphore.acquire().await.unwrap();
+                                        // Per-chunk acquire inside the loop (release between chunks
+                                        // for natural interleaving with /stream and proactive).
+                                        drop(_tail_permit);
                                         let download_iter = client.iter_download(&media)
                                             .chunk_size(chunk_size)
                                             .skip_chunks(skip_chunks);
@@ -3009,6 +3490,7 @@ async fn fmp4_metadata(
                                         loop {
                                             let chunk_result = {
                                                 let _permit = data.download_semaphore.acquire().await.unwrap();
+                                                throttle_api_calls(&data.rate_limiter).await;
                                                 iter.next().await
                                             };
                                             match chunk_result {
@@ -3561,6 +4043,7 @@ fn configure_fmp4(
     cfg.service(fmp4_segment);
     cfg.service(fmp4_metadata);
     cfg.service(fmp4_keyframes);
+    cfg.service(fmp4_keyframe_at);
 }
 
 pub async fn start_streaming_server(

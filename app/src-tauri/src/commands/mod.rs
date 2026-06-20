@@ -32,10 +32,16 @@ pub struct TelegramState {
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Paths of partial download files — cleaned up on app close.
     pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Serializes Telegram iter_download calls on the MAIN client connection.
-    /// 2 permits: 1 for /stream + 1 for proactive-sequential.
-    /// DownloadPool workers have their own connections and don't use this semaphore.
+    /// 2 permits: /stream and proactive run concurrently. The global rate
+    /// limiter (Mutex<u64>) ensures ≥250ms between ALL upload.GetFile calls
+    /// across both paths, preventing FLOOD_PREMIUM_WAIT. Downloads overlap
+    /// (while /stream downloads, proactive can throttle+download).
     pub download_semaphore: Arc<Semaphore>,
+    /// Global rate limiter: Mutex-protected timestamp (ms since UNIX_EPOCH)
+    /// of the last upload.GetFile call. The Mutex makes the check-sleep-store
+    /// sequence atomic across concurrent callers, so 2 semaphore permits
+    /// can coexist without races.
+    pub rate_limiter: Arc<tokio::sync::Mutex<u64>>,
     /// Speed limit for prebuffer/streaming in KB/s. 0 = unlimited.
     /// Read by Actix server.rs after each chunk to inject sleep.
     pub prebuffer_speed_limit_kb: Arc<AtomicU64>,

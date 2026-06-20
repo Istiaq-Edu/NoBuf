@@ -183,6 +183,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // snap off the moment the buffer gate completes. Playback starts immediately
   // underneath the overlay; the overlay is purely informational progress.
   const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
+  // Ref mirror so event handlers (onMeta/onCanPlay) inside the useEffect
+  // closure can check the current cold-start state without re-registering.
+  // Without this, the handlers capture a stale `isColdStartBuffering=false`
+  // and call v.play() before the 5 MB buffer gate resolves, defeating the
+  // cold-start prebuffer and starting playback under the overlay.
+  const coldStartBufferingRef = useRef(false);
+  coldStartBufferingRef.current = isColdStartBuffering;
   useEffect(() => {
     if (isColdStartBuffering) {
       setShowColdStartOverlay(true);
@@ -624,7 +631,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // Mark as MSE blob URL for the durationchange guard
         setLastVideoSrc('mpegts://internal');
       }
-      v.autoplay = true;
+      // NEVER set v.autoplay in MSE mode. For TS files, playerMseUrl goes
+      // null→blobUrl→null as mpegts.js initializes. The blobUrl run would
+      // set autoplay=true, and the browser would auto-play when the first
+      // fMP4 segment is appended — before the 5 MB cold-start gate
+      // resolves. For MP4, the onMeta/onCanPlay handlers call v.play()
+      // explicitly. For TS, player.play() is called after the gate.
+      v.autoplay = false;
     }
 
     const onMeta = () => {
@@ -686,7 +699,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.playbackRate = settings.playerSpeed;
       v.loop = loop;
       setLoad(false);
-      v.play().catch((e) => console.warn('[Player] play() failed:', e));
+      // Don't start playback during cold-start buffering — the gate in
+      // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
+      // is cached. Starting here would play under the overlay with thin buffer.
+      if (!coldStartBufferingRef.current) {
+        v.play().catch((e) => console.warn('[Player] play() failed:', e));
+      }
     };
     const onCanPlay = () => {
       // Update buffered ranges on canplay (first data available)
@@ -701,6 +719,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       // under the overlay, eventually causing the video to hit 'waiting' at
       // duration (the "loading on finish" bug).
       if (videoEndedRef.current) return;
+      // Same cold-start gate as onMeta — don't play before the buffer gate.
+      if (coldStartBufferingRef.current) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
