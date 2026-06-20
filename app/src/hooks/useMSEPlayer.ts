@@ -2775,15 +2775,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     // 2. Fire backend keyframe fetch in the background (NON-BLOCKING)
     //    Delay by 5 seconds so the player's first /stream chunk download
-    //    gets priority on the Telegram connection. Only abort the previous
-    //    HTTP request — do NOT cancel the 5s timer. This way, even with
-    //    rapid seeks, the timer fires 5s after the LAST seek and populates
-    //    the keyframe index for that region. Cancelling the timer on every
-    //    seek meant it never fired during rapid scrubbing.
-    // Abort any previous background keyframe fetch so it doesn't hold
-    // the backend semaphore while a new seek is in progress.
+    //    gets priority on the Telegram connection. Use DEBOUNCE: clear the
+    //    previous timer and set a new one. This way, only the LAST seek in
+    //    a rapid sequence gets a background fetch. Without debounce, each
+    //    seek starts its own timer, causing 6+ concurrent backend searches
+    //    that all compete for the rate limiter, slowing /stream by 3.5x.
+    if (bgKeyframeTimerRef.current !== null) {
+      clearTimeout(bgKeyframeTimerRef.current);
+      bgKeyframeTimerRef.current = null;
+    }
+    // Abort previous timer (debounce) but do NOT abort the previous HTTP request.
+    // Let the previous fetch complete in the background — its keyframe is valid
+    // for future seeks to that region, even if the user has moved to a new position.
+    // Aborting the fetch meant the keyframe was never cached.
     if (bgKeyframeAbortRef.current) {
-      bgKeyframeAbortRef.current.abort();
       bgKeyframeAbortRef.current = null;
     }
     const parsed = streamUrl ? parseStreamUrl(streamUrl) : null;
@@ -2832,7 +2837,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // PAT/PMT before the keyframe — without this, the demuxer may skip the
     // keyframe and land on the NEXT IDR frame (up to 12s later in large GOPs).
     const bitrate = duration > 0 ? filesize / duration : 0;
-    const STEP_BACK_SECONDS = 15;
+    const STEP_BACK_SECONDS = 5;
     const stepBackBytes = seekKeyframeExact
       ? Math.floor(10 * TS_PACKET_SIZE / TS_PACKET_SIZE) * TS_PACKET_SIZE  // 10 packets = 1880 bytes for PAT/PMT
       : Math.floor(bitrate * STEP_BACK_SECONDS / TS_PACKET_SIZE) * TS_PACKET_SIZE;

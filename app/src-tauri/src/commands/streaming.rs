@@ -391,6 +391,7 @@ async fn background_cache_download(
 
         while let Ok(Some(chunk_result)) = {
             let _permit = state.download_semaphore.acquire().await.unwrap();
+            throttle_api_calls(&state.rate_limiter).await;
             iter.next().await
         } {
             // Check cancellation
@@ -781,7 +782,8 @@ async fn proactive_prebuffer_download(
     // Re-check gaps periodically as the cache grows from /stream too.
     // The window slides forward as the frontend reports new playhead positions.
     let mut idle_cycles: u32 = 0;
-    const MAX_IDLE_CYCLES: u32 = 15; // ~30s idle before exiting
+    const MAX_IDLE_CYCLES: u32 = 30; // ~60s idle before exiting (was 15/30s)
+    let mut jumped = false; // Set by inner loop on playhead jump, checked by outer loop
     loop {
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&transfer_id) {
@@ -843,6 +845,14 @@ async fn proactive_prebuffer_download(
                     "[PROACTIVE] msg {}: SEQUENTIAL download gap {}-{} ({:.1}MB)",
                     message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
                 );
+                // Yield to /stream for 5 seconds before starting a new gap download,
+                // but ONLY after a seek jump — not on initial startup or sequential
+                // gap completion. Without this check, the 5s yield would delay the
+                // initial prebuffer and slow sequential prebuffering by 5s per gap.
+                if jumped {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    jumped = false;
+                }
             }
             let skip_bytes = gap_start % chunk_size as u64;
             let mut offset = gap_start;
@@ -883,17 +893,19 @@ async fn proactive_prebuffer_download(
                                 "[PROACTIVE] msg {}: playhead jumped to byte {} (current offset {}), re-evaluating gaps",
                                 message_id, target_byte, offset
                             );
+                            // Set flag so outer loop yields to /stream before
+                            // starting the new gap download.
+                            jumped = true;
                             break;
                         }
                     }
                 }
 
                 // Use blocking acquire — the 250ms global rate limiter ensures
-                // no FLOOD_PREMIUM_WAIT. /stream and proactive alternate fairly
-                // through the single semaphore: each gets every other chunk.
-                // try_acquire was used before but it almost never succeeded
-                // because /stream immediately re-acquires after releasing,
-                // starving the proactive to 0.86 MB/s.
+                // no FLOOD_PREMIUM_WAIT. After a playhead jump (seek), yield to
+                // /stream for 5 seconds so the seek download gets exclusive
+                // access to the rate limiter. Without this, the proactive and
+                // /stream alternate rate-limited calls, making seeks 2x slower.
                 let chunk_result = {
                     let _permit = state.download_semaphore.acquire().await.unwrap();
                     throttle_api_calls(&state.rate_limiter).await;
@@ -927,8 +939,9 @@ async fn proactive_prebuffer_download(
                         offset += to_write as u64;
                         total_downloaded += to_write as u64;
 
-                        // Update meta every 4MB (8 chunks × 512KB)
-                        if offset % (4 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
+                        // Update meta every 1MB (2 chunks × 512KB) for faster
+                        // PREBUFFER HIT detection by /stream handler. Was 4MB.
+                        if offset % (1 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
                             let _lock = cache_mgr.lock_meta(message_id).await;
                             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,

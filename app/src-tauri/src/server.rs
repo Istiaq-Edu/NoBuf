@@ -910,7 +910,7 @@ async fn stream_media(
         let mut bytes_sent: u64 = effective_start_byte - start_byte;
         let mut wait_elapsed_ms: u64 = 0;
         const POLL_INTERVAL_MS: u64 = 100;
-        const FALLBACK_TIMEOUT_MS: u64 = 30000;
+        const FALLBACK_TIMEOUT_MS: u64 = 10000;
 
         // If there's no cache manager at all, skip the poll loop entirely
         // and go directly to the Telegram fallback.
@@ -1043,7 +1043,7 @@ async fn stream_media(
 
             // Safety timeout: if data doesn't appear in 30s, fall back to Telegram
             if wait_elapsed_ms >= FALLBACK_TIMEOUT_MS {
-                log::warn!("[STREAM-CACHE-WAIT] msg {}: 30s timeout waiting for cache at offset {}, falling back to Telegram",
+                log::warn!("[STREAM-CACHE-WAIT] msg {}: 10s timeout waiting for cache at offset {}, falling back to Telegram",
                     message_id, read_offset);
                 break; // Exit poll loop, enter Telegram fallback below
             }
@@ -1353,12 +1353,9 @@ async fn download_and_cache_range(
     };
     let client = client.ok_or("Telegram client not available")?;
 
-    // Use try_acquire (non-blocking) — same as proactive. /stream has priority.
-    // If /stream is holding the permit, the keyframe fetch waits 200ms and retries.
-    // This prevents concurrent upload.GetFile calls that trigger FLOOD_PREMIUM_WAIT.
-    let _initial_permit = data.download_semaphore.acquire().await.unwrap();
-    drop(_initial_permit);
-
+    // Per-chunk try_acquire + rate limiter. The keyframe search is a BACKGROUND
+    // task — try_acquire ensures it doesn't block /stream. The rate limiter
+    // ensures ≥250ms between ALL API calls globally, preventing FLOOD_WAIT.
     let chunk_size: i32 = 512 * 1024;
     let skip_chunks = (start / chunk_size as u64) as i32;
     let bytes_to_discard = start % chunk_size as u64;
@@ -1374,9 +1371,16 @@ async fn download_and_cache_range(
 
     loop {
         let chunk_result = {
-            let _permit = data.download_semaphore.acquire().await.unwrap();
-            throttle_api_calls(&data.rate_limiter).await;
-            iter.next().await
+            match data.download_semaphore.try_acquire() {
+                Ok(_permit) => {
+                    throttle_api_calls(&data.rate_limiter).await;
+                    iter.next().await
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            }
         };
         match chunk_result {
             Ok(Some(chunk)) => {
@@ -2759,6 +2763,7 @@ async fn fmp4_segment(
                 };
 
                 let _permit = data.download_semaphore.acquire().await.unwrap();
+                throttle_api_calls(&data.rate_limiter).await;
                 let mut iter = download_iter;
                 let mut offset = read_start;
                 let mut first_chunk = true;
@@ -3473,14 +3478,8 @@ async fn fmp4_metadata(
                                         let chunk_size: i32 = 512 * 1024;
                                         let skip_chunks = (tail_start / chunk_size as u64) as i32;
                                         let bytes_to_discard = tail_start % chunk_size as u64;
-                                        // Use blocking acquire — the tail download is CRITICAL for PTS duration.
-                                        // Without it, all linear byte estimates use the wrong duration (4Mbps
-                                        // estimate instead of real PTS), causing seeks to land 27% off target.
-                                        // The tail is only 512KB (1 chunk), so it holds the permit briefly.
-                                        let _tail_permit = data.download_semaphore.acquire().await.unwrap();
-                                        // Per-chunk acquire inside the loop (release between chunks
-                                        // for natural interleaving with /stream and proactive).
-                                        drop(_tail_permit);
+                                        // Per-chunk acquire + rate limiter (same as /stream).
+                                        // The tail is critical for PTS duration — use blocking acquire.
                                         let download_iter = client.iter_download(&media)
                                             .chunk_size(chunk_size)
                                             .skip_chunks(skip_chunks);
