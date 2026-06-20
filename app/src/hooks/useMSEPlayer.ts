@@ -2659,7 +2659,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  decode makes it work well enough. The video will show the nearest keyframe
    *  after the target time.
    */
-  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number) => {
+  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number, correctedByteOffset?: number) => {
     // Set the seek-in-progress flag IMMEDIATELY — before any await — so that
     // concurrent seekTo() calls see it as true and skip. Without this, the
     // SourceBuffer await below creates a window where the flag is still false,
@@ -2775,52 +2775,58 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     // 2. Fire backend keyframe fetch in the background (NON-BLOCKING)
     //    Delay by 5 seconds so the player's first /stream chunk download
-    //    gets priority on the Telegram connection. Use DEBOUNCE: clear the
-    //    previous timer and set a new one. This way, only the LAST seek in
-    //    a rapid sequence gets a background fetch. Without debounce, each
-    //    seek starts its own timer, causing 6+ concurrent backend searches
-    //    that all compete for the rate limiter, slowing /stream by 3.5x.
+    //    gets priority. Use debounce: clear previous timer, set new one.
+    //    DON'T abort a running fetch — the backend needs 10-60s per search,
+    //    and aborting before completion means the keyframe is NEVER cached.
+    //    Instead: skip starting a new fetch if one is already running.
+    //    This ensures only 1 backend search at a time (no rate limiter
+    //    contention) while allowing the running search to complete and
+    //    cache its result for future seeks.
     if (bgKeyframeTimerRef.current !== null) {
       clearTimeout(bgKeyframeTimerRef.current);
       bgKeyframeTimerRef.current = null;
     }
-    // Abort previous timer (debounce) but do NOT abort the previous HTTP request.
-    // Let the previous fetch complete in the background — its keyframe is valid
-    // for future seeks to that region, even if the user has moved to a new position.
-    // Aborting the fetch meant the keyframe was never cached.
-    if (bgKeyframeAbortRef.current) {
-      bgKeyframeAbortRef.current = null;
-    }
+    // Do NOT abort a running fetch — let it complete and cache the keyframe
     const parsed = streamUrl ? parseStreamUrl(streamUrl) : null;
     if (parsed && duration > 0 && filesize > 0) {
       bgKeyframeTimerRef.current = window.setTimeout(() => {
         bgKeyframeTimerRef.current = null;
+        // Skip if a fetch is already running — only 1 concurrent search
+        if (bgKeyframeAbortRef.current) {
+          return;
+        }
         const abortCtl = new AbortController();
         bgKeyframeAbortRef.current = abortCtl;
         fetchMpegtsKeyframeAt(parsed.baseUrl, parsed.folderId, parsed.messageId, parsed.token, timeSeconds, duration, abortCtl.signal).then(kfAt => {
+          bgKeyframeAbortRef.current = null; // Clear so next fetch can start
           if (kfAt && !kfAt.fallback) {
-            // Safety net: reject keyframes that are too far from the target.
-            // The backend has a 30s gap check, but this prevents stale/wrong
-            // entries from polluting the frontend index if the backend returns
-            // a bad result (e.g. 898s when seeking to 1392s = 494s gap).
             const gap = Math.abs(timeSeconds - kfAt.timestamp);
-            if (gap > 30) {
-              diagLog(`[MPEGTS] Background keyframe REJECTED: ${timeSeconds.toFixed(1)}s -> ${kfAt.timestamp.toFixed(1)}s (gap ${gap.toFixed(1)}s > 30s) — not caching`);
-              return;
+            if (gap <= 30) {
+              const existing = tsKeyframeIndexRef.current;
+              const newEntry = { timestamp: kfAt.timestamp, byteOffset: kfAt.byteOffset };
+              const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+              filtered.push(newEntry);
+              filtered.sort((a, b) => a.timestamp - b.timestamp);
+              tsKeyframeIndexRef.current = filtered;
+              diagLog(`[MPEGTS] Background keyframe cached: ${timeSeconds.toFixed(1)}s -> ${kfAt.timestamp.toFixed(1)}s, byte ${kfAt.byteOffset} (for future seeks)`);
             }
-            // Update the local keyframe index so the next seek to this region is instant
-            const existing = tsKeyframeIndexRef.current;
-            const newEntry = { timestamp: kfAt.timestamp, byteOffset: kfAt.byteOffset };
-            const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
-            filtered.push(newEntry);
-            filtered.sort((a, b) => a.timestamp - b.timestamp);
-            tsKeyframeIndexRef.current = filtered;
-            diagLog(`[MPEGTS] Background keyframe cached: ${timeSeconds.toFixed(1)}s -> ${kfAt.timestamp.toFixed(1)}s, byte ${kfAt.byteOffset} (for future seeks)`);
           }
-        }).catch(() => {});
+        }).catch(() => {
+          bgKeyframeAbortRef.current = null; // Clear on error too
+        });
       }, 5000);
     }
 
+    // 2b. VBR correction: if a corrected byte offset was provided (from align poll),
+    //     use it directly instead of the linear estimate. This is the key fix for
+    //     VBR seek accuracy — the align poll detects the actual time at the estimated
+    //     byte and calculates the correct byte position.
+    if (correctedByteOffset !== undefined && correctedByteOffset >= 0) {
+      seekByteFromIndex = Math.floor(correctedByteOffset / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+      seekTime = timeSeconds;
+      seekKeyframeExact = true; // treat as exact — no step-back needed
+      diagLog(`[MPEGTS] VBR corrected byte: ${timeSeconds.toFixed(1)}s -> byte ${seekByteFromIndex} (${(seekByteFromIndex / 1024 / 1024).toFixed(1)}MB)`);
+    } else
     // 3. Fall back to linear byte estimate if no usable keyframe was found
     if (seekByteFromIndex < 0) {
       const linearByte = Math.floor((timeSeconds / duration) * filesize);
@@ -2836,17 +2842,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // index hits, step back 10 TS packets (1880 bytes) so TSDemuxer can find
     // PAT/PMT before the keyframe — without this, the demuxer may skip the
     // keyframe and land on the NEXT IDR frame (up to 12s later in large GOPs).
-    const bitrate = duration > 0 ? filesize / duration : 0;
-    const STEP_BACK_SECONDS = 5;
+    // Step-back: 2MB for linear estimates, 10 packets for keyframe-index hits.
+    // 2MB = 3.3s backward at 619 KB/s — covers the previous keyframe for
+    // large-gap seeks (18-49s gaps → previous KF is ~1-2s before estimate).
+    // For small-gap seeks (7-9s → previous KF is 7-12s back), the gap is
+    // small enough that the align poll's forward jump is acceptable.
+    // This uses only 17% of the first chunk for backward coverage vs 67% for 8MB.
     const stepBackBytes = seekKeyframeExact
-      ? Math.floor(10 * TS_PACKET_SIZE / TS_PACKET_SIZE) * TS_PACKET_SIZE  // 10 packets = 1880 bytes for PAT/PMT
-      : Math.floor(bitrate * STEP_BACK_SECONDS / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+      ? 10 * TS_PACKET_SIZE  // 1880 bytes for exact keyframe hits
+      : Math.floor(2 * 1024 * 1024 / TS_PACKET_SIZE) * TS_PACKET_SIZE;  // 2MB for linear estimates
     const ALIGNED_BYTE_OFFSET = Math.max(0,
       Math.floor(RAW_BYTE_OFFSET / TS_PACKET_SIZE) * TS_PACKET_SIZE
       - stepBackBytes
     );
     const byteOffset = ALIGNED_BYTE_OFFSET;
-    diagLog(`[MPEGTS] Unbuffered seek to ${timeSeconds.toFixed(1)}s (target ${seekTime.toFixed(1)}s, raw byte ${RAW_BYTE_OFFSET}, aligned ${ALIGNED_BYTE_OFFSET} [${RAW_BYTE_OFFSET % TS_PACKET_SIZE} off → ${ALIGNED_BYTE_OFFSET % TS_PACKET_SIZE}], ${(byteOffset/1024/1024).toFixed(1)}MB of ${(filesize/1024/1024).toFixed(1)}MB)`);
+    diagLog(`[MPEGTS] Unbuffered seek to ${timeSeconds.toFixed(1)}s (target ${seekTime.toFixed(1)}s, raw byte ${RAW_BYTE_OFFSET}, aligned ${ALIGNED_BYTE_OFFSET} [${RAW_BYTE_OFFSET % TS_PACKET_SIZE} off → ${ALIGNED_BYTE_OFFSET % TS_PACKET_SIZE}], ${(byteOffset/1024/1024).toFixed(1)}MB of ${(filesize/1024/1024).toFixed(1)}MB${seekKeyframeExact ? ', keyframe-index' : ', linear-estimate'})`);
 
     try {
       // Re-read the player ref — though there's no long await before this
@@ -3052,24 +3062,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const rem = eng._transmuxer?._controller?._remuxer;
 
         // The seek byte is approximate and may land in the middle of a GOP.
-        // The video decoder can only start from a keyframe, so the first video
-        // segment may be dropped until the next keyframe is found. Once the video
-        // SourceBuffer has data, if its start is AFTER currentTime, jump the
-        // playhead to that keyframe time so playback resumes. The buffer only
-        // expands forward, so jumping is the only option — re-seeking was tried
-        // and caused DTS overlap / audio frame dropping.
+        // For small gaps (≤5s), jump to the keyframe. For large gaps (>5s),
+        // let the align poll handle VBR correction (re-seek to corrected byte).
         const v = videoRef.current;
         const videoBufferStart = getVideoBufferStart();
         const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
         if (!seekKeyframeAdjusted && v && videoBufferStart !== null) {
-          if (videoBufferStart > v.currentTime + 0.5) {
+          if (videoBufferStart > v.currentTime + 0.5 && videoBufferStart <= v.currentTime + 5) {
             diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s`);
             v.currentTime = videoBufferStart;
             seekKeyframeAdjusted = true;
-          } else {
+          } else if (videoBufferStart <= v.currentTime + 0.5) {
             // Already inside the buffered range, no jump needed.
             seekKeyframeAdjusted = true;
           }
+          // For gaps > 5s: don't jump — let align poll do VBR correction
         }
 
         diagLog(`[SEEK-DIAG] ${label}: currentTime=${v?.currentTime?.toFixed(1)} videoBufferStart=${videoBufferStart?.toFixed(1)} audioBufferStart=${audioBufferStart?.toFixed(1)}`);
@@ -3087,12 +3094,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // Also run a frequent, longer alignment poll for the case where the first
       // video keyframe takes many seconds to arrive (large GOP + slow download).
-      // When the buffer starts >5s ahead of the target, the step-back missed the
-      // keyframe (VBR offset > step-back). The buffer only expands FORWARD, so
-      // the video can't play from currentTime=target. Jump to the buffer start
-      // — playing from the wrong scene is better than stuck forever. The
-      // background keyframe fetch will make the next seek to this region exact.
+      // VBR correction: when the buffer starts >5s ahead of the target, the linear
+      // estimate was wrong (VBR offset). Instead of jumping to the wrong scene,
+      // calculate the CORRECT byte position and re-seek through the full pipeline.
+      // Use audioBufferStart for VBR CORRECTION ONLY (>5s gap) — audio arrives
+      // early and detects the VBR offset before video appears.
+      // Use videoBufferStart for FINAL ALIGNMENT (≤5s gap) — video determines
+      // if playback can proceed. Using audio for alignment is WRONG because
+      // audio can start before the target while video starts after it.
       let alignAttempts = 0;
+      let vbrCorrectionDepth = 0;
+      const MAX_VBR_CORRECTIONS = 2;
       const alignInterval = setInterval(() => {
         alignAttempts++;
         if (mpegtsUnbufferedSeekGenerationRef.current !== seekDiagGen || seekKeyframeAdjusted) {
@@ -3101,19 +3113,71 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
         const v = videoRef.current;
         const videoBufferStart = getVideoBufferStart();
+        const eng = (mpegtsPlayerRef.current as any)?._player_engine;
+        const mc = eng?._mse_controller;
+        const ms = mc?.getObject?.();
+        const sbA = ms?.sourceBuffers?.[1];
+        const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
+
+        // VBR CORRECTION: use audio OR video, whichever appears first (>5s gap only)
+        if (v && audioBufferStart !== null && audioBufferStart > v.currentTime + 5) {
+          // Audio arrived early with large gap → VBR correction before video shows
+          const gap = audioBufferStart - v.currentTime;
+          if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
+            vbrCorrectionDepth++;
+            const bitrate = filesize / duration;
+            const correctionBytes = gap * bitrate;
+            const correctedByte = Math.max(0, byteOffset - correctionBytes);
+            diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
+            clearInterval(alignInterval);
+            seekKeyframeAdjusted = true;
+            _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
+            return;
+          }
+        }
+
+        // FINAL ALIGNMENT: use VIDEO buffer only — video determines playability
         if (v && videoBufferStart !== null) {
           if (videoBufferStart > v.currentTime + 0.5) {
-            // Buffer starts after currentTime — jump to it so video can play.
-            // Whether the gap is 2s or 30s, jumping is the only option because
-            // the buffer only expands forward. Re-seeking was tried and caused
-            // DTS overlap / audio frame dropping (the re-seek bypassed the full
-            // seek pipeline including remuxer reset).
             const gap = videoBufferStart - v.currentTime;
-            diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s)`);
+            if (gap > 5 && vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
+              // Video gap > 5s → VBR correction (re-seek to corrected byte)
+              vbrCorrectionDepth++;
+              const bitrate = filesize / duration;
+              const correctionBytes = gap * bitrate;
+              const correctedByte = Math.max(0, byteOffset - correctionBytes);
+              diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
+              return;
+            }
+            // Gap 0.5-5s or max corrections: jump to video buffer start
+            diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s)${vbrCorrectionDepth > 0 ? ` after ${vbrCorrectionDepth} correction(s)` : ''}`);
             v.currentTime = videoBufferStart;
             seekKeyframeAdjusted = true;
+          } else if (videoBufferStart < v.currentTime - 5) {
+            // BACKWARD VBR correction: buffer starts >5s BEFORE target.
+            // The linear estimate was too far FORWARD in the file (local bitrate
+            // higher than average). Move the download FORWARD so data arrives
+            // closer to the target. Without this, the user waits 10-20s for
+            // the buffer to expand forward to the target.
+            const gap = v.currentTime - videoBufferStart;
+            if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
+              vbrCorrectionDepth++;
+              const bitrate = filesize / duration;
+              const correctionBytes = gap * bitrate;
+              const correctedByte = Math.min(filesize - 1, byteOffset + correctionBytes);
+              diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: backward gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB forward)`);
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
+              return;
+            }
+            // Max corrections reached: let video buffer expand to target
+            seekKeyframeAdjusted = true;
           } else {
-            // Buffer starts at or before currentTime — perfect
+            // Video buffer at or before currentTime (within 5s) — perfect, video can play
             seekKeyframeAdjusted = true;
           }
           if (seekKeyframeAdjusted) {
