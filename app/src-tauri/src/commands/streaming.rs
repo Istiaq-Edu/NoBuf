@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::io::{Write, Seek, SeekFrom};
 
 use crate::commands::TelegramState;
+use crate::server::throttle_api_calls;
 use crate::commands::resolve_peer;
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta, merge_ranges, find_gaps};
 use grammers_client::types::Media;
@@ -872,8 +873,30 @@ async fn proactive_prebuffer_download(
                     return Ok(total_downloaded);
                 }
 
+                // Check if the playhead has jumped far ahead (user seeked).
+                // If so, break out of this gap and re-evaluate from the new position.
+                {
+                    let targets = state.proactive_targets.read().await;
+                    if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
+                        if target_byte > offset + 10 * 1024 * 1024 {
+                            log::info!(
+                                "[PROACTIVE] msg {}: playhead jumped to byte {} (current offset {}), re-evaluating gaps",
+                                message_id, target_byte, offset
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // Use blocking acquire — the 250ms global rate limiter ensures
+                // no FLOOD_PREMIUM_WAIT. /stream and proactive alternate fairly
+                // through the single semaphore: each gets every other chunk.
+                // try_acquire was used before but it almost never succeeded
+                // because /stream immediately re-acquires after releasing,
+                // starving the proactive to 0.86 MB/s.
                 let chunk_result = {
                     let _permit = state.download_semaphore.acquire().await.unwrap();
+                    throttle_api_calls(&state.rate_limiter).await;
                     iter.next().await
                 };
 

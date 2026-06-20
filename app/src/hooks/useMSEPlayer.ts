@@ -526,6 +526,20 @@ export function byteOffsetAtOrBeforeTime(
     }
   }
   const kf = keyframes[lo];
+  // The keyframe index may have sparse coverage — e.g., entries at 0-60s
+  // (from initial playback demuxing) and ~2073s (from PTS tail download),
+  // with nothing in between. The binary search finds the last keyframe at
+  // or before targetTime, but if that keyframe is far from the target
+  // (e.g., 12s when seeking to 707s), the index doesn't cover the seek
+  // position and the keyframe's byte offset is useless.
+  // Fall back to linear interpolation when the gap is >30s — keyframes in
+  // TS streams are typically 2-5s apart, so >30s means clearly uncovered.
+  if (kf && fallbackDuration > 0 && fallbackFileLength > 0) {
+    const timeGap = targetTime - kf.timestamp;
+    if (timeGap > 30) {
+      return Math.floor((targetTime / fallbackDuration) * fallbackFileLength);
+    }
+  }
   return kf && Number.isFinite(kf.byteOffset) ? kf.byteOffset : Math.floor((targetTime / fallbackDuration) * fallbackFileLength);
 }
 
@@ -552,6 +566,31 @@ async function fetchMpegtsKeyframeIndex(
       .sort((a, b) => a.timestamp - b.timestamp);
   } catch (e) {
     return [];
+  }
+}
+
+/** Ask the backend for the exact byte offset of the nearest keyframe at or before `time`. */
+async function fetchMpegtsKeyframeAt(
+  baseUrl: string,
+  folderId: string,
+  messageId: string,
+  token: string,
+  time: number,
+  duration: number,
+  abortSignal?: AbortSignal
+): Promise<{ timestamp: number; byteOffset: number; fallback: boolean } | null> {
+  try {
+    const url = `${baseUrl}/fmp4/keyframe-at/${folderId}/${messageId}?time=${encodeURIComponent(time.toFixed(3))}&duration=${encodeURIComponent(duration.toFixed(3))}&token=${encodeURIComponent(token)}`;
+    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: abortSignal });
+    if (!response.ok) return null;
+    const data = await response.json() as { timestamp_s?: number; byte_offset?: number; fallback?: boolean };
+    const timestamp = Number(data.timestamp_s ?? 0);
+    const byteOffset = Number(data.byte_offset ?? 0);
+    if (!Number.isFinite(timestamp) || !Number.isFinite(byteOffset) || byteOffset < 0) return null;
+    return { timestamp, byteOffset, fallback: !!data.fallback };
+  } catch (e: any) {
+    if (e?.name === 'AbortError') return null; // expected on rapid seek
+    return null;
   }
 }
 
@@ -627,6 +666,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // overlapping downloads on unbuffered parts
   const seekDebounceTimerRef = useRef<number | null>(null);
   const mpegtsUnbufferedSeekGenerationRef = useRef<number>(0);
+  // Timer for the delayed background keyframe fetch — cancelled on new seek
+  // so rapid seeks don't spawn multiple concurrent fetchMpegtsKeyframeAt calls.
+  const bgKeyframeTimerRef = useRef<number | null>(null);
+  // Debounce timer for rapid mpegts.js unbuffered seeks (scrubbing). Only the
+  // last seek within the debounce window executes. If a seek is already in
+  // progress when the debounce fires, the target is stored in pendingSeekTargetRef
+  // and executed after the in-progress seek completes.
+  const mpegtsSeekDebounceRef = useRef<number | null>(null);
+  const pendingSeekTargetRef = useRef<{ time: number; dur: number } | null>(null);
+  // Max depth for recursive pending-seek chain. Each seek can queue 1 pending
+  // seek in its finally block. Without a limit, continuous scrubbing creates
+  // unbounded recursion accumulating orphaned timers. 3 is sufficient — the
+  // debounce coalesces rapid scrubbing, so at most 1 pending per 400ms.
+  const pendingSeekDepthRef = useRef<number>(0);
+  // AbortController for the background keyframe fetch — aborted on new seek
+  // so the old HTTP request doesn't hold the backend semaphore.
+  const bgKeyframeAbortRef = useRef<AbortController | null>(null);
   const SEEK_DEBOUNCE_MS = 500; // MP4/MKV — 500ms debounce for unbuffered seeks
   const SEEK_DEBOUNCE_MS_TS = 2000; // DEPRECATED: Only used by mux.js fallback. The fMP4 pipeline uses SEEK_DEBOUNCE_MS (500ms). // TS format — longer debounce because getKeyPacket is slow (prevent concurrent seeks during drag)
   // Track when the last unbuffered seek was actually executed (instant or debounce expired).
@@ -1036,6 +1092,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         clearTimeout(seekDebounceTimerRef.current);
         seekDebounceTimerRef.current = null;
       }
+      if (bgKeyframeTimerRef.current !== null) {
+        clearTimeout(bgKeyframeTimerRef.current);
+        bgKeyframeTimerRef.current = null;
+      }
+      if (mpegtsSeekDebounceRef.current !== null) {
+        clearTimeout(mpegtsSeekDebounceRef.current);
+        mpegtsSeekDebounceRef.current = null;
+      }
+      pendingSeekTargetRef.current = null;
+      pendingSeekDepthRef.current = 0;
+      if (bgKeyframeAbortRef.current) {
+        bgKeyframeAbortRef.current.abort();
+        bgKeyframeAbortRef.current = null;
+      }
+      // Invalidate all generation-guarded callbacks (checkPipeline timeouts,
+      // alignInterval) so they stop firing after unmount. Also clear the
+      // seek-in-progress flag so future seeks aren't blocked.
+      mpegtsUnbufferedSeekGenerationRef.current++;
+      (window as any).__nobuf_userSeekInProgress = false;
       // Stop streaming chain
       stopStreamingChain();
       refillInProgressRef.current = false;
@@ -1952,6 +2027,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       shadowCache: shadowCacheRef.current,
       firstChunkSize: alignChunkSize(5 * 1024 * 1024),
       chunkSize: alignChunkSize(10 * 1024 * 1024),
+      postSeekFirstChunkSize: alignChunkSize(12 * 1024 * 1024),
     });
 
 
@@ -2167,6 +2243,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Start playback as soon as mpegts.js has identified the media streams AND
       // the first 5MB is in the shadow cache (or the cold-start timeout fired).
       // The overlay is hidden exactly when playback begins.
+
+      // Safety net: pause the video immediately after MEDIA_INFO to prevent
+      // any auto-play (browser autoplay, StartupStallJumper, or mpegts.js
+      // internals) from starting playback before the cold-start gate resolves.
+      // player.play() below is the sole entry point for playback start.
+      if (!video.paused) {
+        video.pause();
+        diagLog('[MPEGTS] Paused video after MEDIA_INFO — waiting for cold-start gate');
+      }
+
       const coldStartDeferred = coldStartDeferredRef.current;
       if (coldStartDeferred) {
         await coldStartDeferred.promise;
@@ -2574,6 +2660,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  after the target time.
    */
   const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number) => {
+    // Set the seek-in-progress flag IMMEDIATELY — before any await — so that
+    // concurrent seekTo() calls see it as true and skip. Without this, the
+    // SourceBuffer await below creates a window where the flag is still false,
+    // allowing rapid seeks to bypass the guard and start overlapping
+    // IOController.seek() calls that overwrite each other.
+    mpegtsUnbufferedSeekGenerationRef.current = (mpegtsUnbufferedSeekGenerationRef.current || 0) + 1;
+    const seekGen = mpegtsUnbufferedSeekGenerationRef.current;
+    (window as any).__nobuf_userSeekInProgress = true;
+
     // Cancel independent prebuffer — seek changes the download position
     if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
       diagLog('[INDEPENDENT-PREBUFFER] Cancelling seek prebuffer');
@@ -2614,24 +2709,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         await Promise.all(waiters.map(p => Promise.race([
           p,
           new Promise<void>(resolve => setTimeout(() => {
-            diagLog('[MPEGTS] Unbuffered seek: SourceBuffer update wait timed out (3s) — proceeding with flush');
+            diagLog('[MPEGTS] Unbuffered seek: SourceBuffer update wait timed out (500ms) — proceeding with flush');
             resolve();
-          }, 3000))])));
+          }, 500))])));
       }
     }
 
-    // Mark user seek in progress — allows _onIOSeeked to fire insertDiscontinuity
-    // (which is correct for user seeks, but wrong for lazyLoad resume/Early-EOF reconnect).
-    // Use a generation counter so an earlier seek that finishes after a later seek does
-    // not clear the flag for the later seek.
-    mpegtsUnbufferedSeekGenerationRef.current = (mpegtsUnbufferedSeekGenerationRef.current || 0) + 1;
-    const seekGen = mpegtsUnbufferedSeekGenerationRef.current;
-    (window as any).__nobuf_userSeekInProgress = true;
+    // Generation/flag already set at the top of the function (before the
+    // SourceBuffer await) so concurrent seekTo() calls are blocked during
+    // the entire seek including the await.
     try {
     const video = videoRef.current;
-    const player = mpegtsPlayerRef.current;
-    if (!video || !player) {
-      diagLog('[MPEGTS] Unbuffered seek: no video or player');
+    if (!video) {
+      diagLog('[MPEGTS] Unbuffered seek: no video element');
       return;
     }
 
@@ -2651,29 +2741,140 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // We also step back ~10 packets (~1880 bytes) so TSDemuxer has room to
     // find PAT/PMT + the nearest keyframe before the target time.
     const TS_PACKET_SIZE = 188;
-    const seekByteFromIndex = byteOffsetAtOrBeforeTime(tsKeyframeIndexRef.current, timeSeconds, duration, filesize);
+    let seekByteFromIndex = -1;
+    let seekTime = timeSeconds;
+    let seekKeyframeExact = false;
+
+    // 1. Try the local keyframe index first (instant — populated from /fmp4/keyframes polling)
+    //    Only use it if the index has enough entries to be meaningful. A sparse index
+    //    with only 1-2 entries (e.g. from initial playback + tail scan) will return
+    //    a keyframe far from the target, which byteOffsetAtOrBeforeTime already
+    //    detects via its 30s gap threshold — but we also need to handle the case
+    //    where the function returns a linear estimate (which is NOT a real keyframe
+    //    and must not be treated as one).
+    const localKfs = tsKeyframeIndexRef.current;
+    if (localKfs.length >= 2) {
+      const candidateByte = byteOffsetAtOrBeforeTime(localKfs, timeSeconds, duration, filesize);
+      if (candidateByte >= 0) {
+        // Find the actual keyframe entry for this byte — byteOffsetAtOrBeforeTime
+        // may return a linear estimate (not a real keyframe) when the gap is >30s,
+        // which won't match any entry in the array.
+        const idx = localKfs.findIndex(k => k.byteOffset === candidateByte);
+        if (idx >= 0) {
+          seekTime = localKfs[idx].timestamp;
+          if (Math.abs(timeSeconds - seekTime) <= 30) {
+            seekByteFromIndex = candidateByte;
+            seekKeyframeExact = true;
+            diagLog(`[MPEGTS] Local keyframe index: ${timeSeconds.toFixed(1)}s -> ${seekTime.toFixed(1)}s, byte ${seekByteFromIndex}`);
+          } else {
+            diagLog(`[MPEGTS] Local keyframe too far (${seekTime.toFixed(1)}s vs target ${timeSeconds.toFixed(1)}s) — using linear estimate`);
+          }
+        }
+      }
+    }
+
+    // 2. Fire backend keyframe fetch in the background (NON-BLOCKING)
+    //    Delay by 5 seconds so the player's first /stream chunk download
+    //    gets priority on the Telegram connection. Only abort the previous
+    //    HTTP request — do NOT cancel the 5s timer. This way, even with
+    //    rapid seeks, the timer fires 5s after the LAST seek and populates
+    //    the keyframe index for that region. Cancelling the timer on every
+    //    seek meant it never fired during rapid scrubbing.
+    // Abort any previous background keyframe fetch so it doesn't hold
+    // the backend semaphore while a new seek is in progress.
+    if (bgKeyframeAbortRef.current) {
+      bgKeyframeAbortRef.current.abort();
+      bgKeyframeAbortRef.current = null;
+    }
+    const parsed = streamUrl ? parseStreamUrl(streamUrl) : null;
+    if (parsed && duration > 0 && filesize > 0) {
+      bgKeyframeTimerRef.current = window.setTimeout(() => {
+        bgKeyframeTimerRef.current = null;
+        const abortCtl = new AbortController();
+        bgKeyframeAbortRef.current = abortCtl;
+        fetchMpegtsKeyframeAt(parsed.baseUrl, parsed.folderId, parsed.messageId, parsed.token, timeSeconds, duration, abortCtl.signal).then(kfAt => {
+          if (kfAt && !kfAt.fallback) {
+            // Safety net: reject keyframes that are too far from the target.
+            // The backend has a 30s gap check, but this prevents stale/wrong
+            // entries from polluting the frontend index if the backend returns
+            // a bad result (e.g. 898s when seeking to 1392s = 494s gap).
+            const gap = Math.abs(timeSeconds - kfAt.timestamp);
+            if (gap > 30) {
+              diagLog(`[MPEGTS] Background keyframe REJECTED: ${timeSeconds.toFixed(1)}s -> ${kfAt.timestamp.toFixed(1)}s (gap ${gap.toFixed(1)}s > 30s) — not caching`);
+              return;
+            }
+            // Update the local keyframe index so the next seek to this region is instant
+            const existing = tsKeyframeIndexRef.current;
+            const newEntry = { timestamp: kfAt.timestamp, byteOffset: kfAt.byteOffset };
+            const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+            filtered.push(newEntry);
+            filtered.sort((a, b) => a.timestamp - b.timestamp);
+            tsKeyframeIndexRef.current = filtered;
+            diagLog(`[MPEGTS] Background keyframe cached: ${timeSeconds.toFixed(1)}s -> ${kfAt.timestamp.toFixed(1)}s, byte ${kfAt.byteOffset} (for future seeks)`);
+          }
+        }).catch(() => {});
+      }, 5000);
+    }
+
+    // 3. Fall back to linear byte estimate if no usable keyframe was found
+    if (seekByteFromIndex < 0) {
+      const linearByte = Math.floor((timeSeconds / duration) * filesize);
+      seekByteFromIndex = linearByte;
+      seekTime = timeSeconds;
+      diagLog(`[MPEGTS] Using linear byte estimate: ${timeSeconds.toFixed(1)}s -> byte ${linearByte} (${(linearByte / 1024 / 1024).toFixed(1)}MB)`);
+    }
     const RAW_BYTE_OFFSET = seekByteFromIndex >= 0
       ? seekByteFromIndex
       : Math.floor((timeSeconds / duration) * filesize);
+    // Adaptive step-back: for non-exact seeks (linear estimate), step back
+    // enough data to cover a typical GOP + VBR offset. For exact keyframe
+    // index hits, step back 10 TS packets (1880 bytes) so TSDemuxer can find
+    // PAT/PMT before the keyframe — without this, the demuxer may skip the
+    // keyframe and land on the NEXT IDR frame (up to 12s later in large GOPs).
+    const bitrate = duration > 0 ? filesize / duration : 0;
+    const STEP_BACK_SECONDS = 15;
+    const stepBackBytes = seekKeyframeExact
+      ? Math.floor(10 * TS_PACKET_SIZE / TS_PACKET_SIZE) * TS_PACKET_SIZE  // 10 packets = 1880 bytes for PAT/PMT
+      : Math.floor(bitrate * STEP_BACK_SECONDS / TS_PACKET_SIZE) * TS_PACKET_SIZE;
     const ALIGNED_BYTE_OFFSET = Math.max(0,
       Math.floor(RAW_BYTE_OFFSET / TS_PACKET_SIZE) * TS_PACKET_SIZE
-      - TS_PACKET_SIZE * 10  // step back ~10 packets for PAT/PMT + keyframe
+      - stepBackBytes
     );
     const byteOffset = ALIGNED_BYTE_OFFSET;
-    diagLog(`[MPEGTS] Unbuffered seek to ${timeSeconds.toFixed(1)}s (raw byte ${RAW_BYTE_OFFSET}, aligned ${ALIGNED_BYTE_OFFSET} [${RAW_BYTE_OFFSET % TS_PACKET_SIZE} off → ${ALIGNED_BYTE_OFFSET % TS_PACKET_SIZE}], ${(byteOffset/1024/1024).toFixed(1)}MB of ${(filesize/1024/1024).toFixed(1)}MB)`);
+    diagLog(`[MPEGTS] Unbuffered seek to ${timeSeconds.toFixed(1)}s (target ${seekTime.toFixed(1)}s, raw byte ${RAW_BYTE_OFFSET}, aligned ${ALIGNED_BYTE_OFFSET} [${RAW_BYTE_OFFSET % TS_PACKET_SIZE} off → ${ALIGNED_BYTE_OFFSET % TS_PACKET_SIZE}], ${(byteOffset/1024/1024).toFixed(1)}MB of ${(filesize/1024/1024).toFixed(1)}MB)`);
 
     try {
+      // Re-read the player ref — though there's no long await before this
+      // point anymore, the player may have been destroyed by React cleanup.
+      const player = mpegtsPlayerRef.current;
       const engine = (player as any)?._player_engine;
-      if (!engine) {
-        diagLog('[MPEGTS] No player engine — falling back to video.currentTime');
-        video.currentTime = timeSeconds;
+      if (!player || !engine) {
+        diagLog(`[MPEGTS] No player/engine for seek — falling back to video.currentTime (player=${!!player}, engine=${!!engine})`);
+        video.currentTime = seekTime;
         return;
+      }
+
+      // Clear the shadow cache before seeking. The cache may have data ahead of
+      // the seek target (from the sequential download). If we don't clear it,
+      // _pumpChunks() serves cached chunks in a synchronous tight loop through
+      // the full transmuxer pipeline, blocking the main thread and freezing the
+      // app. With an empty cache, the loader hits await _fetchRange() which
+      // yields properly, and the backend serves from disk (seek-back) or
+      // Telegram (seek-forward). The disk cache survives — only in-memory data
+      // is cleared.
+      if (shadowCacheRef.current) {
+        const cache = shadowCacheRef.current;
+        const hadEntries = cache.entryCount;
+        cache.reset(cache.urlKey, cache.fileLength);
+        if (hadEntries > 0) {
+          diagLog(`[MPEGTS] Shadow cache cleared for seek (was ${hadEntries} entries)`);
+        }
       }
 
       // Move the video element's playhead to the target time so the UI and the
       // browser's seeking behavior align with the new stream position. This must
       // happen before the IOController seek so mpegts.js can pick up the new time.
-      video.currentTime = timeSeconds;
+      video.currentTime = seekTime;
       // 1. Flush SourceBuffers — remove all buffered ranges for clean slate
       const mseCtrl = engine._mse_controller;
       if (mseCtrl) {
@@ -2699,7 +2900,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const tController = engine._transmuxer?._controller;
       if (!tController) {
         diagLog('[MPEGTS] No transmuxing controller — falling back');
-        video.currentTime = timeSeconds;
+        video.currentTime = seekTime;
         return;
       }
 
@@ -2758,20 +2959,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           remuxer._videoSegmentInfoList?.clear?.();
           remuxer._audioSegmentInfoList?.clear?.();
 
-          // CRITICAL: Reset _dtsBaseInited so _calculateDtsBase() runs again with
-          // the new DTS values from the seek position. Without this, _dtsBase retains
-          // the value from the initial load (~0ms), and originalDts = sample.dts - 0
-          // produces wrong values (~40s from stale demuxer extrapolation instead of
-          // ~1028s from actual PES headers at seek position).
-          remuxer._dtsBaseInited = false;
-          remuxer._audioDtsBase = Infinity;
-          remuxer._videoDtsBase = Infinity;
-          remuxer._dtsBase = -1;
-
-          // insertDiscontinuity() resets _audioNextDts and _videoNextDts to undefined,
-          // so the first batch after seek gets dtsCorrection=0 (clean start).
-          // Note: ioctl.seek() will also trigger _onIOSeeked() → insertDiscontinuity()
-          // again, which is harmless (idempotent).
+          // DO NOT reset _dtsBaseInited / _dtsBase. The original DTS base was
+          // computed from the initial load (~0ms) and is valid across the entire
+          // TS file because the stream's PTS is absolute (monotonically increasing
+          // from 0 to duration). Keeping the base means samples at the seek position
+          // produce absolute DTS values (e.g., ~850s), so the MSE SourceBuffer places
+          // segments at the seek time on the media timeline. If we reset the base,
+          // segments start at relative DTS 0 and end up at 0s on the timeline while
+          // video.currentTime is at 850s, causing playback to stall.
+          // We still clear stashed samples and reset the next-DTS trackers so the
+          // first post-seek batch is treated as a clean discontinuity.
           remuxer.insertDiscontinuity?.();
         }
       } catch (e: any) {
@@ -2813,19 +3010,141 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           } else {
             diagLog('[MPEGTS] IOController still null — full player recreate needed');
             // Last resort: destroy and recreate the entire player
-            _mpegtsRecreatePlayerForSeek(byteOffset, timeSeconds);
+            _mpegtsRecreatePlayerForSeek(byteOffset, seekTime);
           }
         }, 200);
         return; // Don't set currentTime yet — wait for IOController
       }
 
       // 4. Set video.currentTime — video element seeks to the target position
-      video.currentTime = timeSeconds;
-      diagLog(`[MPEGTS] Seek initiated — video.currentTime set to ${timeSeconds.toFixed(1)}s`);
+      video.currentTime = seekTime;
+      diagLog(`[MPEGTS] Seek initiated — video.currentTime set to ${seekTime.toFixed(1)}s`);
+
+      // ── DIAGNOSTIC: check pipeline state at intervals after seek ──
+      // Helps pinpoint where data flow stops: loader → IOController → demuxer → remuxer → MSE
+      const seekDiagGen = seekGen;
+      let seekKeyframeAdjusted = false;
+      const getVideoBufferStart = (): number | null => {
+        const eng = (player as any)?._player_engine;
+        const mc = eng?._mse_controller;
+        const ms = mc?.getObject?.();
+        const sbV = ms?.sourceBuffers?.[0];
+        if (sbV && sbV.buffered && sbV.buffered.length > 0) {
+          return sbV.buffered.start(0);
+        }
+        return null;
+      };
+      const checkPipeline = (label: string) => {
+        if (mpegtsUnbufferedSeekGenerationRef.current !== seekDiagGen) return; // superseded
+        const eng = (player as any)?._player_engine;
+        if (!eng) { diagLog(`[SEEK-DIAG] ${label}: no engine`); return; }
+        const ic = eng._transmuxer?._controller?._ioctl;
+        const mc = eng._mse_controller;
+        const ms = mc?.getObject?.();
+        const sbV = ms?.sourceBuffers?.[0];
+        const sbA = ms?.sourceBuffers?.[1];
+        const dem = eng._transmuxer?._controller?._demuxer;
+        const rem = eng._transmuxer?._controller?._remuxer;
+
+        // The seek byte is approximate and may land in the middle of a GOP.
+        // The video decoder can only start from a keyframe, so the first video
+        // segment may be dropped until the next keyframe is found. Once the video
+        // SourceBuffer has data, if its start is AFTER currentTime, jump the
+        // playhead to that keyframe time so playback resumes. The buffer only
+        // expands forward, so jumping is the only option — re-seeking was tried
+        // and caused DTS overlap / audio frame dropping.
+        const v = videoRef.current;
+        const videoBufferStart = getVideoBufferStart();
+        const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
+        if (!seekKeyframeAdjusted && v && videoBufferStart !== null) {
+          if (videoBufferStart > v.currentTime + 0.5) {
+            diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s`);
+            v.currentTime = videoBufferStart;
+            seekKeyframeAdjusted = true;
+          } else {
+            // Already inside the buffered range, no jump needed.
+            seekKeyframeAdjusted = true;
+          }
+        }
+
+        diagLog(`[SEEK-DIAG] ${label}: currentTime=${v?.currentTime?.toFixed(1)} videoBufferStart=${videoBufferStart?.toFixed(1)} audioBufferStart=${audioBufferStart?.toFixed(1)}`);
+        diagLog(`[SEEK-DIAG] ${label}: ioctl.paused=${ic?._paused} range=${JSON.stringify(ic?._currentRange)}`);
+        diagLog(`[SEEK-DIAG] ${label}: sbV.updating=${sbV?.updating} sbV.buffered=${sbV?.buffered?.length} sbA.updating=${sbA?.updating} sbA.buffered=${sbA?.buffered?.length}`);
+        diagLog(`[SEEK-DIAG] ${label}: pendingRemove V=${mc?._pendingRemoveRanges?.video?.length} A=${mc?._pendingRemoveRanges?.audio?.length} pendingSeg V=${mc?._pendingSegments?.video?.length} A=${mc?._pendingSegments?.audio?.length}`);
+        diagLog(`[SEEK-DIAG] ${label}: remuxer.dtsBaseInited=${rem?._dtsBaseInited} videoMeta=${!!rem?._videoMeta} audioMeta=${!!rem?._audioMeta} videoNextDts=${rem?._videoNextDts} audioNextDts=${rem?._audioNextDts}`);
+        if (dem) {
+          diagLog(`[SEEK-DIAG] ${label}: demuxer.pmt=${!!dem.pmt_} videoTrack.samples=${dem.video_track_?.samples?.length} audioTrack.samples=${dem.audio_track_?.samples?.length}`);
+        }
+      };
+      setTimeout(() => checkPipeline('1s'), 1000);
+      setTimeout(() => checkPipeline('3s'), 3000);
+      setTimeout(() => checkPipeline('5s'), 5000);
+
+      // Also run a frequent, longer alignment poll for the case where the first
+      // video keyframe takes many seconds to arrive (large GOP + slow download).
+      // When the buffer starts >5s ahead of the target, the step-back missed the
+      // keyframe (VBR offset > step-back). The buffer only expands FORWARD, so
+      // the video can't play from currentTime=target. Jump to the buffer start
+      // — playing from the wrong scene is better than stuck forever. The
+      // background keyframe fetch will make the next seek to this region exact.
+      let alignAttempts = 0;
+      const alignInterval = setInterval(() => {
+        alignAttempts++;
+        if (mpegtsUnbufferedSeekGenerationRef.current !== seekDiagGen || seekKeyframeAdjusted) {
+          clearInterval(alignInterval);
+          return;
+        }
+        const v = videoRef.current;
+        const videoBufferStart = getVideoBufferStart();
+        if (v && videoBufferStart !== null) {
+          if (videoBufferStart > v.currentTime + 0.5) {
+            // Buffer starts after currentTime — jump to it so video can play.
+            // Whether the gap is 2s or 30s, jumping is the only option because
+            // the buffer only expands forward. Re-seeking was tried and caused
+            // DTS overlap / audio frame dropping (the re-seek bypassed the full
+            // seek pipeline including remuxer reset).
+            const gap = videoBufferStart - v.currentTime;
+            diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s)`);
+            v.currentTime = videoBufferStart;
+            seekKeyframeAdjusted = true;
+          } else {
+            // Buffer starts at or before currentTime — perfect
+            seekKeyframeAdjusted = true;
+          }
+          if (seekKeyframeAdjusted) {
+            clearInterval(alignInterval);
+          }
+        }
+        if (alignAttempts > 150) { // 30s
+          clearInterval(alignInterval);
+          diagLog(`[MPEGTS] Keyframe alignment poll timed out after 30s`);
+        }
+      }, 200);
+
+      // 5. Report the new playback position to the backend so the proactive
+      //    prebuffer adjusts its sliding window to start from the seek byte.
+      //    The existing proactive task reads proactive_targets on its next loop
+      //    iteration and slides start_byte forward to the seek position. This
+      //    avoids the race condition of stop+restart (cmd_stop clears the flag,
+      //    then cmd_report clears it again before the old task checks it).
+      if (file && activeFolderId !== null && filesize > 0) {
+        invoke('cmd_report_playback_position', {
+          messageId: file.id,
+          folderId: activeFolderId,
+          currentTimeS: seekTime,
+          durationS: duration,
+          fileSize: filesize,
+          isPlayerDownloading: true,
+          playbackRate: 1,
+        }).catch((e: any) => {
+          diagLog(`[MPEGTS] Failed to report seek position: ${e}`);
+        });
+        diagLog(`[MPEGTS] Reported seek position ${seekTime.toFixed(1)}s to backend proactive`);
+      }
 
     } catch (e: any) {
       diagLog(`[MPEGTS] Unbuffered seek failed: ${e.message}`);
-      video.currentTime = timeSeconds;
+      video.currentTime = seekTime;
     }
     } finally {
       // Clear user seek flag — after this point, _onIOSeeked should NOT
@@ -2834,6 +3153,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // the most recent seek generation, otherwise a later seek needs the flag.
       if (mpegtsUnbufferedSeekGenerationRef.current === seekGen) {
         (window as any).__nobuf_userSeekInProgress = false;
+
+        // If a new seek target was queued during this seek (user scrubbed
+        // while this seek was executing), execute it now. The pending ref
+        // always holds the LAST target, so only the final scrub position
+        // gets executed — intermediate positions are discarded.
+        const pending = pendingSeekTargetRef.current;
+        if (pending) {
+          pendingSeekTargetRef.current = null;
+          if (pendingSeekDepthRef.current >= 3) {
+            diagLog(`[MPEGTS] Pending seek to ${pending.time.toFixed(1)}s dropped — max depth 3 reached`);
+            pendingSeekDepthRef.current = 0;
+          } else {
+            pendingSeekDepthRef.current++;
+            diagLog(`[MPEGTS] Executing pending seek to ${pending.time.toFixed(1)}s (depth ${pendingSeekDepthRef.current}) after seek gen ${seekGen} completed`);
+            _mpegtsUnbufferedSeek(pending.time, pending.dur);
+          }
+        } else {
+          // No pending seek — reset depth
+          pendingSeekDepthRef.current = 0;
+        }
       }
     }
   };
@@ -2890,6 +3229,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         autoCleanupMaxBackwardDuration: 60,
         autoCleanupMinBackwardDuration: 30,
         accurateSeek: false,
+        // M5/M6 fix: match initial player's chunk config (10MB regular,
+        // 12MB post-seek first chunk for faster keyframe discovery)
+        firstChunkSize: alignChunkSize(5 * 1024 * 1024),
+        chunkSize: alignChunkSize(10 * 1024 * 1024),
+        postSeekFirstChunkSize: alignChunkSize(12 * 1024 * 1024),
         } as any);
 
       newPlayer.attachMediaElement(video);
@@ -2926,10 +3270,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
         const remuxer = tCtrl._remuxer as any;
         if (remuxer) {
-          remuxer._dtsBaseInited = false;
-          remuxer._audioDtsBase = Infinity;
-          remuxer._videoDtsBase = Infinity;
-          remuxer._dtsBase = -1;
+          // Do NOT reset _dtsBaseInited/_dtsBase. The original base from the
+          // initial load is valid across the entire TS file (absolute PTS).
+          // Resetting it would make segments start at relative DTS 0 and place
+          // them at 0s on the MSE timeline while video.currentTime is at the
+          // seek target, causing a stall. Keep the base and just clear stashed
+          // samples / start a new segment with insertDiscontinuity().
+          remuxer._audioStashedLastSample = null;
+          remuxer._videoStashedLastSample = null;
+          remuxer._videoSegmentInfoList?.clear?.();
+          remuxer._audioSegmentInfoList?.clear?.();
+          remuxer.insertDiscontinuity?.();
         }
       }
       const ioctl = tCtrl?._ioctl;
@@ -4089,11 +4440,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // lazyLoadMaxDuration seconds (recoverDuration) before the buffer end.
     // entire file tail from seek point to EOF.
     if (mpegtsPlayerRef.current && formatRef.current === 'ts') {
-      const dur = state.current.duration || mpegtsDurationRef.current;
+      const dur = mpegtsDurationRef.current || state.current.duration;
       if (!dur || dur <= 0 || !isFinite(dur)) return;
-      const clamped = Math.max(0, Math.min(timeSeconds, dur - 0.1));
       const video = videoRef.current;
       if (!video) return;
+
+      const clamped = Math.max(0, Math.min(timeSeconds, dur - 0.1));
 
       // Check if the target position is buffered (SourceBuffer) or cached (disk/shadow cache)
       const isBuffered = (() => {
@@ -4138,12 +4490,46 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Suppress loading spinner for cache-hit seeks.
         diagLog(`[MPEGTS] Cache-hit seek to ${clamped.toFixed(1)}s (disk cached, suppressing spinner)`);
         suppressLoadingSpinnerRef.current = true;
-        await _mpegtsUnbufferedSeek(clamped, dur);
+        // M7 fix: check seek-in-progress flag instead of calling directly.
+        // If a seek is already running, queue this as pending to prevent
+        // concurrent _mpegtsUnbufferedSeek calls without adding debounce latency.
+        if ((window as any).__nobuf_userSeekInProgress === true) {
+          pendingSeekTargetRef.current = { time: clamped, dur };
+          diagLog(`[MPEGTS] Cache-hit seek to ${clamped.toFixed(1)}s queued as pending (seek in progress)`);
+        } else {
+          await _mpegtsUnbufferedSeek(clamped, dur);
+        }
         // Auto-clear suppress after 3s (safety net)
         setTimeout(() => { suppressLoadingSpinnerRef.current = false; }, 3000);
       } else {
-        // Unbuffered seek — data must be fetched from Telegram (slow)
-        await _mpegtsUnbufferedSeek(clamped, dur);
+        // Unbuffered seek — data must be fetched from Telegram.
+        // Use a 400ms debounce so rapid scrubbing only triggers one seek
+        // (the LAST one wins). If a seek is already in progress when the
+        // debounce fires, store the target as pending and execute it after
+        // the in-progress seek completes.
+        const TS_SEEK_DEBOUNCE_MS = 400;
+
+        // Cancel any previous debounce timer — only the last seek in a
+        // rapid-fire series should execute.
+        if (mpegtsSeekDebounceRef.current !== null) {
+          clearTimeout(mpegtsSeekDebounceRef.current);
+          mpegtsSeekDebounceRef.current = null;
+        }
+
+        mpegtsSeekDebounceRef.current = window.setTimeout(() => {
+          mpegtsSeekDebounceRef.current = null;
+          const seekInProgressNow = (window as any).__nobuf_userSeekInProgress === true;
+          if (seekInProgressNow) {
+            // A seek is still executing — queue this target as pending.
+            // The in-progress seek's finally block will check pendingSeekTargetRef
+            // and execute it after clearing the flag.
+            pendingSeekTargetRef.current = { time: clamped, dur };
+            diagLog(`[MPEGTS] Seek to ${clamped.toFixed(1)}s queued — will execute after current seek completes`);
+          } else {
+            diagLog(`[MPEGTS] Seek debounce fired for ${clamped.toFixed(1)}s — executing`);
+            _mpegtsUnbufferedSeek(clamped, dur);
+          }
+        }, TS_SEEK_DEBOUNCE_MS);
       }
       return;
     }

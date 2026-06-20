@@ -244,7 +244,8 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),  // 2 permits: 1 for /stream + 1 for proactive-sequential. Pool workers have own connections.
+                download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+                rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
                 prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),

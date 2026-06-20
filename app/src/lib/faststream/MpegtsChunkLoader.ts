@@ -55,7 +55,9 @@ export function createChunkedFetchLoader(mpegts: any): any {
 
     private _firstChunkSize: number;
     private _chunkSize: number;
+    private _postSeekFirstChunkSize: number;
     private _shadowCache: StreamShadowCache | null;
+    private _isSeekStart = false;
 
     static isSupported() {
       return typeof self !== 'undefined' && typeof self.fetch === 'function' && typeof self.ReadableStream === 'function' && typeof self.AbortController === 'function';
@@ -68,6 +70,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
 
       this._firstChunkSize = alignToPacket(this._config.firstChunkSize || 5 * 1024 * 1024);
       this._chunkSize = alignToPacket(this._config.chunkSize || 2 * 1024 * 1024);
+      this._postSeekFirstChunkSize = alignToPacket(this._config.postSeekFirstChunkSize || 8 * 1024 * 1024);
       this._shadowCache = this._config.shadowCache || null;
     }
 
@@ -87,6 +90,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
       this._fileLength = Number(dataSource.filesize) || 0;
       this._currentByte = range.from || 0;
       this._isFirstChunk = this._currentByte === 0;
+      this._isSeekStart = !this._isFirstChunk;
 
       if (this._fileLength > 0) {
         this._onContentLengthKnown(this._fileLength);
@@ -106,6 +110,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
 
     private _chunkSizeFor(byte: number): number {
       if (byte === 0 && this._isFirstChunk) return this._firstChunkSize;
+      if (this._isSeekStart) return this._postSeekFirstChunkSize;
       return this._chunkSize;
     }
 
@@ -130,9 +135,21 @@ export function createChunkedFetchLoader(mpegts: any): any {
           const cached = this._shadowCache.getRange(from, to);
           if (cached && cached.byteLength === to - from + 1) {
             this._status = mpegts.LoaderStatus.kBuffering;
-            this._onDataArrival(cached, from, cached.byteLength);
+            try {
+              this._onDataArrival(cached, from, cached.byteLength);
+            } catch (err: any) {
+              this._status = mpegts.LoaderStatus.kError;
+              this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message });
+              return;
+            }
             this._currentByte = to + 1;
             this._isFirstChunk = false;
+            this._isSeekStart = false;
+            // Yield to the event loop between cache chunks. Without this, serving
+            // large cached ranges runs a synchronous tight loop through the full
+            // transmuxer pipeline (TSDemuxer → MP4Remuxer → SourceBuffer.appendBuffer),
+            // blocking the main thread and freezing the UI.
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
             continue;
           }
         }
@@ -187,10 +204,18 @@ export function createChunkedFetchLoader(mpegts: any): any {
         if (this._shadowCache) {
           this._shadowCache.put(offset, chunk);
         }
-        this._onDataArrival(chunk, offset, chunk.byteLength);
+        try {
+          this._onDataArrival(chunk, offset, chunk.byteLength);
+        } catch (err: any) {
+          this._status = mpegts.LoaderStatus.kError;
+          this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message });
+          await reader.cancel().catch(() => {});
+          return;
+        }
         offset += chunk.byteLength;
         this._currentByte = offset;
         this._isFirstChunk = false;
+        this._isSeekStart = false;
       }
 
       // Validate we got the expected number of bytes when file length is known
