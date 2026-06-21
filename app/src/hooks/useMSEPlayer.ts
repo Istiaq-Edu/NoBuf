@@ -3079,6 +3079,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           if (videoBufferStart > v.currentTime + 0.5 && videoBufferStart <= v.currentTime + 5 && bufLen >= 2.0) {
             diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s (buffer ${bufLen.toFixed(1)}s)`);
             v.currentTime = videoBufferStart;
+            v.play().catch(() => {}); // Resume playback after jump
             seekKeyframeAdjusted = true;
             // Cache for future seeks (if VBR correction was used)
             if (vbrCorrectionDepth > 0) {
@@ -3098,9 +3099,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             if (videoBufferStart < v.currentTime - 0.5 && bufLen >= 2.0) {
               diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(v.currentTime - videoBufferStart).toFixed(1)}s before) — jumping back to keyframe (buffer ${bufLen.toFixed(1)}s)`);
               v.currentTime = videoBufferStart;
+              v.play().catch(() => {}); // Resume playback after backward jump
             } else if (videoBufferStart > v.currentTime + 0.05 && bufLen >= 2.0) {
               diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(videoBufferStart - v.currentTime).toFixed(1)}s after) — jumping forward to keyframe (buffer ${bufLen.toFixed(1)}s)`);
               v.currentTime = videoBufferStart;
+              v.play().catch(() => {}); // Resume playback after forward jump
             }
             seekKeyframeAdjusted = true;
             if (vbrCorrectionDepth > 0) {
@@ -3224,6 +3227,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               if (bufferLength >= 2.0) {
                 diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s, buffer ${bufferLength.toFixed(1)}s)${vbrCorrectionDepth > 0 ? ` after ${vbrCorrectionDepth} correction(s)` : ''}`);
                 v.currentTime = videoBufferStart;
+                v.play().catch(() => {}); // Resume playback after forward jump
                 seekKeyframeAdjusted = true;
                 // Cache this keyframe position for future seeks — the VBR correction
                 // found the ACTUAL byte-to-time mapping. Without caching, the next
@@ -3270,9 +3274,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             if (videoBufferStart < v.currentTime - 0.5) {
               diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap -${(v.currentTime - videoBufferStart).toFixed(1)}s) — jumping back to keyframe`);
               v.currentTime = videoBufferStart;
+              v.play().catch(() => {}); // Resume playback after backward jump
             } else if (videoBufferStart > v.currentTime + 0.05) {
               diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap +${(videoBufferStart - v.currentTime).toFixed(1)}s) — jumping forward to keyframe`);
               v.currentTime = videoBufferStart;
+              v.play().catch(() => {}); // Resume playback after forward jump
             }
             seekKeyframeAdjusted = true;
             // Cache this keyframe position for future seeks

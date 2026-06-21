@@ -140,6 +140,12 @@ pub struct ActiveDownload {
     /// Whether this is a background continuation download (vs player-facing).
     /// Used to avoid self-matching when continuation checks for covering downloads.
     pub is_continuation: bool,
+    /// Cancellation flag — set to true when a NEW /stream request for the same
+    /// message arrives with a different byte range. The old download handler
+    /// checks this flag at the top of each loop iteration and breaks immediately.
+    /// This prevents zombie downloads from competing for the rate limiter after
+    /// the frontend aborts the old fetch (AbortController.abort()).
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Information returned to a subscriber (read-only snapshot of an ActiveDownload)
@@ -150,6 +156,9 @@ pub struct ActiveDownloadInfo {
     pub progress_rx: watch::Receiver<u64>,
     /// Whether this is a background continuation download
     pub is_continuation: bool,
+    /// Cancellation flag — clone of the ActiveDownload's flag.
+    /// The /stream handler checks this at the top of each loop iteration.
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Metadata sidecar for a cached file
@@ -514,6 +523,7 @@ impl StreamCacheManager {
                     end_byte: dl.end_byte,
                     progress_rx: dl.progress_tx.subscribe(),
                     is_continuation: dl.is_continuation,
+                    cancel_flag: dl.cancel_flag.clone(),
                 });
             }
         }
@@ -560,6 +570,7 @@ impl StreamCacheManager {
             end_byte: dl.end_byte,
             progress_rx: dl.progress_tx.subscribe(),
             is_continuation: dl.is_continuation,
+            cancel_flag: dl.cancel_flag.clone(),
         })
     }
 
@@ -584,6 +595,7 @@ impl StreamCacheManager {
             end_byte: best.end_byte,
             progress_rx: best.progress_tx.subscribe(),
             is_continuation: best.is_continuation,
+            cancel_flag: best.cancel_flag.clone(),
         })
     }
 
@@ -612,13 +624,27 @@ impl StreamCacheManager {
     /// this is current_offset (already-downloaded bytes from prebuffer), so
     /// subscribers see accurate progress immediately instead of waiting for
     /// a separate update_download_progress call.
-    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64, is_continuation: bool, initial_progress: u64) -> Option<watch::Receiver<u64>> {
+    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64, is_continuation: bool, initial_progress: u64) -> Option<ActiveDownloadInfo> {
         let mut downloads = self.active_downloads.lock().await;
         let current_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
         if current_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
             log::warn!("[COORDINATOR] Max concurrent downloads ({}) reached for msg {}, cannot register range {}-{}",
                 MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE, message_id, start_byte, end_byte);
             return None;
+        }
+        // Cancel old downloads for the same message with different ranges.
+        // When a new /stream request arrives (seek or VBR correction), the old
+        // download from a different byte range is no longer needed. Without this,
+        // the old download continues for 2-4 seconds (zombie) competing for the
+        // rate limiter, slowing down the new download.
+        if let Some(dls) = downloads.get_mut(&message_id) {
+            for dl in dls.iter() {
+                if dl.start_byte != start_byte {
+                    log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {})",
+                        message_id, dl.start_byte, dl.end_byte, start_byte);
+                    dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         // Initialize watch channel with initial_progress (not start_byte).
         // For regular downloads, initial_progress = start_byte (no data yet).
@@ -627,12 +653,14 @@ impl StreamCacheManager {
         // update_download_progress broadcasts current_offset.
         let initial_value = initial_progress.max(start_byte);
         let (progress_tx, progress_rx) = watch::channel(initial_value);
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dl = ActiveDownload {
             start_byte,
             end_byte,
             progress_tx,
             last_progress: initial_value,
             is_continuation,
+            cancel_flag: cancel_flag.clone(),
         };
         downloads.entry(message_id)
             .or_insert_with(Vec::new)
@@ -640,7 +668,13 @@ impl StreamCacheManager {
         let new_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
         log::info!("[COORDINATOR] Registered download for msg {} range {}-{} initial_progress={} (total active: {})",
             message_id, start_byte, end_byte, initial_value, new_count);
-        Some(progress_rx)
+        Some(ActiveDownloadInfo {
+            start_byte,
+            end_byte,
+            progress_rx,
+            is_continuation,
+            cancel_flag,
+        })
     }
 
     /// Update download progress (last byte written to cache). Called by
