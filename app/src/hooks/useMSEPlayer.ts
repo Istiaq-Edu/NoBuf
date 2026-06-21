@@ -3068,27 +3068,54 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // For large gaps (>5s), let the align poll handle VBR correction.
         // CRITICAL: backward gaps > 5s must NOT set seekKeyframeAdjusted —
         // the align poll needs to run to trigger backward VBR correction.
+        // Also: only jump if buffer has ≥2s of data (prevents mpegts.js
+        // from clearing SourceBuffers when jumping with too little data).
         const v = videoRef.current;
         const videoBufferStart = getVideoBufferStart();
         const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
         if (!seekKeyframeAdjusted && v && videoBufferStart !== null) {
-          if (videoBufferStart > v.currentTime + 0.5 && videoBufferStart <= v.currentTime + 5) {
-            diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s`);
+          const bufEnd = sbV?.buffered && sbV.buffered.length > 0 ? sbV.buffered.end(0) : videoBufferStart;
+          const bufLen = bufEnd - videoBufferStart;
+          if (videoBufferStart > v.currentTime + 0.5 && videoBufferStart <= v.currentTime + 5 && bufLen >= 2.0) {
+            diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s (buffer ${bufLen.toFixed(1)}s)`);
             v.currentTime = videoBufferStart;
             seekKeyframeAdjusted = true;
+            // Cache for future seeks (if VBR correction was used)
+            if (vbrCorrectionDepth > 0) {
+              const existing = tsKeyframeIndexRef.current;
+              const newEntry = { timestamp: videoBufferStart, byteOffset: byteOffset };
+              const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+              filtered.push(newEntry);
+              filtered.sort((a, b) => a.timestamp - b.timestamp);
+              tsKeyframeIndexRef.current = filtered;
+              diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
+            }
           } else if (videoBufferStart >= v.currentTime - 5 && videoBufferStart <= v.currentTime + 0.5) {
-            // Backward gap within 5s — jump to videoBufferStart so video plays
-            // immediately from the keyframe. Without this, currentTime stays at
-            // the target where no data exists yet (buffer starts before target)
-            // and the video is stuck for ~5s until the buffer expands forward.
-            if (videoBufferStart < v.currentTime - 0.5) {
-              diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(v.currentTime - videoBufferStart).toFixed(1)}s before) — jumping back to keyframe`);
+            // Backward gap within 5s or at currentTime — jump to videoBufferStart
+            // so video plays immediately from the keyframe. Also handle small
+            // forward gaps (≤0.5s) — without this, currentTime stays just before
+            // the buffer start and the video can't play.
+            if (videoBufferStart < v.currentTime - 0.5 && bufLen >= 2.0) {
+              diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(v.currentTime - videoBufferStart).toFixed(1)}s before) — jumping back to keyframe (buffer ${bufLen.toFixed(1)}s)`);
+              v.currentTime = videoBufferStart;
+            } else if (videoBufferStart > v.currentTime + 0.05 && bufLen >= 2.0) {
+              diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(videoBufferStart - v.currentTime).toFixed(1)}s after) — jumping forward to keyframe (buffer ${bufLen.toFixed(1)}s)`);
               v.currentTime = videoBufferStart;
             }
             seekKeyframeAdjusted = true;
+            if (vbrCorrectionDepth > 0) {
+              const existing = tsKeyframeIndexRef.current;
+              const newEntry = { timestamp: videoBufferStart, byteOffset: byteOffset };
+              const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+              filtered.push(newEntry);
+              filtered.sort((a, b) => a.timestamp - b.timestamp);
+              tsKeyframeIndexRef.current = filtered;
+              diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
+            }
           }
           // For gaps > 5s (forward OR backward): don't set seekKeyframeAdjusted
           // — let align poll handle VBR correction
+          // For buffer < 2s: don't jump — let align poll wait for more data
         }
 
         diagLog(`[SEEK-DIAG] ${label}: currentTime=${v?.currentTime?.toFixed(1)} videoBufferStart=${videoBufferStart?.toFixed(1)} audioBufferStart=${audioBufferStart?.toFixed(1)}`);
@@ -3237,10 +3264,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             seekKeyframeAdjusted = true;
           } else {
             // Video buffer at or before currentTime (within 5s) — jump to keyframe
-            // if backward gap > 0.5s so video plays immediately from the keyframe.
-            // Without this, currentTime stays at target where no data exists yet.
+            // if gap > 0.1s in EITHER direction. Without this, a small forward gap
+            // (e.g. 0.1s) leaves currentTime just BEFORE the buffer start — the
+            // video can't play because there's no data at currentTime.
             if (videoBufferStart < v.currentTime - 0.5) {
               diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap -${(v.currentTime - videoBufferStart).toFixed(1)}s) — jumping back to keyframe`);
+              v.currentTime = videoBufferStart;
+            } else if (videoBufferStart > v.currentTime + 0.05) {
+              diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap +${(videoBufferStart - v.currentTime).toFixed(1)}s) — jumping forward to keyframe`);
               v.currentTime = videoBufferStart;
             }
             seekKeyframeAdjusted = true;
