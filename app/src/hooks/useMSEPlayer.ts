@@ -1968,6 +1968,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         fileSize: knownFilesize,
         isPlayerDownloading: false,
         playbackRate: 1,
+        byteOffset: null, // initial spawn — no byte offset, use linear estimate from time 0
       }).then((spawned: any) => {
         if (spawned) {
           proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
@@ -2211,6 +2212,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                     fileSize: knownFilesize || 0,
                     isPlayerDownloading: false,
                     playbackRate: video.playbackRate || 1,
+                    byteOffset: null, // duration update — no byte offset, use linear estimate
                   });
                 } catch (_e: any) { /* non-critical */ }
               }
@@ -2659,7 +2661,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  decode makes it work well enough. The video will show the nearest keyframe
    *  after the target time.
    */
-  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number, correctedByteOffset?: number) => {
+  const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number, correctedByteOffset?: number, vbrDepth?: number) => {
     // Set the seek-in-progress flag IMMEDIATELY — before any await — so that
     // concurrent seekTo() calls see it as true and skip. Without this, the
     // SourceBuffer await below creates a window where the flag is still false,
@@ -3062,8 +3064,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const rem = eng._transmuxer?._controller?._remuxer;
 
         // The seek byte is approximate and may land in the middle of a GOP.
-        // For small gaps (≤5s), jump to the keyframe. For large gaps (>5s),
-        // let the align poll handle VBR correction (re-seek to corrected byte).
+        // For small gaps (≤5s forward or backward), jump to the keyframe.
+        // For large gaps (>5s), let the align poll handle VBR correction.
+        // CRITICAL: backward gaps > 5s must NOT set seekKeyframeAdjusted —
+        // the align poll needs to run to trigger backward VBR correction.
         const v = videoRef.current;
         const videoBufferStart = getVideoBufferStart();
         const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
@@ -3072,11 +3076,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s landed before first video keyframe; jumping to video buffer start ${videoBufferStart.toFixed(1)}s`);
             v.currentTime = videoBufferStart;
             seekKeyframeAdjusted = true;
-          } else if (videoBufferStart <= v.currentTime + 0.5) {
-            // Already inside the buffered range, no jump needed.
+          } else if (videoBufferStart >= v.currentTime - 5 && videoBufferStart <= v.currentTime + 0.5) {
+            // Backward gap within 5s — jump to videoBufferStart so video plays
+            // immediately from the keyframe. Without this, currentTime stays at
+            // the target where no data exists yet (buffer starts before target)
+            // and the video is stuck for ~5s until the buffer expands forward.
+            if (videoBufferStart < v.currentTime - 0.5) {
+              diagLog(`[MPEGTS] Seek target ${v.currentTime.toFixed(1)}s; video buffer starts ${videoBufferStart.toFixed(1)}s (${(v.currentTime - videoBufferStart).toFixed(1)}s before) — jumping back to keyframe`);
+              v.currentTime = videoBufferStart;
+            }
             seekKeyframeAdjusted = true;
           }
-          // For gaps > 5s: don't jump — let align poll do VBR correction
+          // For gaps > 5s (forward OR backward): don't set seekKeyframeAdjusted
+          // — let align poll handle VBR correction
         }
 
         diagLog(`[SEEK-DIAG] ${label}: currentTime=${v?.currentTime?.toFixed(1)} videoBufferStart=${videoBufferStart?.toFixed(1)} audioBufferStart=${audioBufferStart?.toFixed(1)}`);
@@ -3103,7 +3115,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // if playback can proceed. Using audio for alignment is WRONG because
       // audio can start before the target while video starts after it.
       let alignAttempts = 0;
-      let vbrCorrectionDepth = 0;
+      let vbrCorrectionDepth = vbrDepth ?? 0;
       const MAX_VBR_CORRECTIONS = 2;
       const alignInterval = setInterval(() => {
         alignAttempts++;
@@ -3120,19 +3132,38 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const audioBufferStart = (sbA?.buffered && sbA.buffered.length > 0) ? sbA.buffered.start(0) : null;
 
         // VBR CORRECTION: use audio OR video, whichever appears first (>5s gap only)
-        if (v && audioBufferStart !== null && audioBufferStart > v.currentTime + 5) {
-          // Audio arrived early with large gap → VBR correction before video shows
-          const gap = audioBufferStart - v.currentTime;
-          if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
-            vbrCorrectionDepth++;
-            const bitrate = filesize / duration;
-            const correctionBytes = gap * bitrate;
-            const correctedByte = Math.max(0, byteOffset - correctionBytes);
-            diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
-            clearInterval(alignInterval);
-            seekKeyframeAdjusted = true;
-            _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
-            return;
+        // Forward: audio > target + 5 → download too far BACK → re-seek backward
+        // Backward: audio < target - 5 → download too far FORWARD → re-seek forward
+        if (v && audioBufferStart !== null) {
+          if (audioBufferStart > v.currentTime + 5) {
+            // Audio arrived early with large forward gap → VBR correction before video shows
+            const gap = audioBufferStart - v.currentTime;
+            if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
+              vbrCorrectionDepth++;
+              const bitrate = filesize / duration;
+              const correctionBytes = gap * bitrate;
+              const correctedByte = Math.max(0, byteOffset - correctionBytes);
+              diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
+              return;
+            }
+          } else if (audioBufferStart < v.currentTime - 5) {
+            // Audio arrived with large backward gap → download too far FORWARD
+            // → re-seek forward so data arrives closer to target
+            const gap = v.currentTime - audioBufferStart;
+            if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
+              vbrCorrectionDepth++;
+              const bitrate = filesize / duration;
+              const correctionBytes = gap * bitrate;
+              const correctedByte = Math.min(filesize - 1, byteOffset + correctionBytes);
+              diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: backward gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB forward)`);
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
+              return;
+            }
           }
         }
 
@@ -3149,13 +3180,41 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
               clearInterval(alignInterval);
               seekKeyframeAdjusted = true;
-              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
             }
-            // Gap 0.5-5s or max corrections: jump to video buffer start
-            diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s)${vbrCorrectionDepth > 0 ? ` after ${vbrCorrectionDepth} correction(s)` : ''}`);
-            v.currentTime = videoBufferStart;
-            seekKeyframeAdjusted = true;
+            // Gap 0.5-5s or max corrections: wait for buffer to have enough data
+            // before jumping currentTime. Jumping too early (with <2s of buffer)
+            // can trigger mpegts.js internal seek/cleanup which CLEARS the
+            // SourceBuffers — leaving the video stuck with no data.
+            const eng2 = (mpegtsPlayerRef.current as any)?._player_engine;
+            const mc2 = eng2?._mse_controller;
+            const ms2 = mc2?.getObject?.();
+            const sbV2 = ms2?.sourceBuffers?.[0];
+            if (sbV2 && sbV2.buffered && sbV2.buffered.length > 0) {
+              const bufferEnd = sbV2.buffered.end(0);
+              const bufferLength = bufferEnd - videoBufferStart;
+              if (bufferLength >= 2.0) {
+                diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap ${gap.toFixed(1)}s, buffer ${bufferLength.toFixed(1)}s)${vbrCorrectionDepth > 0 ? ` after ${vbrCorrectionDepth} correction(s)` : ''}`);
+                v.currentTime = videoBufferStart;
+                seekKeyframeAdjusted = true;
+                // Cache this keyframe position for future seeks — the VBR correction
+                // found the ACTUAL byte-to-time mapping. Without caching, the next
+                // seek to this region repeats the entire correction process (10s+).
+                if (vbrCorrectionDepth > 0) {
+                  const existing = tsKeyframeIndexRef.current;
+                  const newEntry = { timestamp: videoBufferStart, byteOffset: byteOffset };
+                  const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+                  filtered.push(newEntry);
+                  filtered.sort((a, b) => a.timestamp - b.timestamp);
+                  tsKeyframeIndexRef.current = filtered;
+                  diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
+                }
+              } else {
+                // Buffer < 2s — not enough data to jump yet. Keep polling.
+                // The align poll will retry on the next 200ms tick.
+              }
+            }
           } else if (videoBufferStart < v.currentTime - 5) {
             // BACKWARD VBR correction: buffer starts >5s BEFORE target.
             // The linear estimate was too far FORWARD in the file (local bitrate
@@ -3171,14 +3230,30 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: backward gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB forward)`);
               clearInterval(alignInterval);
               seekKeyframeAdjusted = true;
-              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte);
+              _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
             }
             // Max corrections reached: let video buffer expand to target
             seekKeyframeAdjusted = true;
           } else {
-            // Video buffer at or before currentTime (within 5s) — perfect, video can play
+            // Video buffer at or before currentTime (within 5s) — jump to keyframe
+            // if backward gap > 0.5s so video plays immediately from the keyframe.
+            // Without this, currentTime stays at target where no data exists yet.
+            if (videoBufferStart < v.currentTime - 0.5) {
+              diagLog(`[MPEGTS] Align poll: currentTime ${v.currentTime.toFixed(1)}s → video buffer start ${videoBufferStart.toFixed(1)}s (gap -${(v.currentTime - videoBufferStart).toFixed(1)}s) — jumping back to keyframe`);
+              v.currentTime = videoBufferStart;
+            }
             seekKeyframeAdjusted = true;
+            // Cache this keyframe position for future seeks
+            if (vbrCorrectionDepth > 0) {
+              const existing = tsKeyframeIndexRef.current;
+              const newEntry = { timestamp: videoBufferStart, byteOffset: byteOffset };
+              const filtered = existing.filter(k => k.byteOffset !== newEntry.byteOffset);
+              filtered.push(newEntry);
+              filtered.sort((a, b) => a.timestamp - b.timestamp);
+              tsKeyframeIndexRef.current = filtered;
+              diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
+            }
           }
           if (seekKeyframeAdjusted) {
             clearInterval(alignInterval);
@@ -3205,10 +3280,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           fileSize: filesize,
           isPlayerDownloading: true,
           playbackRate: 1,
+          // Pass the actual byte offset so PROACTIVE targets the correct position.
+          // Without this, the backend uses the linear estimate (time/duration * filesize)
+          // which is wrong for VBR video. VBR corrections move /stream to a different
+          // byte — PROACTIVE needs to know the actual byte to prebuffer from the right place.
+          byteOffset: byteOffset,
         }).catch((e: any) => {
           diagLog(`[MPEGTS] Failed to report seek position: ${e}`);
         });
-        diagLog(`[MPEGTS] Reported seek position ${seekTime.toFixed(1)}s to backend proactive`);
+        diagLog(`[MPEGTS] Reported seek position ${seekTime.toFixed(1)}s (byte ${byteOffset}) to backend proactive`);
       }
 
     } catch (e: any) {

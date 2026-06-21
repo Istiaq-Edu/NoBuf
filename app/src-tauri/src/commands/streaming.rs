@@ -512,6 +512,7 @@ pub async fn cmd_report_playback_position(
     file_size: u64,
     is_player_downloading: bool,
     playback_rate: f64,
+    byte_offset: Option<u64>,
     state: State<'_, TelegramState>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
@@ -523,10 +524,11 @@ pub async fn cmd_report_playback_position(
     // throttle itself when the IOController is actively downloading.
     state.player_actively_downloading.store(is_player_downloading, std::sync::atomic::Ordering::Relaxed);
 
-    // Allow duration_s = 0 — this means "duration unknown, start from byte 0".
-    // Critical for TS files where /fmp4/metadata hasn't returned yet.
-    // When duration_s <= 0, assume current_byte = 0 (start of file).
-    let current_byte = if duration_s > 0.0 {
+    // Use the exact byte offset if provided (from VBR correction — the linear
+    // estimate is wrong for VBR video). Fall back to linear estimate otherwise.
+    let current_byte = if let Some(byte) = byte_offset {
+        byte.min(file_size)
+    } else if duration_s > 0.0 {
         let ratio = (current_time_s / duration_s).clamp(0.0, 1.0);
         (ratio * file_size as f64) as u64
     } else {
