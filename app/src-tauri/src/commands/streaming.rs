@@ -804,8 +804,17 @@ async fn proactive_prebuffer_download(
         // It is intentionally decoupled from the in-memory sliding window.
         let computed_max_ahead_byte = total_size;
 
-        // Only slide the window forward, never backward.
+        // Only slide the window forward, never backward — EXCEPT when the user
+        // seeked backward (target changed significantly). In that case, update
+        // start_byte so gap evaluation uses the new (backward) position.
+        // Without this, PROACTIVE keeps prebuffering from the old (forward)
+        // position after a backward seek — the user sees "old prebuffers still growing."
         if latest_current_byte > start_byte {
+            start_byte = latest_current_byte;
+        } else if latest_current_byte + 10 * 1024 * 1024 < start_byte {
+            // Backward seek detected — target moved >10MB backward
+            log::info!("[PROACTIVE] msg {}: backward seek detected: start_byte {} -> {}",
+                message_id, start_byte, latest_current_byte);
             start_byte = latest_current_byte;
         }
         if computed_max_ahead_byte > max_ahead_byte {
@@ -851,9 +860,41 @@ async fn proactive_prebuffer_download(
                 // but ONLY after a seek jump — not on initial startup or sequential
                 // gap completion. Without this check, the 5s yield would delay the
                 // initial prebuffer and slow sequential prebuffering by 5s per gap.
+                //
+                // INTERRUPTIBLE YIELD: Instead of a flat 5s sleep, check every 500ms
+                // if the target byte has changed (VBR correction reported a new byte).
+                // If so, update start_byte immediately so the next gap evaluation uses
+                // the corrected byte — not the linear estimate. This fixes:
+                //   - Concern 1: prebuffer starting points off (PROACTIVE gets corrected byte during yield)
+                //   - Concern 2: seeks not using prebuffer (PROACTIVE prebuffers from correct position)
                 if jumped {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let yield_start = std::time::Instant::now();
+                    let yield_duration = std::time::Duration::from_secs(5);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if yield_start.elapsed() >= yield_duration {
+                            break;
+                        }
+                        // Check if VBR correction reported a new target byte
+                        let (current_target, _, _, _) = {
+                            let targets = state.proactive_targets.read().await;
+                            targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
+                        };
+                        if current_target != start_byte {
+                            log::info!("[PROACTIVE] msg {}: target updated during yield: {} -> {} (VBR correction)", 
+                                message_id, start_byte, current_target);
+                            start_byte = current_target;
+                        }
+                    }
                     jumped = false;
+                    // If start_byte was updated during the yield (VBR correction),
+                    // the gap was evaluated from the OLD start_byte. Re-evaluate
+                    // by continuing to the next outer loop iteration.
+                    if start_byte != gap_start {
+                        log::info!("[PROACTIVE] msg {}: start_byte changed during yield ({} -> {}), re-evaluating gaps",
+                            message_id, gap_start, start_byte);
+                        break; // break out of the gap loop → outer loop re-evaluates
+                    }
                 }
             }
             let skip_bytes = gap_start % chunk_size as u64;
@@ -885,18 +926,26 @@ async fn proactive_prebuffer_download(
                     return Ok(total_downloaded);
                 }
 
-                // Check if the playhead has jumped far ahead (user seeked).
-                // If so, break out of this gap and re-evaluate from the new position.
+                // Check if the playhead has jumped (user seeked) — in EITHER direction.
+                // Forward: target_byte > offset + 10MB (seek ahead)
+                // Backward: target_byte + 10MB < offset (seek behind)
+                // Without backward detection, PROACTIVE keeps downloading from the
+                // old (forward) position after a backward seek — "old prebuffers still growing."
                 {
                     let targets = state.proactive_targets.read().await;
                     if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
                         if target_byte > offset + 10 * 1024 * 1024 {
                             log::info!(
-                                "[PROACTIVE] msg {}: playhead jumped to byte {} (current offset {}), re-evaluating gaps",
+                                "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
                                 message_id, target_byte, offset
                             );
-                            // Set flag so outer loop yields to /stream before
-                            // starting the new gap download.
+                            jumped = true;
+                            break;
+                        } else if target_byte + 10 * 1024 * 1024 < offset {
+                            log::info!(
+                                "[PROACTIVE] msg {}: playhead jumped backward to byte {} (current offset {}), re-evaluating gaps",
+                                message_id, target_byte, offset
+                            );
                             jumped = true;
                             break;
                         }

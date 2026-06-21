@@ -922,10 +922,10 @@ async fn spawn_targeted_download_and_wait(
     }
 
     // 4. Register the download with the coordinator
-    let progress_rx = match cache_mgr.register_download(
+    let dl_info = match cache_mgr.register_download(
         message_id, download_start, download_end, false, download_start
     ).await {
-        Some(rx) => rx,
+        Some(info) => info,
         None => {
             log::warn!("[HLS-SEG-TARGETED] msg {} seg {}: failed to register download, returning 503",
                 message_id, index);
@@ -1042,7 +1042,7 @@ async fn spawn_targeted_download_and_wait(
     log::info!("[HLS-SEG-TARGETED] msg {} seg {}: waiting for targeted download {}-{} (seg range {}-{}, {} extra segments) to serve data",
         message_id, index, download_start, download_end, range.data_start, range.data_end, extra_segments);
 
-    let mut progress_rx = progress_rx;
+    let mut progress_rx = dl_info.progress_rx;
     let target_offset = range.data_end + 1;
     const TARGETED_WAIT_TIMEOUT_SECS: u64 = 60;
     let deadline = tokio::time::sleep(tokio::time::Duration::from_secs(TARGETED_WAIT_TIMEOUT_SECS));

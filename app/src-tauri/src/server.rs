@@ -1072,10 +1072,21 @@ async fn stream_media(
 
             // Register this fallback download with the coordinator so
             // overlapping requests can subscribe instead of duplicating.
-            let _registered = if let Some(ref cm) = cache_mgr_for_stream {
-                cm.register_download(message_id, fallback_start, end_byte, false, fallback_start).await.is_some()
+            // Also get the cancel_flag — set by register_download when a NEW
+            // /stream request arrives for the same message with a different range.
+            // The while loop checks this flag and breaks immediately, preventing
+            // zombie downloads from competing for the rate limiter.
+            let mut _registered = false;
+            let stream_cancel_flag: Arc<std::sync::atomic::AtomicBool> = if let Some(ref cm) = cache_mgr_for_stream {
+                match cm.register_download(message_id, fallback_start, end_byte, false, fallback_start).await {
+                    Some(info) => {
+                        _registered = true;
+                        info.cancel_flag
+                    }
+                    None => Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }
             } else {
-                false
+                Arc::new(std::sync::atomic::AtomicBool::new(false))
             };
 
             // Drop-guard that unregisters the download from the coordinator
@@ -1104,6 +1115,13 @@ async fn stream_media(
                 throttle_api_calls(&data.rate_limiter).await;
                 iter.next().await.transpose()
             } {
+                // Check cancellation flag — a NEW /stream request for the same
+                // message with a different range has arrived. Break immediately
+                // to stop this zombie download from competing for the rate limiter.
+                if stream_cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("[STREAM-FALLBACK] Cancelled zombie download for msg {} at offset {}", message_id, current_offset);
+                    break;
+                }
                 match chunk {
                     Ok(bytes) => {
                         let remaining = content_length - bytes_sent;
