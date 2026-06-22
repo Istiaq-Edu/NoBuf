@@ -910,7 +910,7 @@ async fn stream_media(
         let mut bytes_sent: u64 = effective_start_byte - start_byte;
         let mut wait_elapsed_ms: u64 = 0;
         const POLL_INTERVAL_MS: u64 = 100;
-        const FALLBACK_TIMEOUT_MS: u64 = 10000;
+        const FALLBACK_TIMEOUT_MS: u64 = 15000;
 
         // If there's no cache manager at all, skip the poll loop entirely
         // and go directly to the Telegram fallback.
@@ -1155,8 +1155,12 @@ async fn stream_media(
                         // 2) Update meta with per-message lock (batched for efficiency)
                         if let Some(ref cache_mgr) = cache_mgr_for_stream {
                             pending_ranges.push((current_offset, chunk_range_end));
-                            // Flush meta every 4MB or on last chunk
-                            if pending_ranges.len() >= 8 || is_last || chunk_range_end >= end_byte {
+                            // Flush meta every 1MB (2 chunks) instead of 4MB (8 chunks).
+                            // The green prebuffer bar polls cmd_get_cache_status every 500ms.
+                            // With 4MB batching, the first seek's data isn't visible until
+                            // 4MB is downloaded (~8s at 500KB/s) → bar appears empty on
+                            // first seek. With 1MB batching, data is visible after ~2s.
+                            if pending_ranges.len() >= 2 || is_last || chunk_range_end >= end_byte {
                                 let _lock = cache_mgr.lock_meta(message_id).await;
                                 let mut meta = match cache_mgr.load_meta(message_id) {
                                     Some(m) => m,
