@@ -2718,6 +2718,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const seekGen = mpegtsUnbufferedSeekGenerationRef.current;
     (window as any).__nobuf_userSeekInProgress = true;
 
+    // Clear cachedTimeRanges immediately to prevent flicker when suppression ends.
+    // Without this, the old ranges flash for 1-2 frames before the new poll data arrives.
+    setDownloadedTimeRanges([]);
+
     // Cancel independent prebuffer — seek changes the download position
     if (independentPrebufferRef.current.active && independentPrebufferRef.current.abortController) {
       diagLog('[INDEPENDENT-PREBUFFER] Cancelling seek prebuffer');
