@@ -835,14 +835,25 @@ async fn proactive_prebuffer_download(
         // With 20s (12.7MB), PROACTIVE's start falls within /stream's 2nd chunk
         // → both download the same bytes → compete for rate limiter.
         // 40s * average_bitrate = 40 * (total_size / duration) bytes
-        let proactive_start_byte = if let Some(&(_, dur, _, _)) = state.proactive_targets.read().await.get(&message_id) {
-            if dur > 0.0 {
-                let ahead_bytes = (40.0 / dur * total_size as f64) as u64;
-                start_byte.saturating_add(ahead_bytes)
+        //
+        // ONLY apply the 40s offset after a seek jump. On initial playback (no seek),
+        // PROACTIVE should start from byte 0 (or wherever start_byte is) — no offset.
+        // This prevents a gap between /stream (at byte 0) and PROACTIVE (at 40s ahead)
+        // on initial playback, which would leave the first 40s uncached by PROACTIVE.
+        let proactive_start_byte = if jumped && start_byte > 0 {
+            // Seek jump: apply 40s ahead offset
+            if let Some(&(_, dur, _, _)) = state.proactive_targets.read().await.get(&message_id) {
+                if dur > 0.0 {
+                    let ahead_bytes = (40.0 / dur * total_size as f64) as u64;
+                    start_byte.saturating_add(ahead_bytes)
+                } else {
+                    start_byte
+                }
             } else {
                 start_byte
             }
         } else {
+            // Initial playback or sequential gap completion: no offset
             start_byte
         };
 
