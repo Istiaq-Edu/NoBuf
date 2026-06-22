@@ -414,11 +414,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             const sorted = ranges.sort((a, b) => a[0] - b[0]);
             const merged: [number, number][] = [];
             for (const r of sorted) {
-              // Bridge the transient /stream→PROACTIVE gap (40s offset) into
-              // a single visual segment. Genuinely large uncached regions still
-              // render separately.
-              const BRIDGE_S = 45;
-              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + BRIDGE_S) {
+              // Merge overlapping ranges with tight tolerance (0.01s).
+              // Do NOT bridge the gap between /stream and PROACTIVE ranges.
+              // The gap should be EMPTY — no fake fill. The user sees two
+              // separate green bars: one at the seek point (/stream) and one
+              // 40s ahead (PROACTIVE). As /stream progresses, the first bar
+              // grows until it meets the second bar, then they merge naturally.
+              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
                 merged.push([r[0], r[1]]);
               } else {
                 merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
@@ -1322,11 +1324,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               const sorted = [...cachedTimeRanges].sort((a, b) => a[0] - b[0]);
               const merged: [number, number][] = [];
               for (const r of sorted) {
-                // Bridge the transient /stream→PROACTIVE gap (40s offset) into
-              // a single visual segment. Genuinely large uncached regions still
-              // render separately.
-              const BRIDGE_S = 45;
-              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + BRIDGE_S) {
+                // Merge overlapping ranges with tight tolerance (0.01s).
+                // Do NOT bridge the gap between /stream and PROACTIVE ranges.
+                // The gap should be EMPTY — no fake fill. The user sees two
+                // separate green bars: one at the seek point (/stream) and one
+                // 40s ahead (PROACTIVE). As /stream progresses, the first bar
+                // grows until it meets the second bar, then they merge naturally.
+                if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
                   merged.push([r[0], r[1]]);
                 } else {
                   merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
