@@ -555,23 +555,19 @@ pub async fn cmd_report_playback_position(
         state.cancelled_transfers.write().await.remove(&proactive_key);
     }
 
-    // COLD-START GUARD: Don't start the proactive prebuffer until /stream's
-    // bootstrap has written some data to cache. On cold start, /stream downloads
-    // directly from Telegram (bootstrap path). If the proactive starts simultaneously,
-    // both compete for the same Telegram connection — wasteful and slower.
-    // Once cache meta exists with cached ranges, /stream's bootstrap has delivered
-    // data and the proactive can safely start filling gaps ahead of the playhead.
-    if let Some(meta) = cache_state.load_meta(message_id) {
-        if meta.cached_ranges.is_empty() {
-            log::info!("[PROACTIVE] msg {}: cache meta exists but no ranges yet — /stream bootstrap still running, deferring proactive", message_id);
+    // COLD-START GUARD: Only defer PROACTIVE on initial cold start (no byte offset).
+    // On explicit seeks (byte_offset provided), start PROACTIVE immediately —
+    // the 40s ahead offset ensures it won't compete with /stream's bootstrap.
+    if byte_offset.is_none() {
+        if let Some(meta) = cache_state.load_meta(message_id) {
+            if meta.cached_ranges.is_empty() {
+                log::info!("[PROACTIVE] msg {}: cache meta exists but no ranges yet — /stream bootstrap still running, deferring proactive", message_id);
+                return Ok(false);
+            }
+        } else {
+            log::info!("[PROACTIVE] msg {}: no cache meta — /stream bootstrap not started yet, deferring proactive", message_id);
             return Ok(false);
         }
-    } else {
-        // No cache meta at all — /stream bootstrap hasn't even created the file yet.
-        // The proactive would start downloading from Telegram on the same connection,
-        // competing with /stream's bootstrap. Defer until /stream has written some data.
-        log::info!("[PROACTIVE] msg {}: no cache meta — /stream bootstrap not started yet, deferring proactive", message_id);
-        return Ok(false);
     }
 
     // Don't start if already fully cached
@@ -786,6 +782,7 @@ async fn proactive_prebuffer_download(
     let mut idle_cycles: u32 = 0;
     const MAX_IDLE_CYCLES: u32 = 30; // ~60s idle before exiting (was 15/30s)
     let mut jumped = false; // Set by inner loop on playhead jump, checked by outer loop
+    let mut last_target_byte: Option<u64> = None; // Track last target across ALL gaps (prevents loop)
     loop {
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&transfer_id) {
@@ -812,10 +809,16 @@ async fn proactive_prebuffer_download(
         if latest_current_byte > start_byte {
             start_byte = latest_current_byte;
         } else if latest_current_byte + 10 * 1024 * 1024 < start_byte {
-            // Backward seek detected — target moved >10MB backward
+            // Backward seek detected — target moved >10MB backward.
+            // This is typically a VBR correction that moved the target.
+            // Set jumped=true so the 2s sleep runs, giving /stream time to
+            // download at the corrected position before PROACTIVE starts.
+            // Without this, PROACTIVE downloads at the same time as /stream
+            // (competing for rate limiter = double prebuffer).
             log::info!("[PROACTIVE] msg {}: backward seek detected: start_byte {} -> {}",
                 message_id, start_byte, latest_current_byte);
             start_byte = latest_current_byte;
+            jumped = true;
         }
         if computed_max_ahead_byte > max_ahead_byte {
             max_ahead_byte = computed_max_ahead_byte;
@@ -823,10 +826,30 @@ async fn proactive_prebuffer_download(
 
         let current_meta = cache_mgr.load_meta(message_id);
         let current_ranges = current_meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
+
+        // PROACTIVE should start 40s AHEAD of the seeked point, not AT it.
+        // /stream handles the first ~40s of playback (downloading 2-3 chunks
+        // of 12.5MB each from Telegram), PROACTIVE handles everything after.
+        // 40s = ~25.4MB at average bitrate — this puts PROACTIVE beyond
+        // /stream's 2nd chunk boundary (12.5MB × 2 = 25MB), preventing overlap.
+        // With 20s (12.7MB), PROACTIVE's start falls within /stream's 2nd chunk
+        // → both download the same bytes → compete for rate limiter.
+        // 40s * average_bitrate = 40 * (total_size / duration) bytes
+        let proactive_start_byte = if let Some(&(_, dur, _, _)) = state.proactive_targets.read().await.get(&message_id) {
+            if dur > 0.0 {
+                let ahead_bytes = (40.0 / dur * total_size as f64) as u64;
+                start_byte.saturating_add(ahead_bytes)
+            } else {
+                start_byte
+            }
+        } else {
+            start_byte
+        };
+
         let ahead_gaps: Vec<(u64, u64)> = find_gaps(&current_ranges, total_size)
             .into_iter()
-            .filter(|(_gap_start, gap_end)| *gap_end >= start_byte)
-            .map(|(gap_start, gap_end)| (gap_start.max(start_byte), gap_end.min(max_ahead_byte)))
+            .filter(|(gap_start, gap_end)| *gap_end >= proactive_start_byte && *gap_start < max_ahead_byte)
+            .map(|(gap_start, gap_end)| (gap_start.max(proactive_start_byte), gap_end.min(max_ahead_byte)))
             .filter(|(start, end)| *start <= *end)
             .collect();
 
@@ -841,8 +864,21 @@ async fn proactive_prebuffer_download(
         }
         idle_cycles = 0;
 
+        // No skip_all_gaps needed — the 40s ahead offset (proactive_start_byte)
+        // already ensures PROACTIVE downloads beyond /stream's reach.
+        // skip_all_gaps was causing a skip-then-download cycle (double prebuffer):
+        //   1st iteration: skip (jumped=true) → 2s sleep
+        //   2nd iteration: download (jumped=false) ← FIRST prebuffer point
+        //   3rd iteration: skip (backward jump) → 2s sleep
+        //   4th iteration: download (jumped=false) ← SECOND prebuffer point
+        // Removing skip_all_gaps eliminates this cycle.
+        jumped = false;
+
         for (gap_start, gap_end) in ahead_gaps {
             let gap_size = gap_end - gap_start + 1;
+
+            // No skip_all_gaps — PROACTIVE starts 40s ahead of /stream.
+            // The 40s ahead offset (proactive_start_byte) already prevents overlap.
 
             if state.cancelled_transfers.read().await.contains(&transfer_id) {
                 log::info!("[PROACTIVE] msg {}: cancelled", message_id);
@@ -890,9 +926,12 @@ async fn proactive_prebuffer_download(
                     // If start_byte was updated during the yield (VBR correction),
                     // the gap was evaluated from the OLD start_byte. Re-evaluate
                     // by continuing to the next outer loop iteration.
+                    // Also set jumped=true so the next iteration skips the first gap
+                    // (which /stream is now handling at the corrected position).
                     if start_byte != gap_start {
                         log::info!("[PROACTIVE] msg {}: start_byte changed during yield ({} -> {}), re-evaluating gaps",
                             message_id, gap_start, start_byte);
+                        jumped = true; // Ensure first gap is skipped on re-evaluation
                         break; // break out of the gap loop → outer loop re-evaluates
                     }
                 }
@@ -928,12 +967,24 @@ async fn proactive_prebuffer_download(
 
                 // Check if the playhead has jumped (user seeked) — in EITHER direction.
                 // Forward: target_byte > offset + 10MB (seek ahead)
-                // Backward: target_byte + 10MB < offset (seek behind)
-                // Without backward detection, PROACTIVE keeps downloading from the
-                // old (forward) position after a backward seek — "old prebuffers still growing."
+                // Backward: target_byte + 10MB < offset AND target changed (new seek, not prebuffering ahead)
+                //
+                // CRITICAL: The backward check must verify the target ACTUALLY CHANGED.
+                // Without this, PROACTIVE creates an infinite loop: it downloads ahead of
+                // the seek target, then the backward check fires (target < offset), jumps
+                // back, yields, re-evaluates, downloads ahead again, jumps back again...
+                // The target only changes on NEW seeks or VBR corrections — not as playback
+                // progresses. So we track last_target_byte and only trigger if it's different.
                 {
                     let targets = state.proactive_targets.read().await;
                     if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
+                        // Update last_target_byte FIRST, before any break.
+                        // If we break below, this line must have already run,
+                        // otherwise the next iteration sees stale last_target_byte
+                        // and the backward jump loops forever.
+                        let target_changed = last_target_byte != Some(target_byte);
+                        last_target_byte = Some(target_byte);
+                        
                         if target_byte > offset + 10 * 1024 * 1024 {
                             log::info!(
                                 "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
@@ -941,7 +992,11 @@ async fn proactive_prebuffer_download(
                             );
                             jumped = true;
                             break;
-                        } else if target_byte + 10 * 1024 * 1024 < offset {
+                        } else if target_byte + 10 * 1024 * 1024 < offset
+                                   && target_changed {
+                            // Backward seek — but ONLY if the target changed (new seek).
+                            // If target hasn't changed, PROACTIVE is just ahead of the
+                            // seek position = normal prebuffering, NOT a backward seek.
                             log::info!(
                                 "[PROACTIVE] msg {}: playhead jumped backward to byte {} (current offset {}), re-evaluating gaps",
                                 message_id, target_byte, offset

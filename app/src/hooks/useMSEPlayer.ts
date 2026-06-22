@@ -548,15 +548,15 @@ async function fetchMpegtsKeyframeIndex(
   folderId: string,
   messageId: string,
   token: string
-): Promise<TSKeyframeEntry[]> {
+): Promise<{ keyframes: TSKeyframeEntry[]; partial: boolean }> {
   try {
     const response = await fetch(`${baseUrl}/fmp4/keyframes/${folderId}/${messageId}?token=${encodeURIComponent(token)}`, {
       headers: { Accept: 'application/json' },
     });
-    if (!response.ok) return [];
-    const data = await response.json() as { keyframes?: Array<{ timestamp_s?: number; timestamp?: number; byte_offset: number }> };
-    if (!Array.isArray(data?.keyframes)) return [];
-    return data.keyframes
+    if (!response.ok) return { keyframes: [], partial: true };
+    const data = await response.json() as { keyframes?: Array<{ timestamp_s?: number; timestamp?: number; byte_offset: number }>; partial?: boolean };
+    if (!Array.isArray(data?.keyframes)) return { keyframes: [], partial: true };
+    const keyframes = data.keyframes
       .map(kf => {
         const timestamp = Number(kf.timestamp_s ?? kf.timestamp ?? 0);
         const byteOffset = Number(kf.byte_offset);
@@ -564,8 +564,9 @@ async function fetchMpegtsKeyframeIndex(
       })
       .filter(kf => Number.isFinite(kf.timestamp) && Number.isFinite(kf.byteOffset))
       .sort((a, b) => a.timestamp - b.timestamp);
+    return { keyframes, partial: data.partial ?? false };
   } catch (e) {
-    return [];
+    return { keyframes: [], partial: true };
   }
 }
 
@@ -834,16 +835,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   /** Fetch the backend's keyframe index for this TS stream and store it as the
    *  authoritative byte-time map for resume / seek / cache trim. */
-  const refreshTsKeyframeIndex = useCallback(async () => {
-    if (!streamUrl) return;
+  const refreshTsKeyframeIndex = useCallback(async (): Promise<boolean> => {
+    if (!streamUrl) return false;
     const parsed = parseStreamUrl(streamUrl);
-    if (!parsed) return;
-    const keyframes = await fetchMpegtsKeyframeIndex(parsed.baseUrl, parsed.folderId, parsed.messageId, parsed.token);
+    if (!parsed) return false;
+    const { keyframes, partial } = await fetchMpegtsKeyframeIndex(parsed.baseUrl, parsed.folderId, parsed.messageId, parsed.token);
     if (keyframes.length > 0) {
       tsKeyframeIndexRef.current = keyframes;
       // Keep the legacy sample array in sync so findByteForTime consumers still work.
       byteTimeSamplesRef.current = keyframes.map(kf => ({ time: kf.timestamp, byte: kf.byteOffset }));
+      // ALSO populate byteToTimeTableRef from backend keyframes so the green bar
+      // renders at accurate VBR positions. Without this, byteToTime falls back
+      // to linear mapping (wrong for VBR video).
+      byteToTimeTableRef.current = keyframes
+        .map(kf => [kf.byteOffset, kf.timestamp] as [number, number])
+        .sort((a, b) => a[0] - b[0]);
     }
+    // Return true when index is complete (not partial) and has data
+    return !partial && keyframes.length > 0;
   }, [parseStreamUrl, streamUrl]);
 
   // Ref to track whether the TS→fMP4 backend pipeline is active (not mux.js transmuxer)
@@ -958,7 +967,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
  const te = byteToTime(be);
       return [ts, te];
     });
-    setDownloadedTimeRanges(timeRanges);
+    // Don't update downloadedTimeRanges during seek/VBR correction — the initial
+    // /stream download at the linear estimate shows briefly, then VBR correction
+    // resets the shadow cache → the green bar disappears → confusing flash.
+    if ((window as any).__nobuf_userSeekInProgress !== true) {
+      setDownloadedTimeRanges(timeRanges);
+    }
     // Log first range after a seek reset for debugging
     if (justSeekedRef.current) {
       justSeekedRef.current = false;
@@ -970,7 +984,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Clear downloaded ranges (on seek / cleanup)
   const clearDownloadedRanges = useCallback(() => {
     downloadedRangesRef.current = [];
-    setDownloadedTimeRanges([]);
+    // Don't clear the visual bar during seek — it causes a flash.
+    // The bar updates with new data when the seek completes.
+    // Only clear when NOT in a seek (e.g. player cleanup, file change).
+    if ((window as any).__nobuf_userSeekInProgress !== true) {
+      setDownloadedTimeRanges([]);
+    }
   }, []);
 
   // Initialize MSE when streamUrl changes
@@ -2046,6 +2065,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     shadowCacheRef.current.reset(urlKey, fileLen);
     diagLog(`[MPEGTS] Shadow cache initialized: urlKey=${urlKey}, fileLength=${fileLen}`);
 
+    // Seed byteToTimeTableRef with baseline anchors (0,0) and (fileLength, duration)
+    // so byteToTime() uses monotonic interpolation instead of raw linear mapping.
+    // This prevents the green bar from rendering /stream's ranges at the wrong
+    // position on the first seek (before VBR-corrected keyframes populate the table).
+    // For TS files, the table is empty until VBR corrections add entries.
+    if (fileLen > 0 && state.current.duration > 0 && byteToTimeTableRef.current.length === 0) {
+      byteToTimeTableRef.current = [
+        [0, 0],
+        [fileLen, state.current.duration],
+      ];
+    }
+
     try {
       // Attach to the video element — mpegts.js creates its own MediaSource
       player.attachMediaElement(video);
@@ -2172,6 +2203,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               diagLog(`[MPEGTS] Got real duration from metadata: ${metaDur.toFixed(1)}s — updating (was estimated ${knownDuration?.toFixed(1)}s)`);
               (window as any).__nobuf_ptsDuration = metaDur;
               (window as any).__nobuf_durationIsEstimate = false; // real PTS available, no longer an estimate
+
+              // Re-seed byteToTimeTableRef with the real duration now that it's known.
+              // The initial seed at shadow cache init used state.current.duration
+              // which may have been 0 (not yet known). Update with real values.
+              const fl = state.current.fileLength;
+              if (fl > 0 && metaDur > 0) {
+                // Only re-seed if table is still just the baseline (2 entries)
+                // or empty — don't overwrite VBR-corrected keyframe entries.
+                const table = byteToTimeTableRef.current;
+                if (table.length <= 2) {
+                  byteToTimeTableRef.current = [
+                    [0, 0],
+                    [fl, metaDur],
+                  ];
+                }
+              }
 
               // Update mediaSource.duration to the real PTS-based value
               const engine = (player as any)?._player_engine;
@@ -3089,6 +3136,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               filtered.push(newEntry);
               filtered.sort((a, b) => a.timestamp - b.timestamp);
               tsKeyframeIndexRef.current = filtered;
+              // ALSO update byteToTimeTableRef so byteToTime() uses accurate
+              // VBR mapping instead of falling back to linear. Without this,
+              // the green prebuffer bar renders at the wrong time position
+              // (linear mapping says the byte is behind the playhead, but the
+              // actual VBR time is ahead).
+              const btTable = byteToTimeTableRef.current;
+              const btEntry: [number, number] = [byteOffset, videoBufferStart];
+              const btFiltered = btTable.filter(([b]) => b !== byteOffset);
+              btFiltered.push(btEntry);
+              btFiltered.sort((a, b) => a[0] - b[0]);
+              byteToTimeTableRef.current = btFiltered;
               diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
             }
           } else if (videoBufferStart >= v.currentTime - 5 && videoBufferStart <= v.currentTime + 0.5) {
@@ -3113,6 +3171,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               filtered.push(newEntry);
               filtered.sort((a, b) => a.timestamp - b.timestamp);
               tsKeyframeIndexRef.current = filtered;
+              // Also update byteToTimeTableRef for accurate VBR mapping
+              const btTable = byteToTimeTableRef.current;
+              const btFiltered = btTable.filter(([b]) => b !== byteOffset);
+              btFiltered.push([byteOffset, videoBufferStart]);
+              btFiltered.sort((a, b) => a[0] - b[0]);
+              byteToTimeTableRef.current = btFiltered;
               diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
             }
           }
@@ -3289,6 +3353,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               filtered.push(newEntry);
               filtered.sort((a, b) => a.timestamp - b.timestamp);
               tsKeyframeIndexRef.current = filtered;
+              // Also update byteToTimeTableRef for accurate VBR mapping
+              const btTable = byteToTimeTableRef.current;
+              const btFiltered = btTable.filter(([b]) => b !== byteOffset);
+              btFiltered.push([byteOffset, videoBufferStart]);
+              btFiltered.sort((a, b) => a[0] - b[0]);
+              byteToTimeTableRef.current = btFiltered;
               diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
             }
           }
@@ -3321,7 +3391,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // Without this, the backend uses the linear estimate (time/duration * filesize)
           // which is wrong for VBR video. VBR corrections move /stream to a different
           // byte — PROACTIVE needs to know the actual byte to prebuffer from the right place.
-          byteOffset: byteOffset,
+          byteOffset: byteOffset,  // Report ALIGNED_BYTE_OFFSET to PROACTIVE
+                                          // /stream and PROACTIVE must use the SAME base byte.
+                                          // RAW_BYTE_OFFSET is the linear estimate (wrong for VBR).
+                                          // ALIGNED_BYTE_OFFSET is where /stream actually downloads from.
+                                          // PROACTIVE adds 40s ahead on top of this aligned byte.
         }).catch((e: any) => {
           diagLog(`[MPEGTS] Failed to report seek position: ${e}`);
         });
@@ -5341,15 +5415,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const getFmp4ConfigCb = useCallback(() => fmp4ConfigRef.current, []);
 
   // Fetch the backend's TS keyframe index so resume/seek/trim use authoritative
-  // byte-time positions instead of noisy frontend samples. Re-poll every 10s
-  // because the backend index grows as the disk cache fills.
+  // byte-time positions instead of noisy frontend samples.
+  // Fast-retry at 2s until the backend returns a complete (non-partial) index,
+  // then back off to 15s. The backend returns empty/partial at cold start
+  // because the data file isn't ready yet. With 10s retry, the table stayed
+  // at the linear 2-point baseline for the entire session → green bar was
+  // a "random fill" for VBR video.
   useEffect(() => {
     if (!streamUrl) return;
     tsKeyframeIndexRef.current = [];
     byteTimeSamplesRef.current = [];
-    refreshTsKeyframeIndex();
-    const interval = setInterval(() => refreshTsKeyframeIndex(), 10000);
-    return () => clearInterval(interval);
+    let timer: number;
+    let cancelled = false;
+    const tick = async () => {
+      const complete = await refreshTsKeyframeIndex();
+      if (cancelled) return;
+      // Fast retry (2s) while incomplete, slow retry (15s) once complete
+      timer = window.setTimeout(tick, complete ? 15000 : 2000);
+    };
+    tick();
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [streamUrl, refreshTsKeyframeIndex]);
 
   // Cold-start overlay progress poller: keep the overlay visible until the first

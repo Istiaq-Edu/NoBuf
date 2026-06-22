@@ -330,7 +330,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // (which would create an infinite loop: poll → update → state change → effect re-run → new poll → ...)
   const cacheSessionRef = useRef(cacheSession);
   cacheSessionRef.current = cacheSession;
-  const shadowCacheModRef = useRef<any>(null);
+  // shadowCacheModRef removed — shadow cache ranges are no longer shown on the green bar
 
   // Poll cache status for green bar — updates every 500ms for near-realtime feel.
   // Merges disk cache ranges (from backend) with shadow cache ranges (from JS memory)
@@ -345,7 +345,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const poll = async () => {
       while (active) {
         try {
-          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+          // Skip cache status polling during seek/VBR correction.
+          // The initial /stream download at the linear estimate shows on the green bar,
+          // then VBR correction flushes it → green bar disappears → confusing flash.
+          // Wait until seek completes (__nobuf_userSeekInProgress = false) before polling.
+          if ((window as any).__nobuf_userSeekInProgress !== true) {
+            const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
@@ -387,36 +392,33 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           const durForBar = durRef.current || (window as any).__nobuf_estimateDuration || 0;
           const ranges: [number, number][] = [];
 
-          // Backend ranges (disk cache)
+          // Backend ranges (disk cache) — only show ranges ahead of playhead
           if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
             for (const [s, e] of status.cached_ranges as [number, number][]) {
               ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
           }
 
-          // Shadow cache ranges (JS-side byte cache, always fresh)
-          if (durForBar > 0) {
-            try {
-              const scMod = shadowCacheModRef.current || await import('../../lib/faststream/StreamShadowCache');
-              shadowCacheModRef.current = scMod;
-              const sc = scMod.getShadowCache();
-              if (sc && sc.fileLength > 0) {
-                const byteDurRatio = durForBar / sc.fileLength;
-                for (const entry of sc.entryRanges) {
-                  ranges.push([
-                    entry.start * byteDurRatio,
-                    entry.end * byteDurRatio,
-                  ]);
-                }
-              }
-            } catch { /* shadow cache not available */ }
-          }
+          // Shadow cache ranges are NOT shown on the green bar.
+          // The shadow cache is in-memory data already shown by the white bar
+          // (bufferedRanges from v.buffered). Showing it on the green bar is:
+          // 1. Redundant (same data, different color)
+          // 2. Wrong for VBR (byteToTime uses linear mapping when keyframe
+          //    table is empty, which is always for TS files because the backend
+          //    keyframe scanner can't build the index from sparse cached data)
+          // 3. Misleading (shows data that's NOT on disk as "prebuffer")
+          // The green bar should ONLY show disk cache (cmd_get_cache_status)
+          // — the ACTUAL prebuffered data on local disk.
           // Merge overlapping ranges
           if (ranges.length > 0) {
             const sorted = ranges.sort((a, b) => a[0] - b[0]);
             const merged: [number, number][] = [];
             for (const r of sorted) {
-              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
+              // Bridge the transient /stream→PROACTIVE gap (40s offset) into
+              // a single visual segment. Genuinely large uncached regions still
+              // render separately.
+              const BRIDGE_S = 45;
+              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + BRIDGE_S) {
                 merged.push([r[0], r[1]]);
               } else {
                 merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
@@ -424,6 +426,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             }
             setCachedTimeRanges(merged);
           }
+          } // end if (!__nobuf_userSeekInProgress)
         } catch { /* ignore */ }
         await new Promise(r => setTimeout(r, 500));
       }
@@ -460,12 +463,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         try {
           const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
-            const ranges: [number, number][] = status.cached_ranges.map(
-              ([s, e]: [number, number]) => [
-                byteToTime(s),
-                byteToTime(e + 1),
-              ]
-            );
+            const ranges: [number, number][] = status.cached_ranges
+              .map(([s, e]: [number, number]) => [byteToTime(s), byteToTime(e + 1)]);
             setCachedTimeRanges(ranges);
           }
         } catch { /* ignore */ }
@@ -879,11 +878,19 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const pollBuffered = (now: number) => {
       if (now - lastPollTime >= 250) {
         lastPollTime = now;
-        const ranges: [number, number][] = [];
-        for (let i = 0; i < v.buffered.length; i++) {
-          ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+        // Suppress buffered ranges update during seek/VBR correction.
+        // The initial /stream download goes to the linear estimate (wrong position),
+        // shows on the progress bar, then VBR correction flushes SourceBuffers →
+        // the indicator disappears. This flash is confusing. Instead, keep the
+        // old ranges until VBR correction completes and the video is playing
+        // from the correct position.
+        if ((window as any).__nobuf_userSeekInProgress !== true) {
+          const ranges: [number, number][] = [];
+          for (let i = 0; i < v.buffered.length; i++) {
+            ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+          }
+          setBufferedRanges(ranges);
         }
-        setBufferedRanges(ranges);
       }
       rafId = requestAnimationFrame(pollBuffered);
     };
@@ -1315,7 +1322,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               const sorted = [...cachedTimeRanges].sort((a, b) => a[0] - b[0]);
               const merged: [number, number][] = [];
               for (const r of sorted) {
-                if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
+                // Bridge the transient /stream→PROACTIVE gap (40s offset) into
+              // a single visual segment. Genuinely large uncached regions still
+              // render separately.
+              const BRIDGE_S = 45;
+              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + BRIDGE_S) {
                   merged.push([r[0], r[1]]);
                 } else {
                   merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
