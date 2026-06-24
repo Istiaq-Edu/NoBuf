@@ -923,7 +923,7 @@ async fn spawn_targeted_download_and_wait(
 
     // 4. Register the download with the coordinator
     let dl_info = match cache_mgr.register_download(
-        message_id, download_start, download_end, false, download_start
+        message_id, download_start, download_end, false, download_start, None
     ).await {
         Some(info) => info,
         None => {

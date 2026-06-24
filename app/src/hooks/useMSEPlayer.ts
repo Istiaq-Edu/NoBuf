@@ -434,6 +434,7 @@ export interface MSEGetters {
     queryParams: string; // e.g. "token=abc"
     mimeType: string; // e.g. 'video/mp4; codecs="avc1.64001f,mp4a.40.2"'
     duration: number;
+    fileSize: number;
   } | null;
 }
 
@@ -867,6 +868,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     queryParams: string; // e.g. "token=abc"
     mimeType: string; // e.g. 'video/mp4; codecs="avc1.64001f,mp4a.40.2"'
     duration: number;
+    fileSize: number;
   } | null>(null);
   // Current byte offset for the fMP4 download loop — stored as a ref so the
   // seek handler can update it and restart the loop from the new position.
@@ -1969,33 +1971,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // It reads TS bytes via HTTP Range requests from our /stream/ endpoint.
     const streamUrl = `${parsed.baseUrl}/stream/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
 
-    // ── SPAWN PROACTIVE PREBUFFER IMMEDIATELY ──
-    // Start downloading to disk cache BEFORE anything else — before fetching
-    // /fmp4/metadata/, before creating the mpegts.js player. This eliminates
-    // the chicken-and-egg deadlock where /stream polls disk cache but the
-    // prebuffer hasn't started yet. By the time mpegts.js makes its first
-    // Range request to /stream, data is already on disk or being downloaded.
+    // ── PROACTIVE PREBUFFER DISABLED for TS files ──
+    // The PROACTIVE prebuffer downloads the ENTIRE file to disk on every
+    // playback. For non-premium Telegram accounts, this causes FLOOD_PREMIUM_WAIT
+    // (Telegram speed-throttles non-premium accounts after tens of GB downloaded).
+    //
+    // /stream already handles on-demand downloads from Telegram — it downloads
+    // chunks as mpegts.js requests them, writes to cache, and serves from cache
+    // on subsequent requests. The cache naturally grows as the player advances.
+    // This is exactly how MP4 files work, and they never hit FLOOD_PREMIUM_WAIT.
+    //
+    // The PROACTIVE prebuffer is kept for MP4 files (where it's useful for
+    // seeking to uncached positions without a Telegram download). For TS,
+    // mpegts.js's lazyLoad (180s ahead, 60s behind) provides sufficient buffering.
     const knownFilesize = state.current.fileLength > 0 ? state.current.fileLength : undefined;
     const estimatedDurationS = knownFilesize ? (knownFilesize / 4_000_000) * 8 : 0;
     if (knownFilesize && parseInt(parsed.messageId) > 0) {
-      diagLog(`[PROACTIVE] IMMEDIATE spawn: msg=${parsed.messageId} folder=${parsed.folderId} size=${knownFilesize} (estimated duration=${estimatedDurationS.toFixed(1)}s)`);
-      invoke('cmd_report_playback_position', {
-        messageId: parseInt(parsed.messageId),
-        folderId: parseInt(parsed.folderId),
-        currentTimeS: 0,
-        durationS: estimatedDurationS,
-        fileSize: knownFilesize,
-        isPlayerDownloading: false,
-        playbackRate: 1,
-        byteOffset: null, // initial spawn — no byte offset, use linear estimate from time 0
-      }).then((spawned: any) => {
-        if (spawned) {
-          proactivePrebufferMsgIdRef.current = parseInt(parsed.messageId);
-          diagLog(`[PROACTIVE] Immediate spawn succeeded for msg ${parsed.messageId}`);
-        }
-      }).catch((e: any) => {
-        console.error(`[PROACTIVE] Immediate spawn FAILED:`, e);
-      });
+      // PROACTIVE prebuffer disabled for TS — see comment above.
+      // Only /stream downloads data, exactly like MP4 files.
     }
 
     // Get known duration. For TS files, Telegram doesn't provide video duration
@@ -2186,12 +2179,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // it has parsed the PAT/PMT, and playback starts immediately after that.
       player.load();
       diagLog('[MPEGTS] Player loaded, playback starts at MEDIA_INFO');
-      // ── Fetch ACTUAL duration from /fmp4/metadata in parallel ──
+      // ── Fetch ACTUAL duration from /fmp4/metadata ──
       // The player was created with an estimated duration. Now fetch the
       // real PTS-based duration from the backend (which downloads the file's
-      // tail to extract final PTS). This takes ~9s but runs in parallel —
+      // tail to extract final PTS). This takes ~9s but runs concurrently —
       // the player is already buffering and playing with the estimate.
       // When the real duration arrives, we update mediaSource.duration.
+      // With Semaphore(1), the tail download naturally alternates with
+      // /stream and PROACTIVE — no FLOOD_PREMIUM_WAIT, no defer needed.
       if (!file?.duration) {
         const metaUrl = `${parsed.baseUrl}/fmp4/metadata/${parsed.folderId}/${parsed.messageId}?token=${parsed.token}&file_size=${state.current.fileLength}`;
         fetch(metaUrl).then(async (metaResp) => {
@@ -2247,22 +2242,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               mpegtsDurationRef.current = metaDur;
               knownDuration = metaDur;
 
-              // Report real duration to proactive prebuffer so it calculates
-              // correct playhead byte position
-              if (parsed.messageId && parsed.folderId) {
-                try {
-                  await (window as any).__TAURI_INTERNALS__.invoke('cmd_report_playback_position', {
-                    messageId: parseInt(parsed.messageId),
-                    folderId: parseInt(parsed.folderId),
-                    currentTimeS: video.currentTime || 0,
-                    durationS: metaDur,
-                    fileSize: knownFilesize || 0,
-                    isPlayerDownloading: false,
-                    playbackRate: video.playbackRate || 1,
-                    byteOffset: null, // duration update — no byte offset, use linear estimate
-                  });
-                } catch (_e: any) { /* non-critical */ }
-              }
+              // PROACTIVE prebuffer disabled for TS — it downloads the entire
+              // file and causes FLOOD_PREMIUM_WAIT on non-premium accounts.
+              // /stream alone handles on-demand downloads like MP4 files.
             }
           } catch (_e: any) { /* parse error — keep estimated duration */ }
         }).catch((_e: any) => {
@@ -2277,6 +2259,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // codecs. For TS files with stream_type=0x15 (AAC-LATM), the backend
       // must rewrite stream_type 0x15→0x0F in PMT packets, otherwise mpegts.js
       // maps 0x15 to kMetadata (ID3), drops audio PES, and MEDIA_INFO never fires.
+      let mediaInfo: any = null;
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('mpegts.js initialization timeout (10s)'));
@@ -2284,10 +2267,36 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
         player.on(MpegtsPlayer.Events.MEDIA_INFO, (info: any) => {
           clearTimeout(timeout);
+          mediaInfo = info;
           diagLog(`[MPEGTS] Media info: duration=${info.duration}s, codec=${info.videoCodec},${info.audioCodec}`);
           resolve();
         });
       });
+
+      // Activate the fMP4 thumbnail pipeline for TS files.
+      // The Fmp4ThumbnailPipeline uses backend /fmp4/init + /fmp4/segment
+      // endpoints for thumbnail extraction — no second mpegts.js player,
+      // no /stream rate limiter competition. The backend handles TS demuxing
+      // and keyframe alignment server-side.
+      if (mediaInfo && mediaInfo.videoCodec) {
+        fmp4ConfigRef.current = {
+          baseUrl: `${parsed.baseUrl}/fmp4`,
+          folderId: parsed.folderId,
+          messageId: parsed.messageId,
+          queryParams: `token=${encodeURIComponent(parsed.token)}`,
+          mimeType: `video/mp4; codecs="${mediaInfo.videoCodec},${mediaInfo.audioCodec}"`,
+          duration: knownDuration || estimatedDurationS,
+          fileSize: knownFilesize || 0,
+        };
+        fmp4PipelineActiveRef.current = true;
+        diagLog('[MPEGTS] fMP4 thumbnail pipeline activated');
+        // Signal that thumbnail pipeline data is ready for TS files.
+        // For MP4, this is set in the mp4box.js onReady callback. For TS,
+        // the fMP4 backend pipeline doesn't need moov/firstChunk — it fetches
+        // init segments from the backend. Setting this here triggers the
+        // Fmp4ThumbnailPipeline effect in useThumbnailExtractor.ts.
+        setThumbnailDataReady(true);
+      }
 
       // Start playback as soon as mpegts.js has identified the media streams AND
       // the first 5MB is in the shadow cache (or the cold-start timeout fired).
@@ -3381,30 +3390,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       //    The existing proactive task reads proactive_targets on its next loop
       //    iteration and slides start_byte forward to the seek position. This
       //    avoids the race condition of stop+restart (cmd_stop clears the flag,
-      //    then cmd_report clears it again before the old task checks it).
-      if (file && activeFolderId !== null && filesize > 0) {
-        invoke('cmd_report_playback_position', {
-          messageId: file.id,
-          folderId: activeFolderId,
-          currentTimeS: seekTime,
-          durationS: duration,
-          fileSize: filesize,
-          isPlayerDownloading: true,
-          playbackRate: 1,
-          // Pass the actual byte offset so PROACTIVE targets the correct position.
-          // Without this, the backend uses the linear estimate (time/duration * filesize)
-          // which is wrong for VBR video. VBR corrections move /stream to a different
-          // byte — PROACTIVE needs to know the actual byte to prebuffer from the right place.
-          byteOffset: byteOffset,  // Report ALIGNED_BYTE_OFFSET to PROACTIVE
-                                          // /stream and PROACTIVE must use the SAME base byte.
-                                          // RAW_BYTE_OFFSET is the linear estimate (wrong for VBR).
-                                          // ALIGNED_BYTE_OFFSET is where /stream actually downloads from.
-                                          // PROACTIVE adds 40s ahead on top of this aligned byte.
-        }).catch((e: any) => {
-          diagLog(`[MPEGTS] Failed to report seek position: ${e}`);
-        });
-        diagLog(`[MPEGTS] Reported seek position ${seekTime.toFixed(1)}s (byte ${byteOffset}) to backend proactive`);
-      }
+      // PROACTIVE prebuffer disabled for TS — no cmd_report_playback_position.
+      // /stream handles on-demand downloads. Reporting position would spawn
+      // the PROACTIVE background download which causes FLOOD_PREMIUM_WAIT.
 
     } catch (e: any) {
       diagLog(`[MPEGTS] Unbuffered seek failed: ${e.message}`);

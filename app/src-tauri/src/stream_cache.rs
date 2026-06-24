@@ -118,6 +118,17 @@ mod win32 {
 // without hitting the limit and returning 503 errors.
 pub const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 10;
 
+/// Returns true if two source_ids should be treated as the same source
+/// for zombie-cancellation purposes. None matches None (backward compat),
+/// Some(a) matches Some(a), everything else is a mismatch.
+fn source_ids_match(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Tracks an active SEQUENTIAL download for a message.
 /// Other overlapping range requests subscribe via the progress channel
 /// and read from cache as data becomes available.
@@ -146,6 +157,14 @@ pub struct ActiveDownload {
     /// This prevents zombie downloads from competing for the rate limiter after
     /// the frontend aborts the old fetch (AbortController.abort()).
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Identifies the source of this download (e.g. "player", "thumbnail").
+    /// The coordinator only cancels zombie downloads from the SAME source_id.
+    /// This prevents the thumbnail pipeline's seek from cancelling the main
+    /// player's download (and vice versa) — the ping-pong cancellation loop
+    /// that caused 60K+ lines of Early-EOF / reconnect spam in session 121.
+    /// None = backward compatible (cancel any same-message download with
+    /// different start_byte, same as original behaviour).
+    pub source_id: Option<String>,
 }
 
 /// Information returned to a subscriber (read-only snapshot of an ActiveDownload)
@@ -624,7 +643,7 @@ impl StreamCacheManager {
     /// this is current_offset (already-downloaded bytes from prebuffer), so
     /// subscribers see accurate progress immediately instead of waiting for
     /// a separate update_download_progress call.
-    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64, is_continuation: bool, initial_progress: u64) -> Option<ActiveDownloadInfo> {
+    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64, is_continuation: bool, initial_progress: u64, source_id: Option<String>) -> Option<ActiveDownloadInfo> {
         let mut downloads = self.active_downloads.lock().await;
         let current_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
         if current_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
@@ -637,11 +656,17 @@ impl StreamCacheManager {
         // download from a different byte range is no longer needed. Without this,
         // the old download continues for 2-4 seconds (zombie) competing for the
         // rate limiter, slowing down the new download.
+        //
+        // source_id isolation: only cancel zombies from the SAME source_id.
+        // This prevents the thumbnail pipeline's seek from cancelling the main
+        // player's active download (and vice versa). When source_id is None
+        // (backward compat), cancel any same-message download with a different
+        // start_byte — same as the original behaviour.
         if let Some(dls) = downloads.get_mut(&message_id) {
             for dl in dls.iter() {
-                if dl.start_byte != start_byte {
-                    log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {})",
-                        message_id, dl.start_byte, dl.end_byte, start_byte);
+                if dl.start_byte != start_byte && source_ids_match(&dl.source_id, &source_id) {
+                    log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?})",
+                        message_id, dl.start_byte, dl.end_byte, start_byte, source_id);
                     dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -661,6 +686,7 @@ impl StreamCacheManager {
             last_progress: initial_value,
             is_continuation,
             cancel_flag: cancel_flag.clone(),
+            source_id: source_id.clone(),
         };
         downloads.entry(message_id)
             .or_insert_with(Vec::new)

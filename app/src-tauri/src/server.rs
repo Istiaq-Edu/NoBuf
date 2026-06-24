@@ -264,6 +264,18 @@ pub(crate) struct StreamQuery {
     /// Passed to ffmpeg via -t so the fMP4 moov box contains the correct
     /// total duration — without this, the browser can't show the video length.
     pub(crate) duration: Option<f64>,
+    /// Identifies the source of this stream request (e.g. "player", "thumbnail").
+    /// Passed to register_download() so the coordinator only cancels zombie
+    /// downloads from the SAME source_id. This prevents the thumbnail pipeline's
+    /// seek from cancelling the main player's active download (and vice versa).
+    /// None = backward compatible (cancel any same-message download with
+    /// different start_byte, same as the original behaviour).
+    pub(crate) source_id: Option<String>,
+    /// Maximum bytes to serve for this stream request. When set, clamps
+    /// end_byte to min(end_byte, start_byte + max_bytes - 1). Used by the
+    /// thumbnail pipeline to limit downloads to ~5MB instead of fetching
+    /// to EOF (hundreds of MB) — only needs enough data to find one keyframe.
+    pub(crate) max_bytes: Option<u64>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -272,11 +284,12 @@ pub(crate) struct StreamQuery {
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 /// Minimum interval between upload.GetFile API calls on the main client.
-/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~6 req/s sustained. At 200ms
-/// interval, max rate = 5 req/s — safely under the threshold.
-/// This is a GLOBAL rate limit shared by all download paths (checked while
-/// holding the download_semaphore, so it's race-free).
-const MIN_API_CALL_INTERVAL_MS: u64 = 250;
+/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. With
+/// Semaphore(1), the actual API call rate is 1/(interval + network_latency).
+/// At 150ms interval + ~150ms network = 300ms per call = 3.3 req/s — safely
+/// under the threshold. Throughput: 512KB / 300ms = 1.71 MB/s.
+/// Previous 250ms gave 1.28 MB/s — too slow for practical playback.
+const MIN_API_CALL_INTERVAL_MS: u64 = 150;
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -350,6 +363,15 @@ pub(crate) async fn resolve_media_from_path(
         }
     }
 
+    // Fast path: check media cache — eliminates unthrottled get_messages_by_id
+    // calls that contribute to FLOOD_PREMIUM_WAIT.
+    {
+        let cache = data.media_cache.read().await;
+        if let Some((media, total_size)) = cache.get(&message_id) {
+            return Ok((media.clone(), *total_size));
+        }
+    }
+
     let folder_id = if folder_id_str == "me" || folder_id_str == "home" || folder_id_str == "null" {
         None
     } else {
@@ -413,6 +435,13 @@ pub(crate) async fn resolve_media_from_path(
         }
         _ => 0,
     };
+
+    // Cache the media object — eliminates unthrottled get_messages_by_id
+    // calls on subsequent /stream requests for the same message.
+    {
+        let mut cache = data.media_cache.write().await;
+        cache.insert(message_id, (media.clone(), size));
+    }
 
     Ok((media, size))
 }
@@ -512,6 +541,18 @@ async fn stream_media(
         }
     } else {
         (0, size.saturating_sub(1), false)
+    };
+
+    // Clamp end_byte if max_bytes is set (thumbnail pipeline limits download size)
+    let end_byte = if let Some(max_bytes) = query.max_bytes {
+        let clamped_end = start_byte.saturating_add(max_bytes).saturating_sub(1).min(end_byte);
+        if clamped_end != end_byte {
+            log::info!("[PREBUFFER] max_bytes={} clamped range for msg {} from {}-{} to {}-{}",
+                max_bytes, message_id, start_byte, end_byte, start_byte, clamped_end);
+        }
+        clamped_end
+    } else {
+        end_byte
     };
 
     let content_length = end_byte - start_byte + 1;
@@ -1078,7 +1119,7 @@ async fn stream_media(
             // zombie downloads from competing for the rate limiter.
             let mut _registered = false;
             let stream_cancel_flag: Arc<std::sync::atomic::AtomicBool> = if let Some(ref cm) = cache_mgr_for_stream {
-                match cm.register_download(message_id, fallback_start, end_byte, false, fallback_start).await {
+                match cm.register_download(message_id, fallback_start, end_byte, false, fallback_start, query.source_id.clone()).await {
                     Some(info) => {
                         _registered = true;
                         info.cancel_flag
@@ -1393,16 +1434,9 @@ async fn download_and_cache_range(
 
     loop {
         let chunk_result = {
-            match data.download_semaphore.try_acquire() {
-                Ok(_permit) => {
-                    throttle_api_calls(&data.rate_limiter).await;
-                    iter.next().await
-                }
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-            }
+            let _permit = data.download_semaphore.acquire().await.unwrap();
+            throttle_api_calls(&data.rate_limiter).await;
+            iter.next().await
         };
         match chunk_result {
             Ok(Some(chunk)) => {
@@ -1677,7 +1711,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2667,8 +2701,11 @@ async fn fmp4_segment(
                 if time_s <= 0.0 {
                     0u64
                 } else if total_size > 0 {
-                    // Crude fallback: proportional estimate
-                    let bitrate_bytes = (total_size as f64 * 8.0) / 3600.0 / 8.0;
+                    // Proportional estimate using file size.
+                    // Without duration in CacheMeta, use a reasonable default
+                    // bitrate of 500KB/s (typical for 4Mbps video).
+                    // This is only used when no keyframes are found in cached data.
+                    let bitrate_bytes = 500_000.0; // ~500KB/s default
                     (time_s * bitrate_bytes) as u64
                 } else {
                     0u64
@@ -2765,7 +2802,7 @@ async fn fmp4_segment(
         } else {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -2784,15 +2821,22 @@ async fn fmp4_segment(
                     }
                 };
 
-                let _permit = data.download_semaphore.acquire().await.unwrap();
-                throttle_api_calls(&data.rate_limiter).await;
+                // Blocking acquire — with Semaphore(1), all download paths
+                // serialize. The 250ms rate limiter spaces API calls.
+                // Thumbnail downloads briefly pause /stream (400ms per chunk),
+                // but the 180s buffer ahead absorbs this.
                 let mut iter = download_iter;
                 let mut offset = read_start;
                 let mut first_chunk = true;
                 let download_end = read_end;
 
                 loop {
-                    match iter.next().await.transpose() {
+                    let chunk_result = {
+                        let _permit = data.download_semaphore.acquire().await.unwrap();
+                        throttle_api_calls(&data.rate_limiter).await;
+                        iter.next().await
+                    };
+                    match chunk_result.transpose() {
                         Some(Ok(bytes)) => {
                             let mut chunk_data = bytes;
                             if first_chunk && bytes_to_discard > 0 {

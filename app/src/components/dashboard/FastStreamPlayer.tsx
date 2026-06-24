@@ -1156,7 +1156,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // - Native mode: hidden video can seek to any position
         // - MP4 MSE: mini pipeline + moov buffer enables on-demand capture
         // - Transmuxer (MKV/TS): second transmuxer instance + hidden video + MSE
-        const canGenerateThumbnails = playerUseNative || (thumbnailDataReady && moovBufferReady) || isTransmuxer();
+        // - TS via fMP4 backend: Fmp4ThumbnailPipeline (backend /fmp4/segment)
+        const canGenerateThumbnails = playerUseNative
+          || (thumbnailDataReady && moovBufferReady)
+          || isTransmuxer()
+          || (thumbnailDataReady && mseGetters?.isFmp4Stream());
         if (canGenerateThumbnails) {
           setThumbUrl(null);
           setThumbLoading(true);
@@ -1173,7 +1177,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         }
       }
     }
-  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
+  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, thumbnailDataReady, moovBufferReady, mseGetters]);
 
   // Keyboard
   useEffect(() => {

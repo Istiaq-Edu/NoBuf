@@ -64,6 +64,11 @@ pub struct TelegramState {
     /// as the playhead advances instead of being a one-shot fixed-window download.
     /// (current_byte, duration_s, playback_rate, file_size)
     pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
+    /// Cache of resolved media objects per message_id. Eliminates repeated
+    /// `get_messages_by_id` API calls (which are unthrottled and contribute
+    /// to FLOOD_PREMIUM_WAIT). The media object doesn't change between requests
+    /// for the same message, so caching is safe.
+    pub media_cache: Arc<tokio::sync::RwLock<HashMap<i32, (grammers_client::types::Media, u64)>>>,
 }
 
 pub mod auth;
