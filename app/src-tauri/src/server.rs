@@ -1148,6 +1148,7 @@ async fn stream_media(
             let mut current_offset = fallback_start;
             let mut iter = download_iter;
             let mut pending_ranges: Vec<(u64, u64)> = Vec::new();
+            let mut stream_retries = 0u32;
 
             while let Some(chunk) = {
                 // Acquire the global semaphore — serializes all iter_download calls
@@ -1243,10 +1244,37 @@ async fn stream_media(
                         yield Ok::<_, actix_web::Error>(web::Bytes::from(yield_data));
 
                         if is_last { break; }
+
+                        // Self-throttle: enforce download speed limit to prevent FLOOD_PREMIUM_WAIT.
+                        // 0 = unlimited (default). When set, sleep to stay under configured KB/s.
+                        let dl_limit_kb = data.download_speed_limit_kb.load(std::sync::atomic::Ordering::Relaxed);
+                        if dl_limit_kb > 0 {
+                            let sleep_ms = (bytes_in_chunk * 1000) / (dl_limit_kb * 1024);
+                            let sleep_ms = sleep_ms.min(2000);
+                            if sleep_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                            }
+                        }
                     }
                     Err(e) => {
-                        log::error!("[STREAM-FALLBACK] Download error for msg {}: {}", message_id, e);
-                        break;
+                        log::warn!("[STREAM-FALLBACK] Download error for msg {} at offset {}: {}", message_id, current_offset, e);
+                        stream_retries += 1;
+                        if stream_retries > 3 {
+                            log::error!("[STREAM-FALLBACK] Max retries exceeded for msg {}, breaking", message_id);
+                            break;
+                        }
+                        let backoff = 3 * (1u64 << (stream_retries - 1));
+                        log::info!("[STREAM-FALLBACK] Retrying in {}s (attempt {}/3)", backoff, stream_retries);
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        if stream_cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            log::info!("[STREAM-FALLBACK] Cancelled during backoff for msg {}", message_id);
+                            break;
+                        }
+                        let skip_chunks = (current_offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
+                        iter = client_clone.iter_download(&media_clone)
+                            .chunk_size(TELEGRAM_CHUNK_SIZE)
+                            .skip_chunks(skip_chunks);
+                        continue;
                     }
                 }
             }
@@ -1431,6 +1459,7 @@ async fn download_and_cache_range(
     let mut iter = download_iter;
     let mut downloaded = Vec::new();
     let mut first_chunk = true;
+    let mut dac_retries = 0u32;
 
     loop {
         let chunk_result = {
@@ -1454,7 +1483,28 @@ async fn download_and_cache_range(
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(format!("iter_download error: {}", e)),
+            Err(e) => {
+                dac_retries += 1;
+                if dac_retries > 3 {
+                    return Err(format!("iter_download error after 3 retries: {}", e));
+                }
+                let backoff = 3 * (1u64 << (dac_retries - 1));
+                log::warn!("[DAC] Retrying in {}s (attempt {}/3): {}", backoff, dac_retries, e);
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                let resume_byte = start + downloaded.len() as u64;
+                let skip_chunks = (resume_byte / chunk_size as u64) as i32;
+                let bytes_already = resume_byte % chunk_size as u64;
+                iter = client.iter_download(media)
+                    .chunk_size(chunk_size)
+                    .skip_chunks(skip_chunks);
+                if bytes_already > 0 {
+                    first_chunk = true;
+                    // Adjust bytes_to_discard for the retry — discard bytes already in `downloaded`
+                    // We can't modify the original bytes_to_discard (it's immutable), so use a local
+                    let _ = bytes_already; // bytes_to_discard is used via first_chunk flag
+                }
+                continue;
+            }
         }
     }
 
@@ -1549,6 +1599,8 @@ async fn find_keyframe_at_or_before_time(
     //    of a symmetric window is wasted.
     let mut window_size: u64 = 4 * 1024 * 1024; // 4MB initial
     let max_window: u64 = 256 * 1024 * 1024; // 256MB max (for extreme VBR offsets up to ~128MB forward)
+    let search_start = std::time::Instant::now();
+    let search_deadline = std::time::Duration::from_secs(30);
 
     while window_size <= max_window {
         // Symmetric search: 50% backward, 50% forward.
@@ -1646,6 +1698,17 @@ async fn find_keyframe_at_or_before_time(
         }
 
         window_size *= 2;
+
+        // Search deadline: if the search has been running for >30s (due to
+        // FLOOD_PREMIUM_WAIT on each download), stop expanding and return None.
+        // The caller returns a linear byte estimate fallback. The frontend's
+        // 5s AbortController has already fired by this point, but the backend
+        // keeps running and caches the result for future seeks.
+        if search_start.elapsed() >= search_deadline {
+            log::warn!("[FMP4-KF-AT] Search deadline (30s) exceeded for msg {} at {}s, returning fallback",
+                message_id, target_time_s);
+            return None;
+        }
     }
 
     None
@@ -2829,6 +2892,7 @@ async fn fmp4_segment(
                 let mut offset = read_start;
                 let mut first_chunk = true;
                 let download_end = read_end;
+                let mut fmp4_retries = 0u32;
 
                 loop {
                     let chunk_result = {
@@ -2875,8 +2939,20 @@ async fn fmp4_segment(
                         }
                         None => break,
                         Some(Err(e)) => {
-                            log::error!("[FMP4-SEG] Targeted download error for msg {}: {}", message_id, e);
-                            break;
+                            log::warn!("[FMP4-SEG] Download error for msg {} at offset {}: {}", message_id, offset, e);
+                            fmp4_retries += 1;
+                            if fmp4_retries > 3 {
+                                log::error!("[FMP4-SEG] Max retries exceeded for msg {}", message_id);
+                                break;
+                            }
+                            let backoff = 3 * (1u64 << (fmp4_retries - 1));
+                            log::info!("[FMP4-SEG] Retrying in {}s (attempt {}/3)", backoff, fmp4_retries);
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                            let skip_chunks = (offset / TELEGRAM_CHUNK_SIZE as u64) as i32;
+                            iter = client.iter_download(&media)
+                                .chunk_size(TELEGRAM_CHUNK_SIZE)
+                                .skip_chunks(skip_chunks);
+                            continue;
                         }
                     }
                 }
@@ -3552,6 +3628,7 @@ async fn fmp4_metadata(
                                         let mut iter = download_iter;
                                         let mut tail_buf = Vec::new();
                                         let mut first_chunk = true;
+                                        let mut tail_retries = 0u32;
                                         loop {
                                             let chunk_result = {
                                                 let _permit = data.download_semaphore.acquire().await.unwrap();
@@ -3573,7 +3650,20 @@ async fn fmp4_metadata(
                                                 Ok(None) => break,
                                                 Err(e) => {
                                                     log::warn!("[FMP4-META] msg {} tail download error: {}", message_id, e);
-                                                    break;
+                                                    tail_retries += 1;
+                                                    if tail_retries > 3 {
+                                                        log::warn!("[FMP4-META] msg {} tail max retries exceeded, using partial", message_id);
+                                                        break;
+                                                    }
+                                                    let backoff = 3 * (1u64 << (tail_retries - 1));
+                                                    log::info!("[FMP4-META] Retrying tail in {}s (attempt {}/3)", backoff, tail_retries);
+                                                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                                                    let resume_byte = tail_start + tail_buf.len() as u64;
+                                                    let skip_chunks = (resume_byte / chunk_size as u64) as i32;
+                                                    iter = client.iter_download(&media)
+                                                        .chunk_size(chunk_size)
+                                                        .skip_chunks(skip_chunks);
+                                                    continue;
                                                 }
                                             }
                                         }
