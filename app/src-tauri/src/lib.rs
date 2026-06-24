@@ -244,13 +244,14 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+                download_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                 rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
                 prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });

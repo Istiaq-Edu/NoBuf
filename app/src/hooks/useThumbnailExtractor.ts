@@ -978,6 +978,7 @@ class Fmp4ThumbnailPipeline {
   queryParams: string;
   mimeType: string;
   duration: number = 0;
+  fileSize: number = 0;
   ready = false;
   active = true;
   busy = false;
@@ -990,6 +991,7 @@ class Fmp4ThumbnailPipeline {
       queryParams: string;
       mimeType: string;
       duration: number;
+      fileSize: number;
     },
     canvas: HTMLCanvasElement,
   ) {
@@ -999,6 +1001,7 @@ class Fmp4ThumbnailPipeline {
     this.queryParams = config.queryParams;
     this.mimeType = config.mimeType;
     this.duration = config.duration;
+    this.fileSize = config.fileSize;
     this.canvas = canvas;
 
     // Create hidden video element
@@ -1214,11 +1217,63 @@ class Fmp4ThumbnailPipeline {
         await this._waitForUpdateEnd();
       }
 
-      // 3. Fetch media segment at desired time from backend
-      const segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time}&duration=0.5`;
+      // 3. Fetch keyframe byte offset from backend for precise seeking.
+      //    Timeout: 5s — if the keyframe search takes longer (FLOOD_PREMIUM_WAIT,
+      //    expanding window search), fall back to linear byte estimate.
+      let segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=0.5`;
+      try {
+        const kfUrl = `${this.fmp4BaseUrl}/keyframe-at/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=${this.duration.toFixed(3)}`;
+        const kfController = new AbortController();
+        const kfTimeoutId = setTimeout(() => kfController.abort(), 5000);
+        const kfResp = await fetch(kfUrl, { signal: kfController.signal });
+        clearTimeout(kfTimeoutId);
+        if (kfResp.ok) {
+          const kfData = await kfResp.json();
+          if (kfData.byte_offset != null && !kfData.fallback) {
+            segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${kfData.byte_offset}&duration=0.5&align=keyframe`;
+            console.log('[Fmp4ThumbnailPipeline] Using keyframe-at byte_offset=' + kfData.byte_offset + ' for time=' + time.toFixed(2) + 's');
+          }
+        }
+      } catch {
+        // Timeout — keyframe-at took too long (FLOOD_PREMIUM_WAIT, expanding
+        // window search). Fall back to linear byte estimate instead of time-based
+        // fetch, because the backend's time→byte cache (Fmp4ByteTimeCache) has
+        // sparse entries and will return a keyframe at ~12s for a 881s target.
+        // Linear estimate: (time / duration) * fileSize — only 6-10MB off for VBR.
+        if (this.duration > 0 && this.fileSize > 0) {
+          const linearByte = Math.floor((time / this.duration) * this.fileSize);
+          segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${linearByte}&duration=0.5`;
+          console.log('[Fmp4ThumbnailPipeline] Keyframe-at timeout, using linear byte_offset=' + linearByte + ' for time=' + time.toFixed(2) + 's');
+        }
+      }
+
+      // 4. Fetch media segment from backend (with 10s timeout for uncached positions)
       console.log('[Fmp4ThumbnailPipeline] Fetching segment at time=' + time.toFixed(2) + 's');
 
-      const segResp = await fetch(segUrl);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      let segResp: Response;
+      try {
+        segResp = await fetch(segUrl, { signal: controller.signal });
+      } catch (e: any) {
+        if (e?.name === 'AbortError') {
+          console.warn('[Fmp4ThumbnailPipeline] Segment fetch timed out for time:', time.toFixed(2));
+        } else {
+          console.warn('[Fmp4ThumbnailPipeline] Segment fetch error:', e?.message);
+        }
+        return false;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      // 5. Handle 503 (download busy) — retry once after Retry-After
+      if (segResp.status === 503) {
+        const retryAfter = parseInt(segResp.headers.get('Retry-After') || '2', 10);
+        console.log('[Fmp4ThumbnailPipeline] Segment 503, retrying after ' + retryAfter + 's');
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        segResp = await fetch(segUrl);
+      }
+
       if (!segResp.ok) {
         console.warn(`[Fmp4ThumbnailPipeline] Segment fetch failed (HTTP ${segResp.status})`);
         return false;
@@ -1230,7 +1285,7 @@ class Fmp4ThumbnailPipeline {
         return false;
       }
 
-      // 4. Append segment to SourceBuffer
+      // 6. Append segment to SourceBuffer
       await this._waitForUpdateEnd();
       this.sourceBuffer!.appendBuffer(segData);
       await this._waitForUpdateEnd();
