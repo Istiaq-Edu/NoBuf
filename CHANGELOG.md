@@ -2,6 +2,16 @@
 
 All notable changes to NoBuf will be documented in this file.
 
+## [0.5.0] - 2026-05-27
+
+### Documentation
+
+- Update CHANGELOG.md for v0.4.7
+
+### Features
+
+- Add responsive UI and mobile sidebar behavior
+
 ## [0.4.7] - 2026-05-27
 
 ### Documentation
