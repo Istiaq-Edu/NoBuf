@@ -21,11 +21,12 @@ pub struct FileMetadata {
     pub id: i64,
     pub folder_id: Option<i64>,
     pub name: String,
-    pub size: u64, // Updated to u64
+    pub size: u64,
     pub mime_type: Option<String>,
-    pub file_ext: Option<String>, // Added field
+    pub file_ext: Option<String>,
     pub created_at: String, 
     pub icon_type: String, 
+    pub duration: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

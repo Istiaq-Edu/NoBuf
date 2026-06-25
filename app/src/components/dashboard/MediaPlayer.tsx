@@ -33,10 +33,6 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
         ? `${streamInfo.base_url}/stream/${folderIdParam}/${file.id}?token=${streamInfo.token}`
         : null;
 
-    useEffect(() => {
-        console.log(`[MediaPlayer] Stream URL resolved: ${streamUrl}, fileId: ${file.id}`);
-    }, [streamUrl, file.id]);
-
     if (!streamUrl) {
         return null;
     }

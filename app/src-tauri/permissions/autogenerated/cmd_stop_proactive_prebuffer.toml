@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-stop-proactive-prebuffer"
+description = "Enables the cmd_stop_proactive_prebuffer command without any pre-configured scope."
+commands.allow = ["cmd_stop_proactive_prebuffer"]
+
+[[permission]]
+identifier = "deny-cmd-stop-proactive-prebuffer"
+description = "Denies the cmd_stop_proactive_prebuffer command without any pre-configured scope."
+commands.deny = ["cmd_stop_proactive_prebuffer"]

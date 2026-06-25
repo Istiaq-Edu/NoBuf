@@ -111,9 +111,23 @@ mod win32 {
 // FLOOD_PREMIUM_WAIT bombardment. Without this, a rapidly-seeking
 // player can spawn 10+ simultaneous downloads (each ~1MB prebuffer
 // request), all hitting Telegram API concurrently and triggering
-// FLOOD_PREMIUM_WAIT retries. When the limit is reached, new requests
-// subscribe to the nearest existing download instead of spawning a new one.
-const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 3;
+// Increased from 5 to 10. With maxBufferLength=10 (hls.js), seeking generates
+// 1-2 MISS-FAR requests per seek position, not 5+. But the user may seek
+// multiple times, and hls.js may request segments at scattered offsets.
+// 10 slots provide enough headroom for multiple simultaneous targeted downloads
+// without hitting the limit and returning 503 errors.
+pub const MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE: usize = 10;
+
+/// Returns true if two source_ids should be treated as the same source
+/// for zombie-cancellation purposes. None matches None (backward compat),
+/// Some(a) matches Some(a), everything else is a mismatch.
+fn source_ids_match(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// Tracks an active SEQUENTIAL download for a message.
 /// Other overlapping range requests subscribe via the progress channel
@@ -134,6 +148,23 @@ pub struct ActiveDownload {
     /// (a download starting at 287MB is "closer" to offset 287.5MB than
     /// one starting at 0, even before any chunks are downloaded).
     pub last_progress: u64,
+    /// Whether this is a background continuation download (vs player-facing).
+    /// Used to avoid self-matching when continuation checks for covering downloads.
+    pub is_continuation: bool,
+    /// Cancellation flag — set to true when a NEW /stream request for the same
+    /// message arrives with a different byte range. The old download handler
+    /// checks this flag at the top of each loop iteration and breaks immediately.
+    /// This prevents zombie downloads from competing for the rate limiter after
+    /// the frontend aborts the old fetch (AbortController.abort()).
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Identifies the source of this download (e.g. "player", "thumbnail").
+    /// The coordinator only cancels zombie downloads from the SAME source_id.
+    /// This prevents the thumbnail pipeline's seek from cancelling the main
+    /// player's download (and vice versa) — the ping-pong cancellation loop
+    /// that caused 60K+ lines of Early-EOF / reconnect spam in session 121.
+    /// None = backward compatible (cancel any same-message download with
+    /// different start_byte, same as original behaviour).
+    pub source_id: Option<String>,
 }
 
 /// Information returned to a subscriber (read-only snapshot of an ActiveDownload)
@@ -142,6 +173,11 @@ pub struct ActiveDownloadInfo {
     pub end_byte: u64,
     /// Receiver that tracks the last byte written to cache
     pub progress_rx: watch::Receiver<u64>,
+    /// Whether this is a background continuation download
+    pub is_continuation: bool,
+    /// Cancellation flag — clone of the ActiveDownload's flag.
+    /// The /stream handler checks this at the top of each loop iteration.
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Metadata sidecar for a cached file
@@ -200,6 +236,8 @@ pub struct StreamCacheManager {
     cache_dir: PathBuf,
     /// Active background cache tasks: message_id
     active_tasks: Arc<Mutex<Vec<i32>>>,
+    /// Active proactive prebuffer tasks: message_id (separate from active_tasks)
+    proactive_tasks: Arc<Mutex<Vec<i32>>>,
     /// Per-message locks to serialize meta read-modify-write operations
     /// between player reports and download updates (prevents race conditions)
     meta_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
@@ -218,6 +256,36 @@ pub struct StreamCacheManager {
     /// Windows (ERROR_SHARING_VIOLATION / os error 32). When both streaming
     /// and downloads end for a queued message, we retry the .dat deletion.
     pending_deletions: Arc<std::sync::Mutex<Vec<i32>>>,
+    /// HLS layout cache: maps message_id → HlsLayoutInfo.
+    /// Populated by the manifest endpoint after resolving media from Telegram.
+    /// Used by the segment route to calculate layout without re-resolving,
+    /// and to spawn targeted downloads for missing segments.
+    hls_layout_cache: Arc<std::sync::Mutex<HashMap<i32, HlsLayoutInfo>>>,
+    /// Standalone init_prefix cache: maps message_id → rewritten init_prefix bytes.
+    /// Populated on-the-fly by the /stream/ endpoint when serving TS data.
+    /// This cache works independently of hls_layout_cache — init_prefix can be
+    /// cached even without the HLS manifest endpoint being called (MSE mode).
+    init_prefix_cache: Arc<std::sync::Mutex<HashMap<i32, Vec<u8>>>>,
+}
+
+/// Cached HLS layout info for a message, including the Media object
+/// needed to spawn targeted downloads for missing segments.
+#[derive(Clone)]
+pub struct HlsLayoutInfo {
+    pub file_size: u64,
+    pub duration: f64,
+    pub folder_id_str: String,
+    pub media: grammers_client::types::Media,
+    pub mime_type: String,
+    /// Detected TS packet size: 188 for standard MPEG-TS, 192 for M2TS (Blu-ray BDAV)
+    pub ts_packet_size: u64,
+    /// Whether the file is M2TS format (192-byte packets with 4-byte timestamp prefix)
+    pub is_m2ts: bool,
+    /// Cached init prefix bytes (PAT+PMT packets, 188-byte aligned).
+    /// For standard TS: extracted 376 bytes (2 packets).
+    /// For M2TS: extracted and stripped (4-byte prefix removed from each 192-byte packet → 188-byte).
+    /// Empty if not yet extracted; will be populated lazily on first segment request.
+    pub init_prefix: Vec<u8>,
 }
 
 impl StreamCacheManager {
@@ -226,16 +294,101 @@ impl StreamCacheManager {
         Ok(Self {
             cache_dir,
             active_tasks: Arc::new(Mutex::new(Vec::new())),
+            proactive_tasks: Arc::new(Mutex::new(Vec::new())),
             meta_locks: Arc::new(Mutex::new(HashMap::new())),
             streaming_active: Arc::new(std::sync::Mutex::new(Vec::new())),
             active_downloads: Arc::new(Mutex::new(HashMap::new())),
             pending_deletions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hls_layout_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            init_prefix_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
     /// Path to the data file for a message
     pub fn data_path(&self, message_id: i32) -> PathBuf {
         self.cache_dir.join(format!("{}.dat", message_id))
+    }
+
+    /// Store HLS layout info for a message, including the Media object
+    /// needed for targeted downloads. Called by the manifest endpoint after
+    /// resolving media from Telegram.
+    pub fn store_hls_layout(
+        &self,
+        message_id: i32,
+        file_size: u64,
+        duration: f64,
+        folder_id_str: String,
+        media: grammers_client::types::Media,
+        mime_type: String,
+        ts_packet_size: u64,
+        is_m2ts: bool,
+    ) {
+        if let Ok(mut cache) = self.hls_layout_cache.lock() {
+            cache.insert(message_id, HlsLayoutInfo {
+                file_size,
+                duration,
+                folder_id_str,
+                media,
+                mime_type,
+                ts_packet_size,
+                is_m2ts,
+                init_prefix: Vec::new(),
+            });
+        }
+    }
+
+    /// Update the cached init prefix for a message (called lazily when data becomes available).
+    /// Returns the updated init_prefix if successful, or None if no layout exists.
+    /// Stores in BOTH hls_layout_cache (if entry exists) AND standalone init_prefix_cache
+    /// (always). The standalone cache ensures init_prefix is available even without
+    /// the HLS manifest endpoint being called (MSE transmuxer mode).
+    pub fn cache_init_prefix(&self, message_id: i32, init_prefix: Vec<u8>) -> Option<Vec<u8>> {
+        // Always store in standalone cache (works regardless of HLS manifest)
+        if let Ok(mut standalone) = self.init_prefix_cache.lock() {
+            standalone.insert(message_id, init_prefix.clone());
+        }
+        // Also store in hls_layout_cache if entry exists (for HLS segment handler)
+        if let Ok(mut cache) = self.hls_layout_cache.lock() {
+            if let Some(info) = cache.get_mut(&message_id) {
+                info.init_prefix = init_prefix.clone();
+                Some(init_prefix)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve cached HLS layout info for a message.
+    /// Returns None if the manifest endpoint hasn't resolved this message yet.
+    /// Returns (file_size, duration, ts_packet_size, is_m2ts) — init_prefix
+    /// is kept internally but not returned here (use get_init_prefix separately).
+    pub fn get_hls_layout(&self, message_id: i32) -> Option<(u64, f64, u64, bool)> {
+        self.hls_layout_cache.lock().ok().and_then(|cache| cache.get(&message_id).map(|info| (info.file_size, info.duration, info.ts_packet_size, info.is_m2ts)))
+    }
+
+    /// Retrieve the cached init_prefix for a message.
+    /// Returns None if the manifest hasn't been resolved or init_prefix hasn't been extracted.
+    /// Returns Some(empty Vec) if extraction hasn't been attempted yet.
+    /// Checks BOTH standalone init_prefix_cache (MSE mode) and hls_layout_cache (HLS mode).
+    pub fn get_init_prefix(&self, message_id: i32) -> Option<Vec<u8>> {
+        // Check standalone cache first (populated by /stream/ endpoint)
+        if let Ok(standalone) = self.init_prefix_cache.lock() {
+            if let Some(prefix) = standalone.get(&message_id) {
+                if !prefix.is_empty() {
+                    return Some(prefix.clone());
+                }
+            }
+        }
+        // Fall back to hls_layout_cache (populated by HLS manifest endpoint)
+        self.hls_layout_cache.lock().ok().and_then(|cache| cache.get(&message_id).map(|info| info.init_prefix.clone()))
+    }
+
+    /// Retrieve the full cached HLS layout info (including Media) for a message.
+    /// Used by the segment handler to spawn targeted downloads for missing data.
+    pub fn get_hls_layout_full(&self, message_id: i32) -> Option<HlsLayoutInfo> {
+        self.hls_layout_cache.lock().ok().and_then(|cache| cache.get(&message_id).cloned())
     }
 
     /// Open the data file for writing, protected from external deletion.
@@ -388,6 +541,8 @@ impl StreamCacheManager {
                     start_byte: dl.start_byte,
                     end_byte: dl.end_byte,
                     progress_rx: dl.progress_tx.subscribe(),
+                    is_continuation: dl.is_continuation,
+                    cancel_flag: dl.cancel_flag.clone(),
                 });
             }
         }
@@ -433,6 +588,8 @@ impl StreamCacheManager {
             start_byte: dl.start_byte,
             end_byte: dl.end_byte,
             progress_rx: dl.progress_tx.subscribe(),
+            is_continuation: dl.is_continuation,
+            cancel_flag: dl.cancel_flag.clone(),
         })
     }
 
@@ -456,6 +613,8 @@ impl StreamCacheManager {
             start_byte: best.start_byte,
             end_byte: best.end_byte,
             progress_rx: best.progress_tx.subscribe(),
+            is_continuation: best.is_continuation,
+            cancel_flag: best.cancel_flag.clone(),
         })
     }
 
@@ -466,12 +625,25 @@ impl StreamCacheManager {
         downloads.get(&message_id).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Check if there are any active downloads for a message.
+    /// Used by cmd_delete_cache to prevent deleting cache metadata
+    /// while a continuation download is still running.
+    pub async fn has_active_download(&self, message_id: i32) -> bool {
+        let downloads = self.active_downloads.lock().await;
+        downloads.contains_key(&message_id)
+    }
+
     /// Register a new active download for a message. Creates a watch channel
     /// for progress broadcasting. Returns the progress receiver.
     /// Bug #13 fix: Pushes into Vec<ActiveDownload>.
     /// Bug #15 fix: Refuses to register if MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE
     /// is already reached. Caller should use find_nearest_download instead.
-    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64) -> Option<watch::Receiver<u64>> {
+    /// Race condition fix: `initial_progress` initializes the watch channel
+    /// to the actual progress value (not just start_byte). For continuations,
+    /// this is current_offset (already-downloaded bytes from prebuffer), so
+    /// subscribers see accurate progress immediately instead of waiting for
+    /// a separate update_download_progress call.
+    pub async fn register_download(&self, message_id: i32, start_byte: u64, end_byte: u64, is_continuation: bool, initial_progress: u64, source_id: Option<String>) -> Option<ActiveDownloadInfo> {
         let mut downloads = self.active_downloads.lock().await;
         let current_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
         if current_count >= MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE {
@@ -479,20 +651,56 @@ impl StreamCacheManager {
                 MAX_CONCURRENT_DOWNLOADS_PER_MESSAGE, message_id, start_byte, end_byte);
             return None;
         }
-        let (progress_tx, progress_rx) = watch::channel(start_byte);
+        // Cancel old downloads for the same message with different ranges.
+        // When a new /stream request arrives (seek or VBR correction), the old
+        // download from a different byte range is no longer needed. Without this,
+        // the old download continues for 2-4 seconds (zombie) competing for the
+        // rate limiter, slowing down the new download.
+        //
+        // source_id isolation: only cancel zombies from the SAME source_id.
+        // This prevents the thumbnail pipeline's seek from cancelling the main
+        // player's active download (and vice versa). When source_id is None
+        // (backward compat), cancel any same-message download with a different
+        // start_byte — same as the original behaviour.
+        if let Some(dls) = downloads.get_mut(&message_id) {
+            for dl in dls.iter() {
+                if dl.start_byte != start_byte && source_ids_match(&dl.source_id, &source_id) {
+                    log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?})",
+                        message_id, dl.start_byte, dl.end_byte, start_byte, source_id);
+                    dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // Initialize watch channel with initial_progress (not start_byte).
+        // For regular downloads, initial_progress = start_byte (no data yet).
+        // For continuations, initial_progress = current_offset (prebuffer already on disk).
+        // This eliminates the race where subscribers read start_byte=0 before
+        // update_download_progress broadcasts current_offset.
+        let initial_value = initial_progress.max(start_byte);
+        let (progress_tx, progress_rx) = watch::channel(initial_value);
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dl = ActiveDownload {
             start_byte,
             end_byte,
             progress_tx,
-            last_progress: start_byte,
+            last_progress: initial_value,
+            is_continuation,
+            cancel_flag: cancel_flag.clone(),
+            source_id: source_id.clone(),
         };
         downloads.entry(message_id)
             .or_insert_with(Vec::new)
             .push(dl);
         let new_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
-        log::info!("[COORDINATOR] Registered download for msg {} range {}-{} (total active: {})",
-            message_id, start_byte, end_byte, new_count);
-        Some(progress_rx)
+        log::info!("[COORDINATOR] Registered download for msg {} range {}-{} initial_progress={} (total active: {})",
+            message_id, start_byte, end_byte, initial_value, new_count);
+        Some(ActiveDownloadInfo {
+            start_byte,
+            end_byte,
+            progress_rx,
+            is_continuation,
+            cancel_flag,
+        })
     }
 
     /// Update download progress (last byte written to cache). Called by
@@ -622,6 +830,14 @@ impl StreamCacheManager {
                 }
             }
         }
+        // Remove init_prefix from standalone cache (no longer valid after data deletion)
+        if let Ok(mut ipc) = self.init_prefix_cache.lock() {
+            ipc.remove(&message_id);
+        }
+        // Remove HLS layout cache entry (no longer valid after data deletion)
+        if let Ok(mut hlc) = self.hls_layout_cache.lock() {
+            hlc.remove(&message_id);
+        }
         Ok(true)
     }
 
@@ -631,6 +847,99 @@ impl StreamCacheManager {
             std::fs::remove_dir_all(&self.cache_dir)?;
             std::fs::create_dir_all(&self.cache_dir)?;
         }
+        Ok(())
+    }
+
+    /// Robust version of clear_all that handles Windows file-lock issues.
+    ///
+    /// On Windows, `remove_dir_all()` fails entirely if ANY file in the
+    /// directory has an open handle (ERROR_SHARING_VIOLATION). This is
+    /// especially likely because open_data_file_write() opens .dat files
+    /// with FILE_SHARE_READ | FILE_SHARE_WRITE (no FILE_SHARE_DELETE),
+    /// which means even our own handles block deletion.
+    ///
+    /// Strategy: iterate files individually, delete what we can, retry
+    /// locked files after a short delay. Report total freed bytes.
+    pub fn clear_all_robust(&self) -> std::io::Result<()> {
+        if !self.cache_dir.exists() {
+            return Ok(());
+        }
+
+        let mut total_freed: u64 = 0;
+        let mut failed_files: Vec<(PathBuf, std::io::Error)> = Vec::new();
+
+        // Walk the directory tree and delete files one by one
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Handle subdirectories (e.g., remux/)
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
+                            let size = std::fs::metadata(&sub_path).map(|m| m.len()).unwrap_or(0);
+                            match std::fs::remove_file(&sub_path) {
+                                Ok(()) => total_freed += size,
+                                Err(e) => failed_files.push((sub_path, e)),
+                            }
+                        }
+                    }
+                    // Try to remove the now-empty subdirectory
+                    let _ = std::fs::remove_dir(&path);
+                } else {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => total_freed += size,
+                        Err(e) => failed_files.push((path, e)),
+                    }
+                }
+            }
+        }
+
+        // Retry locked files after a short delay (handles race with
+        // file handles closing from server shutdown)
+        if !failed_files.is_empty() {
+            log::info!(
+                "[CACHE] {} files locked on first pass, retrying after 1s...",
+                failed_files.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
+            let still_locked: Vec<_> = failed_files.into_iter().filter(|(path, first_err)| {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        total_freed += size;
+                        false // removed, filter out
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[CACHE] Still can't delete {:?}: {} (first: {})",
+                            path, e, first_err
+                        );
+                        true // still locked
+                    }
+                }
+            }).collect();
+
+            if !still_locked.is_empty() {
+                log::warn!(
+                    "[CACHE] {} files still locked after retry — will be cleaned on next startup",
+                    still_locked.len()
+                );
+            }
+        }
+
+        log::info!(
+            "[CACHE] clear_all_robust: freed {:.1} MB from {:?}",
+            total_freed as f64 / 1e6,
+            self.cache_dir
+        );
+
+        // Try to remove the now-empty cache directory and recreate it
+        let _ = std::fs::remove_dir_all(&self.cache_dir);
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+
         Ok(())
     }
 
@@ -652,6 +961,35 @@ impl StreamCacheManager {
     /// Check if a message has an active background task
     pub async fn has_active_task(&self, message_id: i32) -> bool {
         self.active_tasks.lock().await.contains(&message_id)
+    }
+
+    /// Track a proactive prebuffer task (separate from active_tasks which
+    /// is shared with /stream coordinator — we need an independent tracker)
+    pub async fn track_proactive(&self, message_id: i32) {
+        self.proactive_tasks.lock().await.push(message_id);
+    }
+
+    /// Untrack a proactive prebuffer task
+    pub async fn untrack_proactive(&self, message_id: i32) {
+        self.proactive_tasks.lock().await.retain(|&id| id != message_id);
+    }
+
+    /// Check if a message has an active proactive prebuffer task
+    pub async fn has_proactive_task(&self, message_id: i32) -> bool {
+        self.proactive_tasks.lock().await.contains(&message_id)
+    }
+
+    /// Check if any download (proactive prebuffer OR coordinator-registered) is
+    /// running for a message. Used by /stream cache-poll to detect when no
+    /// downloader exists and fall back to Telegram quickly (5s instead of 30s).
+    pub async fn has_active_download_for_msg(&self, message_id: i32) -> bool {
+        // Check proactive prebuffer first
+        if self.proactive_tasks.lock().await.contains(&message_id) {
+            return true;
+        }
+        // Check coordinator-registered downloads
+        let downloads = self.active_downloads.lock().await;
+        downloads.contains_key(&message_id)
     }
 
     /// Track that a message is currently being streamed (Actix response active).

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::io::{Write, Seek, SeekFrom};
 
 use crate::commands::TelegramState;
+use crate::server::throttle_api_calls;
 use crate::commands::resolve_peer;
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta, merge_ranges, find_gaps};
 use grammers_client::types::Media;
@@ -216,6 +217,13 @@ pub async fn cmd_delete_cache(
     message_id: i32,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
+    // Check for active downloads BEFORE attempting deletion.
+    // The download coordinator uses async mutex, so we check here
+    // (in the async Tauri command) rather than in the sync delete_cache method.
+    if cache_state.has_active_download(message_id).await {
+        return Err("Cache has active download — retry later".to_string());
+    }
+
     let deleted = cache_state
         .delete_cache(message_id)
         .map_err(|e| format!("Failed to delete cache: {}", e))?;
@@ -356,11 +364,12 @@ async fn background_cache_download(
     let chunk_size: i32 = 512 * 1024;
     let transfer_id = format!("bg-cache-{}", message_id);
 
-    // Get DownloadPool for parallel gap-filling of large gaps (>1MB)
-    let pool_clone = { state.download_pool.lock().await.clone() };
+    // Always use sequential iter_download — Telegram triggers FLOOD_PREMIUM_WAIT
+    // on parallel connections (same approach as .mp4 streaming).
+    let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
 
     for (gap_start, gap_end) in gaps {
-        let gap_size = gap_end - gap_start + 1;
+        let _gap_size = gap_end - gap_start + 1;
 
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&transfer_id) {
@@ -368,41 +377,7 @@ async fn background_cache_download(
             return Ok(());
         }
 
-        // Use parallel download for large gaps when DownloadPool is available
-        if let Some(ref pool) = pool_clone {
-            if gap_size > 1024 * 1024 {
-                log::info!("Background cache {}: parallel download gap {}-{} ({:.1}MB)",
-                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0));
-
-                let data = pool.download_range(&media, gap_start, gap_end, total_size).await
-                    .map_err(|e| format!("Parallel gap download error: {}", e))?;
-
-                cache_file
-                    .seek(SeekFrom::Start(gap_start))
-                    .map_err(|e| format!("Seek error: {}", e))?;
-                cache_file
-                    .write_all(&data)
-                    .map_err(|e| format!("Write error: {}", e))?;
-
-                // Update meta (serialized via per-message lock)
-                let _lock = cache_mgr.lock_meta(message_id).await;
-                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                    message_id,
-                    folder_id,
-                    total_size,
-                    filename: filename.clone(),
-                    cached_ranges: Vec::new(),
-                    mime_type: mime_type.clone(),
-                });
-                meta.cached_ranges.push((gap_start, gap_end));
-                merge_ranges(&mut meta.cached_ranges);
-                let _ = cache_mgr.save_meta(&meta);
-
-                continue; // Skip sequential download for this gap
-            }
-        }
-
-        // Sequential iter_download for small gaps or when pool unavailable
+        // Sequential iter_download for all gaps (no parallel pool)
         let skip_chunks = gap_start / chunk_size as u64;
         let skip_bytes = gap_start % chunk_size as u64;
 
@@ -416,6 +391,7 @@ async fn background_cache_download(
 
         while let Ok(Some(chunk_result)) = {
             let _permit = state.download_semaphore.acquire().await.unwrap();
+            throttle_api_calls(&state.rate_limiter).await;
             iter.next().await
         } {
             // Check cancellation
@@ -489,4 +465,645 @@ async fn background_cache_download(
     }
 
     Ok(())
+}
+
+/// Get total cache size on disk (in bytes). Scans all files in the
+/// stream-cache directory including remux/ subdirectory.
+#[tauri::command]
+pub async fn cmd_get_cache_total_size(
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<u64, String> {
+    let cache_dir = cache_state.cache_dir().clone();
+    let mut total: u64 = 0;
+
+    fn scan_dir(dir: &std::path::Path, total: &mut u64) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, total);
+                } else if let Ok(meta) = std::fs::metadata(&path) {
+                    *total += meta.len();
+                }
+            }
+        }
+    }
+
+    scan_dir(&cache_dir, &mut total);
+    Ok(total)
+}
+
+/// Report the current playback position so the backend can proactively
+/// download ahead to disk cache. This ensures that when the MSE player
+/// resumes (lazyLoad or after eviction), data is already on disk and can
+/// be served instantly via CACHE-PREFIX without Telegram network latency.
+///
+/// The frontend calls this every 10s during playback. The backend:
+///   1. Approximates the current byte position from playback time
+///   2. Checks what's already cached on disk
+///   3. Spawns a proactive download task for gaps ahead of the playhead
+///   4. Skips if a download is already running for this message
+#[tauri::command]
+pub async fn cmd_report_playback_position(
+    message_id: i32,
+    folder_id: i64,
+    current_time_s: f64,
+    duration_s: f64,
+    file_size: u64,
+    is_player_downloading: bool,
+    playback_rate: f64,
+    byte_offset: Option<u64>,
+    state: State<'_, TelegramState>,
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<bool, String> {
+    if file_size == 0 {
+        return Ok(false);
+    }
+
+    // Store the player download state so the proactive prebuffer can
+    // throttle itself when the IOController is actively downloading.
+    state.player_actively_downloading.store(is_player_downloading, std::sync::atomic::Ordering::Relaxed);
+
+    // Use the exact byte offset if provided (from VBR correction — the linear
+    // estimate is wrong for VBR video). Fall back to linear estimate otherwise.
+    let current_byte = if let Some(byte) = byte_offset {
+        byte.min(file_size)
+    } else if duration_s > 0.0 {
+        let ratio = (current_time_s / duration_s).clamp(0.0, 1.0);
+        (ratio * file_size as f64) as u64
+    } else {
+        0u64
+    };
+
+    // Store the latest target so a running proactive task can slide its window.
+    state.proactive_targets.write().await.insert(
+        message_id,
+        (current_byte, duration_s, playback_rate, file_size)
+    );
+
+    // Don't start if a proactive prebuffer is already running for this message.
+    // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
+    // download is tracked there too — it would always return true during playback,
+    // preventing the proactive prebuffer from ever starting.
+    if cache_state.has_proactive_task(message_id).await {
+        return Ok(false); // target updated; existing task will use it
+    }
+
+    // Clear any previous cancellation so a new task can start after stop.
+    let proactive_key = format!("proactive-{}", message_id);
+    if state.cancelled_transfers.read().await.contains(&proactive_key) {
+        state.cancelled_transfers.write().await.remove(&proactive_key);
+    }
+
+    // COLD-START GUARD: Only defer PROACTIVE on initial cold start (no byte offset).
+    // On explicit seeks (byte_offset provided), start PROACTIVE immediately —
+    // the 40s ahead offset ensures it won't compete with /stream's bootstrap.
+    if byte_offset.is_none() {
+        if let Some(meta) = cache_state.load_meta(message_id) {
+            if meta.cached_ranges.is_empty() {
+                log::info!("[PROACTIVE] msg {}: cache meta exists but no ranges yet — /stream bootstrap still running, deferring proactive", message_id);
+                return Ok(false);
+            }
+        } else {
+            log::info!("[PROACTIVE] msg {}: no cache meta — /stream bootstrap not started yet, deferring proactive", message_id);
+            return Ok(false);
+        }
+    }
+
+    // Don't start if already fully cached
+    if let Some(meta) = cache_state.load_meta(message_id) {
+        if meta.is_complete() {
+            return Ok(false);
+        }
+    }
+
+    // Check if there are uncached gaps ahead of current position
+    let cached_ranges = cache_state.load_meta(message_id)
+        .map(|m| m.cached_ranges.clone())
+        .unwrap_or_default();
+
+    // Proactive prebuffer downloads the entire remaining file to disk cache (EOF),
+    // decoupled from the in-memory sliding window. It fills gaps from the playhead
+    // all the way to the end of the file, so lazyLoad / resume never stalls waiting
+    // for Telegram after the initial seek.
+    let max_ahead_byte = file_size;
+
+    // Only care about gaps from current_byte onward, capped at max_ahead_byte
+    let ahead_gaps: Vec<(u64, u64)> = find_gaps(&cached_ranges, file_size)
+        .into_iter()
+        .filter(|(_start, end)| *end >= current_byte)
+        .map(|(start, end)| (start.max(current_byte), end.min(max_ahead_byte)))
+        .filter(|(start, end)| *start <= *end)
+        .collect();
+
+    if ahead_gaps.is_empty() {
+        return Ok(false); // Nothing to download ahead
+    }
+
+    let total_ahead_bytes: u64 = ahead_gaps.iter()
+        .map(|(s, e)| e - s + 1)
+        .sum();
+
+    // Only start if there's meaningful work (>2MB ahead)
+    if total_ahead_bytes < 2 * 1024 * 1024 {
+        return Ok(false);
+    }
+
+    log::info!(
+        "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — window to EOF (byte {}) — spawning proactive download",
+        message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len(), max_ahead_byte
+    );
+
+    let client = { state.client.lock().await.clone() }
+        .ok_or("Not connected")?;
+
+    let cache_mgr = cache_state.inner().clone();
+    let tg_state = Arc::new(state.inner().clone());
+
+    cache_mgr.track_proactive(message_id).await;
+
+    tokio::spawn(async move {
+        let result = proactive_prebuffer_download(
+            message_id, folder_id, current_byte, max_ahead_byte, client, tg_state, cache_mgr.clone(),
+        ).await;
+
+        cache_mgr.untrack_proactive(message_id).await;
+
+        match result {
+            Ok(downloaded) => {
+                if downloaded > 0 {
+                    log::info!("[PROACTIVE] msg {}: downloaded {} bytes to disk cache", message_id, downloaded);
+                }
+            }
+            Err(e) => log::warn!("[PROACTIVE] msg {}: download failed: {}", message_id, e),
+        }
+    });
+
+    Ok(true)
+}
+
+/// Stop any proactive prebuffer download for a message (called when
+/// playback stops or switches to a different file).
+#[tauri::command]
+pub async fn cmd_stop_proactive_prebuffer(
+    message_id: i32,
+    state: State<'_, TelegramState>,
+    cache_state: State<'_, StreamCacheManager>,
+) -> Result<bool, String> {
+    let transfer_id = format!("proactive-{}", message_id);
+    state.cancelled_transfers.write().await.insert(transfer_id);
+    cache_state.untrack_proactive(message_id).await;
+    log::info!("[PROACTIVE] msg {}: stopped", message_id);
+    Ok(true)
+}
+
+/// Proactive prebuffer download task — downloads from `start_byte` to
+/// `file_end` to disk cache, filling gaps ahead of the playhead.
+/// Modelled after `background_cache_download` but starts from a specific
+/// byte position (not the beginning of the file).
+async fn proactive_prebuffer_download(
+    message_id: i32,
+    folder_id: i64,
+    start_byte: u64,
+    max_ahead_byte: u64,
+    client: grammers_client::Client,
+    state: Arc<TelegramState>,
+    cache_mgr: StreamCacheManager,
+) -> Result<u64, String> {
+    let transfer_id = format!("proactive-{}", message_id);
+
+    // Retry initial setup (resolve_peer + get_messages) for transient network errors.
+    // Genuine errors like "message not found" or "no media" are not retried.
+    let (_peer, message, media) = {
+        let mut setup_attempt = 0u32;
+        const MAX_SETUP_RETRIES: u32 = 3;
+        loop {
+            match (async {
+                let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
+                let messages = client
+                    .get_messages_by_id(&peer, &[message_id])
+                    .await
+                    .map_err(|e| format!("Failed to fetch message: {}", e))?;
+                let message = messages
+                    .into_iter()
+                    .next()
+                    .ok_or("Message not found")?
+                    .ok_or("Message is empty")?;
+                let media = message.media().ok_or("No media on message")?;
+                Ok::<_, String>((peer, message, media))
+            })
+            .await
+            {
+                Ok(result) => break result,
+                Err(e) => {
+                    // Don't retry genuine errors that won't fix themselves
+                    if e.contains("Message not found")
+                        || e.contains("No media")
+                        || e.contains("Message is empty")
+                    {
+                        return Err(e);
+                    }
+                    setup_attempt += 1;
+                    if setup_attempt >= MAX_SETUP_RETRIES {
+                        return Err(e);
+                    }
+                    let delay = 5000u64 * 2u64.pow(setup_attempt - 1);
+                    log::warn!(
+                        "[PROACTIVE] msg {}: setup attempt {}/{} failed: {}. Retry in {}ms",
+                        message_id, setup_attempt, MAX_SETUP_RETRIES, e, delay
+                    );
+                    // Check cancellation during retry wait
+                    if state
+                        .cancelled_transfers
+                        .read()
+                        .await
+                        .contains(&transfer_id)
+                    {
+                        return Ok(0);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    };
+
+    // Extract total size
+    let total_size: u64 = match &message.raw {
+        tl::enums::Message::Message(m) => match &m.media {
+            Some(tl::enums::MessageMedia::Document(md)) => md
+                .document
+                .as_ref()
+                .and_then(|d| match d {
+                    tl::enums::Document::Document(doc) => Some(doc.size as u64),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    };
+
+    if total_size == 0 {
+        return Err("Could not determine file size".into());
+    }
+
+    // Check what's already cached
+    let existing_meta = cache_mgr.load_meta(message_id);
+    let cached_ranges = existing_meta
+        .as_ref()
+        .map(|m| m.cached_ranges.clone())
+        .unwrap_or_default();
+
+    // Allow the window to slide as the playhead advances while the task runs.
+    let mut start_byte = start_byte;
+    let mut max_ahead_byte = max_ahead_byte;
+
+    let filename = match &media {
+        Media::Document(d) => d.name().to_string(),
+        _ => format!("{}.ts", message_id),
+    };
+    let mime_type = crate::server::mime_type_from_media(&media);
+
+    let mut cache_file = cache_mgr.open_data_file_write(message_id)
+        .map_err(|e| format!("Failed to open cache file: {}", e))?;
+
+    let chunk_size: i32 = 512 * 1024;
+    let mut total_downloaded: u64 = 0;
+
+    // NEVER use DownloadPool for streaming — Telegram triggers FLOOD_PREMIUM_WAIT
+    // on ANY parallel downloads from the same account. Always use sequential
+    // iter_download via the main client (same approach as .mp4 streaming).
+    // The pool exists for non-streaming downloads only.
+    let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
+
+    // Download all gaps sequentially (one Telegram connection).
+    // Re-check gaps periodically as the cache grows from /stream too.
+    // The window slides forward as the frontend reports new playhead positions.
+    let mut idle_cycles: u32 = 0;
+    const MAX_IDLE_CYCLES: u32 = 30; // ~60s idle before exiting (was 15/30s)
+    let mut jumped = false; // Set by inner loop on playhead jump, checked by outer loop
+    let mut last_target_byte: Option<u64> = None; // Track last target across ALL gaps (prevents loop)
+    loop {
+        // Check cancellation
+        if state.cancelled_transfers.read().await.contains(&transfer_id) {
+            log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+            return Ok(total_downloaded);
+        }
+
+        // Re-read latest target from frontend position reports so the window
+        // slides as the playhead advances, instead of being a one-shot fixed window.
+        let (latest_current_byte, _latest_duration_s, _latest_rate, _latest_file_size) = {
+            let targets = state.proactive_targets.read().await;
+            targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
+        };
+
+        // Proactive prebuffer downloads the whole file to disk cache; the window is EOF.
+        // It is intentionally decoupled from the in-memory sliding window.
+        let computed_max_ahead_byte = total_size;
+
+        // Only slide the window forward, never backward — EXCEPT when the user
+        // seeked backward (target changed significantly). In that case, update
+        // start_byte so gap evaluation uses the new (backward) position.
+        // Without this, PROACTIVE keeps prebuffering from the old (forward)
+        // position after a backward seek — the user sees "old prebuffers still growing."
+        if latest_current_byte > start_byte {
+            start_byte = latest_current_byte;
+        } else if latest_current_byte + 10 * 1024 * 1024 < start_byte {
+            // Backward seek detected — target moved >10MB backward.
+            // This is typically a VBR correction that moved the target.
+            // Set jumped=true so the 2s sleep runs, giving /stream time to
+            // download at the corrected position before PROACTIVE starts.
+            // Without this, PROACTIVE downloads at the same time as /stream
+            // (competing for rate limiter = double prebuffer).
+            log::info!("[PROACTIVE] msg {}: backward seek detected: start_byte {} -> {}",
+                message_id, start_byte, latest_current_byte);
+            start_byte = latest_current_byte;
+            jumped = true;
+        }
+        if computed_max_ahead_byte > max_ahead_byte {
+            max_ahead_byte = computed_max_ahead_byte;
+        }
+
+        let current_meta = cache_mgr.load_meta(message_id);
+        let current_ranges = current_meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
+
+        // PROACTIVE should start 40s AHEAD of the seeked point, not AT it.
+        // /stream handles the first ~40s of playback (downloading 2-3 chunks
+        // of 12.5MB each from Telegram), PROACTIVE handles everything after.
+        // 40s = ~25.4MB at average bitrate — this puts PROACTIVE beyond
+        // /stream's 2nd chunk boundary (12.5MB × 2 = 25MB), preventing overlap.
+        // With 20s (12.7MB), PROACTIVE's start falls within /stream's 2nd chunk
+        // → both download the same bytes → compete for rate limiter.
+        // 40s * average_bitrate = 40 * (total_size / duration) bytes
+        //
+        // ONLY apply the 40s offset after a seek jump. On initial playback (no seek),
+        // PROACTIVE should start from byte 0 (or wherever start_byte is) — no offset.
+        // This prevents a gap between /stream (at byte 0) and PROACTIVE (at 40s ahead)
+        // on initial playback, which would leave the first 40s uncached by PROACTIVE.
+        let proactive_start_byte = if jumped && start_byte > 0 {
+            // Seek jump: apply 40s ahead offset
+            if let Some(&(_, dur, _, _)) = state.proactive_targets.read().await.get(&message_id) {
+                if dur > 0.0 {
+                    let ahead_bytes = (40.0 / dur * total_size as f64) as u64;
+                    start_byte.saturating_add(ahead_bytes)
+                } else {
+                    start_byte
+                }
+            } else {
+                start_byte
+            }
+        } else {
+            // Initial playback or sequential gap completion: no offset
+            start_byte
+        };
+
+        let ahead_gaps: Vec<(u64, u64)> = find_gaps(&current_ranges, total_size)
+            .into_iter()
+            .filter(|(gap_start, gap_end)| *gap_end >= proactive_start_byte && *gap_start < max_ahead_byte)
+            .map(|(gap_start, gap_end)| (gap_start.max(proactive_start_byte), gap_end.min(max_ahead_byte)))
+            .filter(|(start, end)| *start <= *end)
+            .collect();
+
+        if ahead_gaps.is_empty() {
+            idle_cycles += 1;
+            if idle_cycles >= MAX_IDLE_CYCLES {
+                log::info!("[PROACTIVE] msg {}: no gaps ahead for {} cycles, exiting", message_id, idle_cycles);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            continue;
+        }
+        idle_cycles = 0;
+
+        // No skip_all_gaps needed — the 40s ahead offset (proactive_start_byte)
+        // already ensures PROACTIVE downloads beyond /stream's reach.
+        // skip_all_gaps was causing a skip-then-download cycle (double prebuffer):
+        //   1st iteration: skip (jumped=true) → 2s sleep
+        //   2nd iteration: download (jumped=false) ← FIRST prebuffer point
+        //   3rd iteration: skip (backward jump) → 2s sleep
+        //   4th iteration: download (jumped=false) ← SECOND prebuffer point
+        // Removing skip_all_gaps eliminates this cycle.
+        jumped = false;
+
+        for (gap_start, gap_end) in ahead_gaps {
+            let gap_size = gap_end - gap_start + 1;
+
+            // No skip_all_gaps — PROACTIVE starts 40s ahead of /stream.
+            // The 40s ahead offset (proactive_start_byte) already prevents overlap.
+
+            if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+                return Ok(total_downloaded);
+            }
+
+            // Always use sequential iter_download — same approach as .mp4 streaming.
+            // Telegram triggers FLOOD_PREMIUM_WAIT on parallel connections.
+            if gap_size > 1024 * 1024 {
+                log::info!(
+                    "[PROACTIVE] msg {}: SEQUENTIAL download gap {}-{} ({:.1}MB)",
+                    message_id, gap_start, gap_end, gap_size as f64 / (1024.0 * 1024.0)
+                );
+                // Yield to /stream for 5 seconds before starting a new gap download,
+                // but ONLY after a seek jump — not on initial startup or sequential
+                // gap completion. Without this check, the 5s yield would delay the
+                // initial prebuffer and slow sequential prebuffering by 5s per gap.
+                //
+                // INTERRUPTIBLE YIELD: Instead of a flat 5s sleep, check every 500ms
+                // if the target byte has changed (VBR correction reported a new byte).
+                // If so, update start_byte immediately so the next gap evaluation uses
+                // the corrected byte — not the linear estimate. This fixes:
+                //   - Concern 1: prebuffer starting points off (PROACTIVE gets corrected byte during yield)
+                //   - Concern 2: seeks not using prebuffer (PROACTIVE prebuffers from correct position)
+                if jumped {
+                    let yield_start = std::time::Instant::now();
+                    let yield_duration = std::time::Duration::from_secs(5);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if yield_start.elapsed() >= yield_duration {
+                            break;
+                        }
+                        // Check if VBR correction reported a new target byte
+                        let (current_target, _, _, _) = {
+                            let targets = state.proactive_targets.read().await;
+                            targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
+                        };
+                        if current_target != start_byte {
+                            log::info!("[PROACTIVE] msg {}: target updated during yield: {} -> {} (VBR correction)", 
+                                message_id, start_byte, current_target);
+                            start_byte = current_target;
+                        }
+                    }
+                    jumped = false;
+                    // If start_byte was updated during the yield (VBR correction),
+                    // the gap was evaluated from the OLD start_byte. Re-evaluate
+                    // by continuing to the next outer loop iteration.
+                    // Also set jumped=true so the next iteration skips the first gap
+                    // (which /stream is now handling at the corrected position).
+                    if start_byte != gap_start {
+                        log::info!("[PROACTIVE] msg {}: start_byte changed during yield ({} -> {}), re-evaluating gaps",
+                            message_id, gap_start, start_byte);
+                        jumped = true; // Ensure first gap is skipped on re-evaluation
+                        break; // break out of the gap loop → outer loop re-evaluates
+                    }
+                }
+            }
+            let skip_bytes = gap_start % chunk_size as u64;
+            let mut offset = gap_start;
+            let mut first_chunk = true;
+            let mut seq_retries = 0u32;
+            const MAX_SEQ_RETRIES: u32 = 5;
+            let mut need_new_iter = true;
+            let mut iter = client
+                .iter_download(&media)
+                .chunk_size(chunk_size)
+                .skip_chunks(0); // placeholder; recreated below
+
+            loop {
+                // (Re)create iterator from current offset when needed (initial or after error)
+                if need_new_iter {
+                    let skip_chunks = offset / chunk_size as u64;
+                    iter = client
+                        .iter_download(&media)
+                        .chunk_size(chunk_size)
+                        .skip_chunks(skip_chunks as i32);
+                    need_new_iter = false;
+                    first_chunk = true;
+                }
+
+                // Check cancellation before each chunk
+                if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                    log::info!("[PROACTIVE] msg {}: cancelled", message_id);
+                    return Ok(total_downloaded);
+                }
+
+                // Check if the playhead has jumped (user seeked) — in EITHER direction.
+                // Forward: target_byte > offset + 10MB (seek ahead)
+                // Backward: target_byte + 10MB < offset AND target changed (new seek, not prebuffering ahead)
+                //
+                // CRITICAL: The backward check must verify the target ACTUALLY CHANGED.
+                // Without this, PROACTIVE creates an infinite loop: it downloads ahead of
+                // the seek target, then the backward check fires (target < offset), jumps
+                // back, yields, re-evaluates, downloads ahead again, jumps back again...
+                // The target only changes on NEW seeks or VBR corrections — not as playback
+                // progresses. So we track last_target_byte and only trigger if it's different.
+                {
+                    let targets = state.proactive_targets.read().await;
+                    if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
+                        // Update last_target_byte FIRST, before any break.
+                        // If we break below, this line must have already run,
+                        // otherwise the next iteration sees stale last_target_byte
+                        // and the backward jump loops forever.
+                        let target_changed = last_target_byte != Some(target_byte);
+                        last_target_byte = Some(target_byte);
+                        
+                        if target_byte > offset + 10 * 1024 * 1024 {
+                            log::info!(
+                                "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
+                                message_id, target_byte, offset
+                            );
+                            jumped = true;
+                            break;
+                        } else if target_byte + 10 * 1024 * 1024 < offset
+                                   && target_changed {
+                            // Backward seek — but ONLY if the target changed (new seek).
+                            // If target hasn't changed, PROACTIVE is just ahead of the
+                            // seek position = normal prebuffering, NOT a backward seek.
+                            log::info!(
+                                "[PROACTIVE] msg {}: playhead jumped backward to byte {} (current offset {}), re-evaluating gaps",
+                                message_id, target_byte, offset
+                            );
+                            jumped = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Use blocking acquire — the 250ms global rate limiter ensures
+                // no FLOOD_PREMIUM_WAIT. After a playhead jump (seek), yield to
+                // /stream for 5 seconds so the seek download gets exclusive
+                // access to the rate limiter. Without this, the proactive and
+                // /stream alternate rate-limited calls, making seeks 2x slower.
+                let chunk_result = {
+                    let _permit = state.download_semaphore.acquire().await.unwrap();
+                    throttle_api_calls(&state.rate_limiter).await;
+                    iter.next().await
+                };
+
+                match chunk_result {
+                    Ok(Some(chunk)) => {
+                        // Reset retry counter on successful chunk
+                        seq_retries = 0;
+
+                        let chunk_slice: &[u8] = if first_chunk && skip_bytes > 0 && offset == gap_start {
+                            let discard = skip_bytes.min(chunk.len() as u64) as usize;
+                            first_chunk = false;
+                            &chunk[discard..]
+                        } else {
+                            first_chunk = false;
+                            &chunk
+                        };
+
+                        let remaining_in_gap = (gap_end - offset + 1) as usize;
+                        let to_write = chunk_slice.len().min(remaining_in_gap);
+
+                        cache_file
+                            .seek(SeekFrom::Start(offset))
+                            .map_err(|e| format!("Seek error: {}", e))?;
+                        cache_file
+                            .write_all(&chunk_slice[..to_write])
+                            .map_err(|e| format!("Write error: {}", e))?;
+
+                        offset += to_write as u64;
+                        total_downloaded += to_write as u64;
+
+                        // Update meta every 1MB (2 chunks × 512KB) for faster
+                        // PREBUFFER HIT detection by /stream handler. Was 4MB.
+                        if offset % (1 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
+                            let _lock = cache_mgr.lock_meta(message_id).await;
+                            let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                                message_id,
+                                folder_id,
+                                total_size,
+                                filename: filename.clone(),
+                                cached_ranges: Vec::new(),
+                                mime_type: mime_type.clone(),
+                            });
+                            meta.cached_ranges.push((gap_start, offset - 1));
+                            merge_ranges(&mut meta.cached_ranges);
+                            let _ = cache_mgr.save_meta(&meta);
+                        }
+
+                        if offset > gap_end {
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // End of stream
+                    Err(e) => {
+                        // Network/error — retry with backoff and recreate iterator
+                        seq_retries += 1;
+                        if seq_retries >= MAX_SEQ_RETRIES {
+                            log::warn!(
+                                "[PROACTIVE] msg {}: download at offset {} failed after {} retries: {}. Stopping gap.",
+                                message_id, offset, MAX_SEQ_RETRIES, e
+                            );
+                            break; // Move to next gap
+                        }
+                        let delay = (2000u64 * 2u64.pow(seq_retries - 1)).min(60_000);
+                        log::warn!(
+                            "[PROACTIVE] msg {}: download error at offset {} (attempt {}/{}): {}. Retry in {}ms",
+                            message_id, offset, seq_retries, MAX_SEQ_RETRIES, e, delay
+                        );
+                        // Check cancellation during retry wait
+                        if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                            return Ok(total_downloaded);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        need_new_iter = true; // Recreate iterator from current offset
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total_downloaded)
 }

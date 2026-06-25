@@ -2,10 +2,10 @@ export interface TelegramFile {
     id: number;
     name: string;
     size: number;
-    sizeStr: string; // Formatted size
+    sizeStr: string;
     created_at?: string;
-    type?: 'folder' | 'file'; // implied icon_type
-    // Add other fields if backend sends them
+    type?: 'folder' | 'file';
+    duration?: number;
 }
 
 export interface TelegramFolder {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-report-playback-position"
+description = "Enables the cmd_report_playback_position command without any pre-configured scope."
+commands.allow = ["cmd_report_playback_position"]
+
+[[permission]]
+identifier = "deny-cmd-report-playback-position"
+description = "Denies the cmd_report_playback_position command without any pre-configured scope."
+commands.deny = ["cmd_report_playback_position"]

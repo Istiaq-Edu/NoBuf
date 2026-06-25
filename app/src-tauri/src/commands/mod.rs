@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicBool};
 use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
@@ -32,10 +32,16 @@ pub struct TelegramState {
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Paths of partial download files — cleaned up on app close.
     pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Serializes all Telegram iter_download calls across player prebuffer and
-    /// file download. Increased from 1 to 4 to allow concurrent streaming +
-    /// background cache + file downloads via the DownloadPool.
+    /// 2 permits: /stream and proactive run concurrently. The global rate
+    /// limiter (Mutex<u64>) ensures ≥250ms between ALL upload.GetFile calls
+    /// across both paths, preventing FLOOD_PREMIUM_WAIT. Downloads overlap
+    /// (while /stream downloads, proactive can throttle+download).
     pub download_semaphore: Arc<Semaphore>,
+    /// Global rate limiter: Mutex-protected timestamp (ms since UNIX_EPOCH)
+    /// of the last upload.GetFile call. The Mutex makes the check-sleep-store
+    /// sequence atomic across concurrent callers, so 2 semaphore permits
+    /// can coexist without races.
+    pub rate_limiter: Arc<tokio::sync::Mutex<u64>>,
     /// Speed limit for prebuffer/streaming in KB/s. 0 = unlimited.
     /// Read by Actix server.rs after each chunk to inject sleep.
     pub prebuffer_speed_limit_kb: Arc<AtomicU64>,
@@ -47,6 +53,22 @@ pub struct TelegramState {
     /// following Telegram's official recommendation for parallel downloads.
     /// Initialized on first successful connection; None until then.
     pub download_pool: Arc<Mutex<Option<DownloadPool>>>,
+    /// Whether the player's IOController is actively downloading (NOT paused by lazyLoad).
+    /// Set by cmd_report_playback_position from the frontend every ~10s.
+    /// When true, the proactive prebuffer throttles itself (100ms delay between
+    /// segments) to yield Telegram bandwidth and avoid FLOOD_PREMIUM_WAIT.
+    /// When false (IOController paused), proactive prebuffer runs at full speed.
+    pub player_actively_downloading: Arc<AtomicBool>,
+    /// Latest proactive prebuffer target for each message. Updated by
+    /// cmd_report_playback_position so the prebuffer task can slide its window
+    /// as the playhead advances instead of being a one-shot fixed-window download.
+    /// (current_byte, duration_s, playback_rate, file_size)
+    pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
+    /// Cache of resolved media objects per message_id. Eliminates repeated
+    /// `get_messages_by_id` API calls (which are unthrottled and contribute
+    /// to FLOOD_PREMIUM_WAIT). The media object doesn't change between requests
+    /// for the same message, so caching is safe.
+    pub media_cache: Arc<tokio::sync::RwLock<HashMap<i32, (grammers_client::types::Media, u64)>>>,
 }
 
 pub mod auth;

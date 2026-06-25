@@ -106,6 +106,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
                     const cleaned = Object.fromEntries(
                         Object.entries(saved).filter(([_, v]) => v !== undefined)
                     ) as Partial<Settings>;
+                    // Never restore playerSpeed from disk: each video starts at 1x
+                    delete cleaned.playerSpeed;
                     setSettings({ ...defaultSettings, ...cleaned });
                 }
             } catch {
@@ -120,7 +122,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     const persistSettings = useCallback(async (next: Settings) => {
         try {
             const store = await load('settings.json');
-            await store.set('settings', next);
+            // playerSpeed is a per-session setting, not persisted across app launches
+            const { playerSpeed: _, ...toPersist } = next;
+            await store.set('settings', toPersist);
             await store.save();
         } catch {
             // best-effort persistence

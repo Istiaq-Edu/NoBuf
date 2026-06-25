@@ -16,23 +16,49 @@ export class SourceBufferWrapper {
    *  calls will fail. Stop processing queue entirely to prevent infinite
    *  cascade of InvalidStateError logs (Bug #4 fix). */
   private fatalError = false;
+  /** Set when QuotaExceededError was hit — download loop should pause. */
+  private quotaExceeded = false;
+
+  private appendCounter = 0;
+  private appendStartTime = 0;
+  private lastAppendSize = 0;
 
   constructor(sourceBuffer: SourceBuffer) {
     this.sourceBuffer = sourceBuffer;
     this.sourceBuffer.addEventListener('updateend', () => {
       this.processing = false;
+      this.appendCounter++;
+      const elapsed = Date.now() - this.appendStartTime;
+      if (this.appendCounter <= 30 || this.appendCounter % 20 === 0) {
+        try {
+          const b = this.sourceBuffer.buffered;
+          let rs = '';
+          for (let i = 0; i < b.length; i++) rs += `[${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}s]`;
+          console.log(`[SBW] updateend #${this.appendCounter}: ${elapsed}ms, ${this.lastAppendSize}B, queue=${this.queue.length}, SB=${rs}`);
+        } catch (_) {}
+      }
       this.processQueue();
     });
     this.sourceBuffer.addEventListener('error', (e) => {
-      console.error('[SourceBuffer] error:', e);
+      console.error('[SourceBuffer] error event:', e, `after ${Date.now() - this.appendStartTime}ms`);
       this.processing = false;
-      // Don't retry after error event — check if it's fatal
       this.checkFatalError();
     });
   }
 
   get buffered(): TimeRanges {
-    return this.sourceBuffer.buffered;
+    try {
+      return this.sourceBuffer.buffered;
+    } catch (e: any) {
+      if (e instanceof DOMException && e.name === 'InvalidStateError' &&
+          e.message?.includes('removed from the parent media source')) {
+        this.fatalError = true;
+        this.queue = [];
+        console.error('[SourceBuffer] SourceBuffer removed from parent MediaSource — marking as fatal');
+      }
+      // Return empty TimeRanges-like object to prevent downstream crashes
+      return { length: 0, start: () => 0, end: () => 0 } as unknown as TimeRanges;
+    }
   }
 
   get updating(): boolean {
@@ -43,6 +69,39 @@ export class SourceBufferWrapper {
    *  no more data can be appended (HTMLMediaElement.error is not null). */
   get hasFatalError(): boolean {
     return this.fatalError;
+  }
+
+  /** Returns true if the last appendBuffer hit QuotaExceededError.
+   *  The download loop should pause until the player consumes buffer. */
+  get isQuotaExceeded(): boolean {
+    return this.quotaExceeded;
+  }
+
+  /** Clear the quota exceeded flag after eviction frees space. */
+  clearQuotaExceeded(): void {
+    this.quotaExceeded = false;
+  }
+
+  /** Set appendWindowStart/End to filter overlap-region frames. */
+  setAppendWindow(start: number, end: number = Infinity): void {
+    try {
+      this.sourceBuffer.appendWindowStart = start;
+      this.sourceBuffer.appendWindowEnd = end;
+    } catch (_) {
+      // Some implementations don't support appendWindow
+    }
+  }
+
+  /** Clear appendWindow (allow all frames). */
+  clearAppendWindow(): void {
+    try {
+      this.sourceBuffer.appendWindowStart = 0;
+      this.sourceBuffer.appendWindowEnd = Infinity;
+    } catch (_) { /* ignore */ }
+  }
+
+  get queueLength(): number {
+    return this.queue.length;
   }
 
   appendBuffer(data: ArrayBuffer): void {
@@ -78,6 +137,8 @@ export class SourceBufferWrapper {
 
     try {
       if (op.type === 'append' && op.data) {
+        this.appendStartTime = Date.now();
+        this.lastAppendSize = op.data.byteLength;
         this.sourceBuffer.appendBuffer(op.data);
       } else if (op.type === 'remove' && op.start !== undefined && op.end !== undefined) {
         this.sourceBuffer.remove(op.start, op.end);
@@ -96,18 +157,29 @@ export class SourceBufferWrapper {
         return;
       }
 
+      // SourceBuffer removed from parent MediaSource — no more operations possible
+      if (e instanceof DOMException && e.name === 'InvalidStateError' &&
+          e.message?.includes('removed from the parent media source')) {
+        this.fatalError = true;
+        this.queue = [];
+        this.processing = false;
+        console.error('[SourceBuffer] SourceBuffer removed from parent MediaSource — marking as fatal');
+        return;
+      }
+
       // Bug #16 fix: QuotaExceededError — SourceBuffer is full and cannot
       // append more data. Stop processing the queue to prevent the infinite
       // retry cascade where each failed append triggers another processQueue
       // call. The next onSegment callback will call evictOldBuffer() BEFORE
       // appendBuffer(), freeing space and resuming queue processing naturally.
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+        this.quotaExceeded = true;
         console.warn('[SourceBuffer] QuotaExceededError — buffer full, stopping queue. Eviction will free space before next append.');
         this.processing = false;
         return;
       }
 
-      console.error('SourceBuffer operation failed:', e);
+      console.error(`[SourceBuffer] operation failed (type=${op.type}, queue=${this.queue.length}):`, e);
       this.processing = false;
       this.processQueue();
     }
@@ -132,8 +204,15 @@ export class SourceBufferWrapper {
       const apply = () => {
         try {
           this.sourceBuffer.timestampOffset = offset;
-        } catch (e) {
-          console.error('[SourceBuffer] Failed to set timestampOffset:', e);
+        } catch (e: any) {
+          if (e instanceof DOMException && e.name === 'InvalidStateError' &&
+              e.message?.includes('removed from the parent media source')) {
+            this.fatalError = true;
+            this.queue = [];
+            console.error('[SourceBuffer] SourceBuffer removed from parent MediaSource — marking as fatal');
+          } else {
+            console.error('[SourceBuffer] Failed to set timestampOffset:', e);
+          }
         }
         resolve();
       };
@@ -156,6 +235,13 @@ export class SourceBufferWrapper {
    *  Does NOT set timestampOffset because mp4box produces absolute timestamps. */
   resetForSeek(): Promise<void> {
     return new Promise<void>((resolve) => {
+      // If SourceBuffer has been removed from parent MediaSource (e.g., MSE
+      // cleanup triggered by fallback to native playback), resolve immediately.
+      if (this.fatalError) {
+        resolve();
+        return;
+      }
+
       // Clear pending operations
       this.queue = [];
       this.processing = false;
@@ -170,23 +256,55 @@ export class SourceBufferWrapper {
   }
 
   private _removeAllAndFinish(callback: () => void): void {
-    const buffered = this.sourceBuffer.buffered;
-    if (buffered.length === 0) {
-      callback();
-      return;
-    }
-
-    const onDone = () => {
-      this.sourceBuffer.removeEventListener('updateend', onDone);
-      callback();
-    };
-    this.sourceBuffer.addEventListener('updateend', onDone, { once: true });
     try {
-      this.sourceBuffer.remove(buffered.start(0), buffered.end(buffered.length - 1));
-    } catch (_) {
-      this.sourceBuffer.removeEventListener('updateend', onDone);
+      const buffered = this.sourceBuffer.buffered;
+      if (buffered.length === 0) {
+        callback();
+        return;
+      }
+
+      const onDone = () => {
+        this.sourceBuffer.removeEventListener('updateend', onDone);
+        callback();
+      };
+      this.sourceBuffer.addEventListener('updateend', onDone, { once: true });
+      try {
+        this.sourceBuffer.remove(buffered.start(0), buffered.end(buffered.length - 1));
+      } catch (_) {
+        this.sourceBuffer.removeEventListener('updateend', onDone);
+        callback();
+      }
+    } catch (e) {
+      // SourceBuffer removed from parent MediaSource (InvalidStateError) —
+      // can't read .buffered or remove data. Just resolve immediately.
       callback();
     }
+  }
+
+  /** Wait for all queued operations to complete (queue empty + not processing).
+   *  Used after flushing multiple appendBuffer calls to ensure all data
+   *  is actually available in the SourceBuffer before setting currentTime. */
+  waitForQueueDrain(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const checkAndResolve = () => {
+        // Fatal error — no more operations will process, resolve immediately
+        if (this.fatalError) {
+          resolve();
+          return;
+        }
+        if (this.queue.length === 0 && !this.processing) {
+          resolve();
+        } else {
+          // Queue not empty or still processing — wait for next updateend
+          this.sourceBuffer.addEventListener('updateend', () => {
+            // After updateend, processQueue may have started the next item.
+            // Re-check after a micro-task to see if queue truly drained.
+            setTimeout(checkAndResolve, 0);
+          }, { once: true });
+        }
+      };
+      checkAndResolve();
+    });
   }
 
   destroy(): void {
