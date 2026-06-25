@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-set-speed-limits"
+description = "Enables the cmd_set_speed_limits command without any pre-configured scope."
+commands.allow = ["cmd_set_speed_limits"]
+
+[[permission]]
+identifier = "deny-cmd-set-speed-limits"
+description = "Denies the cmd_set_speed_limits command without any pre-configured scope."
+commands.deny = ["cmd_set_speed_limits"]

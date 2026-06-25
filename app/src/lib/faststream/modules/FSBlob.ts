@@ -17,6 +17,10 @@ export class FSBlob {
         return;
       }
       this.db = await this.openDB();
+      // Clear stale data from previous sessions — prevents unbounded
+      // growth of IndexedDB blobs (video/audio segments) across sessions.
+      // Fresh data will be cached as needed during playback.
+      this.clearStaleData();
     } catch (e) {
       console.warn('FSBlob IndexedDB setup failed, falling back to memory', e);
       this.db = null;
@@ -114,6 +118,19 @@ export class FSBlob {
       } catch (e) {
         // Ignore
       }
+    }
+  }
+
+  /** Clear stale data from previous sessions — called on startup.
+   *  Prevents unbounded IndexedDB growth across sessions. */
+  private clearStaleData(): void {
+    if (!this.db) return;
+    try {
+      const tx = this.db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).clear();
+      console.log('[FSBlob] Cleared stale IndexedDB blobs from previous session');
+    } catch (e) {
+      // Ignore — memory-only fallback still works
     }
   }
 }

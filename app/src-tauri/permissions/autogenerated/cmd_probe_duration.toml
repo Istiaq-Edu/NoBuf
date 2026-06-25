@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-probe-duration"
+description = "Enables the cmd_probe_duration command without any pre-configured scope."
+commands.allow = ["cmd_probe_duration"]
+
+[[permission]]
+identifier = "deny-cmd-probe-duration"
+description = "Denies the cmd_probe_duration command without any pre-configured scope."
+commands.deny = ["cmd_probe_duration"]

@@ -39,7 +39,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [vol, setVol] = useState(1);
   const [muted, setMuted] = useState(false);
   const [rate, setRate] = useState(settings.playerSpeed);
-  const [buf, setBuf] = useState(0);
+
+  // Reset playback speed to the (non-persistent) default every time a new video is opened.
+  useEffect(() => {
+    setRate(settings.playerSpeed);
+  }, [file.id, settings.playerSpeed]);
+  const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   // Track the actual URL set as <video>.src for diagnostic display
@@ -77,6 +82,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const [cacheComplete, setCacheComplete] = useState(false);
   // Time ranges from backend cache (includes both playback buffer + download)
   const [cachedTimeRanges, setCachedTimeRanges] = useState<[number, number][]>([]);
+  // SourceBuffer memory ranges — updated by 'progress' event on <video>
+  // for real-time white bar rendering (not dependent on React re-renders)
+  const [bufferedRanges, setBufferedRanges] = useState<[number, number][]>([]);
+  // Maximum time position with cached data — used to prevent thumbnail
+  // extractor from seeking beyond available data (which causes 503 → fatal error)
+  const maxCachedTime = cachedTimeRanges.length > 0
+    ? Math.max(...cachedTimeRanges.map(r => r[1]))
+    : 0;
   const [controlsHeight, setControlsHeight] = useState(0);
   const [miniBarVisible, setMiniBarVisible] = useState(false);
 
@@ -86,56 +99,127 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const dlTransferIdRef = useRef<string>('');
   const dismissTimerRef = useRef<number>(0);
 
-  // MSE player with native fallback
+  // MSE player handles ALL formats (MP4/MKV/WebM/TS).
+  // TS files now use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
+  // keyframe seeking instead of hls.js. This eliminates MISS-FAR targeted
+  // downloads at seek positions — same "seek poison" approach as .mp4 files.
+
+  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId);
+
+  // MSE player handles ALL formats (MP4, TS, MKV, WebM).
+  // TS files use MediabunnyTransmuxer instead of hls.js.
+
+  // Merge into unified player interface — MSE player handles everything
+  const player = {
+    mseUrl: msePlayer.mseUrl,
+    error: msePlayer.error,
+    useNative: msePlayer.useNative,
+    remuxUrl: msePlayer.remuxUrl,
+    unsupportedCodec: msePlayer.unsupportedCodec,
+    prefetchedBytes: msePlayer.prefetchedBytes,
+    totalBytes: msePlayer.totalBytes,
+    isPrefetching: msePlayer.isPrefetching,
+    isPaused: msePlayer.isPaused,
+    isComplete: msePlayer.isComplete,
+    speed: msePlayer.speed,
+    pausePrefetch: msePlayer.pausePrefetch,
+    resumePrefetch: msePlayer.resumePrefetch,
+    seekTo: msePlayer.seekTo,
+    suppressLoadingSpinnerRef: msePlayer.suppressLoadingSpinnerRef,
+    setVideoRef: msePlayer.setVideoRef,
+    downloadedTimeRanges: msePlayer.downloadedTimeRanges,
+    byteToTime: msePlayer.byteToTime,
+    setSuppressBackendReports: msePlayer.setSuppressBackendReports,
+    thumbnailDataReady: msePlayer.thumbnailDataReady,
+    moovBufferReady: msePlayer.moovBufferReady,
+    isTransmuxer: msePlayer.isTransmuxer,
+    isTransmuxerActive: msePlayer.isTransmuxerActive,
+    keyframeIndexReady: msePlayer.keyframeIndexReady,
+    coldStartProgress: msePlayer.coldStartProgress,
+    isColdStartBuffering: msePlayer.isColdStartBuffering,
+    getMoovBuffer: msePlayer.getMoovBuffer,
+    getFirstChunk: msePlayer.getFirstChunk,
+    getInitSegments: msePlayer.getInitSegments,
+    getVideoTrackInfo: msePlayer.getVideoTrackInfo,
+    getMP4BoxClass: msePlayer.getMP4BoxClass,
+    getFileLength: msePlayer.getFileLength,
+    getFormat: msePlayer.getFormat,
+    getKeyframeTimestamps: msePlayer.getKeyframeTimestamps,
+    getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets,
+    getTsHeaderData: msePlayer.getTsHeaderData,
+    getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig,
+  };
+
   const {
-    mseUrl,
-    error: mseError,
-    useNative,
-    unsupportedCodec,
+    mseUrl: playerMseUrl,
+    error: playerError,
+    useNative: playerUseNative,
+    remuxUrl: playerRemuxUrl,
+    unsupportedCodec: playerUnsupportedCodec,
     prefetchedBytes,
     totalBytes,
     isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
-    speed,
+    speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
     pausePrefetch,
     resumePrefetch,
     seekTo,
+    suppressLoadingSpinnerRef,
     setVideoRef,
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
     setSuppressBackendReports,
-    getMoovBuffer,
-    getFirstChunk,
-    getInitSegments,
-    getVideoTrackInfo,
-    getMP4BoxClass,
-    getFileLength,
     thumbnailDataReady,
     moovBufferReady,
-  } = useMSEPlayer(streamUrl, file, activeFolderId);
+    isTransmuxer,
+    isTransmuxerActive: _isTransmuxerActive,
+    keyframeIndexReady: _keyframeIndexReady,
+    isColdStartBuffering,
+    coldStartProgress,
+  } = player;
 
-  // Native playback fallback: when MSE fails (e.g., codec not supported),
+  // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
+  // snap off the moment the buffer gate completes. Playback starts immediately
+  // underneath the overlay; the overlay is purely informational progress.
+  const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
+  // Ref mirror so event handlers (onMeta/onCanPlay) inside the useEffect
+  // closure can check the current cold-start state without re-registering.
+  // Without this, the handlers capture a stale `isColdStartBuffering=false`
+  // and call v.play() before the 5 MB buffer gate resolves, defeating the
+  // cold-start prebuffer and starting playback under the overlay.
+  const coldStartBufferingRef = useRef(false);
+  coldStartBufferingRef.current = isColdStartBuffering;
+  useEffect(() => {
+    if (isColdStartBuffering) {
+      setShowColdStartOverlay(true);
+    } else if (showColdStartOverlay) {
+      setShowColdStartOverlay(false);
+    }
+  }, [isColdStartBuffering, showColdStartOverlay]);
+
+  // Native playback fallback: when MSE/HLS fails (e.g., codec not supported),
   // the player falls back to native <video> using streamUrl directly.
-  // Only show error if there's an actual error from the MSE player, not just
+  // Only show error if there's an actual error from the player, not just
   // because native mode is active.
   useEffect(() => {
-    if (unsupportedCodec) {
-      setErr(unsupportedCodec);
+    if (playerUnsupportedCodec) {
+      setErr(playerUnsupportedCodec);
       setLoad(false);
-    } else if (useNative && mseError && !mseUrl) {
-      setErr(mseError);
+    } else if (playerUseNative && playerError && !playerMseUrl) {
+      setErr(playerError);
       setLoad(false);
     }
-  }, [useNative, mseUrl, mseError, unsupportedCodec]);
+  }, [playerUseNative, playerMseUrl, playerError, playerUnsupportedCodec]);
 
-  // Thumbnail extractor — ref-based hover processor + synchronous cache check
-  // useMemo stabilizes mseGetters so the effect in useThumbnailExtractor doesn't re-run on every render
+  // Thumbnail extractor — all formats use MSE-based extraction now
+  // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
+  // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength,
-  }), [getMoovBuffer, getFirstChunk, getInitSegments, getVideoTrackInfo, getMP4BoxClass, getFileLength]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config]);
 
-  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, useNative, mseGetters, thumbnailDataReady, moovBufferReady);
+  const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const [thumbLoading, setThumbLoading] = useState(false);
   const lastThumbTimeRef = useRef<number>(-1);
@@ -246,34 +330,107 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // (which would create an infinite loop: poll → update → state change → effect re-run → new poll → ...)
   const cacheSessionRef = useRef(cacheSession);
   cacheSessionRef.current = cacheSession;
+  // shadowCacheModRef removed — shadow cache ranges are no longer shown on the green bar
 
-  // Poll cache status every 5 seconds while playing — also updates session tracker
+  // Poll cache status for green bar — updates every 500ms for near-realtime feel.
+  // Merges disk cache ranges (from backend) with shadow cache ranges (from JS memory)
+  // Also computes the GREEN BAR download speed (actual Telegram download speed),
+  // not the white bar speed (which is now just local disk reads).
+  const greenBarSpeedHistoryRef = useRef<{ bytes: number; time: number }[]>([]);
+  const [greenBarSpeed, setGreenBarSpeed] = useState(0);
+
   useEffect(() => {
     let active = true;
+    let lastCachedBytes = 0;
     const poll = async () => {
       while (active) {
         try {
-          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+          // Skip cache status polling during seek/VBR correction.
+          // The initial /stream download at the linear estimate shows on the green bar,
+          // then VBR correction flushes it → green bar disappears → confusing flash.
+          // Wait until seek completes (__nobuf_userSeekInProgress = false) before polling.
+          if ((window as any).__nobuf_userSeekInProgress !== true) {
+            const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
+
+            // ── Green bar download speed (actual Telegram speed) ──
+            // Compute from cached_bytes delta over time, using a 5-second sliding window
+            const now = Date.now();
+            const cachedBytes: number = status.cached_bytes ?? 0;
+            if (lastCachedBytes > 0 && cachedBytes > lastCachedBytes) {
+              const delta = cachedBytes - lastCachedBytes;
+              const hist = greenBarSpeedHistoryRef.current;
+              hist.push({ bytes: delta, time: now });
+              // Keep last 5 seconds of history
+              while (hist.length > 0 && hist[0].time < now - 5000) hist.shift();
+              if (hist.length >= 2) {
+                const totalBytes = hist.reduce((s, e) => s + e.bytes, 0);
+                const dt = (hist[hist.length - 1].time - hist[0].time) / 1000;
+                if (dt > 0.3) {
+                  setGreenBarSpeed(totalBytes / dt);
+                }
+              }
+            }
+            if (cachedBytes > 0) lastCachedBytes = cachedBytes;
+            // Reset speed when cache is complete (no more downloading)
+            if (status.is_complete) {
+              setGreenBarSpeed(0);
+              lastCachedBytes = 0;
+              greenBarSpeedHistoryRef.current = [];
+            }
+
             // Update session cache tracker via ref (avoids re-triggering this effect)
             const cs = cacheSessionRef.current;
             if (cs.getCacheInfo(file.id) && status.percentage > 0) {
               cs.updateCachePercent(file.id, status.percentage);
             }
-            if (status.cached_ranges && durRef.current > 0 && status.total_bytes > 0) {
-              const ranges: [number, number][] = status.cached_ranges.map(
-                ([s, e]: [number, number]) => [
-                  byteToTime(s),
-                  byteToTime(e + 1),
-                ]
-              );
-              setCachedTimeRanges(ranges);
+          }
+          // Build ranges from BOTH backend + shadow cache, regardless of status
+          // Use real duration if available, fall back to estimate for green bar calculation
+          const durForBar = durRef.current || (window as any).__nobuf_estimateDuration || 0;
+          const ranges: [number, number][] = [];
+
+          // Backend ranges (disk cache) — only show ranges ahead of playhead
+          if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
+            for (const [s, e] of status.cached_ranges as [number, number][]) {
+              ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
           }
+
+          // Shadow cache ranges are NOT shown on the green bar.
+          // The shadow cache is in-memory data already shown by the white bar
+          // (bufferedRanges from v.buffered). Showing it on the green bar is:
+          // 1. Redundant (same data, different color)
+          // 2. Wrong for VBR (byteToTime uses linear mapping when keyframe
+          //    table is empty, which is always for TS files because the backend
+          //    keyframe scanner can't build the index from sparse cached data)
+          // 3. Misleading (shows data that's NOT on disk as "prebuffer")
+          // The green bar should ONLY show disk cache (cmd_get_cache_status)
+          // — the ACTUAL prebuffered data on local disk.
+          // Merge overlapping ranges
+          if (ranges.length > 0) {
+            const sorted = ranges.sort((a, b) => a[0] - b[0]);
+            const merged: [number, number][] = [];
+            for (const r of sorted) {
+              // Merge overlapping ranges with tight tolerance (0.01s).
+              // Do NOT bridge the gap between /stream and PROACTIVE ranges.
+              // The gap should be EMPTY — no fake fill. The user sees two
+              // separate green bars: one at the seek point (/stream) and one
+              // 40s ahead (PROACTIVE). As /stream progresses, the first bar
+              // grows until it meets the second bar, then they merge naturally.
+              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
+                merged.push([r[0], r[1]]);
+              } else {
+                merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
+              }
+            }
+            setCachedTimeRanges(merged);
+          }
+          } // end if (!__nobuf_userSeekInProgress)
         } catch { /* ignore */ }
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, 500));
       }
     };
     poll();
@@ -308,12 +465,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         try {
           const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
-            const ranges: [number, number][] = status.cached_ranges.map(
-              ([s, e]: [number, number]) => [
-                byteToTime(s),
-                byteToTime(e + 1),
-              ]
-            );
+            const ranges: [number, number][] = status.cached_ranges
+              .map(([s, e]: [number, number]) => [byteToTime(s), byteToTime(e + 1)]);
             setCachedTimeRanges(ranges);
           }
         } catch { /* ignore */ }
@@ -330,8 +483,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // Download handler — player prebuffer and file download run simultaneously,
   // interleaved at the Rust level via a Semaphore(1) that serializes all Telegram
   // iter_download calls. Only one chunk request hits Telegram at a time → no FLOOD_WAIT.
-  // Green bar merges player's in-memory ranges (downloadedTimeRanges) and download's
-  // cache ranges (cachedTimeRanges from cmd_get_cache_status polling).
+  // Green bar = disk cache (cachedTimeRanges from cmd_get_cache_status polling).
+  // Gray/White bar = in-memory SourceBuffer (video.buffered — instant seeks).
+  // Yellow bar = thumbnail coverage.
   const handleDownload = useCallback(async () => {
     try {
       const savePath = await save({ defaultPath: file.name });
@@ -415,55 +569,171 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const v = vidRef.current;
     if (!v) return;
 
-    // Pass video element to MSE hook for seek currentTime setting
+    // Pass video element to player hook
     setVideoRef(v);
 
-    // MSE mode uses a Blob URL (same-origin, bypasses WebView2 restrictions).
-    // Native fallback uses streamUrl directly — the Actix streaming server
-    // now includes CORS headers with Access-Control-Allow-Private-Network: true,
-    // allowing cross-port localhost requests under Chromium's LNA/PNA restrictions.
-    // Native <video> handles moov-at-end files via Range requests naturally
-    // (browser requests moov from tail first). Works in both dev and production
-    // thanks to tauri-plugin-localhost (app runs from http://localhost, same-origin
-    // with the streaming server).
-    const videoUrl = useNative ? streamUrl : mseUrl;
-    if (!videoUrl) return;
+    // Video src assignment depends on playback mode:
+    // - MSE mode (ALL formats including TS): uses Blob URL (same-origin, bypasses WebView2 restrictions)
+    //   Native fallback uses streamUrl directly — the Actix streaming server
+    //   includes CORS headers with Access-Control-Allow-Private-Network: true.
+    //   TS files use MSE transmuxer (MediabunnyTransmuxer) instead of hls.js.
+    if (playerUseNative) {
+      // Native fallback: use remux URL (ffmpeg TS→MP4) if available, otherwise raw streamUrl
+      // Two strategies in the /remux/ endpoint:
+      //   Strategy A (file cached): disk remux with faststart → moov has correct duration
+      //   Strategy B (not cached): piped fMP4 → empty_moov with duration=0
+      // For Strategy B, we must override the player UI duration from metadata.
+      const nativeUrl = playerRemuxUrl || streamUrl;
+      console.log('[Player] Native fallback: setting video src to', nativeUrl === playerRemuxUrl ? 'remux URL' : 'streamUrl');
 
-    console.log('[Player] Setting video src:', videoUrl, 'useNative:', useNative);
-    v.src = videoUrl;
-    setLastVideoSrc(videoUrl);
-    v.autoplay = true;
+      // For remux URLs: Override the player UI duration with the KNOWN duration.
+      // When the file is NOT cached, the /remux/ endpoint streams piped fMP4
+      // with empty_moov (duration=0 in moov box). Chrome reads this as
+      // "live streaming" and video.duration shows ~3s. Override from metadata.
+      // When the file IS cached, faststart moov has the correct duration
+      // and Chrome gets it right — the override is harmless (same value).
+      if (nativeUrl === playerRemuxUrl && file) {
+        let knownDuration = 0;
+        // Priority 1: Telegram metadata duration
+        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
+          knownDuration = file.duration;
+        }
+        // Priority 2: PTS-based duration from backend metadata endpoint
+        if (knownDuration <= 0 && (window as any).__nobuf_ptsDuration > 0) {
+          knownDuration = (window as any).__nobuf_ptsDuration;
+        }
+        // Priority 3: Bitrate estimation from file size (unreliable for TS)
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8; // bits / bitrate = seconds
+        }
+        if (knownDuration > 0) {
+          console.log('[Player] Remux: overriding duration to', knownDuration.toFixed(1), 's');
+          setDur(knownDuration);
+          durRef.current = knownDuration;
+        }
+      }
+
+      v.src = nativeUrl;
+      setLastVideoSrc(nativeUrl);
+      v.autoplay = true;
+    } else {
+      // MSE mode (ALL formats): use Blob URL
+      // For mpegts.js (TS files), mseUrl is null because mpegts.js creates
+      // its own MediaSource and sets video.src internally. We must NOT
+      // skip event listener setup — just skip the src assignment.
+      const videoUrl = playerMseUrl;
+      if (videoUrl) {
+        console.log('[Player] Setting video src:', videoUrl);
+        v.src = videoUrl;
+        setLastVideoSrc(videoUrl);
+      } else {
+        console.log('[Player] MSE URL is null (mpegts.js mode) — skipping video.src, mpegts.js will set it');
+        // mpegts.js will set video.src after attachMediaElement()
+        // Mark as MSE blob URL for the durationchange guard
+        setLastVideoSrc('mpegts://internal');
+      }
+      // NEVER set v.autoplay in MSE mode. For TS files, playerMseUrl goes
+      // null→blobUrl→null as mpegts.js initializes. The blobUrl run would
+      // set autoplay=true, and the browser would auto-play when the first
+      // fMP4 segment is appended — before the 5 MB cold-start gate
+      // resolves. For MP4, the onMeta/onCanPlay handlers call v.play()
+      // explicitly. For TS, player.play() is called after the gate.
+      v.autoplay = false;
+    }
 
     const onMeta = () => {
       console.log('[Player] loadedmetadata, duration:', v.duration, 'readyState:', v.readyState);
-      setDur(v.duration);
-      durRef.current = v.duration;
+      // For TS files via mpegts.js: video.duration is often Infinity
+      // because TS has no global duration header. Override with known duration.
+      // Priority: (1) Telegram metadata, (2) PTS-based from backend /fmp4/metadata/,
+      // (3) file.size bitrate estimate (last resort, often wrong for TS)
+      if (!isFinite(v.duration) && file) {
+        let knownDuration = 0;
+        const isEstimateSource = !file.duration && !(window as any).__nobuf_ptsDuration;
+        if (file.duration && file.duration > 0 && isFinite(file.duration)) {
+          knownDuration = file.duration;
+        }
+        if (knownDuration <= 0 && (window as any).__nobuf_ptsDuration > 0) {
+          knownDuration = (window as any).__nobuf_ptsDuration; // PTS-based from tail scan
+        }
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8; // ~4Mbps estimate (unreliable for TS)
+        }
+        if (knownDuration > 0) {
+          console.log('[Player] MPEGTS: overriding Infinity duration to', knownDuration.toFixed(1), 's (source:', file.duration ? 'Telegram' : (window as any).__nobuf_ptsDuration ? 'PTS-tail' : '4Mbps-estimate', ')');
+          if (isEstimateSource) {
+            // 4Mbps estimate — DO NOT show in UI (user wants 0 until real PTS arrives).
+            // Keep the estimate in __nobuf_estimateDuration for seek bar range
+            // calculation, but leave dur state at 0.
+            (window as any).__nobuf_durationIsEstimate = true;
+            (window as any).__nobuf_estimateDuration = knownDuration;
+            // setDur stays at 0 — UI shows "0:00 / 0:00" until real PTS
+            // durRef.current stays at 0 — shrink guard won't block real PTS
+          } else {
+            (window as any).__nobuf_durationIsEstimate = false;
+            setDur(knownDuration);
+            durRef.current = knownDuration;
+          }
+        }
+      } else {
+        // For remux URLs in piped mode: video.duration is unreliable (empty_moov = ~3s).
+        // If we already set a metadata-provided duration, don't let video.duration
+        // overwrite it. For cached mode, video.duration is correct from faststart moov.
+        // For mpegts.js, if the only duration we have is the 4 Mbps estimate, keep
+        // the UI at 0:00 until the real PTS duration arrives.
+        const isRemux = lastVideoSrc === playerRemuxUrl;
+        const realDuration = (file?.duration && file.duration > 0 && isFinite(file.duration))
+          ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
+        const isEstimate = (window as any).__nobuf_durationIsEstimate === true && realDuration <= 0;
+        if (!isRemux || v.duration > durRef.current) {
+          if (isEstimate) {
+            (window as any).__nobuf_estimateDuration = v.duration;
+          } else {
+            setDur(v.duration);
+            durRef.current = v.duration;
+          }
+        }
+      }
       setVol(v.volume);
       setMuted(v.muted);
       setVideoResolution({ w: v.videoWidth, h: v.videoHeight });
       v.playbackRate = settings.playerSpeed;
       v.loop = loop;
       setLoad(false);
-      // Ensure playback starts (autoplay may be blocked by browser)
-      v.play().catch((e) => console.warn('[Player] play() failed:', e));
+      // Don't start playback during cold-start buffering — the gate in
+      // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
+      // is cached. Starting here would play under the overlay with thin buffer.
+      if (!coldStartBufferingRef.current) {
+        v.play().catch((e) => console.warn('[Player] play() failed:', e));
+      }
     };
     const onCanPlay = () => {
+      // Update buffered ranges on canplay (first data available)
+      const ranges: [number, number][] = [];
+      for (let i = 0; i < v.buffered.length; i++) {
+        ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+      }
+      if (ranges.length > 0) setBufferedRanges(ranges);
       // Don't auto-play when the replay overlay is showing — the MSE guard
       // already paused the video and dispatched 'ended'. canplay fires from
       // the currentTime change, and calling play() here would resume playback
       // under the overlay, eventually causing the video to hit 'waiting' at
       // duration (the "loading on finish" bug).
       if (videoEndedRef.current) return;
+      // Same cold-start gate as onMeta — don't play before the buffer gate.
+      if (coldStartBufferingRef.current) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
       const err = v.error;
       console.error('[Player] video error:', err?.code, err?.message, 'src:', v.src);
-      setErr(mseError || `Video error: ${err?.message || 'unknown'}`);
+      setErr(playerError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
     const onTime = () => {
-      setTime(v.currentTime);
+      const ct = v.currentTime;
+      if (!isFinite(ct)) return; // guard against NaN after eviction/resume
+      setTime(ct);
       // Get the furthest buffered position
       if (v.buffered.length > 0) {
         let maxBuf = 0;
@@ -472,6 +742,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         }
         setBuf(maxBuf);
       }
+      // Update SourceBuffer memory ranges for white bar (every timeupdate = ~250ms)
+      const ranges: [number, number][] = [];
+      for (let i = 0; i < v.buffered.length; i++) {
+        ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+      }
+      setBufferedRanges(ranges);
     };
     const onPlay = () => {
       setPlaying(true);
@@ -493,10 +769,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     };
     const onPause = () => setPlaying(false);
     const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
-    const onWait = () => setLoad(true);
+    const onWait = () => { if (!suppressLoadingSpinnerRef.current) setLoad(true); };
     const onPlay2 = () => setLoad(false);
     const onProgress = () => {
-      // Update buffer on progress events too
+      // Update buffer end for UI
       if (v.buffered.length > 0) {
         let maxBuf = 0;
         for (let i = 0; i < v.buffered.length; i++) {
@@ -504,6 +780,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         }
         setBuf(maxBuf);
       }
+      // Update SourceBuffer memory ranges for white bar (real-time)
+      const ranges: [number, number][] = [];
+      for (let i = 0; i < v.buffered.length; i++) {
+        ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+      }
+      setBufferedRanges(ranges);
     };
 
     v.addEventListener('loadedmetadata', onMeta);
@@ -516,8 +798,109 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
     v.addEventListener('progress', onProgress);
+    const onDurChange = () => {
+      if (!file) return;
+
+      // Authoritative duration sources (highest priority first):
+      // 1. Telegram metadata attached to the file object
+      // 2. PTS-based tail-scan duration reported by the backend
+      // The 4 Mbps filesize estimate is NEVER authoritative and must never be
+      // used as a floor for the real duration.
+      const realDuration = (file.duration && file.duration > 0 && isFinite(file.duration))
+        ? file.duration
+        : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
+
+      const isRemux = lastVideoSrc === playerRemuxUrl;
+
+      if (isFinite(v.duration) && v.duration > 0) {
+        // Overflow guard: mpegts.js can report ~2^32/1000 ≈ 4294967s after aborts.
+        const isOverflow = realDuration > 0 && v.duration > realDuration * 1.5;
+        const clampedDur = isOverflow ? realDuration : v.duration;
+
+        // Real metadata/PTS duration is the hard floor. If mpegts.js recalculates
+        // duration from the current buffer only (e.g., 153s instead of 2073s),
+        // restore the authoritative value.
+        const safeDur = (realDuration > 0 && clampedDur < realDuration) ? realDuration : clampedDur;
+
+        if (!isRemux || safeDur > durRef.current) {
+          const isEstimate = (window as any).__nobuf_durationIsEstimate === true;
+
+          if (safeDur !== v.duration) {
+            console.warn('[Player] durationchange corrected:', v.duration, '→', safeDur, '(real:', realDuration, ')');
+          } else {
+            console.log('[Player] durationchange:', safeDur, 's (was:', durRef.current, ')');
+          }
+
+          if (realDuration <= 0 && isEstimate) {
+            // Still only the 4 Mbps estimate: keep the UI at 0:00 until real PTS
+            // arrives, but store the estimate for the seek-bar range.
+            (window as any).__nobuf_estimateDuration = safeDur;
+          } else {
+            setDur(safeDur);
+            durRef.current = safeDur;
+            (window as any).__nobuf_durationIsEstimate = false;
+          }
+        }
+      } else if (!isFinite(v.duration)) {
+        // mpegts.js reports Infinity before metadata arrives. Override from the
+        // best available source; fall back to the 4 Mbps estimate only if needed.
+        let knownDuration = realDuration;
+        let isEstimate = realDuration <= 0;
+
+        if (knownDuration <= 0 && file.size > 0) {
+          knownDuration = (file.size / 4_000_000) * 8; // unreliable for TS
+          isEstimate = true;
+        }
+
+        if (knownDuration > 0) {
+          const source = isEstimate ? '4Mbps' : (file.duration ? 'Telegram' : 'PTS-tail');
+          console.log('[Player] durationchange Infinity → override:', knownDuration.toFixed(1), 's (source:', source, ')');
+
+          if (isEstimate) {
+            (window as any).__nobuf_durationIsEstimate = true;
+            (window as any).__nobuf_estimateDuration = knownDuration;
+            // Don't set durRef/setDur — wait for the real PTS duration.
+          } else {
+            (window as any).__nobuf_durationIsEstimate = false;
+            setDur(knownDuration);
+            durRef.current = knownDuration;
+          }
+        }
+      }
+    };
+    v.addEventListener('durationchange', onDurChange);
+
+    // ── rAF-based buffered ranges polling ──
+    // SourceBuffer.remove() and appendBuffer() don't fire 'progress' or
+    // 'timeupdate'. After BUFFER_FULL eviction, the white bar shows stale
+    // data until the next video event. Poll video.buffered every ~250ms
+    // via requestAnimationFrame to ensure real-time bar updates.
+    let rafId = 0;
+    let lastPollTime = 0;
+    const pollBuffered = (now: number) => {
+      if (now - lastPollTime >= 250) {
+        lastPollTime = now;
+        // Suppress buffered ranges update during seek/VBR correction.
+        // The initial /stream download goes to the linear estimate (wrong position),
+        // shows on the progress bar, then VBR correction flushes SourceBuffers →
+        // the indicator disappears. This flash is confusing. Instead, keep the
+        // old ranges until VBR correction completes and the video is playing
+        // from the correct position.
+        if ((window as any).__nobuf_userSeekInProgress !== true) {
+          const ranges: [number, number][] = [];
+          for (let i = 0; i < v.buffered.length; i++) {
+            ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+          }
+          setBufferedRanges(ranges);
+        }
+      }
+      rafId = requestAnimationFrame(pollBuffered);
+    };
+    rafId = requestAnimationFrame(pollBuffered);
+
     return () => {
       setVideoRef(null);
+      cancelAnimationFrame(rafId);
       v.removeEventListener('loadedmetadata', onMeta);
       v.removeEventListener('canplay', onCanPlay);
       v.removeEventListener('error', onErr);
@@ -528,8 +911,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
       v.removeEventListener('progress', onProgress);
+      v.removeEventListener('durationchange', onDurChange);
     };
-  }, [streamUrl, mseUrl, useNative, setVideoRef]);
+  }, [streamUrl, playerMseUrl, playerUseNative, playerRemuxUrl, setVideoRef]);
 
   // Buffer state is already updated by timeupdate and progress events above
 
@@ -624,14 +1008,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     if (!v) return;
     setVideoEnded(false);
     videoEndedRef.current = false;
-    if (useNative) {
+    if (playerUseNative) {
       v.play().catch(() => {});
     } else {
       seekTo(0);
       // seekTo sets pendingSeek + restarts download loop; video.play() starts playback
       v.play().catch(() => {});
     }
-  }, [useNative, seekTo]);
+  }, [playerUseNative, seekTo]);
 
   useEffect(() => {
     if (pip && vidRef.current) {
@@ -659,7 +1043,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const v = vidRef.current;
     if (!v) return;
     const target = Math.max(0, Math.min(v.currentTime + s, dur));
-    if (useNative) {
+    if (playerUseNative) {
       v.currentTime = target;
     } else if (target >= dur) {
       // Seeking to/past the end → directly show replay overlay.
@@ -676,7 +1060,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     } else {
       seekTo(target);
     }
-  }, [dur, useNative, seekTo]);
+  }, [dur, playerUseNative, seekTo]);
   const seekFwd = useCallback(() => {
     // When replay overlay is showing, ignore forward seeks — the video
     // has already ended. Pressing space/k calls replay() via toggle().
@@ -728,7 +1112,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     }
     const r = barRef.current.getBoundingClientRect();
     const targetTime = ((e.clientX - r.left) / r.width) * dur;
-    if (useNative) {
+    if (playerUseNative) {
       vidRef.current.currentTime = targetTime;
     } else if (targetTime >= dur) {
       vidRef.current.currentTime = dur;
@@ -740,7 +1124,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     } else {
       seekTo(targetTime);
     }
-  }, [dur, useNative, seekTo]);
+  }, [dur, playerUseNative, seekTo]);
 
   const tipRafRef = useRef(0);
   const hoverDebounceRef = useRef(0);
@@ -768,21 +1152,32 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         clearTimeout(hoverDebounceRef.current);
         clearDesiredHover();
       } else {
-        // Not cached: show spinner immediately, but delay the on-demand seek
-        // by 1 second. This prevents accidental/sweep hovers from triggering
-        // expensive network seeks. If the user stays at this position for 1s,
-        // the hover processor starts generating the thumbnail.
-        setThumbUrl(null);
-        setThumbLoading(true);
+        // Not cached: show spinner if thumbnails CAN be generated.
+        // - Native mode: hidden video can seek to any position
+        // - MP4 MSE: mini pipeline + moov buffer enables on-demand capture
+        // - Transmuxer (MKV/TS): second transmuxer instance + hidden video + MSE
+        // - TS via fMP4 backend: Fmp4ThumbnailPipeline (backend /fmp4/segment)
+        const canGenerateThumbnails = playerUseNative
+          || (thumbnailDataReady && moovBufferReady)
+          || isTransmuxer()
+          || (thumbnailDataReady && mseGetters?.isFmp4Stream());
+        if (canGenerateThumbnails) {
+          setThumbUrl(null);
+          setThumbLoading(true);
 
-        // Cancel previous debounce timer
-        clearTimeout(hoverDebounceRef.current);
-        hoverDebounceRef.current = window.setTimeout(() => {
-          setDesiredHoverTime(hoverTime);
-        }, 1000);
+          // Cancel previous debounce timer
+          clearTimeout(hoverDebounceRef.current);
+          hoverDebounceRef.current = window.setTimeout(() => {
+            setDesiredHoverTime(hoverTime);
+          }, 1000);
+        } else {
+          setThumbUrl(null);
+          setThumbLoading(false);
+          clearDesiredHover();
+        }
       }
     }
-  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover]);
+  }, [dur, getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, thumbnailDataReady, moovBufferReady, mseGetters]);
 
   // Keyboard
   useEffect(() => {
@@ -811,7 +1206,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   }, [toggle, seek, setVol2, mute, fs2, handleClose, onNext, onPrev, vol, rate, rate2, dur]);
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
-  const bufPct = dur > 0 ? (buf / dur) * 100 : 0;
 
   return (
     <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex flex-col select-none">
@@ -820,7 +1214,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         {err ? (
           <div className="text-center px-8">
             <div className="text-amber-400 text-lg mb-2">{err}</div>
-            {unsupportedCodec ? (
+            {playerUnsupportedCodec ? (
               <div className="flex gap-3 justify-center">
                 <button onClick={handleDownload} className="px-4 py-2 bg-nobuf-primary/15 hover:bg-nobuf-primary/25 text-nobuf-primary rounded-lg transition-colors">Download Video</button>
                 <button onClick={handleClose} className="px-4 py-2 bg-white/10 hover:bg-white/20 text-nobuf-subtext rounded-lg transition-colors">Close</button>
@@ -847,6 +1241,26 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+          </div>
+        )}
+        {/* Cold-start optimization overlay — hidden as soon as the byte target is reached */}
+        {showColdStartOverlay && !err && (
+          <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${isColdStartBuffering ? 'opacity-100' : 'opacity-0'}`}>
+            <div className="flex flex-col items-center gap-4 max-w-md px-6">
+              <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
+              <div className="text-center">
+                <div className="text-white text-lg font-semibold mb-1">Optimizing video for No Buffer playback</div>
+                <div className="text-white/60 text-sm font-mono">
+                  {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+                </div>
+              </div>
+              <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-nobuf-primary rounded-full transition-all duration-300"
+                  style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
+                />
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -878,43 +1292,67 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             setTip(p => ({ ...p, show: false }));
             clearTimeout(hoverDebounceRef.current);
             clearDesiredHover();
+            // Clear thumbnail loading state — spinner should disappear
+            // immediately when mouse leaves the progress bar
+            setThumbLoading(false);
+            setThumbUrl(null);
+            lastThumbTimeRef.current = -1;
           }}
         >
           {/* Visual bar track */}
           <div className="relative h-4 bg-white/20 rounded-full group-hover:h-5 transition-all">
-            {/* Green buffer bar — all locally available data (SourceBuffer + disk cache) */}
-            {(() => {
-              const vid = vidRef.current;
-              const bufferedRanges: [number, number][] = [];
-              if (vid && vid.buffered && vid.buffered.length > 0) {
-                for (let i = 0; i < vid.buffered.length; i++) {
-                  bufferedRanges.push([vid.buffered.start(i), vid.buffered.end(i)]);
-                }
-              }
-              const merged = [...bufferedRanges, ...cachedTimeRanges];
-              if (merged.length === 0 || dur <= 0) return null;
-              const sorted = merged.sort((a, b) => a[0] - b[0]);
-              const deduped: [number, number][] = [];
-              for (const r of sorted) {
-                if (deduped.length === 0 || r[0] > deduped[deduped.length - 1][1] + 0.01) {
-                  deduped.push(r);
-                } else {
-                  deduped[deduped.length - 1][1] = Math.max(deduped[deduped.length - 1][1], r[1]);
-                }
-              }
-              return deduped.map(([ts, te], i) => {
+            {/* White bar — SourceBuffer memory (in-memory data visible to the player).
+                Shows the ENTIRE SourceBuffer range: from start to end of each buffered
+                range (both behind and ahead of playhead). This represents the 10min
+                backward + 10min forward buffer window. Base layer (z-0) so red bar
+                draws on top.
+                Updated in real-time via 'progress' and 'timeupdate' events. */}
+            {bufferedRanges.length > 0 && dur > 0 && (() => {
+              return bufferedRanges.map(([ts, te], i) => {
                 const leftPct = (ts / dur) * 100;
                 const widthPct = ((te - ts) / dur) * 100;
                 return (
                   <div
-                    key={`buf-${i}`}
+                    key={`mem-${i}`}
+                    className="absolute inset-y-0 bg-white/40 rounded-full z-0"
+                    style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.15)}%` }}
+                  />
+                );
+              });
+            })()}
+            {/* Playback position (red) — z-10, ON TOP of white bar */}
+            <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full z-10" style={{ width: `${pct}%` }} />
+            {/* Green bar — disk + shadow cache (thin, above red bar, bottom edge) */}
+            {cachedTimeRanges.length > 0 && dur > 0 && (() => {
+              // Merge overlapping cached ranges
+              const sorted = [...cachedTimeRanges].sort((a, b) => a[0] - b[0]);
+              const merged: [number, number][] = [];
+              for (const r of sorted) {
+                // Merge overlapping ranges with tight tolerance (0.01s).
+                // Do NOT bridge the gap between /stream and PROACTIVE ranges.
+                // The gap should be EMPTY — no fake fill. The user sees two
+                // separate green bars: one at the seek point (/stream) and one
+                // 40s ahead (PROACTIVE). As /stream progresses, the first bar
+                // grows until it meets the second bar, then they merge naturally.
+                if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
+                  merged.push([r[0], r[1]]);
+                } else {
+                  merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
+                }
+              }
+              return merged.map(([ts, te], i) => {
+                const leftPct = (ts / dur) * 100;
+                const widthPct = ((te - ts) / dur) * 100;
+                return (
+                  <div
+                    key={`cache-${i}`}
                     className="absolute bottom-0 h-[3px] bg-green-400/70 rounded-full z-20"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* Preview thumbnail coverage — yellow bar, hover-only */}
+            {/* Preview thumbnail coverage — yellow bar (thin, above red bar, top edge) */}
             {cachedTimes.size > 0 && dur > 0 && (() => {
               // Group consecutive cached times into segments
               const sorted = Array.from(cachedTimes).sort((a, b) => a - b);
@@ -938,18 +1376,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 return (
                   <div
                     key={i}
-                    className="absolute top-0 h-[3px] bg-yellow-400/70 rounded-full z-10"
+                    className="absolute top-0 h-[3px] bg-yellow-400/70 rounded-full z-30"
                     style={{ left: `${leftPct}%`, width: `${Math.max(widthPct, 0.2)}%` }}
                   />
                 );
               });
             })()}
-            {/* MSE buffer indicator */}
-            <div className="absolute inset-y-0 left-0 bg-white/30 rounded-full" style={{ width: `${bufPct}%` }} />
-            {/* Playback position */}
-            <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
             {/* Knob */}
-            <div className="absolute w-4 h-4 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
+            <div className="absolute w-4 h-4 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-40" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
           </div>
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {
@@ -1016,25 +1450,80 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <span className="text-white text-xs font-mono ml-1">{fmt(time)} / {fmt(dur)}</span>
           </div>
           <div className="flex items-center gap-1">
-            {/* FastStream Buffer control button */}
-            {(isPrefetching || prefetchPaused || prefetchComplete || prefetchedBytes > 0) && (
-              <button
-                onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
-                className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1"
-                title={prefetchPaused ? 'Resume buffering' : prefetchComplete ? 'Buffering complete' : 'Pause buffering'}
-              >
-                {prefetchPaused ? (
-                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                ) : prefetchComplete ? (
-                  <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
-                ) : (
-                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
-                )}
-                <span className="text-xs">
-                  {prefetchComplete ? 'Done' : `${formatBytes(prefetchedBytes)}${speed > 0 ? ` (${formatSpeed(speed)})` : ''}`}
-                </span>
-              </button>
-            )}
+            {/* Prebuffer controller — download speed from Telegram */}
+            {(() => {
+              const vid = vidRef.current;
+              const curTime = vid?.currentTime ?? 0;
+              // Calculate SourceBuffer ahead
+              let sbAhead = 0;
+              if (vid?.buffered && vid.buffered.length > 0) {
+                for (let i = 0; i < vid.buffered.length; i++) {
+                  if (vid.buffered.end(i) > curTime) {
+                    sbAhead += vid.buffered.end(i) - Math.max(vid.buffered.start(i), curTime);
+                  }
+                }
+              }
+              // Calculate disk cache ahead (green bar data beyond SourceBuffer)
+              let cacheAhead = 0;
+              if (cachedTimeRanges.length > 0 && dur > 0) {
+                for (const [s, e] of cachedTimeRanges) {
+                  if (e > curTime) {
+                    cacheAhead += e - Math.max(s, curTime);
+                  }
+                }
+              }
+              cacheAhead = Math.max(0, cacheAhead - sbAhead);
+              const totalAhead = sbAhead + cacheAhead;
+
+              // Buffer health color
+              const healthColor = totalAhead > 300 ? 'text-green-400'
+                : totalAhead > 60 ? 'text-yellow-400'
+                : totalAhead > 10 ? 'text-orange-400'
+                : 'text-red-400';
+
+              // Progress toward full file (disk cache)
+              const cacheProgress = totalBytes > 0 ? Math.min(1, prefetchedBytes / totalBytes) : 0;
+              const showController = isPrefetching || prefetchPaused || prefetchComplete || prefetchedBytes > 0 || sbAhead > 0;
+
+              if (!showController) return null;
+
+              return (
+                <div className="flex items-center gap-2 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
+                  {/* Play/Pause buffering icon */}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
+                    className="hover:bg-white/10 rounded p-0.5"
+                    title={prefetchPaused ? 'Resume buffering' : prefetchComplete ? 'Buffering complete' : 'Pause buffering'}
+                  >
+                    {prefetchPaused ? (
+                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                    ) : prefetchComplete ? (
+                      <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
+                    ) : (
+                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                    )}
+                  </button>
+
+                  {/* Buffer ahead */}
+                  <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
+                    {totalAhead >= 60 ? `${(totalAhead / 60).toFixed(1)}m` : `${totalAhead.toFixed(0)}s`}
+                  </span>
+
+                  {/* Mini progress bar: cache fill */}
+                  <div className="w-10 h-1.5 bg-white/10 rounded-full overflow-hidden" title={`${formatBytes(prefetchedBytes)} / ${formatBytes(totalBytes)} cached`}>
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${prefetchComplete ? 'bg-green-400' : 'bg-nobuf-primary'}`}
+                      style={{ width: `${cacheProgress * 100}%` }}
+                    />
+                  </div>
+
+                  {/* Download speed from Telegram (green bar / proactive prebuffer) */}
+                  <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
+                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+                  </span>
+                </div>
+              );
+            })()}
             {/* Prebuffer speed limit indicator */}
             {settings.prebufferSpeedLimit > 0 && (
               <button

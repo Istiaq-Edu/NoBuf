@@ -37,6 +37,7 @@ fn main() {
                 "cmd_delete_cache",
                 "cmd_start_background_cache",
                 "cmd_stop_background_cache",
+                "cmd_probe_duration",
             ])),
     )
     .unwrap();

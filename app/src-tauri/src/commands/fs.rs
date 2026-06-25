@@ -16,6 +16,26 @@ use std::io::{Read, Seek, SeekFrom, Write};
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
+fn extract_duration(doc: &tl::enums::Document) -> Option<f64> {
+    if let tl::enums::Document::Document(d) = doc {
+        for attr in &d.attributes {
+            match attr {
+                tl::enums::DocumentAttribute::Video(v) => return Some(v.duration),
+                tl::enums::DocumentAttribute::Audio(a) => return Some(a.duration as f64),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn extract_duration_from_media(d: &Media) -> Option<f64> {
+    match d {
+        Media::Document(doc) => doc.raw.document.as_ref().and_then(extract_duration),
+        _ => None,
+    }
+}
+
 /// Rename a NoBuf folder (channel). Updates the Telegram channel title
 /// and appends the [NB] tag if missing. Updates peer cache.
 #[tauri::command]
@@ -354,7 +374,11 @@ pub async fn cmd_upload_file(
     }
 
     let uploaded_file = upload_result.map_err(map_error)?;
-    let message = InputMessage::new().text("").file(uploaded_file);
+    // Use .document() instead of .file() — .file() sets force_file:true
+    // which causes Telegram to strip DocumentAttributeVideo, losing the
+    // duration metadata needed for HLS/fMP4 playback.  .document() sets
+    // force_file:false so Telegram preserves video attributes.
+    let message = InputMessage::new().text("").document(uploaded_file);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
@@ -904,20 +928,20 @@ pub async fn cmd_get_files(
 
     let mut msgs = client.iter_messages(&peer);
     while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
-        if let Some(doc) = msg.media() {
-            let (name, size, mime, ext) = match doc {
+    if let Some(doc) = msg.media() {
+            let (name, size, mime, ext, duration) = match &doc {
                 Media::Document(d) => {
                     let n = d.name().to_string();
                     let s = d.size();
                     let m = d.mime_type().map(|s| s.to_string());
                     let e = std::path::Path::new(&n).extension().map(|os| os.to_str().unwrap_or("").to_string());
-                    (n, s, m, e)
+                    (n, s, m, e, extract_duration_from_media(&doc))
                 },
-                Media::Photo(_) => ("Photo.jpg".to_string(), 0, Some("image/jpeg".into()), Some("jpg".into())),
-                _ => ("Unknown".to_string(), 0, None, None),
+                Media::Photo(_) => ("Photo.jpg".to_string(), 0, Some("image/jpeg".into()), Some("jpg".into()), None),
+                _ => ("Unknown".to_string(), 0, None, None, None),
             };
             files.push(FileMetadata {
-                id: msg.id() as i64, folder_id, name, size: size as u64, mime_type: mime, file_ext: ext, created_at: msg.date().to_string(), icon_type: "file".into()
+                id: msg.id() as i64, folder_id, name, size: size as u64, mime_type: mime, file_ext: ext, created_at: msg.date().to_string(), icon_type: "file".into(), duration
             });
         }
     }
@@ -966,6 +990,7 @@ pub async fn cmd_search_global(
                         let size = doc.size as u64;
                         let mime = doc.mime_type.clone();
                         let ext = std::path::Path::new(&name).extension().map(|os| os.to_str().unwrap_or("").to_string());
+                        let duration = extract_duration(&tl::enums::Document::Document(doc.clone()));
                         let folder_id = match m.peer_id {
                             tl::enums::Peer::Channel(c) => Some(c.channel_id),
                             tl::enums::Peer::User(u) => Some(u.user_id),
@@ -974,7 +999,7 @@ pub async fn cmd_search_global(
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
-                            created_at: m.date.to_string(), icon_type: "file".into()
+                            created_at: m.date.to_string(), icon_type: "file".into(), duration
                         });
                     }
                 }
@@ -992,6 +1017,7 @@ pub async fn cmd_search_global(
                         let size = doc.size as u64;
                         let mime = doc.mime_type.clone();
                         let ext = std::path::Path::new(&name).extension().map(|os| os.to_str().unwrap_or("").to_string());
+                        let duration = extract_duration(&tl::enums::Document::Document(doc.clone()));
                         let folder_id = match m.peer_id {
                             tl::enums::Peer::Channel(c) => Some(c.channel_id),
                             tl::enums::Peer::User(u) => Some(u.user_id),
@@ -1000,7 +1026,7 @@ pub async fn cmd_search_global(
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
-                            created_at: m.date.to_string(), icon_type: "file".into()
+                            created_at: m.date.to_string(), icon_type: "file".into(), duration
                         });
                     }
                 }
