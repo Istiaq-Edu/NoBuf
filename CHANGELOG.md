@@ -2,11 +2,21 @@
 
 All notable changes to NoBuf will be documented in this file.
 
+## [0.7.0] - 2026-06-26
+
+### Features
+
+- Add About page and bump version to 0.6.0
+
 ## [0.6.0] - 2026-06-26
 
 ### Bug Fixes
 
 - Mock navigator for CI — sanitizeFilename tests pass in Node
+
+### Documentation
+
+- Update CHANGELOG.md for v0.6.0
 
 ### Features
 
