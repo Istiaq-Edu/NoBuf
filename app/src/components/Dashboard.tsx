@@ -21,6 +21,7 @@ import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
+import { AboutPage } from './dashboard/AboutPage';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -52,6 +53,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [selectedIds, setSelectedIds] = useState<number[]>([]);
     const [showMoveModal, setShowMoveModal] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+    const [showAbout, setShowAbout] = useState(false);
     const [showRemoteUpload, setShowRemoteUpload] = useState(false);
     const [showTransferPanel, setShowTransferPanel] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
@@ -539,6 +541,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     searchTerm={searchTerm}
                     onSearchChange={setSearchTerm}
                     onSettingsClick={() => setShowSettings(true)}
+                    onAboutClick={() => setShowAbout(true)}
                     onRemoteUpload={() => setShowRemoteUpload(true)}
                     onToggleTransfers={() => setShowTransferPanel(p => !p)}
                     showTransferPanel={showTransferPanel}
@@ -611,6 +614,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <AnimatePresence>
                 {showSettings && (
                     <SettingsPage onClose={() => setShowSettings(false)} onLogout={handleLogout} />
+                )}
+            </AnimatePresence>
+
+            <AnimatePresence>
+                {showAbout && (
+                    <AboutPage onClose={() => setShowAbout(false)} />
                 )}
             </AnimatePresence>
         </div>
