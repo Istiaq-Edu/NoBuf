@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
 import { TelegramFile, BandwidthStats } from '../types';
-import { formatBytes, isMediaFile, isPdfFile, getFileCategory, ALL_FILE_CATEGORIES } from '../utils';
+import { formatBytes, isMediaFile, isPdfFile, isArchiveFile, getFileCategory, ALL_FILE_CATEGORIES } from '../utils';
 
 // Components
 import { Sidebar } from './dashboard/Sidebar';
@@ -14,9 +14,11 @@ import { FileExplorer } from './dashboard/FileExplorer';
 import { TransferPanel } from './dashboard/TransferPanel';
 import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
+import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
+import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
 
@@ -37,8 +39,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
 
     const {
-        store, folders, activeFolderId, setActiveFolderId, isSyncing, isConnected,
-        handleLogout, handleSyncFolders, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
+        store, folders, activeFolderId, setActiveFolderId, isConnected,
+        handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
     } = useTelegramConnection(onLogout);
 
 
@@ -50,6 +52,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [selectedIds, setSelectedIds] = useState<number[]>([]);
     const [showMoveModal, setShowMoveModal] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+    const [showRemoteUpload, setShowRemoteUpload] = useState(false);
     const [showTransferPanel, setShowTransferPanel] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
@@ -77,6 +80,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
+    const [archiveFile, setArchiveFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
@@ -121,7 +125,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
@@ -289,19 +293,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
         const isMedia = isMediaFile(file.name);
         const isPdf = isPdfFile(file.name);
+        const isArchive = isArchiveFile(file.name);
 
         if (isMedia) {
             setPlayingFile(file);
             setPreviewFile(null);
             setPdfFile(null);
+            setArchiveFile(null);
         } else if (isPdf) {
             setPdfFile(file);
             setPreviewFile(null);
             setPlayingFile(null);
+            setArchiveFile(null);
+        } else if (isArchive) {
+            setArchiveFile(file);
+            setPreviewFile(null);
+            setPlayingFile(null);
+            setPdfFile(null);
         } else {
             setPreviewFile(file);
             setPlayingFile(null);
             setPdfFile(null);
+            setArchiveFile(null);
         }
     };
 
@@ -452,6 +465,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         key="move-modal"
                     />
                 )}
+                <RemoteUploadModal
+                    open={showRemoteUpload}
+                    onClose={() => setShowRemoteUpload(false)}
+                    onSubmit={handleRemoteUpload}
+                />
                 {playingFile && (
                     <MediaPlayer
                         file={playingFile}
@@ -478,6 +496,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         key="pdf-viewer"
                     />
                 )}
+                {archiveFile && (
+                    <ArchiveViewerModal
+                        file={archiveFile}
+                        activeFolderId={activeFolderId}
+                        onClose={() => setArchiveFile(null)}
+                    />
+                )}
                 {isDragging && internalDragFileId === null && <DragDropOverlay key="drag-drop-overlay" />}
             </AnimatePresence>
 
@@ -493,10 +518,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onRename={handleFolderRename}
                 onReorder={handleFolderReorder}
                 onCreate={handleCreateFolder}
-                isSyncing={isSyncing}
                 isConnected={isConnected}
-                onSync={handleSyncFolders}
-                onLogout={handleLogout}
                 bandwidth={bandwidth || null}
                 collapsed={sidebarCollapsed}
                 onToggleCollapse={toggleSidebar}
@@ -517,6 +539,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     searchTerm={searchTerm}
                     onSearchChange={setSearchTerm}
                     onSettingsClick={() => setShowSettings(true)}
+                    onRemoteUpload={() => setShowRemoteUpload(true)}
                     onToggleTransfers={() => setShowTransferPanel(p => !p)}
                     showTransferPanel={showTransferPanel}
                     uploadActiveCount={uploadActiveCount}
@@ -546,6 +569,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                     onPreview={handlePreview}
                     onManualUpload={handleManualUpload}
+                    onFolderUpload={handleFolderUpload}
                     onSelectionClear={() => setSelectedIds([])}
                     onToggleSelection={handleToggleSelection}
                     onDrop={handleDropOnFolder}
@@ -586,7 +610,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <AnimatePresence>
                 {showSettings && (
-                    <SettingsPage onClose={() => setShowSettings(false)} />
+                    <SettingsPage onClose={() => setShowSettings(false)} onLogout={handleLogout} />
                 )}
             </AnimatePresence>
         </div>

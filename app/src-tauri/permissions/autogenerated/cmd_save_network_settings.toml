@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-save-network-settings"
+description = "Enables the cmd_save_network_settings command without any pre-configured scope."
+commands.allow = ["cmd_save_network_settings"]
+
+[[permission]]
+identifier = "deny-cmd-save-network-settings"
+description = "Denies the cmd_save_network_settings command without any pre-configured scope."
+commands.deny = ["cmd_save_network_settings"]

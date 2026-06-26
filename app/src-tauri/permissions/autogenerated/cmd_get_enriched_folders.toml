@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-enriched-folders"
+description = "Enables the cmd_get_enriched_folders command without any pre-configured scope."
+commands.allow = ["cmd_get_enriched_folders"]
+
+[[permission]]
+identifier = "deny-cmd-get-enriched-folders"
+description = "Denies the cmd_get_enriched_folders command without any pre-configured scope."
+commands.deny = ["cmd_get_enriched_folders"]

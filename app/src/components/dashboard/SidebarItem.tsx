@@ -1,5 +1,13 @@
 import { useState, useRef, useEffect } from 'react';
-import { Plus, Pencil, Trash2, Check, X } from 'lucide-react';
+import { Plus, Pencil, Trash2, Check, X, FolderInput } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+
+interface FolderGroup {
+    id: number;
+    name: string;
+    color_hex: string;
+    display_order: number;
+}
 
 interface SidebarItemProps {
     icon: React.ElementType;
@@ -9,6 +17,9 @@ interface SidebarItemProps {
     onDrop: (e: React.DragEvent) => void;
     onDelete?: () => void;
     onRename?: (newName: string) => void;
+    onAssignGroup?: (groupId: number | null) => void;
+    currentGroupId?: number | null;
+    groupColor?: string | null;
     /** Folder reorder drag — only for folders (folderId !== null). */
     onFolderDragStart?: (e: React.DragEvent) => void;
     onFolderDragOver?: (e: React.DragEvent) => void;
@@ -27,7 +38,7 @@ interface SidebarItemProps {
 const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 
 export function SidebarItem({
-    icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename,
+    icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename, onAssignGroup, currentGroupId, groupColor,
     onFolderDragStart, onFolderDragOver, onFolderDragLeave, onFolderDrop, onFolderDragEnd,
     reorderIndicator, isFirst, isLast, folderId, collapsed
 }: SidebarItemProps) {
@@ -36,6 +47,8 @@ export function SidebarItem({
     const [renameValue, setRenameValue] = useState(label);
     const [showContextMenu, setShowContextMenu] = useState(false);
     const [contextMenuPos, setContextMenuPos] = useState({ x: 0, y: 0 });
+    const [showGroupSubmenu, setShowGroupSubmenu] = useState(false);
+    const [availableGroups, setAvailableGroups] = useState<FolderGroup[]>([]);
     const inputRef = useRef<HTMLInputElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
 
@@ -164,14 +177,17 @@ export function SidebarItem({
                 }}
                 title={collapsed ? label : undefined}
                 // When this item is the reorder drop target, add a subtle shift animation
-                className={`group w-full flex items-center rounded-lg text-sm font-medium transition-all duration-150 overflow-hidden ${collapsed ? 'relative justify-center py-2' : 'px-3 py-2 gap-3'} ${active
+                className={`group flex items-center rounded-lg text-sm font-medium transition-all duration-150 shrink-0 ${collapsed ? 'relative justify-center w-8 h-8' : 'w-full px-3 py-2 gap-3'} ${active
                     ? 'bg-nobuf-primary/10 text-nobuf-primary'
                     : isOver
                         ? 'bg-nobuf-primary/30 text-nobuf-text ring-2 ring-nobuf-primary scale-[1.02] shadow-lg'
                         : 'text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text'
                     } ${isFolder && !isRenaming && !collapsed ? 'cursor-grab active:cursor-grabbing' : ''}`}
             >
-                <Icon className={`w-4 h-4 shrink-0 ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-nobuf-primary' : ''}`} />
+                <Icon
+                    className={`w-4 h-4 shrink-0 transition-colors ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-nobuf-primary' : ''}`}
+                    style={groupColor && !isOver ? { color: groupColor } : undefined}
+                />
                 {isRenaming ? (
                     <div className="flex-1 flex items-center gap-1 min-w-0">
                         <input
@@ -212,26 +228,82 @@ export function SidebarItem({
             {showContextMenu && isFolder && (
                 <div
                     ref={contextMenuRef}
-                    className="fixed z-50 bg-nobuf-surface border border-nobuf-border rounded-lg shadow-xl py-1 min-w-[140px]"
-                    style={{ left: contextMenuPos.x, top: contextMenuPos.y }}
+                    className="fixed z-50 bg-nobuf-surface/95 backdrop-blur-md border border-nobuf-border rounded-xl shadow-2xl py-1.5 min-w-[180px] animate-in fade-in zoom-in-95 duration-150"
+                    style={{
+                        left: Math.min(contextMenuPos.x, window.innerWidth - 200),
+                        top: Math.min(contextMenuPos.y, window.innerHeight - 200),
+                    }}
                 >
                     {onRename && (
                         <button
-                            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-colors"
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
                             onClick={startRename}
                         >
-                            <Pencil className="w-3.5 h-3.5" />
+                            <Pencil className="w-4 h-4" />
                             Rename
                         </button>
                     )}
+                    {onAssignGroup && (
+                        <div className="relative">
+                            <button
+                                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
+                                onClick={() => {
+                                    setShowGroupSubmenu(!showGroupSubmenu);
+                                    if (!showGroupSubmenu) {
+                                        invoke<FolderGroup[]>('cmd_get_groups').then(setAvailableGroups).catch(() => {});
+                                    }
+                                }}
+                            >
+                                <FolderInput className="w-4 h-4" />
+                                Move to Group
+                                <span className="ml-auto text-xs opacity-60">›</span>
+                            </button>
+                            {showGroupSubmenu && (
+                                <div
+                                    className="absolute bg-nobuf-surface/95 backdrop-blur-md border border-nobuf-border rounded-xl shadow-2xl py-1.5 min-w-[160px] animate-in fade-in slide-in-from-left-2 duration-150"
+                                    style={{
+                                        left: '100%',
+                                        top: 0,
+                                        marginLeft: '4px',
+                                    }}
+                                >
+                                    <button
+                                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
+                                        onClick={() => { setShowContextMenu(false); setShowGroupSubmenu(false); onAssignGroup(null); }}
+                                    >
+                                        <span className="w-2.5 h-2.5 rounded-full bg-nobuf-subtext/40 border border-nobuf-subtext/20" />
+                                        None
+                                        {currentGroupId === null && <Check className="w-3.5 h-3.5 ml-auto text-nobuf-primary" />}
+                                    </button>
+                                    {availableGroups.map(g => (
+                                        <button
+                                            key={g.id}
+                                            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm rounded-lg mx-1 transition-all duration-150 ${currentGroupId === g.id ? 'bg-nobuf-primary/10 text-nobuf-text' : 'text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text'}`}
+                                            onClick={() => { setShowContextMenu(false); setShowGroupSubmenu(false); onAssignGroup(g.id); }}
+                                        >
+                                            <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: g.color_hex }} />
+                                            {g.name}
+                                            {currentGroupId === g.id && <Check className="w-3.5 h-3.5 ml-auto" style={{ color: g.color_hex }} />}
+                                        </button>
+                                    ))}
+                                    {availableGroups.length === 0 && (
+                                        <div className="px-3 py-2 text-xs text-nobuf-subtext italic">No groups created</div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
                     {onDelete && (
-                        <button
-                            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-nobuf-subtext hover:bg-red-500/10 hover:text-red-400 transition-colors"
-                            onClick={() => { setShowContextMenu(false); onDelete(); }}
-                        >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            Delete
-                        </button>
+                        <>
+                            <div className="h-px bg-nobuf-border mx-2 my-1" />
+                            <button
+                                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-red-500/10 hover:text-red-400 rounded-lg mx-1 transition-all duration-150"
+                                onClick={() => { setShowContextMenu(false); onDelete(); }}
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                Delete
+                            </button>
+                        </>
                     )}
                 </div>
             )}

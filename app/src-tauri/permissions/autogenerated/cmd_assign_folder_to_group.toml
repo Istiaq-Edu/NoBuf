@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-assign-folder-to-group"
+description = "Enables the cmd_assign_folder_to_group command without any pre-configured scope."
+commands.allow = ["cmd_assign_folder_to_group"]
+
+[[permission]]
+identifier = "deny-cmd-assign-folder-to-group"
+description = "Denies the cmd_assign_folder_to_group command without any pre-configured scope."
+commands.deny = ["cmd_assign_folder_to_group"]

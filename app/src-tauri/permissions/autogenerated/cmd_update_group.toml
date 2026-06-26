@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-update-group"
+description = "Enables the cmd_update_group command without any pre-configured scope."
+commands.allow = ["cmd_update_group"]
+
+[[permission]]
+identifier = "deny-cmd-update-group"
+description = "Denies the cmd_update_group command without any pre-configured scope."
+commands.deny = ["cmd_update_group"]
