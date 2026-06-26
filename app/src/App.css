@@ -1142,3 +1142,294 @@ body,
     flex-shrink: 0;
     margin-right: 0;
 }
+
+/* ========================================
+   About Section — Settings Page
+   ======================================== */
+
+/* About page body — centered, narrower than settings */
+.about-page-body {
+    max-width: 520px;
+    margin: 0 auto;
+    padding: 24px 24px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+@media (max-width: 420px) {
+    .about-page-body {
+        padding: 16px 16px 32px;
+    }
+}
+
+/* Hero card — app identity header */
+.about-hero-card {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 18px 20px !important;
+    background: linear-gradient(135deg, var(--color-nobuf-surface) 0%, rgba(29, 252, 159, 0.04) 100%) !important;
+    border-color: rgba(29, 252, 159, 0.15) !important;
+}
+
+:root.light .about-hero-card {
+    background: linear-gradient(135deg, var(--color-nobuf-surface) 0%, rgba(10, 87, 48, 0.03) 100%) !important;
+    border-color: rgba(10, 87, 48, 0.1) !important;
+}
+
+.about-logo-wrap {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex: 1;
+    min-width: 0;
+}
+
+.about-logo-badge {
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, var(--color-nobuf-primary) 0%, var(--color-nobuf-ocean-green, #1dfc9f) 100%);
+    color: #0a0f0d;
+    flex-shrink: 0;
+    box-shadow: 0 4px 16px rgba(29, 252, 159, 0.25);
+}
+
+:root.light .about-logo-badge {
+    box-shadow: 0 4px 12px rgba(10, 87, 48, 0.2);
+}
+
+.about-hero-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.about-app-name {
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--color-nobuf-text);
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+}
+
+.about-app-tagline {
+    font-size: 11px;
+    color: var(--color-nobuf-subtext);
+    margin-top: 3px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Version pill */
+.about-version-pill {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background: var(--color-nobuf-bg);
+    border: 1px solid var(--color-nobuf-border);
+    flex-shrink: 0;
+}
+
+.about-version-label {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-nobuf-subtext);
+}
+
+.about-version-value {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--color-nobuf-primary);
+    font-family: 'Fira Code', monospace;
+    margin-top: 2px;
+}
+
+/* Update panel — shown when update is available */
+.about-update-panel {
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 10px;
+    background: var(--color-nobuf-bg);
+    border: 1px solid rgba(29, 252, 159, 0.2);
+}
+
+:root.light .about-update-panel {
+    border-color: rgba(10, 87, 48, 0.12);
+}
+
+.about-update-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.about-update-version {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--color-nobuf-primary);
+    font-family: 'Fira Code', monospace;
+}
+
+.about-update-arrow {
+    font-size: 14px;
+    color: var(--color-nobuf-subtext);
+}
+
+.about-update-current {
+    font-size: 13px;
+    color: var(--color-nobuf-subtext);
+    font-family: 'Fira Code', monospace;
+}
+
+.about-update-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    justify-content: center;
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    background: var(--color-nobuf-primary);
+    color: #0a0f0d;
+    border: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+:root.light .about-update-btn {
+    color: #ffffff;
+}
+
+.about-update-btn:hover {
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px rgba(29, 252, 159, 0.3);
+}
+
+/* Progress bar */
+.about-update-progress-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.about-update-progress-bar {
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--color-nobuf-hover);
+    overflow: hidden;
+}
+
+.about-update-progress-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--color-nobuf-primary), var(--color-nobuf-ocean-green, #1dfc9f));
+    transition: width 0.3s ease;
+}
+
+.about-update-progress-pct {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-nobuf-primary);
+    font-family: 'Fira Code', monospace;
+    min-width: 36px;
+    text-align: right;
+}
+
+/* Update error */
+.about-update-error {
+    margin-top: 10px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 11px;
+    color: #f43f5e;
+    background: rgba(244, 63, 94, 0.08);
+    border: 1px solid rgba(244, 63, 94, 0.12);
+}
+
+/* Links grid */
+.about-links-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+@media (max-width: 420px) {
+    .about-links-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.about-link-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-nobuf-text);
+    background: var(--color-nobuf-bg);
+    border: 1px solid var(--color-nobuf-border);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-align: left;
+}
+
+.about-link-btn:hover {
+    border-color: rgba(29, 252, 159, 0.25);
+    background: var(--color-nobuf-hover);
+    color: var(--color-nobuf-primary);
+}
+
+:root.light .about-link-btn:hover {
+    border-color: rgba(10, 87, 48, 0.15);
+}
+
+.about-link-btn svg {
+    flex-shrink: 0;
+    color: var(--color-nobuf-subtext);
+}
+
+.about-link-btn:hover svg {
+    color: var(--color-nobuf-primary);
+}
+
+/* Credits card */
+.about-credits-card {
+    text-align: center;
+}
+
+.about-credits-text {
+    font-size: 11px;
+    color: var(--color-nobuf-text);
+    line-height: 1.5;
+    flex: 1;
+}
+
+.about-credits-sub {
+    font-size: 10px;
+    color: var(--color-nobuf-subtext);
+    margin-top: 8px;
+    line-height: 1.4;
+}
+
+.about-tauri-version {
+    font-family: 'Fira Code', monospace;
+    opacity: 0.7;
+    margin-top: 4px;
+}
