@@ -3,16 +3,20 @@ import { motion } from 'framer-motion';
 import {
     ArrowLeft, Upload, Download, LayoutGrid, FileText, Globe, HardDrive,
     Key, Copy, Check, RefreshCw, Trash2, RotateCcw, Film, Music,
-    ImageIcon, Package, Cpu
+    ImageIcon, Package, Cpu, Wifi, Network, Activity, Shield, LogOut, Palette, Sparkles, Plus
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useSettings } from '../../context/SettingsContext';
+import { useTheme } from '../../context/ThemeContext';
 import { useConfirm } from '../../context/ConfirmContext';
+import { CustomTheme, ThemeColorPalette, generateThemeId } from '../../theme/themeEngine';
+import { getDefaultPalette } from '../../theme/presets';
 import { FileCategory, ALL_FILE_CATEGORIES } from '../../utils';
 
 interface SettingsPageProps {
     onClose: () => void;
+    onLogout: () => void;
 }
 
 interface ApiSettings {
@@ -30,10 +34,25 @@ const CATEGORY_META: Record<FileCategory, { label: string; icon: typeof Film; co
     misc:       { label: 'Misc',       icon: Package,   color: 'bg-gray-500' },
 };
 
-export function SettingsPage({ onClose }: SettingsPageProps) {
+export function SettingsPage({ onClose, onLogout }: SettingsPageProps) {
     const { settings, updateSetting, resetSettings } = useSettings();
+    const { theme: _theme, toggleTheme: _toggleTheme, customThemes, activeCustomThemeId, setActiveCustomTheme, addCustomTheme, deleteCustomTheme, updateCustomTheme } = useTheme();
     const { confirm } = useConfirm();
     const [clearing, setClearing] = useState(false);
+
+    // Theme editor state
+    const [editingThemeId, setEditingThemeId] = useState<string | null>(null);
+
+    // Network settings state
+    const [chunkSize, setChunkSize] = useState(512);
+    const [keepAlive, setKeepAlive] = useState(0);
+    const [prebufferLimit, setPrebufferLimit] = useState(0);
+    const [downloadLimit, setDownloadLimit] = useState(0);
+    const [vpnDetected, setVpnDetected] = useState<boolean | null>(null);
+    const [checkingVpn, setCheckingVpn] = useState(false);
+    const [networkSettingsLoaded, setNetworkSettingsLoaded] = useState(false);
+    const [dcResults, setDcResults] = useState<[string, number][] | null>(null);
+    const [testingDcs, setTestingDcs] = useState(false);
 
     // API settings state
     const [apiSettings, setApiSettings] = useState<ApiSettings>({ enabled: false, port: 8550, key_set: false, running: false });
@@ -65,6 +84,20 @@ export function SettingsPage({ onClose }: SettingsPageProps) {
         setGeneratedKey(null);
         setKeyCopied(false);
     }, [fetchApiSettings]);
+
+    // Load network settings on mount
+    useEffect(() => {
+        if (networkSettingsLoaded) return;
+        invoke<{ chunk_size_kb: number; keep_alive_interval_sec: number; prebuffer_speed_limit_kb: number; download_speed_limit_kb: number }>('cmd_get_network_settings')
+            .then(s => {
+                setChunkSize(s.chunk_size_kb);
+                setKeepAlive(s.keep_alive_interval_sec);
+                setPrebufferLimit(s.prebuffer_speed_limit_kb);
+                setDownloadLimit(s.download_speed_limit_kb);
+                setNetworkSettingsLoaded(true);
+            })
+            .catch(() => setNetworkSettingsLoaded(true));
+    }, [networkSettingsLoaded]);
 
     useEffect(() => {
         if (!apiSettings.enabled) return;
@@ -278,6 +311,219 @@ export function SettingsPage({ onClose }: SettingsPageProps) {
                         </div>
                     </div>
 
+                    {/* ===== Themes ===== */}
+                    <div className="settings-category">
+                        <div className="settings-category-header">
+                            <Palette className="w-4 h-4" />
+                            <h3 className="settings-category-title">Themes</h3>
+                            <p className="settings-category-desc">Customize colors</p>
+                        </div>
+                        <div className="settings-category-body space-y-3">
+
+                            {/* Preset themes */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <Palette className="w-4 h-4 text-nobuf-primary shrink-0" />
+                                    <p className="settings-card-title">Presets</p>
+                                </div>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {customThemes.filter(t => t.isBuiltin).map(t => (
+                                        <button
+                                            key={t.id}
+                                            onClick={() => {
+                                                if (activeCustomThemeId === t.id) {
+                                                    setActiveCustomTheme(null);
+                                                    setEditingThemeId(null);
+                                                } else {
+                                                    setActiveCustomTheme(t.id);
+                                                    setEditingThemeId(null);
+                                                }
+                                            }}
+                                            className={`relative rounded-lg p-0.5 transition-all duration-200 ${activeCustomThemeId === t.id ? 'ring-2 ring-nobuf-primary ring-offset-1 ring-offset-nobuf-surface' : 'hover:ring-1 hover:ring-nobuf-subtext/30'}`}
+                                            title={t.name}
+                                        >
+                                            <div className="rounded-md overflow-hidden h-10 flex">
+                                                <div className="flex-1" style={{ background: t.palette.bg }} />
+                                                <div className="flex-1" style={{ background: t.palette.surface }} />
+                                                <div className="flex-1" style={{ background: t.palette.primary }} />
+                                            </div>
+                                            <p className="text-[10px] text-nobuf-subtext mt-1 truncate text-center">{t.name}</p>
+                                            {activeCustomThemeId === t.id && (
+                                                <div className="absolute -top-1 -right-1 w-4 h-4 bg-nobuf-primary rounded-full flex items-center justify-center">
+                                                    <Check className="w-2.5 h-2.5 text-white" />
+                                                </div>
+                                            )}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Custom themes */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <Sparkles className="w-4 h-4 text-nobuf-primary shrink-0" />
+                                    <p className="settings-card-title">Custom Themes</p>
+                                </div>
+
+                                {customThemes.filter(t => !t.isBuiltin).length > 0 && (
+                                    <div className="grid grid-cols-4 gap-2 mb-2">
+                                        {customThemes.filter(t => !t.isBuiltin).map(t => (
+                                            <button
+                                                key={t.id}
+                                                onClick={() => {
+                                                    if (activeCustomThemeId === t.id) {
+                                                        setActiveCustomTheme(null);
+                                                        setEditingThemeId(null);
+                                                    } else {
+                                                        setActiveCustomTheme(t.id);
+                                                        setEditingThemeId(t.id);
+                                                    }
+                                                }}
+                                                className={`relative rounded-lg p-0.5 transition-all duration-200 ${activeCustomThemeId === t.id ? 'ring-2 ring-nobuf-primary ring-offset-1 ring-offset-nobuf-surface' : 'hover:ring-1 hover:ring-nobuf-subtext/30'}`}
+                                                title={t.name}
+                                            >
+                                                <div className="rounded-md overflow-hidden h-10 flex">
+                                                    <div className="flex-1" style={{ background: t.palette.bg }} />
+                                                    <div className="flex-1" style={{ background: t.palette.surface }} />
+                                                    <div className="flex-1" style={{ background: t.palette.primary }} />
+                                                </div>
+                                                <p className="text-[10px] text-nobuf-subtext mt-1 truncate text-center">{t.name}</p>
+                                                {activeCustomThemeId === t.id && (
+                                                    <div className="absolute -top-1 -right-1 w-4 h-4 bg-nobuf-primary rounded-full flex items-center justify-center">
+                                                        <Check className="w-2.5 h-2.5 text-white" />
+                                                    </div>
+                                                )}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+
+                                <button
+                                    onClick={() => {
+                                        const id = generateThemeId();
+                                        const newTheme: CustomTheme = {
+                                            id,
+                                            name: 'My Theme',
+                                            isDark: true,
+                                            palette: getDefaultPalette(true),
+                                        };
+                                        addCustomTheme(newTheme);
+                                        setEditingThemeId(id);
+                                        setActiveCustomTheme(id);
+                                    }}
+                                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border border-dashed border-nobuf-border text-nobuf-subtext hover:text-nobuf-primary hover:border-nobuf-primary/50 transition-colors text-xs"
+                                >
+                                    <Plus className="w-3.5 h-3.5" />
+                                    Create Theme
+                                </button>
+                            </div>
+
+                            {/* Theme editor — shown when a custom theme is selected for editing */}
+                            {(() => {
+                                const editingTheme = editingThemeId ? customThemes.find(t => t.id === editingThemeId) : null;
+                                if (!editingTheme || editingTheme.isBuiltin) return null;
+
+                                const handlePaletteChange = (key: keyof ThemeColorPalette, value: string) => {
+                                    const newPalette = { ...editingTheme.palette, [key]: value };
+                                    updateCustomTheme(editingTheme.id, { palette: newPalette });
+                                };
+
+                                const paletteKeys: { key: keyof ThemeColorPalette; label: string }[] = [
+                                    { key: 'bg', label: 'Background' },
+                                    { key: 'surface', label: 'Surface' },
+                                    { key: 'primary', label: 'Primary' },
+                                    { key: 'secondary', label: 'Secondary' },
+                                    { key: 'text', label: 'Text' },
+                                    { key: 'subtext', label: 'Subtext' },
+                                    { key: 'border', label: 'Border' },
+                                    { key: 'hover', label: 'Hover' },
+                                ];
+
+                                return (
+                                    <div className="settings-card space-y-3">
+                                        <div className="flex items-center gap-2">
+                                            <p className="settings-card-title flex-1">Edit Theme</p>
+                                            <button
+                                                onClick={async () => {
+                                                    const ok = await confirm({
+                                                        title: 'Delete Theme',
+                                                        message: 'Delete this custom theme?',
+                                                        confirmText: 'Delete',
+                                                        variant: 'danger',
+                                                    });
+                                                    if (ok) {
+                                                        deleteCustomTheme(editingTheme.id);
+                                                        setEditingThemeId(null);
+                                                    }
+                                                }}
+                                                className="p-1.5 text-nobuf-subtext hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                                                title="Delete theme"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </button>
+                                        </div>
+
+                                        {/* Theme name */}
+                                        <div className="flex items-center gap-2">
+                                            <label className="text-xs text-nobuf-subtext w-20 shrink-0">Name</label>
+                                            <input
+                                                type="text"
+                                                value={editingTheme.name}
+                                                onChange={e => updateCustomTheme(editingTheme.id, { name: e.target.value })}
+                                                className="flex-1 px-2 py-1.5 rounded-md text-xs bg-nobuf-bg border border-nobuf-border text-nobuf-text focus:border-nobuf-primary outline-none transition"
+                                                maxLength={32}
+                                            />
+                                        </div>
+
+                                        {/* Dark/Light base */}
+                                        <div className="flex items-center gap-2">
+                                            <label className="text-xs text-nobuf-subtext w-20 shrink-0">Base</label>
+                                            <div className="flex gap-1">
+                                                <button
+                                                    onClick={() => updateCustomTheme(editingTheme.id, { isDark: true })}
+                                                    className={`px-3 py-1 rounded-md text-xs font-medium transition ${editingTheme.isDark ? 'bg-nobuf-primary text-white' : 'bg-nobuf-hover text-nobuf-subtext hover:text-nobuf-text'}`}
+                                                >
+                                                    Dark
+                                                </button>
+                                                <button
+                                                    onClick={() => updateCustomTheme(editingTheme.id, { isDark: false })}
+                                                    className={`px-3 py-1 rounded-md text-xs font-medium transition ${!editingTheme.isDark ? 'bg-nobuf-primary text-white' : 'bg-nobuf-hover text-nobuf-subtext hover:text-nobuf-text'}`}
+                                                >
+                                                    Light
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        {/* Color pickers */}
+                                        <div className="space-y-2">
+                                            {paletteKeys.map(({ key, label }) => (
+                                                <div key={key} className="flex items-center gap-2">
+                                                    <label className="text-xs text-nobuf-subtext w-20 shrink-0">{label}</label>
+                                                    <div className="flex items-center gap-1.5 flex-1">
+                                                        <input
+                                                            type="color"
+                                                            value={editingTheme.palette[key].startsWith('#') ? editingTheme.palette[key] : '#888888'}
+                                                            onChange={e => handlePaletteChange(key, e.target.value)}
+                                                            className="w-7 h-7 rounded-md border border-nobuf-border cursor-pointer p-0.5 bg-transparent shrink-0"
+                                                        />
+                                                        <input
+                                                            type="text"
+                                                            value={editingTheme.palette[key]}
+                                                            onChange={e => handlePaletteChange(key, e.target.value)}
+                                                            className="flex-1 px-2 py-1 rounded-md text-xs bg-nobuf-bg border border-nobuf-border text-nobuf-text focus:border-nobuf-primary outline-none transition font-mono"
+                                                            maxLength={30}
+                                                        />
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })()}
+
+                        </div>
+                    </div>
+
                     {/* ===== File Filters ===== */}
                     <div className="settings-category">
                         <div className="settings-category-header">
@@ -410,6 +656,248 @@ export function SettingsPage({ onClose }: SettingsPageProps) {
                         </div>
                     </div>
 
+                    {/* ===== Network ===== */}
+                    <div className="settings-category">
+                        <div className="settings-category-header">
+                            <Network className="w-4 h-4" />
+                            <h3 className="settings-category-title">Network</h3>
+                            <p className="settings-category-desc">Connection, chunk sizes, keep-alive, diagnostics</p>
+                        </div>
+                        <div className="settings-category-body space-y-3">
+
+                            {/* Chunk Size */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Download className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Download Chunk Size</p>
+                                        <p className="settings-card-desc">Smaller = more stable on bad connections. Larger = faster on good ones.</p>
+                                    </div>
+                                    <div className="settings-toggle-group shrink-0">
+                                        {([ { v: 128, l: '128' }, { v: 256, l: '256' }, { v: 512, l: '512' } ]).map(opt => (
+                                            <button
+                                                key={opt.v}
+                                                onClick={async () => {
+                                                    setChunkSize(opt.v);
+                                                    try {
+                                                        await invoke('cmd_set_chunk_size', { chunkSizeKb: opt.v });
+                                                        await invoke('cmd_save_network_settings', {
+                                                            chunkSizeKb: opt.v, keepAliveIntervalSec: keepAlive,
+                                                            prebufferSpeedLimitKb: prebufferLimit, downloadSpeedLimitKb: downloadLimit
+                                                        });
+                                                        toast.success(`Chunk size set to ${opt.v}KB`);
+                                                    } catch (err) { toast.error(`Failed: ${err}`); }
+                                                }}
+                                                className={`settings-toggle-option ${chunkSize === opt.v ? 'active' : ''}`}
+                                            >
+                                                {opt.l}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Keep-Alive */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Wifi className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">TCP Keep-Alive</p>
+                                        <p className="settings-card-desc">Prevents disconnects on VPN/restrictive networks.</p>
+                                    </div>
+                                    <div className="settings-toggle-group shrink-0">
+                                        {([ { v: 0, l: 'Off' }, { v: 30, l: '30s' }, { v: 60, l: '60s' }, { v: 120, l: '120s' } ]).map(opt => (
+                                            <button
+                                                key={opt.v}
+                                                onClick={async () => {
+                                                    setKeepAlive(opt.v);
+                                                    try {
+                                                        await invoke('cmd_set_keep_alive', { intervalSec: opt.v });
+                                                        await invoke('cmd_save_network_settings', {
+                                                            chunkSizeKb: chunkSize, keepAliveIntervalSec: opt.v,
+                                                            prebufferSpeedLimitKb: prebufferLimit, downloadSpeedLimitKb: downloadLimit
+                                                        });
+                                                        toast.success(opt.v === 0 ? 'Keep-alive disabled' : `Keep-alive set to ${opt.v}s`);
+                                                    } catch (err) { toast.error(`Failed: ${err}`); }
+                                                }}
+                                                className={`settings-toggle-option ${keepAlive === opt.v ? 'active' : ''}`}
+                                            >
+                                                {opt.l}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Prebuffer Speed Limit */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Activity className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Streaming Speed Limit</p>
+                                        <p className="settings-card-desc">KB/s limit for video prebuffering. 0 = unlimited.</p>
+                                    </div>
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        value={prebufferLimit}
+                                        onChange={async (e) => {
+                                            const val = Math.max(0, Number(e.target.value));
+                                            setPrebufferLimit(val);
+                                        }}
+                                        onBlur={async () => {
+                                            try {
+                                                await invoke('cmd_set_speed_limits', { prebufferLimitKb: prebufferLimit, downloadLimitKb: downloadLimit });
+                                                await invoke('cmd_save_network_settings', {
+                                                    chunkSizeKb: chunkSize, keepAliveIntervalSec: keepAlive,
+                                                    prebufferSpeedLimitKb: prebufferLimit, downloadSpeedLimitKb: downloadLimit
+                                                });
+                                                toast.success('Streaming speed limit saved');
+                                            } catch (err) { toast.error(`Failed: ${err}`); }
+                                        }}
+                                        className="w-24 bg-nobuf-hover border border-nobuf-border rounded-lg px-3 py-1.5 text-sm text-nobuf-text focus:outline-none focus:border-nobuf-primary text-right"
+                                    />
+                                    <span className="text-xs text-nobuf-subtext">KB/s</span>
+                                </div>
+                            </div>
+
+                            {/* Download Speed Limit */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Download className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Download Speed Limit</p>
+                                        <p className="settings-card-desc">KB/s limit for file downloads. 0 = unlimited.</p>
+                                    </div>
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        value={downloadLimit}
+                                        onChange={async (e) => {
+                                            const val = Math.max(0, Number(e.target.value));
+                                            setDownloadLimit(val);
+                                        }}
+                                        onBlur={async () => {
+                                            try {
+                                                await invoke('cmd_set_speed_limits', { prebufferLimitKb: prebufferLimit, downloadLimitKb: downloadLimit });
+                                                await invoke('cmd_save_network_settings', {
+                                                    chunkSizeKb: chunkSize, keepAliveIntervalSec: keepAlive,
+                                                    prebufferSpeedLimitKb: prebufferLimit, downloadSpeedLimitKb: downloadLimit
+                                                });
+                                                toast.success('Download speed limit saved');
+                                            } catch (err) { toast.error(`Failed: ${err}`); }
+                                        }}
+                                        className="w-24 bg-nobuf-hover border border-nobuf-border rounded-lg px-3 py-1.5 text-sm text-nobuf-text focus:outline-none focus:border-nobuf-primary text-right"
+                                    />
+                                    <span className="text-xs text-nobuf-subtext">KB/s</span>
+                                </div>
+                            </div>
+
+                            {/* VPN Detection */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Shield className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">VPN Status</p>
+                                        <p className="settings-card-desc">Check if a VPN interface is active.</p>
+                                    </div>
+                                    <button
+                                        disabled={checkingVpn}
+                                        onClick={async () => {
+                                            setCheckingVpn(true);
+                                            try {
+                                                const result = await invoke<boolean>('cmd_detect_vpn');
+                                                setVpnDetected(result);
+                                            } catch { setVpnDetected(null); }
+                                            finally { setCheckingVpn(false); }
+                                        }}
+                                        className="px-3 py-1.5 text-sm bg-nobuf-hover border border-nobuf-border rounded-lg text-nobuf-text hover:bg-nobuf-hover/80 transition-colors disabled:opacity-50"
+                                    >
+                                        {checkingVpn ? 'Checking...' : 'Check'}
+                                    </button>
+                                    {vpnDetected !== null && !checkingVpn && (
+                                        <span className={`text-xs font-medium ${vpnDetected ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
+                                            {vpnDetected ? 'VPN Active' : 'No VPN'}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* DC Latency — Test All Servers */}
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box">
+                                        <Activity className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Telegram Server Latency</p>
+                                        <p className="settings-card-desc">Test all 5 data centres to find the fastest.</p>
+                                    </div>
+                                    <button
+                                        disabled={testingDcs}
+                                        onClick={async () => {
+                                            setTestingDcs(true);
+                                            setDcResults(null);
+                                            try {
+                                                const results = await invoke<[string, number][]>('cmd_test_all_dcs');
+                                                setDcResults(results);
+                                                // Find fastest
+                                                const fastest = results
+                                                    .filter(([, ms]) => ms >= 0)
+                                                    .sort(([, a], [, b]) => a - b);
+                                                if (fastest.length > 0) {
+                                                    toast.success(`Fastest: ${fastest[0][0]} at ${fastest[0][1]}ms`);
+                                                } else {
+                                                    toast.error('All DCs unreachable');
+                                                }
+                                            } catch { toast.error('Test failed'); }
+                                            finally { setTestingDcs(false); }
+                                        }}
+                                        className="px-3 py-1.5 text-sm bg-nobuf-hover border border-nobuf-border rounded-lg text-nobuf-text hover:bg-nobuf-hover/80 transition-colors disabled:opacity-50"
+                                    >
+                                        {testingDcs ? 'Testing...' : 'Test All'}
+                                    </button>
+                                </div>
+                                {dcResults && !testingDcs && (
+                                    <div className="mt-3 space-y-1.5">
+                                        {dcResults.map(([name, ms]) => {
+                                            const fastest = dcResults.filter(([, m]) => m >= 0).sort(([, a], [, b]) => a - b)[0];
+                                            const isFastest = fastest && fastest[0] === name && ms >= 0;
+                                            return (
+                                                <div key={name} className="flex items-center gap-2 text-xs">
+                                                    <span className={`font-medium ${isFastest ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
+                                                        {name}
+                                                    </span>
+                                                    {isFastest && <span className="text-nobuf-primary text-[10px]">★</span>}
+                                                    <span className="ml-auto font-mono">
+                                                        {ms >= 0 ? (
+                                                            <span className={ms < 100 ? 'text-nobuf-primary' : ms < 300 ? 'text-nobuf-text' : 'text-amber-400'}>
+                                                                {ms}ms
+                                                            </span>
+                                                        ) : (
+                                                            <span className="text-red-400">Unreachable</span>
+                                                        )}
+                                                    </span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+
+                        </div>
+                    </div>
+
                     {/* ===== Storage ===== */}
                     <div className="settings-category">
                         <div className="settings-category-header">
@@ -455,6 +943,43 @@ export function SettingsPage({ onClose }: SettingsPageProps) {
                             </div>
                         </div>
                     </div>
+
+                    {/* ===== Account ===== */}
+                    <div className="settings-category">
+                        <div className="settings-category-header">
+                            <Shield className="w-4 h-4" />
+                            <h3 className="settings-category-title">Account</h3>
+                            <p className="settings-category-desc">Session management</p>
+                        </div>
+                        <div className="settings-category-body space-y-3">
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="settings-icon-box danger">
+                                        <LogOut className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Sign Out</p>
+                                        <p className="settings-card-desc">Disconnect from Telegram and return to login screen.</p>
+                                    </div>
+                                    <button
+                                        onClick={async () => {
+                                            const ok = await confirm({
+                                                title: 'Sign Out',
+                                                message: 'Are you sure you want to sign out? You will need to log in again.',
+                                                confirmText: 'Sign Out',
+                                                variant: 'danger',
+                                            });
+                                            if (ok) onLogout();
+                                        }}
+                                        className="settings-danger-btn"
+                                    >
+                                        Sign Out
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                 </div>
             </div>
         </motion.div>

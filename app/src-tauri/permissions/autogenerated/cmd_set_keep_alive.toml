@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-set-keep-alive"
+description = "Enables the cmd_set_keep_alive command without any pre-configured scope."
+commands.allow = ["cmd_set_keep_alive"]
+
+[[permission]]
+identifier = "deny-cmd-set-keep-alive"
+description = "Denies the cmd_set_keep_alive command without any pre-configured scope."
+commands.deny = ["cmd_set_keep_alive"]

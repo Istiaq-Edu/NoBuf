@@ -30,6 +30,8 @@ export interface QueueItem {
     uploadedBytes?: number;
     totalBytes?: number;
     speedBytesPerSec?: number;
+    url?: string; // For remote upload from URL
+    phase?: 'downloading' | 'uploading'; // For remote upload dual-phase progress
 }
 
 export interface BandwidthStats {

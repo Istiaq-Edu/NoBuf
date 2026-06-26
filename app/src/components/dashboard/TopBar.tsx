@@ -1,5 +1,4 @@
-import { LayoutGrid, Sun, Moon, Settings, ArrowLeftRight, Menu } from 'lucide-react';
-import { useTheme } from '../../context/ThemeContext';
+import { LayoutGrid, Settings, ArrowLeftRight, Menu, Globe } from 'lucide-react';
 
 interface TopBarProps {
     currentFolderName: string;
@@ -13,6 +12,7 @@ interface TopBarProps {
     searchTerm: string;
     onSearchChange: (term: string) => void;
     onSettingsClick: () => void;
+    onRemoteUpload: () => void;
     onToggleTransfers: () => void;
     showTransferPanel: boolean;
     uploadActiveCount?: number;
@@ -25,14 +25,12 @@ interface TopBarProps {
 
 export function TopBar({
     currentFolderName, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
-    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick,
+    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick, onRemoteUpload,
     onToggleTransfers, showTransferPanel,
     uploadActiveCount = 0, uploadFinishedCount = 0,
     downloadActiveCount = 0, downloadFinishedCount = 0,
     onToggleMobileSidebar, isMobile,
 }: TopBarProps) {
-    const { theme, toggleTheme } = useTheme();
-
     return (
         <header className="h-14 border-b border-nobuf-border flex items-center px-4 justify-between bg-nobuf-surface/80 backdrop-blur-md sticky top-0 z-10" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-2">
@@ -110,6 +108,17 @@ export function TopBar({
                 </button>
 
                 <button
+                    onClick={onRemoteUpload}
+                    className="p-2 hover:bg-nobuf-hover rounded-md text-nobuf-subtext hover:text-nobuf-text transition relative group"
+                    title="Remote Upload"
+                >
+                    <Globe className="w-5 h-5" />
+                    <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-nobuf-surface border border-nobuf-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
+                        Remote Upload
+                    </span>
+                </button>
+
+                <button
                     onClick={onSettingsClick}
                     className="p-2 hover:bg-nobuf-hover rounded-md text-nobuf-subtext hover:text-nobuf-text transition relative group"
                     title="Settings"
@@ -117,17 +126,6 @@ export function TopBar({
                     <Settings className="w-5 h-5" />
                     <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-nobuf-surface border border-nobuf-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
                         Settings
-                    </span>
-                </button>
-
-                <button
-                    onClick={toggleTheme}
-                    className="p-2 hover:bg-nobuf-hover rounded-md text-nobuf-subtext hover:text-nobuf-text transition relative group"
-                    title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-                >
-                    {theme === 'dark' ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-                    <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-nobuf-surface border border-nobuf-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
-                        {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
                     </span>
                 </button>
             </div>

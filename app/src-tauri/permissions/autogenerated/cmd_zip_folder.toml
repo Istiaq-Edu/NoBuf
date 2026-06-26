@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-zip-folder"
+description = "Enables the cmd_zip_folder command without any pre-configured scope."
+commands.allow = ["cmd_zip_folder"]
+
+[[permission]]
+identifier = "deny-cmd-zip-folder"
+description = "Denies the cmd_zip_folder command without any pre-configured scope."
+commands.deny = ["cmd_zip_folder"]

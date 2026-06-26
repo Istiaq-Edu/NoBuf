@@ -16,6 +16,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 /// (MIN_CHUNK_SIZE). We use the maximum allowed value to minimize round-trips.
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
+/// Get the configurable chunk size from TelegramState (in bytes).
+/// Falls back to 512KB if state is unavailable (e.g. in tests).
+fn get_chunk_size_bytes(state: &TelegramState) -> i32 {
+    let kb = state.chunk_size_kb.load(std::sync::atomic::Ordering::Relaxed);
+    (kb as i32) * 1024
+}
+
 fn extract_duration(doc: &tl::enums::Document) -> Option<f64> {
     if let tl::enums::Document::Document(d) = doc {
         for attr in &d.attributes {
@@ -396,6 +403,224 @@ pub async fn cmd_upload_file(
     Ok("File uploaded successfully".to_string())
 }
 
+/// Upload a file from a remote URL. Downloads to a temp file first, then
+/// uploads to Telegram. Emits dual-phase progress: "downloading" then "uploading".
+#[tauri::command]
+pub async fn cmd_upload_from_url(
+    url: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, BandwidthManager>,
+) -> Result<String, String> {
+    let tid = transfer_id.unwrap_or_default();
+    let temp_dir = std::env::temp_dir().join("nobuf_remote_upload");
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    // Phase 1: Download from URL to temp file
+    log::info!("[REMOTE-UPLOAD] Downloading from {}", url);
+
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    // Reject HTML responses (likely an error page, not a file)
+    let content_type = resp.header("Content-Type").unwrap_or("").to_string();
+    if content_type.starts_with("text/html") {
+        return Err("URL returned an HTML page, not a file. Please check the URL.".to_string());
+    }
+
+    // Extract filename from Content-Disposition header, fallback to URL path
+    let filename = {
+        let cd = resp.header("Content-Disposition");
+        if let Some(cd) = cd {
+            // Parse filename*=UTF-8''... or filename="..."
+            if let Some(pos) = cd.find("filename*=UTF-8''") {
+                cd[pos + 17..].split(';').next().unwrap_or("file").to_string()
+            } else if let Some(pos) = cd.find("filename=\"") {
+                cd[pos + 10..].split('"').next().unwrap_or("file").to_string()
+            } else if let Some(pos) = cd.find("filename=") {
+                cd[pos + 9..].split(';').next().unwrap_or("file").to_string()
+            } else {
+                url.split('/').last().filter(|s| !s.is_empty()).unwrap_or("file").to_string()
+            }
+        } else {
+            url.split('/').last().filter(|s| !s.is_empty()).unwrap_or("file").to_string()
+        }
+    };
+
+    let content_length: u64 = resp.header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Check 2GB Telegram limit
+    if content_length > 2 * 1024 * 1024 * 1024 {
+        return Err(format!("File exceeds Telegram's 2GB limit ({} bytes)", content_length));
+    }
+
+    // Check disk space (rough check — temp dir)
+    // We skip sysinfo crate to avoid adding another dependency.
+    // The OS will return a write error if disk is full, which we handle below.
+
+    let temp_path = temp_dir.join(format!("remote_{}_{}", tid, filename));
+    let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+    // Download with progress
+    let mut downloaded: u64 = 0;
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
+    let mut last_emit = std::time::Instant::now();
+    let mut last_bytes: u64 = 0;
+
+    if !tid.is_empty() {
+        let _ = app_handle.emit("remote-upload-progress", ProgressPayload {
+            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: content_length, speed_bytes_per_sec: 0,
+        });
+    }
+
+    loop {
+        // Check cancellation
+        if state.cancelled_transfers.read().await.contains(&tid) {
+            state.cancelled_transfers.write().await.remove(&tid);
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("Transfer cancelled".to_string());
+        }
+
+        let n = reader.read(&mut buf).map_err(|e| format!("Download read error: {}", e))?;
+        if n == 0 { break; }
+
+        file.write_all(&buf[..n]).map_err(|e| format!("Temp file write error: {}", e))?;
+        downloaded += n as u64;
+
+        // Emit progress every 250ms
+        if !tid.is_empty() {
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(last_emit).as_secs_f64();
+            if dt >= 0.25 || (content_length > 0 && downloaded >= content_length) {
+                let speed = if dt > 0.0 { ((downloaded - last_bytes) as f64 / dt) as u64 } else { 0 };
+                let percent = if content_length > 0 {
+                    ((downloaded as f64 / content_length as f64) * 100.0).min(100.0) as u8
+                } else { 0 };
+                let _ = app_handle.emit("remote-upload-progress", ProgressPayload {
+                    id: tid.clone(), percent, uploaded_bytes: downloaded, total_bytes: content_length, speed_bytes_per_sec: speed,
+                });
+                last_emit = now;
+                last_bytes = downloaded;
+            }
+        }
+    }
+
+    // Flush and sync the temp file
+    file.flush().map_err(|e| format!("Flush error: {}", e))?;
+    file.sync_all().map_err(|e| format!("Sync error: {}", e))?;
+    drop(file);
+
+    let actual_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
+    if actual_size == 0 {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("Downloaded file was empty".to_string());
+    }
+
+    log::info!("[REMOTE-UPLOAD] Downloaded {} bytes, starting upload to Telegram", actual_size);
+
+    // Phase 2: Upload to Telegram (same as cmd_upload_file)
+    bw_state.can_transfer(actual_size)?;
+
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("Not connected to Telegram".to_string());
+    }
+    let client = client_opt.unwrap();
+
+    // Emit upload phase start
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload {
+            id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: actual_size, speed_bytes_per_sec: 0,
+        });
+    }
+
+    let (mut reader_upload, _file_size, bytes_counter) = ProgressReader::new(temp_path.to_str().unwrap()).await?;
+
+    // Spawn progress reporter for upload phase
+    let cancelled = state.cancelled_transfers.clone();
+    let progress_tid = tid.clone();
+    let progress_handle = app_handle.clone();
+    let progress_counter = bytes_counter.clone();
+    let progress_task = if !tid.is_empty() {
+        Some(tokio::spawn(async move {
+            let mut last_bytes: u64 = 0;
+            let mut last_time = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let current = progress_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_time).as_secs_f64();
+                let speed = if dt > 0.0 { ((current - last_bytes) as f64 / dt) as u64 } else { 0 };
+                let percent = if actual_size > 0 { ((current as f64 / actual_size as f64) * 100.0).min(99.0) as u8 } else { 0 };
+
+                let _ = progress_handle.emit("upload-progress", ProgressPayload {
+                    id: progress_tid.clone(), percent, uploaded_bytes: current, total_bytes: actual_size, speed_bytes_per_sec: speed,
+                });
+
+                last_bytes = current;
+                last_time = now;
+
+                if current >= actual_size { break; }
+                if cancelled.read().await.contains(&progress_tid) { break; }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Check cancellation before upload
+    if state.cancelled_transfers.read().await.contains(&tid) {
+        state.cancelled_transfers.write().await.remove(&tid);
+        if let Some(t) = progress_task { t.abort(); }
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("Transfer cancelled".to_string());
+    }
+
+    let client_clone = client.clone();
+    let upload_result = tokio::spawn(async move {
+        client_clone.upload_stream(&mut reader_upload, actual_size as usize, filename.clone()).await
+    }).await.map_err(|e| format!("Task join error: {}", e))?;
+
+    if let Some(t) = progress_task { t.abort(); }
+
+    // Check cancellation after upload
+    if state.cancelled_transfers.read().await.contains(&tid) {
+        state.cancelled_transfers.write().await.remove(&tid);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("Transfer cancelled".to_string());
+    }
+
+    let uploaded_file = upload_result.map_err(map_error)?;
+    let message = InputMessage::new().text("").document(uploaded_file);
+
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
+    client.send_message(&peer, message).await.map_err(map_error)?;
+
+    bw_state.add_up(actual_size);
+
+    // Cleanup temp file
+    let _ = std::fs::remove_file(&temp_path);
+
+    // Emit completion
+    if !tid.is_empty() {
+        let _ = app_handle.emit("upload-progress", ProgressPayload {
+            id: tid, percent: 100, uploaded_bytes: actual_size, total_bytes: actual_size, speed_bytes_per_sec: 0,
+        });
+    }
+
+    log::info!("[REMOTE-UPLOAD] Upload complete ({} bytes)", actual_size);
+    Ok("Remote file uploaded successfully".to_string())
+}
+
 #[tauri::command]
 pub async fn cmd_delete_file(
     message_id: i32,
@@ -426,6 +651,24 @@ pub async fn cmd_download_file(
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<String, String> {
     let tid = transfer_id.unwrap_or_default();
+
+    // Canonicalize the parent directory of save_path to detect path traversal.
+    // We canonicalize the parent (not the file) because the target file may not exist yet.
+    if let Some(parent) = std::path::Path::new(&save_path).parent() {
+        match std::fs::canonicalize(parent) {
+            Ok(canon_parent) => {
+                let canon_save = canon_parent.join(
+                    std::path::Path::new(&save_path).file_name().unwrap_or_default()
+                );
+                if canon_save.to_string_lossy() != save_path {
+                    log::warn!("Path canonicalization changed: {} → {}", save_path, canon_save.display());
+                }
+            }
+            Err(e) => {
+                log::warn!("Cannot canonicalize parent of save_path {}: {}", save_path, e);
+            }
+        }
+    }
 
     let client_opt = { state.client.lock().await.clone() };
     if client_opt.is_none() { 
@@ -776,6 +1019,36 @@ pub async fn cmd_download_file(
                 }
             }
 
+            // Flush + sync to ensure data is on disk before verification
+            file.flush().map_err(|e| format!("Flush error: {}", e))?;
+            file.sync_all().map_err(|e| format!("Sync error: {}", e))?;
+            drop(file);
+
+            // Verify download integrity (skip for photos where size is unknown)
+            if total_size > 0 {
+                if downloaded == 0 {
+                    cleanup_partial_file(&save_path);
+                    return Err("Downloaded file was empty".to_string());
+                }
+                if downloaded != total_size {
+                    cleanup_partial_file(&save_path);
+                    return Err(format!(
+                        "Incomplete download: expected {} bytes, received {} bytes",
+                        total_size, downloaded
+                    ));
+                }
+                let actual_size = std::fs::metadata(&save_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if actual_size != total_size {
+                    cleanup_partial_file(&save_path);
+                    return Err(format!(
+                        "File size mismatch: expected {} bytes on disk, found {} bytes",
+                        total_size, actual_size
+                    ));
+                }
+            }
+
             bw_state.add_down(total_size);
 
             if !tid.is_empty() {
@@ -790,9 +1063,10 @@ pub async fn cmd_download_file(
 
     // === SEQUENTIAL FALLBACK ===
     // Progressive chunk sizing for fresh downloads.
-    // Gammers-client caps chunk_size at 512KB — use TELEGRAM_CHUNK_SIZE.
+    // Configurable chunk size (default 512KB, can be set to 128/256 via cmd_set_chunk_size)
+    let chunk_size = get_chunk_size_bytes(&state);
     let mut download_iter = client.iter_download(&media)
-        .chunk_size(TELEGRAM_CHUNK_SIZE);
+        .chunk_size(chunk_size);
     let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
     let mut downloaded: u64 = 0;
     let mut last_emit_time = std::time::Instant::now();
@@ -866,6 +1140,36 @@ pub async fn cmd_download_file(
         }
         // Yield so player prebuffer gets a fair share of the semaphore
         tokio::task::yield_now().await;
+    }
+
+    // Flush + sync to ensure data is on disk before verification
+    file.flush().map_err(|e| format!("Flush error: {}", e))?;
+    file.sync_all().map_err(|e| format!("Sync error: {}", e))?;
+    drop(file);
+
+    // Verify download integrity (skip for photos where size is unknown)
+    if total_size > 0 {
+        if downloaded == 0 {
+            cleanup_partial_file(&save_path);
+            return Err("Downloaded file was empty".to_string());
+        }
+        if downloaded != total_size {
+            cleanup_partial_file(&save_path);
+            return Err(format!(
+                "Incomplete download: expected {} bytes, received {} bytes",
+                total_size, downloaded
+            ));
+        }
+        let actual_size = std::fs::metadata(&save_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if actual_size != total_size {
+            cleanup_partial_file(&save_path);
+            return Err(format!(
+                "File size mismatch: expected {} bytes on disk, found {} bytes",
+                total_size, actual_size
+            ));
+        }
     }
 
     bw_state.add_down(total_size);
@@ -1035,6 +1339,29 @@ pub async fn cmd_search_global(
     }
 
     Ok(files)
+}
+
+/// Get the username of a channel (for copy-link feature).
+/// Returns None if the channel is private (no username).
+#[tauri::command]
+pub async fn cmd_get_channel_username(
+    folder_id: Option<i64>,
+    state: State<'_, TelegramState>,
+) -> Result<Option<String>, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        return Ok(None);
+    }
+    let client = client_opt.unwrap();
+
+    let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
+
+    match peer {
+        Peer::Channel(c) => {
+            Ok(c.raw.username.as_deref().map(|s| s.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Full reconciliation sync: scans all Telegram dialogs for NoBuf-tagged channels,
