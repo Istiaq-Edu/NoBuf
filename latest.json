@@ -1,0 +1,51 @@
+{
+  "version": "0.6.0",
+  "notes": "",
+  "pub_date": "2026-06-26T16:53:16.543Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYXNIdDNKK3I0aWZwQVVSdFZsVTU1KzEyYzNGekl6S0VKUEtEa25zVUxqZ3p2QXgrUHkzWW1QV1haQURWQ2kyKzRZMDFCa01LV2dUaWpndmZvL0Y1YmdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyMzI1CWZpbGU6Tm9CdWYuYXBwLnRhci5negpTSUdzVEJyMWxSRnh5V3lmeWhIMTMybkxCOHRBcklPY1d4MGNHL0ZIdXM2SGwwU1IwUTVaeUN1ZFBWSEJmVzBUNVlObWZwbU93QzViK29LektvS3pBdz09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_aarch64.app.tar.gz"
+    },
+    "darwin-aarch64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYXNIdDNKK3I0aWZwQVVSdFZsVTU1KzEyYzNGekl6S0VKUEtEa25zVUxqZ3p2QXgrUHkzWW1QV1haQURWQ2kyKzRZMDFCa01LV2dUaWpndmZvL0Y1YmdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyMzI1CWZpbGU6Tm9CdWYuYXBwLnRhci5negpTSUdzVEJyMWxSRnh5V3lmeWhIMTMybkxCOHRBcklPY1d4MGNHL0ZIdXM2SGwwU1IwUTVaeUN1ZFBWSEJmVzBUNVlObWZwbU93QzViK29LektvS3pBdz09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_aarch64.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWc0dnlXcms1T3N4d2lxV1d2bHhsbHFodzZJSHgzTEdEK3lSWW9EWnNuT1VzMnVIQ2VjVSt2WHgwbWgrZnN6SThOUUtTejUxYzhEdnBsdFRWVFNHb0FjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNDc5CWZpbGU6Tm9CdWYuYXBwLnRhci5negpnKzIzbU9ycGRCVXpSN2FhczVFT1FjUWk0Qjh6MVhhQnRFSFpoK095NU9JbGFUbFdHUFVrUkc1V1J4VVpXZ2xTZzN5MFYyNnRtdzQwRVR1UmNkVkFCQT09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_x64.app.tar.gz"
+    },
+    "darwin-x86_64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWc0dnlXcms1T3N4d2lxV1d2bHhsbHFodzZJSHgzTEdEK3lSWW9EWnNuT1VzMnVIQ2VjVSt2WHgwbWgrZnN6SThOUUtTejUxYzhEdnBsdFRWVFNHb0FjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNDc5CWZpbGU6Tm9CdWYuYXBwLnRhci5negpnKzIzbU9ycGRCVXpSN2FhczVFT1FjUWk0Qjh6MVhhQnRFSFpoK095NU9JbGFUbFdHUFVrUkc1V1J4VVpXZ2xTZzN5MFYyNnRtdzQwRVR1UmNkVkFCQT09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_x64.app.tar.gz"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWhxaW9BZEl5QlRWR2QyQWZYS3l5WGFMNEpUcGRIKy9WWFNDUEdKajAyeHN3emNYbXJxQk1vY3VKanIxQUk1dHhxTnVmS2FuM2pOV2xYaHJaL1oyZndJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNTI3CWZpbGU6Tm9CdWZfMC42LjBfYW1kNjQuQXBwSW1hZ2UKYlhTVXpxM2JVbnJpc0N0OUJHL1VBbVNVRmMrT29qNytXZ1lYZzRzRVRMa0JMRDFOTkRtQWhqWUJNdDFoQmdjOXdmZ21RNnpYbUlnTHd6a3MyQmFaQXc9PQo=",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_amd64.AppImage"
+    },
+    "linux-x86_64-appimage": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWhxaW9BZEl5QlRWR2QyQWZYS3l5WGFMNEpUcGRIKy9WWFNDUEdKajAyeHN3emNYbXJxQk1vY3VKanIxQUk1dHhxTnVmS2FuM2pOV2xYaHJaL1oyZndJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNTI3CWZpbGU6Tm9CdWZfMC42LjBfYW1kNjQuQXBwSW1hZ2UKYlhTVXpxM2JVbnJpc0N0OUJHL1VBbVNVRmMrT29qNytXZ1lYZzRzRVRMa0JMRDFOTkRtQWhqWUJNdDFoQmdjOXdmZ21RNnpYbUlnTHd6a3MyQmFaQXc9PQo=",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_amd64.AppImage"
+    },
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYXZwM20xc0lqRXdmb1FnYURQWGx2Mzd2R2FFYmVZR0pTeTBoVFFuMGJiQXBSckg2NHY3VDlIOGo4OEpDZTNXbkVabWQvWlA3Q2tQSzg4UEwxekQ2MndzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNTI3CWZpbGU6Tm9CdWZfMC42LjBfYW1kNjQuZGViCnV1bkVpaVhLOUs4TXlnQU5iZDluNXRwOVl2UnhDOHhRRjhvU0NwdVU4T2J4blN4QnduTW9UdWFIS3ZhcDA0dmVWNG1wSzI1Y0tjdHBlSjhRTzVCbkN3PT0K",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_amd64.deb"
+    },
+    "linux-x86_64-rpm": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYXFnd3psWURhbHFHN2hFRXFvRTNHN2loMkI5Q2c2WHdTTHQrZkRSVTNGNFdSWEJtV0EvV0ZLY3hHNHdqdjl1R3VWOVI3d3ZTNFNkQ2NGK3ZUOGVtbmdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNTI3CWZpbGU6Tm9CdWYtMC42LjAtMS54ODZfNjQucnBtClpIaWdKN2gyUjZySmhTdzQ3NXYvMHdVWUo0K0NNSmlLbzZ0Rkc3UW5BZFprdTFuV0ZIVEY4VktaWHNuVEE1OVV5S2tCQTd1eXpQWVhmUk54ejArTUFnPT0K",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf-0.6.0-1.x86_64.rpm"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWxVTE1uWFJqTTQvYjQzQVRiS2UwOUxKRXZWU1NsaGJZYXFaVE5FM1lHS0lFbWZldGcySXdMOTk2UmdkVkZwZWxqSnp5ekpqVTdwTnkwSzJ2NHMwMVFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNzkyCWZpbGU6Tm9CdWZfMC42LjBfeDY0X2VuLVVTLm1zaQpOd2VSK2oyRnhnNElIRzRPNEVKL0orRTB5OGtORTUwSTc5aFcvQUN2SDlNMTNFekcwVzZVVW9yUFV6cG5kdXFJbmFaSkdTQ01JS1BUZkJnZVlBdW5DZz09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_x64_en-US.msi"
+    },
+    "windows-x86_64-msi": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWxVTE1uWFJqTTQvYjQzQVRiS2UwOUxKRXZWU1NsaGJZYXFaVE5FM1lHS0lFbWZldGcySXdMOTk2UmdkVkZwZWxqSnp5ekpqVTdwTnkwSzJ2NHMwMVFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNzkyCWZpbGU6Tm9CdWZfMC42LjBfeDY0X2VuLVVTLm1zaQpOd2VSK2oyRnhnNElIRzRPNEVKL0orRTB5OGtORTUwSTc5aFcvQUN2SDlNMTNFekcwVzZVVW9yUFV6cG5kdXFJbmFaSkdTQ01JS1BUZkJnZVlBdW5DZz09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_x64_en-US.msi"
+    },
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVVF2TUg2eFgvYWk1Q01LbWtFa09WTHU0cUtWR1FJTmI1dWxqdjUyT2dtVVg1TTU4NzNuUTR3djl4M2FmS2ZVeFNwNVNFMHVuWjZnaVU4b3Z0ZGJRNDlEdGV2U013c0FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyNDkyNzkyCWZpbGU6Tm9CdWZfMC42LjBfeDY0LXNldHVwLmV4ZQo0SjJXOE9zSlJBUXJuYTgrVm1LcGltYXE5NTJnV3M5cy9uYUp4aUszK05oL1NLOEh2Y1hyekIzQTUxR2pZSGExaVU4aFh3Y05KTTd5ay9IWjBqYUJBQT09Cg==",
+      "url": "https://github.com/Istiaq-Edu/NoBuf/releases/latest/download/NoBuf_0.6.0_x64-setup.exe"
+    }
+  }
+}
