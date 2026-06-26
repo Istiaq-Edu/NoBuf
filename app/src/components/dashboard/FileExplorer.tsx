@@ -1,5 +1,7 @@
 ﻿import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
 import { Plus, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileCard } from './FileCard';
 import { EmptyState } from './EmptyState';
@@ -20,6 +22,7 @@ interface FileExplorerProps {
     onDownload: (id: number, name: string) => void;
     onPreview: (file: TelegramFile, orderedFiles?: TelegramFile[]) => void;
     onManualUpload: () => void;
+    onFolderUpload: () => void;
     onSelectionClear: () => void;
     onToggleSelection: (id: number) => void;
     onDrop?: (e: React.DragEvent, folderId: number) => void;
@@ -112,9 +115,33 @@ function useGridColumns(density: GridDensity) {
 
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
-    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd
+    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd
 }: FileExplorerProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
+    const [channelUsername, setChannelUsername] = useState<string | null>(null);
+
+    // Fetch channel username when active folder changes (for copy-link feature)
+    useEffect(() => {
+        if (activeFolderId !== null) {
+            invoke<string | null>('cmd_get_channel_username', { folderId: activeFolderId })
+                .then(setChannelUsername)
+                .catch(() => setChannelUsername(null));
+        } else {
+            setChannelUsername(null);
+        }
+    }, [activeFolderId]);
+
+    const handleCopyLink = useCallback(async () => {
+        if (!channelUsername || !contextMenu) return;
+        const link = `https://t.me/${channelUsername}/${contextMenu.file.id}`;
+        try {
+            await navigator.clipboard.writeText(link);
+            toast.success('Link copied to clipboard');
+        } catch {
+            toast.error('Failed to copy link');
+        }
+        setContextMenu(null);
+    }, [channelUsername, contextMenu]);
     const { settings, updateSetting } = useSettings();
     const { columns, containerRef, scrollRef, animateShift } = useGridColumns(settings.gridDensity);
 
@@ -161,13 +188,13 @@ export function FileExplorer({
             let comparison = 0;
             switch (sortField) {
                 case 'name':
-                    comparison = a.name.localeCompare(b.name);
+                    comparison = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
                     break;
                 case 'size':
                     comparison = (a.size || 0) - (b.size || 0);
                     break;
                 case 'date':
-                    comparison = (a.created_at || '').localeCompare(b.created_at || '');
+                    comparison = (a.created_at || '').localeCompare(b.created_at || '', undefined, { numeric: true });
                     break;
             }
             return sortDirection === 'asc' ? comparison : -comparison;
@@ -284,13 +311,23 @@ export function FileExplorer({
                                 Date <SortIcon field="date" />
                             </button>
                         </div>
-                        <button
-                            onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                            className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
-                        >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span className="hidden sm:inline">Upload</span>
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                            <button
+                                onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
+                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
+                            >
+                                <Plus className="w-3.5 h-3.5" />
+                                <span className="hidden sm:inline">Upload</span>
+                            </button>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); onFolderUpload(); }}
+                                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-nobuf-hover text-nobuf-text hover:brightness-110 active:scale-95 transition-all border border-nobuf-border"
+                                title="Upload Folder (zipped)"
+                            >
+                                <Plus className="w-3.5 h-3.5" />
+                                <span className="hidden sm:inline">Folder</span>
+                            </button>
+                        </div>
                     </div>
 
 
@@ -417,6 +454,8 @@ export function FileExplorer({
                         }
                         setContextMenu(null);
                     }}
+                    onCopyLink={handleCopyLink}
+                    channelIsPublic={!!channelUsername}
                 />
             )}
         </div>

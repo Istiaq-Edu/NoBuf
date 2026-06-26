@@ -1,6 +1,7 @@
 use grammers_client::Client;
 use grammers_client::types::Peer;
-use tauri::State;
+use tauri::{State, Manager};
+use serde::{Deserialize, Serialize};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::TelegramState;
 use std::collections::HashMap;
@@ -89,6 +90,51 @@ pub fn map_error(e: impl std::fmt::Display) -> String {
     err_str
 }
 
+/// Calculate exponential backoff delay with ~25% random jitter.
+/// Prevents thundering herd effects when multiple clients retry simultaneously.
+/// - `attempt`: 1-based retry attempt number
+/// - `base_ms`: base delay for first attempt
+/// - `max_ms`: maximum delay cap
+pub fn backoff_with_jitter(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+    let shift = attempt.saturating_sub(1).min(10);
+    let exp = base_ms.saturating_mul(1u64 << shift);
+    let capped = exp.min(max_ms);
+    let jitter = (capped as f64 * 0.25 * rand::random::<f64>()) as u64;
+    capped + jitter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backoff_grows_exponentially() {
+        let b1 = backoff_with_jitter(1, 5000, 60_000);
+        let b2 = backoff_with_jitter(2, 5000, 60_000);
+        let b3 = backoff_with_jitter(3, 5000, 60_000);
+        // attempt=1: 5000 * 2^0 = 5000, jitter 0-1250 → [5000, 6250]
+        // attempt=2: 5000 * 2^1 = 10000, jitter 0-2500 → [10000, 12500]
+        // attempt=3: 5000 * 2^2 = 20000, jitter 0-5000 → [20000, 25000]
+        assert!(b1 >= 5000 && b1 <= 6250, "b1 should be 5000-6250, got {}", b1);
+        assert!(b2 >= 10000 && b2 <= 12500, "b2 should be 10000-12500, got {}", b2);
+        assert!(b3 >= 20000 && b3 <= 25000, "b3 should be 20000-25000, got {}", b3);
+    }
+
+    #[test]
+    fn test_backoff_capped_at_max() {
+        // attempt=10: 5000 * 2^9 = 2,560,000 — way over 60,000 cap
+        let delay = backoff_with_jitter(10, 5000, 60_000);
+        assert!(delay >= 60000 && delay <= 75000, "should be capped at 60000+jitter, got {}", delay);
+    }
+
+    #[test]
+    fn test_backoff_attempt_zero() {
+        let delay = backoff_with_jitter(0, 5000, 60_000);
+        // attempt=0: saturating_sub(1)=0, 5000 * 2^0 = 5000, jitter 0-1250
+        assert!(delay >= 5000 && delay <= 6250, "attempt 0 should be 5000-6250, got {}", delay);
+    }
+}
+
 /// Set speed limits for prebuffer (streaming) and download (file download panel).
 /// Values in KB/s. 0 = unlimited. Stored atomically so the Actix server
 /// and download loops can read them without async locks.
@@ -100,8 +146,128 @@ pub fn cmd_set_speed_limits(
 ) -> Result<bool, String> {
     state.prebuffer_speed_limit_kb.store(prebuffer_limit_kb, Ordering::Relaxed);
     state.download_speed_limit_kb.store(download_limit_kb, Ordering::Relaxed);
-    // let prebuf_str = if prebuffer_limit_kb == 0 { "unlimited" } else { &prebuffer_limit_kb.to_string() };
-    // let dl_str = if download_limit_kb == 0 { "unlimited" } else { &download_limit_kb.to_string() };
-    // log::info!("[THROTTLE-DBG] cmd_set_speed_limits called: prebuffer={} KB/s, download={} KB/s", prebuf_str, dl_str);
     Ok(true)
+}
+
+/// Set the download chunk size in KB. Valid values: 128, 256, 512.
+/// Grammers-client caps at 512KB. Smaller chunks improve stability on
+/// high-packet-loss networks at the cost of more API round-trips.
+#[tauri::command]
+pub fn cmd_set_chunk_size(
+    chunk_size_kb: u64,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    // Validate: must be 128, 256, or 512
+    match chunk_size_kb {
+        128 | 256 | 512 => {
+            state.chunk_size_kb.store(chunk_size_kb, Ordering::Relaxed);
+            log::info!("Chunk size set to {} KB", chunk_size_kb);
+            Ok(true)
+        }
+        _ => Err(format!("Invalid chunk size: {} KB. Must be 128, 256, or 512.", chunk_size_kb)),
+    }
+}
+
+/// Set TCP keep-alive interval in seconds (0 = disabled, 30-120 typical).
+/// Prevents idle disconnections through strict VPN tunnels.
+#[tauri::command]
+pub fn cmd_set_keep_alive(
+    interval_sec: u64,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    // 0 = disabled, otherwise must be 30-120
+    if interval_sec != 0 && (interval_sec < 30 || interval_sec > 120) {
+        return Err(format!("Keep-alive interval must be 0 (disabled) or 30-120 seconds, got {}", interval_sec));
+    }
+    state.keep_alive_interval_sec.store(interval_sec, Ordering::Relaxed);
+    log::info!("Keep-alive interval set to {} seconds", if interval_sec == 0 { "disabled" } else { "enabled" });
+    Ok(true)
+}
+
+/// Network settings persisted to network_settings.json in the app data dir.
+/// Stores chunk size, keep-alive interval, speed limits, and VPN detection flag.
+/// Loaded on startup, saved on change.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NetworkSettings {
+    pub chunk_size_kb: u64,
+    pub keep_alive_interval_sec: u64,
+    pub prebuffer_speed_limit_kb: u64,
+    pub download_speed_limit_kb: u64,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            chunk_size_kb: 512,
+            keep_alive_interval_sec: 0,
+            prebuffer_speed_limit_kb: 0,
+            download_speed_limit_kb: 0,
+        }
+    }
+}
+
+fn network_settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("network_settings.json"))
+}
+
+/// Load network settings from disk and apply to TelegramState atomics.
+pub fn load_and_apply_network_settings(app: &tauri::AppHandle, state: &TelegramState) {
+    let path = match network_settings_path(app) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let settings: NetworkSettings = match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => NetworkSettings::default(),
+    };
+    state.chunk_size_kb.store(settings.chunk_size_kb, Ordering::Relaxed);
+    state.keep_alive_interval_sec.store(settings.keep_alive_interval_sec, Ordering::Relaxed);
+    state.prebuffer_speed_limit_kb.store(settings.prebuffer_speed_limit_kb, Ordering::Relaxed);
+    state.download_speed_limit_kb.store(settings.download_speed_limit_kb, Ordering::Relaxed);
+    log::info!("Network settings loaded: chunk={}KB keepalive={}s prebuf={}KB/s dl={}KB/s",
+        settings.chunk_size_kb, settings.keep_alive_interval_sec,
+        settings.prebuffer_speed_limit_kb, settings.download_speed_limit_kb);
+}
+
+/// Save current network settings to disk.
+#[tauri::command]
+pub fn cmd_save_network_settings(
+    chunk_size_kb: u64,
+    keep_alive_interval_sec: u64,
+    prebuffer_speed_limit_kb: u64,
+    download_speed_limit_kb: u64,
+    app: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    let settings = NetworkSettings {
+        chunk_size_kb,
+        keep_alive_interval_sec,
+        prebuffer_speed_limit_kb,
+        download_speed_limit_kb,
+    };
+    // Apply to state atomics
+    state.chunk_size_kb.store(chunk_size_kb, Ordering::Relaxed);
+    state.keep_alive_interval_sec.store(keep_alive_interval_sec, Ordering::Relaxed);
+    state.prebuffer_speed_limit_kb.store(prebuffer_speed_limit_kb, Ordering::Relaxed);
+    state.download_speed_limit_kb.store(download_speed_limit_kb, Ordering::Relaxed);
+    // Persist to disk
+    let path = network_settings_path(&app)?;
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    log::info!("Network settings saved to disk");
+    Ok(true)
+}
+
+/// Load network settings from disk (for frontend display).
+#[tauri::command]
+pub fn cmd_get_network_settings(
+    app: tauri::AppHandle,
+) -> Result<NetworkSettings, String> {
+    let path = network_settings_path(&app)?;
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(serde_json::from_str(&contents).unwrap_or_default()),
+        Err(_) => Ok(NetworkSettings::default()),
+    }
 }

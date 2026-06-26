@@ -707,7 +707,7 @@ async fn proactive_prebuffer_download(
                     if setup_attempt >= MAX_SETUP_RETRIES {
                         return Err(e);
                     }
-                    let delay = 5000u64 * 2u64.pow(setup_attempt - 1);
+                    let delay = crate::commands::utils::backoff_with_jitter(setup_attempt, 5000, 60_000);
                     log::warn!(
                         "[PROACTIVE] msg {}: setup attempt {}/{} failed: {}. Retry in {}ms",
                         message_id, setup_attempt, MAX_SETUP_RETRIES, e, delay
@@ -1088,7 +1088,7 @@ async fn proactive_prebuffer_download(
                             );
                             break; // Move to next gap
                         }
-                        let delay = (2000u64 * 2u64.pow(seq_retries - 1)).min(60_000);
+                        let delay = crate::commands::utils::backoff_with_jitter(seq_retries, 2000, 60_000);
                         log::warn!(
                             "[PROACTIVE] msg {}: download error at offset {} (attempt {}/{}): {}. Retry in {}ms",
                             message_id, offset, seq_retries, MAX_SEQ_RETRIES, e, delay

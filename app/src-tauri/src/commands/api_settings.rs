@@ -59,9 +59,42 @@ fn hash_key(key: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Verify a plaintext key against a stored hash
+/// Verify a plaintext key against a stored hash using constant-time comparison
+/// to prevent timing side-channel attacks.
 pub fn verify_key(plaintext: &str, stored_hash: &str) -> bool {
-    hash_key(plaintext) == stored_hash
+    let computed = hash_key(plaintext);
+    constant_time_eq::constant_time_eq(computed.as_bytes(), stored_hash.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_key_correct() {
+        let hash = hash_key("my-secret-key-123");
+        assert!(verify_key("my-secret-key-123", &hash));
+    }
+
+    #[test]
+    fn test_verify_key_wrong() {
+        let hash = hash_key("my-secret-key-123");
+        assert!(!verify_key("wrong-key", &hash));
+    }
+
+    #[test]
+    fn test_verify_key_empty() {
+        let hash = hash_key("");
+        assert!(verify_key("", &hash));
+        assert!(!verify_key("a", &hash));
+    }
+
+    #[test]
+    fn test_verify_key_different_lengths() {
+        let hash = hash_key("key1");
+        assert!(!verify_key("key1extra", &hash));
+        assert!(!verify_key("ke", &hash));
+    }
 }
 
 #[tauri::command]

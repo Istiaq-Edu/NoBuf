@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-extract-archive-entry"
+description = "Enables the cmd_extract_archive_entry command without any pre-configured scope."
+commands.allow = ["cmd_extract_archive_entry"]
+
+[[permission]]
+identifier = "deny-cmd-extract-archive-entry"
+description = "Denies the cmd_extract_archive_entry command without any pre-configured scope."
+commands.deny = ["cmd_extract_archive_entry"]

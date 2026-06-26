@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-channel-username"
+description = "Enables the cmd_get_channel_username command without any pre-configured scope."
+commands.allow = ["cmd_get_channel_username"]
+
+[[permission]]
+identifier = "deny-cmd-get-channel-username"
+description = "Denies the cmd_get_channel_username command without any pre-configured scope."
+commands.deny = ["cmd_get_channel_username"]

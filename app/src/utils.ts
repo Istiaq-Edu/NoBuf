@@ -27,6 +27,12 @@ export const isImageFile   = (name: string) => endsWithAny(name, IMAGE_EXTENSION
 export const isDocumentFile = (name: string) => endsWithAny(name, DOCUMENT_EXTENSIONS);
 export const isPdfFile     = (name: string) => name.toLowerCase().endsWith('.pdf');
 
+const ARCHIVE_EXTENSIONS = ['zip', 'rar', '7z'] as const;
+export const isArchiveFile = (name: string) => {
+    const lower = name.toLowerCase();
+    return ARCHIVE_EXTENSIONS.some(ext => lower.endsWith('.' + ext));
+};
+
 export type FileCategory = 'videos' | 'audio' | 'images' | 'documents' | 'misc';
 
 export function getFileCategory(name: string): FileCategory {
@@ -38,3 +44,18 @@ export function getFileCategory(name: string): FileCategory {
 }
 
 export const ALL_FILE_CATEGORIES: FileCategory[] = ['videos', 'audio', 'images', 'documents', 'misc'];
+
+/// Sanitize a filename for the current OS by removing invalid characters.
+/// Windows: strips <>:"/\|?* and trailing dots/spaces (NTFS ADS prevention).
+/// macOS/Linux: strips / and null bytes only.
+export function sanitizeFilename(name: string): string {
+    if (typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')) {
+        // Windows invalid chars: < > : " / \ | ? *
+        // Also strip trailing dots and spaces (NTFS doesn't allow them at end)
+        return name
+            .replace(/[<>:"/\\|?*]/g, '')
+            .replace(/[.\s]+$/g, '');
+    }
+    // macOS/Linux: only / and null are invalid in filenames
+    return name.replace(/[/\0]/g, '');
+}

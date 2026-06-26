@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-set-chunk-size"
+description = "Enables the cmd_set_chunk_size command without any pre-configured scope."
+commands.allow = ["cmd_set_chunk_size"]
+
+[[permission]]
+identifier = "deny-cmd-set-chunk-size"
+description = "Denies the cmd_set_chunk_size command without any pre-configured scope."
+commands.deny = ["cmd_set_chunk_size"]

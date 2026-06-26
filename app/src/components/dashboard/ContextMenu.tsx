@@ -1,7 +1,7 @@
 ﻿import { useEffect, useRef, useState } from 'react';
-import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText } from 'lucide-react';
+import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText, FileArchive, Link } from 'lucide-react';
 import { TelegramFile } from '../../types';
-import { isMediaFile, isPdfFile } from '../../utils';
+import { isMediaFile, isPdfFile, isArchiveFile } from '../../utils';
 
 interface ContextMenuProps {
     x: number;
@@ -11,9 +11,11 @@ interface ContextMenuProps {
     onDownload: () => void;
     onDelete: () => void;
     onPreview: () => void;
+    onCopyLink?: () => void;
+    channelIsPublic?: boolean;
 }
 
-export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview }: ContextMenuProps) {
+export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onCopyLink, channelIsPublic }: ContextMenuProps) {
     const [adjustedPos, setAdjustedPos] = useState({ x, y });
     const menuRef = useRef<HTMLDivElement>(null);
 
@@ -74,6 +76,11 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                             <FileText className="w-4 h-4 text-red-400" />
                             View PDF
                         </>
+                    ) : isArchiveFile(file.name) ? (
+                        <>
+                            <FileArchive className="w-4 h-4 text-amber-400" />
+                            View Archive
+                        </>
                     ) : (
                         <>
                             <Eye className="w-4 h-4 text-nobuf-primary" />
@@ -94,6 +101,18 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 <HardDrive className="w-4 h-4 text-green-500" />
                 Download
             </button>
+
+            {file.type !== 'folder' && onCopyLink && (
+                <button
+                    onClick={onCopyLink}
+                    disabled={!channelIsPublic}
+                    className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-text hover:bg-nobuf-hover rounded transition-colors text-left w-full disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={channelIsPublic ? 'Copy t.me link' : 'Channel is private — no public link available'}
+                >
+                    <Link className="w-4 h-4 text-nobuf-primary" />
+                    Copy Telegram Link
+                </button>
+            )}
 
             <button disabled className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-subtext hover:bg-nobuf-hover rounded transition-colors text-left w-full cursor-not-allowed opacity-50">
                 <Pencil className="w-4 h-4" />

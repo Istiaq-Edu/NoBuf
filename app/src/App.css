@@ -461,10 +461,9 @@ body,
 }
 
 /* ========================================
-   Settings Page — Full-page scrollable layout
+   Settings Page — Redesigned Layout
    ======================================== */
 
-/* Page container — overlays the dashboard */
 .settings-page {
     position: absolute;
     inset: 0;
@@ -473,29 +472,36 @@ body,
     background: var(--color-nobuf-bg);
 }
 
-/* Single scrollable content area */
+/* Scrollable content area */
 .settings-content-full {
     flex: 1;
     overflow-y: auto;
     background: var(--color-nobuf-bg);
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-nobuf-border) transparent;
 }
 
 /* Header with back button */
 .settings-page-header {
-    padding: 24px 32px 16px;
+    padding: 20px 32px 14px;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 14px;
     position: sticky;
     top: 0;
-    z-index: 5;
-    background: var(--color-nobuf-bg);
+    z-index: 10;
+    background: rgba(10, 15, 13, 0.85);
+    backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--color-nobuf-border);
 }
 
+:root.light .settings-page-header {
+    background: rgba(245, 250, 247, 0.85);
+}
+
 .settings-back-btn {
-    width: 40px;
-    height: 40px;
+    width: 38px;
+    height: 38px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -511,17 +517,18 @@ body,
     background: var(--color-nobuf-hover);
     color: var(--color-nobuf-text);
     border-color: var(--color-nobuf-primary);
+    transform: translateX(-2px);
 }
 
 .settings-page-title {
-    font-size: 22px;
+    font-size: 20px;
     font-weight: 700;
     color: var(--color-nobuf-text);
     line-height: 1.2;
 }
 
 .settings-page-subtitle {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--color-nobuf-subtext);
     margin-top: 2px;
 }
@@ -530,11 +537,11 @@ body,
 .settings-reset-btn-inline {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
+    gap: 6px;
+    padding: 7px 12px;
     border-radius: 8px;
-    font-size: 12px;
-    font-weight: 500;
+    font-size: 11px;
+    font-weight: 600;
     color: var(--color-nobuf-subtext);
     background: transparent;
     border: 1px solid var(--color-nobuf-border);
@@ -554,15 +561,15 @@ body,
     border-color: rgba(220, 38, 38, 0.2);
 }
 
-/* Scrollable body */
+/* Scrollable body — responsive, fluid for Tauri window */
 .settings-page-body {
-    padding: 24px 32px 40px;
-    max-width: 700px;
+    padding: 20px 24px 48px;
 }
 
-/* Category groups — visually separated */
+/* Category groups — grid layout on desktop */
 .settings-category {
-    margin-bottom: 32px;
+    margin-bottom: 28px;
+    break-inside: avoid;
 }
 
 .settings-category:last-child {
@@ -573,27 +580,29 @@ body,
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-bottom: 12px;
+    margin-bottom: 10px;
     color: var(--color-nobuf-primary);
 }
 
 .settings-category-title {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 700;
     color: var(--color-nobuf-text);
+    letter-spacing: -0.01em;
 }
 
 .settings-category-desc {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--color-nobuf-subtext);
     margin-left: auto;
+    text-align: right;
 }
 
 .settings-category-body {
     /* body of cards */
 }
 
-/* Section headers — used inside tab views, still available */
+/* Section headers — used inside tab views */
 .settings-section-header {
     display: flex;
     align-items: center;
@@ -619,38 +628,41 @@ body,
     background: var(--color-nobuf-surface);
     border: 1px solid var(--color-nobuf-border);
     border-radius: 12px;
-    padding: 16px;
-    transition: background 0.2s ease, border-color 0.2s ease;
+    padding: 14px 16px;
+    transition: all 0.2s ease;
 }
 
 .settings-card:hover {
-    border-color: rgba(29, 252, 159, 0.2);
+    border-color: rgba(29, 252, 159, 0.25);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
 }
 
 :root.light .settings-card:hover {
     border-color: rgba(10, 87, 48, 0.15);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
 }
 
 .settings-card-title {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     color: var(--color-nobuf-text);
 }
 
 .settings-card-desc {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--color-nobuf-subtext);
     margin-top: 2px;
+    line-height: 1.4;
 }
 
 /* Icon boxes — colored containers for setting icons */
 .settings-icon-box {
-    width: 36px;
-    height: 36px;
+    width: 34px;
+    height: 34px;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 8px;
+    border-radius: 9px;
     background: rgba(29, 252, 159, 0.1);
     color: var(--color-nobuf-primary);
     flex-shrink: 0;
@@ -673,8 +685,8 @@ body,
 
 /* Stepper buttons — + / - controls */
 .stepper-btn {
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -692,8 +704,12 @@ body,
     border-color: var(--color-nobuf-primary);
 }
 
+.stepper-btn:active {
+    transform: scale(0.95);
+}
+
 .stepper-value {
-    width: 32px;
+    width: 30px;
     text-align: center;
     font-size: 14px;
     font-weight: 700;
@@ -712,9 +728,9 @@ body,
 
 .settings-toggle-option {
     flex: 1;
-    padding: 8px 12px;
-    border-radius: 8px;
-    font-size: 13px;
+    padding: 7px 12px;
+    border-radius: 7px;
+    font-size: 12px;
     font-weight: 500;
     color: var(--color-nobuf-subtext);
     background: transparent;
@@ -743,9 +759,9 @@ body,
 .settings-filter-chip {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
-    border-radius: 10px;
+    gap: 6px;
+    padding: 7px 12px;
+    border-radius: 9px;
     font-size: 12px;
     font-weight: 600;
     color: var(--color-nobuf-subtext);
@@ -782,7 +798,7 @@ body,
 
 /* API toggle switch */
 .settings-toggle-switch {
-    width: 44px;
+    width: 42px;
     height: 24px;
     border-radius: 12px;
     border: none;
@@ -817,7 +833,7 @@ body,
 }
 
 .settings-toggle-switch.on .settings-toggle-knob {
-    transform: translateX(20px);
+    transform: translateX(18px);
 }
 
 /* Status dots */
@@ -831,6 +847,7 @@ body,
 .settings-status-dot.running {
     background: var(--color-nobuf-primary);
     box-shadow: 0 0 8px rgba(29, 252, 159, 0.5);
+    animation: pulse-dot 2s ease-in-out infinite;
 }
 
 .settings-status-dot.stopped {
@@ -845,9 +862,14 @@ body,
     background: rgba(10, 87, 48, 0.25);
 }
 
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
 /* Small input for port */
 .settings-input-small {
-    width: 80px;
+    width: 72px;
     background: var(--color-nobuf-bg);
     border: 1px solid var(--color-nobuf-border);
     border-radius: 8px;
@@ -869,7 +891,7 @@ body,
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 14px;
+    padding: 7px 12px;
     border-radius: 8px;
     font-size: 12px;
     font-weight: 600;
@@ -899,7 +921,7 @@ body,
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 8px 16px;
+    padding: 7px 14px;
     border-radius: 8px;
     font-size: 12px;
     font-weight: 600;
@@ -931,7 +953,7 @@ body,
 
 /* Key reveal section */
 .settings-key-reveal {
-    margin-top: 16px;
+    margin-top: 14px;
     padding: 12px;
     background: var(--color-nobuf-bg);
     border-radius: 10px;
@@ -980,26 +1002,143 @@ body,
 }
 
 /* ========================================
-   Responsive Breakpoints
+   Responsive Breakpoints — Fluid for Tauri window
    ======================================== */
 
-/* Mobile: sidebar drawer overlay */
-@media (max-width: 639px) {
+/* Base: single centered column — looks great at any window size */
+.settings-page-body {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 20px 24px 48px;
+}
+
+/* Medium window: two-column masonry using CSS columns */
+@media (min-width: 720px) {
     .settings-page-body {
-        padding: 16px;
+        max-width: none;
+        column-count: 2;
+        column-gap: 20px;
+        padding: 24px 28px 48px;
     }
-    .settings-page-header {
-        padding: 16px;
-    }
-    .settings-card {
-        padding: 12px;
+    .settings-category {
+        break-inside: avoid;
+        margin-bottom: 20px;
     }
 }
 
-/* Tablet adjustments */
-@media (max-width: 1023px) {
+/* Large window: three-column masonry */
+@media (min-width: 1100px) {
     .settings-page-body {
-        max-width: 100%;
-        padding: 20px 24px 32px;
+        column-count: 3;
+        column-gap: 24px;
+        padding: 28px 36px 56px;
     }
+}
+
+/* Extra large window: four columns */
+@media (min-width: 1500px) {
+    .settings-page-body {
+        column-gap: 28px;
+        padding: 32px 48px 64px;
+    }
+}
+
+/* Small window: tighter spacing */
+@media (max-width: 719px) {
+    .settings-page-body {
+        padding: 16px 18px 40px;
+    }
+    .settings-page-header {
+        padding: 14px 18px;
+    }
+    .settings-card {
+        padding: 12px 14px;
+    }
+    .settings-page-title {
+        font-size: 18px;
+    }
+    .settings-category-desc {
+        display: none;
+    }
+    .settings-category {
+        margin-bottom: 22px;
+    }
+}
+
+/* Very small window: minimal padding */
+@media (max-width: 420px) {
+    .settings-page-body {
+        padding: 12px 12px 32px;
+    }
+    .settings-page-header {
+        padding: 12px 14px;
+    }
+    .settings-icon-box {
+        width: 30px;
+        height: 30px;
+    }
+    .settings-card {
+        padding: 10px 12px;
+    }
+    .settings-page-subtitle {
+        display: none;
+    }
+    .settings-reset-btn-inline span {
+        display: none;
+    }
+}
+
+/* ========================================
+   Sidebar scrollbars + group color outline
+   ======================================== */
+
+/* Scrollbar for sidebar folder list — always visible */
+.sidebar-scroll {
+    scrollbar-width: auto;
+    scrollbar-color: rgba(128, 128, 128, 0.4) rgba(128, 128, 128, 0.1);
+    overflow-y: auto !important;
+}
+.sidebar-scroll::-webkit-scrollbar {
+    width: 6px;
+    -webkit-appearance: none;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+    background: rgba(128, 128, 128, 0.08);
+    border-radius: 3px;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.35);
+    border-radius: 3px;
+    min-height: 30px;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(128, 128, 128, 0.55);
+}
+
+/* Horizontal scrollbar for group tabs */
+.group-tabs-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-nobuf-border) transparent;
+}
+.group-tabs-scroll::-webkit-scrollbar {
+    height: 4px;
+}
+.group-tabs-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+.group-tabs-scroll::-webkit-scrollbar-thumb {
+    background: var(--color-nobuf-border);
+    border-radius: 2px;
+}
+.group-tabs-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--color-nobuf-subtext);
+}
+
+/* Group color indicator on sidebar items */
+.sidebar-group-indicator {
+    width: 3px;
+    height: 16px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    margin-right: 0;
 }

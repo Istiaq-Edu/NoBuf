@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-network-settings"
+description = "Enables the cmd_get_network_settings command without any pre-configured scope."
+commands.allow = ["cmd_get_network_settings"]
+
+[[permission]]
+identifier = "deny-cmd-get-network-settings"
+description = "Denies the cmd_get_network_settings command without any pre-configured scope."
+commands.deny = ["cmd_get_network_settings"]

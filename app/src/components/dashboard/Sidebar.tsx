@@ -1,7 +1,9 @@
-import { useState, useCallback } from 'react';
-import { HardDrive, Folder, Plus, RefreshCw, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { useState, useCallback, useEffect } from 'react';
+import { HardDrive, Folder, Plus, PanelLeftClose, PanelLeftOpen, Check } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
+import { FolderGroupTabs } from './FolderGroupTabs';
 import { TelegramFolder, BandwidthStats } from '../../types';
 
 interface SidebarProps {
@@ -13,10 +15,7 @@ interface SidebarProps {
     onRename: (id: number, newName: string) => void;
     onReorder: (reordered: TelegramFolder[]) => void;
     onCreate: (name: string) => Promise<void>;
-    isSyncing: boolean;
     isConnected: boolean;
-    onSync: () => void;
-    onLogout: () => void;
     bandwidth: BandwidthStats | null;
     collapsed: boolean;
     onToggleCollapse: () => void;
@@ -33,11 +32,61 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
-    isSyncing, isConnected, onSync, onLogout, bandwidth, collapsed, onToggleCollapse,
+    isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
+    const [activeGroupId, setActiveGroupId] = useState<number | null>(null);
+
+    // Enriched folder data: maps folderId → { group_id, group_color }
+    const [folderGroupMap, setFolderGroupMap] = useState<Record<number, { id: number | null; color: string | null }>>({});
+    const [groupAssignVersion, setGroupAssignVersion] = useState(0);
+    const [groupRefreshKey, setGroupRefreshKey] = useState(0);
+
+    // New Group inline input
+    const [showNewGroupInput, setShowNewGroupInput] = useState(false);
+    const [newGroupName, setNewGroupName] = useState('');
+    const [newGroupColor, setNewGroupColor] = useState('#22c55e');
+
+    const handleCreateGroup = async () => {
+        if (!newGroupName.trim()) return;
+        try {
+            await invoke('cmd_create_group', { name: newGroupName.trim(), colorHex: newGroupColor });
+            setNewGroupName('');
+            setShowNewGroupInput(false);
+            setGroupRefreshKey(k => k + 1);
+        } catch (e) {
+            console.error('Failed to create group:', e);
+        }
+    };
+
+    // Fetch enriched folders to know which folder is in which group
+    useEffect(() => {
+        invoke<Array<{ id: number; group_id: number | null; group_color: string | null }>>('cmd_get_enriched_folders')
+            .then(enriched => {
+                const map: Record<number, { id: number | null; color: string | null }> = {};
+                for (const f of enriched) {
+                    map[f.id] = { id: f.group_id, color: f.group_color };
+                }
+                setFolderGroupMap(map);
+            })
+            .catch(() => {});
+    }, [groupAssignVersion]);
+
+    // Filter folders by active group
+    const filteredFolders = activeGroupId === null
+        ? folders
+        : folders.filter(f => (folderGroupMap[f.id]?.id ?? null) === activeGroupId);
+
+    const handleAssignGroup = useCallback(async (folderId: number, groupId: number | null) => {
+        try {
+            await invoke('cmd_assign_folder_to_group', { channelId: folderId, groupId });
+            setGroupAssignVersion(v => v + 1);
+        } catch (e) {
+            console.error('Failed to assign group:', e);
+        }
+    }, []);
 
     // Reorder drag state: tracks which folder is being dragged and
     // where it would be inserted (the index of the drop target).
@@ -135,10 +184,10 @@ export function Sidebar({
     }, []);
 
     return (
-        <aside className={`${collapsed ? 'w-16' : 'w-64'} bg-nobuf-surface border-r border-nobuf-border flex flex-col transition-[width] duration-200 ease-in-out shrink-0 max-sm:fixed max-sm:inset-y-0 max-sm:left-0 max-sm:z-40 max-sm:shadow-2xl ${mobileOpen ? 'max-sm:translate-x-0' : 'max-sm:-translate-x-full'} max-sm:transition-transform max-sm:duration-300`} onClick={e => e.stopPropagation()}>
+        <aside className={`${collapsed ? 'w-16' : 'w-64'} h-screen max-sm:h-full bg-nobuf-surface border-r border-nobuf-border flex flex-col overflow-hidden transition-[width] duration-200 ease-in-out shrink-0 max-sm:fixed max-sm:inset-y-0 max-sm:left-0 max-sm:z-40 max-sm:shadow-2xl ${mobileOpen ? 'max-sm:translate-x-0' : 'max-sm:-translate-x-full'} max-sm:transition-transform max-sm:duration-300`} onClick={e => e.stopPropagation()}>
 
-            {/* Toggle button — always in the same spot */}
-            <div className="p-3 flex items-center">
+            {/* Toggle button — left aligned */}
+            <div className={`flex items-center pt-3 pb-2 shrink-0 ${collapsed ? 'px-4' : 'px-3'}`}>
                 <button
                     onClick={onToggleCollapse}
                     className="w-8 h-8 rounded-lg flex items-center justify-center text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-hover transition-colors"
@@ -151,8 +200,19 @@ export function Sidebar({
                 </button>
             </div>
 
+            {/* Folder group chips — only show when sidebar is expanded */}
+            {!collapsed && (
+                <div className="border-b border-nobuf-border">
+                    <FolderGroupTabs
+                        activeGroupId={activeGroupId}
+                        onGroupSelect={setActiveGroupId}
+                        refreshKey={groupRefreshKey}
+                    />
+                </div>
+            )}
+
             {/* Scrollable folder list */}
-            <nav className="flex-1 px-2 py-2 overflow-y-auto min-h-0" style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            <nav className={`flex-1 flex flex-col gap-0.5 overflow-y-auto overflow-x-hidden min-h-0 sidebar-scroll py-2 ${collapsed ? 'px-4' : 'px-3'}`}>
                 <SidebarItem
                     icon={HardDrive}
                     label="Saved Messages"
@@ -162,7 +222,7 @@ export function Sidebar({
                     folderId={null}
                     collapsed={collapsed}
                 />
-                {folders.map((folder, index) => (
+                {filteredFolders.map((folder, index) => (
                     <SidebarItem
                         key={folder.id}
                         icon={Folder}
@@ -180,6 +240,9 @@ export function Sidebar({
                         }}
                         onDelete={() => onDelete(folder.id, folder.name)}
                         onRename={(newName: string) => onRename(folder.id, newName)}
+                        onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
+                        currentGroupId={folderGroupMap[folder.id]?.id ?? null}
+                        groupColor={folderGroupMap[folder.id]?.color ?? null}
                         onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
                         onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
                         onFolderDragLeave={handleFolderDragLeave}
@@ -187,76 +250,130 @@ export function Sidebar({
                         onFolderDragEnd={handleDragEnd}
                         reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
                         isFirst={index === 0}
-                        isLast={index === folders.length - 1}
+                        isLast={index === filteredFolders.length - 1}
                         folderId={folder.id}
                         collapsed={collapsed}
                     />
                 ))}
             </nav>
 
-            {/* Create Folder */}
-            <div className="px-2 pb-2 border-b border-nobuf-border">
+            {/* Create Folder + New Group — bottom row */}
+            <div className={`border-b border-nobuf-border shrink-0 space-y-2 pb-2 ${collapsed ? 'flex flex-col px-4' : 'px-3'}`}>
+                {/* Inline input for Create Folder */}
                 {showNewFolderInput ? (
-                    <div className="px-3 py-2">
+                    <div className="px-2 py-2 bg-nobuf-hover rounded-lg border border-nobuf-primary/30">
+                        <div className="flex items-center gap-2 mb-2">
+                            <Folder className="w-4 h-4 text-nobuf-primary shrink-0" />
+                            <span className="text-xs font-medium text-nobuf-subtext">New Channel</span>
+                        </div>
                         <input
                             autoFocus
                             type="text"
-                            className="w-full bg-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:ring-1 focus:ring-nobuf-primary"
-                            placeholder="Folder Name"
+                            className="w-full bg-nobuf-bg rounded-lg px-3 py-2 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 transition-all border border-nobuf-border"
+                            placeholder="Enter channel name..."
                             value={newFolderName}
                             onChange={e => setNewFolderName(e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && submitCreate()}
-                            onBlur={() => { if (!newFolderName) { setShowNewFolderInput(false); if (collapsed) onToggleCollapse(); } }}
+                            onKeyDown={e => {
+                                if (e.key === 'Enter') submitCreate();
+                                if (e.key === 'Escape') { setShowNewFolderInput(false); setNewFolderName(''); }
+                            }}
                         />
+                        <div className="flex gap-2 mt-2">
+                            <button
+                                onClick={submitCreate}
+                                disabled={!newFolderName.trim()}
+                                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-nobuf-primary text-nobuf-county-green rounded-lg hover:brightness-110 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                                <Check className="w-3.5 h-3.5" />
+                                Create
+                            </button>
+                            <button
+                                onClick={() => { setShowNewFolderInput(false); setNewFolderName(''); }}
+                                className="px-3 py-1.5 text-xs font-medium text-nobuf-subtext hover:text-nobuf-text bg-nobuf-bg border border-nobuf-border rounded-lg transition-colors"
+                            >
+                                Cancel
+                            </button>
+                        </div>
                     </div>
                 ) : (
-                    <button
-                        onClick={() => {
-                            if (collapsed) { onToggleCollapse(); }
-                            setShowNewFolderInput(true);
-                        }}
-                        className={`w-full flex items-center px-3 py-2 rounded-lg text-sm font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-colors border border-dashed border-nobuf-border overflow-hidden ${collapsed ? 'justify-center' : 'gap-3'}`}
-                        title="Create Folder"
-                    >
-                        <Plus className="w-4 h-4 shrink-0" />
-                        <span className={`whitespace-nowrap transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>Create Folder</span>
-                    </button>
+                    /* Inline input for New Group */
+                    showNewGroupInput ? (
+                        <div className="px-2 py-2 bg-nobuf-hover rounded-lg border border-nobuf-primary/30">
+                            <div className="flex items-center gap-2 mb-2">
+                                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: newGroupColor }} />
+                                <span className="text-xs font-medium text-nobuf-subtext">New Group</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <input
+                                    type="color"
+                                    value={newGroupColor}
+                                    onChange={(e) => setNewGroupColor(e.target.value)}
+                                    className="w-7 h-7 rounded cursor-pointer bg-transparent border border-nobuf-border shrink-0"
+                                />
+                                <input
+                                    autoFocus
+                                    type="text"
+                                    className="flex-1 bg-nobuf-bg rounded-lg px-3 py-2 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 transition-all border border-nobuf-border"
+                                    placeholder="Group name..."
+                                    value={newGroupName}
+                                    onChange={e => setNewGroupName(e.target.value)}
+                                    onKeyDown={e => {
+                                        if (e.key === 'Enter') handleCreateGroup();
+                                        if (e.key === 'Escape') { setShowNewGroupInput(false); setNewGroupName(''); }
+                                    }}
+                                />
+                            </div>
+                            <div className="flex gap-2 mt-2">
+                                <button
+                                    onClick={handleCreateGroup}
+                                    disabled={!newGroupName.trim()}
+                                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-nobuf-primary text-nobuf-county-green rounded-lg hover:brightness-110 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    <Check className="w-3.5 h-3.5" />
+                                    Create
+                                </button>
+                                <button
+                                    onClick={() => { setShowNewGroupInput(false); setNewGroupName(''); }}
+                                    className="px-3 py-1.5 text-xs font-medium text-nobuf-subtext hover:text-nobuf-text bg-nobuf-bg border border-nobuf-border rounded-lg transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className={`flex gap-2 ${collapsed ? 'flex-col items-center' : ''}`}>
+                            <button
+                                onClick={() => { if (collapsed) onToggleCollapse(); setShowNewFolderInput(true); }}
+                                className={`flex items-center justify-center rounded-lg text-xs font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-all border border-dashed border-nobuf-border hover:border-nobuf-primary/40 active:scale-95 gap-1.5 ${collapsed ? 'w-8 h-8' : 'flex-1 px-3 py-2'}`}
+                                title="Create Folder"
+                            >
+                                <Plus className="w-3.5 h-3.5 shrink-0" />
+                                {!collapsed && <span>Folder</span>}
+                            </button>
+                            <button
+                                onClick={() => { if (collapsed) onToggleCollapse(); setShowNewGroupInput(true); }}
+                                className={`flex items-center justify-center rounded-lg text-xs font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-all border border-dashed border-nobuf-border hover:border-nobuf-primary/40 active:scale-95 gap-1.5 ${collapsed ? 'w-8 h-8' : 'flex-1 px-3 py-2'}`}
+                                title="New Group"
+                            >
+                                <Plus className="w-3.5 h-3.5 shrink-0" />
+                                {!collapsed && <span>Group</span>}
+                            </button>
+                        </div>
+                    )
                 )}
             </div>
 
-            {/* Footer — single structure, text fades out */}
-            <div className="p-3 border-t border-nobuf-border">
-                <div className={`flex items-center text-nobuf-subtext text-xs mb-3 ${collapsed ? 'justify-center' : 'gap-2'}`}>
+            {/* Footer — connection status + bandwidth */}
+            <div className={`border-t border-nobuf-border shrink-0 ${collapsed ? 'px-4 py-3' : 'p-3'}`}>
+                <div className={`flex items-center text-nobuf-subtext text-xs mb-2 gap-2`}>
                     <div className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-nobuf-primary animate-pulse' : 'bg-red-500'}`}></div>
                     <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'max-w-0 opacity-0' : 'max-w-[200px] opacity-100'}`}>
                         {isConnected ? 'Connected' : 'Disconnected'}
                     </span>
                 </div>
 
-                <div className={`flex ${collapsed ? 'flex-col items-center gap-2' : 'gap-2'}`}>
-                    <button
-                        onClick={onSync}
-                        disabled={isSyncing}
-                        className={`btn-shine flex items-center justify-center text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:bg-nobuf-primary/90 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'} ${isSyncing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                        title={isSyncing ? 'Syncing...' : 'Sync'}
-                    >
-                        <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isSyncing ? 'animate-spin' : ''}`} />
-                        <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>
-                            {isSyncing ? 'Syncing...' : 'Sync'}
-                        </span>
-                    </button>
-                    <button
-                        onClick={onLogout}
-                        className={`btn-shine flex items-center justify-center text-xs font-medium bg-red-500 text-white hover:bg-red-600 rounded-lg transition-all duration-200 ${collapsed ? 'w-10 h-10' : 'flex-1 px-3 py-2 gap-2'}`}
-                        title="Sign Out"
-                    >
-                        <LogOut className="w-3.5 h-3.5 shrink-0" />
-                        <span className={`whitespace-nowrap overflow-hidden transition-all duration-200 ${collapsed ? 'w-0 opacity-0' : 'opacity-100'}`}>Logout</span>
-                    </button>
-                </div>
-
                 {/* Bandwidth — fades out when collapsed */}
-                <div className={`transition-all duration-200 overflow-hidden ${collapsed ? 'max-h-0 opacity-0 mt-0' : 'max-h-40 opacity-100 mt-3'}`}>
+                <div className={`transition-all duration-200 overflow-hidden ${collapsed ? 'max-h-0 opacity-0 mt-0' : 'max-h-40 opacity-100'}`}>
                     {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
                 </div>
             </div>
