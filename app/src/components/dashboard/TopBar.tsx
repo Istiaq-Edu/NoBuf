@@ -1,4 +1,4 @@
-import { LayoutGrid, Settings, ArrowLeftRight, Menu, Globe } from 'lucide-react';
+import { LayoutGrid, Settings, ArrowLeftRight, Menu, Globe, Info } from 'lucide-react';
 
 interface TopBarProps {
     currentFolderName: string;
@@ -12,6 +12,7 @@ interface TopBarProps {
     searchTerm: string;
     onSearchChange: (term: string) => void;
     onSettingsClick: () => void;
+    onAboutClick: () => void;
     onRemoteUpload: () => void;
     onToggleTransfers: () => void;
     showTransferPanel: boolean;
@@ -25,7 +26,7 @@ interface TopBarProps {
 
 export function TopBar({
     currentFolderName, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
-    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick, onRemoteUpload,
+    onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick, onAboutClick, onRemoteUpload,
     onToggleTransfers, showTransferPanel,
     uploadActiveCount = 0, uploadFinishedCount = 0,
     downloadActiveCount = 0, downloadFinishedCount = 0,
@@ -126,6 +127,17 @@ export function TopBar({
                     <Settings className="w-5 h-5" />
                     <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-nobuf-surface border border-nobuf-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
                         Settings
+                    </span>
+                </button>
+
+                <button
+                    onClick={onAboutClick}
+                    className="p-2 hover:bg-nobuf-hover rounded-md text-nobuf-subtext hover:text-nobuf-text transition relative group"
+                    title="About"
+                >
+                    <Info className="w-5 h-5" />
+                    <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] bg-nobuf-surface border border-nobuf-border px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-lg">
+                        About
                     </span>
                 </button>
             </div>

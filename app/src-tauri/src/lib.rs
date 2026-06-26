@@ -370,7 +370,7 @@ pub fn run() {
             let window_url = tauri::WebviewUrl::External("http://localhost:1420".parse().unwrap());
 
             WebviewWindowBuilder::new(app, "main", window_url)
-                .title("NoBuf")
+                .title(format!("NoBuf v{}", env!("CARGO_PKG_VERSION")))
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(360.0, 500.0)
                 .disable_drag_drop_handler()
