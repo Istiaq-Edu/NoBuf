@@ -248,11 +248,15 @@ pub fn run() {
                 rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
                 prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                chunk_size_kb: Arc::new(std::sync::atomic::AtomicU64::new(512)),
+                keep_alive_interval_sec: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
+            // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
+            commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
@@ -380,6 +384,7 @@ pub fn run() {
             commands::cmd_auth_check_password,
             commands::cmd_get_files,
             commands::cmd_upload_file,
+            commands::cmd_upload_from_url,
             commands::cmd_connect,
             commands::cmd_log,
             commands::cmd_delete_file,
@@ -392,10 +397,14 @@ pub fn run() {
             commands::cmd_logout,
             commands::cmd_scan_folders,
             commands::cmd_search_global,
+            commands::cmd_get_channel_username,
             commands::cmd_check_connection,
             commands::cmd_rename_folder,
             commands::cmd_start_auto_sync,
             commands::cmd_is_network_available,
+            commands::cmd_detect_vpn,
+            commands::cmd_check_latency,
+            commands::cmd_test_all_dcs,
             commands::cmd_clean_cache,
             commands::cmd_get_thumbnail,
             commands::cmd_get_stream_info,
@@ -417,6 +426,20 @@ pub fn run() {
             commands::cmd_report_playback_position,
             commands::cmd_stop_proactive_prebuffer,
             commands::cmd_set_speed_limits,
+            commands::cmd_set_chunk_size,
+            commands::cmd_set_keep_alive,
+            commands::cmd_save_network_settings,
+            commands::cmd_get_network_settings,
+            commands::cmd_list_archive_contents,
+            commands::cmd_extract_archive_entry,
+            commands::cmd_zip_folder,
+            commands::cmd_get_groups,
+            commands::cmd_create_group,
+            commands::cmd_update_group,
+            commands::cmd_delete_group,
+            commands::cmd_assign_folder_to_group,
+            commands::cmd_update_group_order,
+            commands::cmd_get_enriched_folders,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));

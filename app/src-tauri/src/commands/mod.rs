@@ -48,6 +48,15 @@ pub struct TelegramState {
     /// Speed limit for file downloads in KB/s. 0 = unlimited.
     /// Read by cmd_download_file after each chunk to inject sleep.
     pub download_speed_limit_kb: Arc<AtomicU64>,
+    /// Configurable download chunk size in KB (128, 256, or 512).
+    /// Default: 512 (max allowed by grammers-client). Read by download
+    /// and streaming paths. Smaller chunks improve stability on
+    /// high-packet-loss networks at the cost of more API round-trips.
+    pub chunk_size_kb: Arc<AtomicU64>,
+    /// TCP keep-alive interval in seconds (0 = disabled, 30-120 typical).
+    /// Applied to the grammers connection to prevent idle disconnections
+    /// through strict VPN tunnels.
+    pub keep_alive_interval_sec: Arc<AtomicU64>,
     /// Multi-connection download pool for parallel file transfers.
     /// Each worker has its own TCP connection to the Telegram media DC,
     /// following Telegram's official recommendation for parallel downloads.
@@ -79,6 +88,8 @@ pub mod network;
 pub mod streaming;
 pub mod api_settings;
 pub mod sprite;
+pub mod archive;
+pub mod folder_groups;
 
 pub use auth::*;
 pub use fs::*;
@@ -87,4 +98,6 @@ pub use utils::*;
 pub use network::*;
 pub use streaming::*;
 pub use api_settings::*;
+pub use archive::*;
+pub use folder_groups::*;
 pub use sprite::*;

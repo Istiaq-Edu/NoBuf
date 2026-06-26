@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-check-latency"
+description = "Enables the cmd_check_latency command without any pre-configured scope."
+commands.allow = ["cmd_check_latency"]
+
+[[permission]]
+identifier = "deny-cmd-check-latency"
+description = "Denies the cmd_check_latency command without any pre-configured scope."
+commands.deny = ["cmd_check_latency"]

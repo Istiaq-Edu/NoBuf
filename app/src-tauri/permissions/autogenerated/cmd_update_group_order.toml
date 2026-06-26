@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-update-group-order"
+description = "Enables the cmd_update_group_order command without any pre-configured scope."
+commands.allow = ["cmd_update_group_order"]
+
+[[permission]]
+identifier = "deny-cmd-update-group-order"
+description = "Denies the cmd_update_group_order command without any pre-configured scope."
+commands.deny = ["cmd_update_group_order"]

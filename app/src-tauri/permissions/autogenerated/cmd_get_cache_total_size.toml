@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-cache-total-size"
+description = "Enables the cmd_get_cache_total_size command without any pre-configured scope."
+commands.allow = ["cmd_get_cache_total_size"]
+
+[[permission]]
+identifier = "deny-cmd-get-cache-total-size"
+description = "Denies the cmd_get_cache_total_size command without any pre-configured scope."
+commands.deny = ["cmd_get_cache_total_size"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-list-archive-contents"
+description = "Enables the cmd_list_archive_contents command without any pre-configured scope."
+commands.allow = ["cmd_list_archive_contents"]
+
+[[permission]]
+identifier = "deny-cmd-list-archive-contents"
+description = "Denies the cmd_list_archive_contents command without any pre-configured scope."
+commands.deny = ["cmd_list_archive_contents"]

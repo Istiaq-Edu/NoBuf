@@ -26,6 +26,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     // Listen for progress events from Rust
     useEffect(() => {
         let unlisten: UnlistenFn | undefined;
+        let unlistenRemote: UnlistenFn | undefined;
         listen<ProgressPayload>('upload-progress', (event) => {
             setUploadQueue(q => q.map(i =>
                 i.id === event.payload.id && i.status !== 'cancelled' && i.status !== 'error' ? {
@@ -34,10 +35,24 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                     uploadedBytes: event.payload.uploaded_bytes,
                     totalBytes: event.payload.total_bytes,
                     speedBytesPerSec: event.payload.speed_bytes_per_sec,
+                    phase: i.url ? 'uploading' : undefined,
                 } : i
             ));
         }).then(fn => { unlisten = fn; });
-        return () => { unlisten?.(); };
+        // Remote upload download phase progress
+        listen<ProgressPayload>('remote-upload-progress', (event) => {
+            setUploadQueue(q => q.map(i =>
+                i.id === event.payload.id && i.status !== 'cancelled' && i.status !== 'error' ? {
+                    ...i,
+                    progress: event.payload.percent,
+                    uploadedBytes: event.payload.uploaded_bytes,
+                    totalBytes: event.payload.total_bytes,
+                    speedBytesPerSec: event.payload.speed_bytes_per_sec,
+                    phase: 'downloading',
+                } : i
+            ));
+        }).then(fn => { unlistenRemote = fn; });
+        return () => { unlisten?.(); unlistenRemote?.(); };
     }, []);
 
     useEffect(() => {
@@ -72,7 +87,13 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         setProcessing(true);
         setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i));
         try {
-            await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id });
+            if (item.url) {
+                // Remote upload from URL
+                await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+            } else {
+                // Local file upload
+                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id });
+            }
             // Check if cancelled during upload
             if (cancelledRef.current.has(item.id)) {
                 cancelledRef.current.delete(item.id);
@@ -114,6 +135,48 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         } catch {
             toast.error("Failed to open file dialog");
         }
+    };
+
+    const handleFolderUpload = async () => {
+        try {
+            const selected = await open({ multiple: false, directory: true });
+            if (!selected) return;
+            const folderPath = Array.isArray(selected) ? selected[0] : selected;
+            toast.info('Compressing folder...');
+            try {
+                const zipPath = await invoke<string>('cmd_zip_folder', { folderPath });
+                const folderName = folderPath.split(/[/\\]/).pop() || 'folder';
+                const newItem: QueueItem = {
+                    id: Math.random().toString(36).substr(2, 9),
+                    path: zipPath,
+                    folderId: activeFolderId,
+                    status: 'pending',
+                };
+                setUploadQueue(prev => [...prev, newItem]);
+                toast.success(`Folder "${folderName}" compressed, queued for upload`);
+            } catch (e) {
+                toast.error(`Folder zip failed: ${e}`);
+            }
+        } catch {
+            toast.error("Failed to open folder dialog");
+        }
+    };
+
+    const handleRemoteUpload = (url: string) => {
+        if (!url || !url.startsWith('http://') && !url.startsWith('https://')) {
+            toast.error("Please enter a valid URL (http:// or https://)");
+            return;
+        }
+        const newItem: QueueItem = {
+            id: Math.random().toString(36).substr(2, 9),
+            path: '',
+            url,
+            folderId: activeFolderId,
+            status: 'pending',
+            phase: 'downloading',
+        };
+        setUploadQueue(prev => [...prev, newItem]);
+        toast.info(`Queued remote URL for upload`);
     };
 
     const cancelAll = () => {
@@ -160,6 +223,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         uploadQueue,
         setUploadQueue,
         handleManualUpload,
+        handleFolderUpload,
+        handleRemoteUpload,
         cancelAll,
         cancelItem,
         retryItem,
