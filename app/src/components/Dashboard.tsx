@@ -22,6 +22,8 @@ import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
 import { AboutPage } from './dashboard/AboutPage';
+import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
+import { ActiveView } from '../types';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -43,6 +45,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         store, folders, activeFolderId, setActiveFolderId, isConnected,
         handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
     } = useTelegramConnection(onLogout);
+
+    const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
+    const { publicChannels, syncFromRemote } = usePublicChannels();
+
+    // Sync activeFolderId with activeView for backward compat
+    useEffect(() => {
+        if (activeView.type === 'saved') {
+            setActiveFolderId(null);
+        } else if (activeView.type === 'folder') {
+            setActiveFolderId(activeView.folderId);
+        }
+    }, [activeView, setActiveFolderId]);
 
 
     const { settings, updateSetting } = useSettings();
@@ -86,15 +100,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
-    const { data: allFiles = [], isLoading, error } = useQuery({
+    const isPublicView = activeView.type === 'public';
+    const { files: pubChannelFiles, isLoading: pubFilesLoading } = usePublicChannelFiles(
+        isPublicView ? activeView.channelId : null
+    );
+
+    const { data: nbFiles = [], isLoading: nbFilesLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
         queryFn: () => invoke<any[]>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
             ...f,
             sizeStr: formatBytes(f.size),
             type: f.icon_type || (f.name.endsWith('/') ? 'folder' : 'file')
         }))),
-        enabled: !!store,
+        enabled: !!store && !isPublicView,
     });
+
+    const allFiles = isPublicView ? pubChannelFiles : nbFiles;
+    const isLoading = isPublicView ? pubFilesLoading : nbFilesLoading;
 
     const displayedFiles = (() => {
         // 1. Apply search filter
@@ -418,9 +440,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }
 
-    const currentFolderName = activeFolderId === null
-        ? "Saved Messages"
-        : folders.find(f => f.id === activeFolderId)?.name || "Folder";
+    const currentFolderName = activeView.type === 'public'
+        ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
+        : activeFolderId === null
+            ? "Saved Messages"
+            : folders.find(f => f.id === activeFolderId)?.name || "Folder";
 
 
     const handleRootDragOver = (e: React.DragEvent) => {
@@ -526,6 +550,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onToggleCollapse={toggleSidebar}
                 mobileOpen={mobileSidebarOpen}
                 onMobileClose={() => setMobileSidebarOpen(false)}
+                activeView={activeView}
+                publicChannels={publicChannels}
+                onSelectPublicChannel={(channelId) => setActiveView({ type: 'public', channelId })}
+                onPublicChannelsChanged={() => syncFromRemote.mutate()}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>

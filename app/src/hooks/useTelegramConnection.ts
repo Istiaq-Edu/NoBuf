@@ -56,6 +56,12 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             try {
                 const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
                 applySyncResult(result);
+                // Sync public channels from [NB-PUB]
+                try {
+                    await invoke('cmd_sync_public_channels');
+                } catch (e) {
+                    console.warn('[Public Channels] Sync failed:', e);
+                }
                 if (result.added.length > 0 || result.updated.length > 0 || result.removed.length > 0) {
                     showSyncSummary(result);
                 }
