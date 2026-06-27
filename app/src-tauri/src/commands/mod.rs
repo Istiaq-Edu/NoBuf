@@ -90,6 +90,7 @@ pub mod api_settings;
 pub mod sprite;
 pub mod archive;
 pub mod folder_groups;
+pub mod public_channels;
 
 pub use auth::*;
 pub use fs::*;
@@ -100,4 +101,5 @@ pub use streaming::*;
 pub use api_settings::*;
 pub use archive::*;
 pub use folder_groups::*;
+pub use public_channels::*;
 pub use sprite::*;
