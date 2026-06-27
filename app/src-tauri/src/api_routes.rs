@@ -1,6 +1,7 @@
 use actix_web::{get, head, web, HttpRequest, HttpResponse, Responder};
 use crate::commands::TelegramState;
 use crate::commands::utils::resolve_peer;
+use crate::server::throttle_api_calls;
 use grammers_client::types::Media;
 use serde::Serialize;
 use std::sync::Arc;
@@ -84,14 +85,14 @@ fn parse_range_header(range: &str, total_size: u64) -> Option<(u64, u64)> {
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
-    version: String,
+    version: Option<String>,
 }
 
 #[get("/api/v1/health")]
 async fn api_health() -> impl Responder {
     HttpResponse::Ok().json(HealthResponse {
         status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: None,
     })
 }
 
@@ -368,35 +369,42 @@ async fn api_download_file(
                         let mut bytes_sent: u64 = 0;
                         let mut first_chunk = true;
                         let mut iter = download_iter;
-                        while let Some(chunk) = iter.next().await.transpose() {
-                            match chunk {
-                                Ok(bytes) => {
-                                    let remaining = content_length - bytes_sent;
-                                    if remaining == 0 {
-                                        break;
-                                    }
-
-                                    let mut data = bytes;
-
-                                    // On first chunk, discard leading bytes to align with start_byte
-                                    if first_chunk && bytes_to_discard > 0 {
-                                        let discard = bytes_to_discard.min(data.len() as u64) as usize;
-                                        data = data[discard..].to_vec();
-                                        first_chunk = false;
-                                    }
-
-                                    if data.len() as u64 > remaining {
-                                        yield Ok::<_, actix_web::Error>(web::Bytes::from(data[..remaining as usize].to_vec()));
-                                        break;
-                                    }
-                                    bytes_sent += data.len() as u64;
-                                    yield Ok::<_, actix_web::Error>(web::Bytes::from(data));
-                                }
-                                Err(e) => {
+                        loop {
+                            let chunk_result = {
+                                let _permit = tg_state.download_semaphore.acquire().await.unwrap();
+                                throttle_api_calls(&tg_state.rate_limiter).await;
+                                iter.next().await
+                            };
+                            let chunk = match chunk_result.transpose() {
+                                Some(Ok(bytes)) => bytes,
+                                Some(Err(e)) => {
                                     log::error!("API download stream error: {}", e);
                                     break;
                                 }
+                                None => break,
+                            };
+                            tokio::task::yield_now().await;
+
+                            let remaining = content_length - bytes_sent;
+                            if remaining == 0 {
+                                break;
                             }
+
+                            let mut data = chunk;
+
+                            // On first chunk, discard leading bytes to align with start_byte
+                            if first_chunk && bytes_to_discard > 0 {
+                                let discard = bytes_to_discard.min(data.len() as u64) as usize;
+                                data = data[discard..].to_vec();
+                                first_chunk = false;
+                            }
+
+                            if data.len() as u64 > remaining {
+                                yield Ok::<_, actix_web::Error>(web::Bytes::from(data[..remaining as usize].to_vec()));
+                                break;
+                            }
+                            bytes_sent += data.len() as u64;
+                            yield Ok::<_, actix_web::Error>(web::Bytes::from(data));
                         }
                     };
 
@@ -406,13 +414,13 @@ async fn api_download_file(
                             .insert_header(("Content-Length", content_length.to_string()))
                             .insert_header(("Content-Range", format!("bytes {}-{}/{}", start_byte, end_byte, size)))
                             .insert_header(("Accept-Ranges", "bytes"))
-                            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+                            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename.replace('"', "").replace('\r', "").replace('\n', ""))))
                             .streaming(stream);
                     } else {
                         return HttpResponse::Ok()
                             .insert_header(("Content-Type", mime))
                             .insert_header(("Content-Length", size.to_string()))
-                            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+                            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename.replace('"', "").replace('\r', "").replace('\n', ""))))
                             .insert_header(("Accept-Ranges", "bytes"))
                             .streaming(stream);
                     }

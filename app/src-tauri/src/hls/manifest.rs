@@ -39,13 +39,13 @@ const INIT_SEGMENT_PACKETS: u64 = 2;
 /// We rewrite the PMT PID to 0x1000 (a valid, non-reserved PID) in the init_prefix.
 const PMT_PID_REWRITE: u16 = 0x1000;
 
-/// Stream types that hls.js misidentifies.
-/// stream_type=0x15 maps to id3Pid (metadata) in hls.js's parsePMT, NOT audioPid.
-/// The PID carrying this stream_type actually holds AAC audio PES data, so
-/// hls.js never discovers the audio track → "Found no media" on seek segments.
-/// We rewrite 0x15→0x0F (ISO/IEC 13818-7 AAC ADTS audio) so hls.js assigns
-/// it to audioPid correctly, AND the entry is properly recognized as audio.
-const REWRITE_STREAM_TYPES: &[(u8, u8)] = &[(0x15, 0x0F)];
+/// Stream types that need rewriting for mpegts.js compatibility.
+/// stream_type=0x15 is mapped to kMetadata (ID3) by mpegts.js, causing audio
+/// PES packets to be silently dropped. The correct mapping is 0x11 (kLOASAAC)
+/// which routes to parseLOASAACPayload — mpegts.js's native LATM/LOAS parser.
+/// Previously rewritten to 0x0F (kADTSAAC) which caused parseADTSAACPayload
+/// to parse LATM frames as ADTS, corrupting audio → PIPELINE_ERROR_DECODE.
+const REWRITE_STREAM_TYPES: &[(u8, u8)] = &[(0x15, 0x11)];
 
 /// Detect TS packet size (188 for MPEG-TS, 192 for M2TS/BDAV) by scanning
 /// the first bytes of a file for the MPEG-TS sync byte (0x47) at regular
@@ -429,7 +429,7 @@ async fn resolve_hls_media(
 ) -> Result<(Media, u64, String, Option<f64>, Option<u32>, Option<u32>), HttpResponse> {
     // Validate token
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => return Err(HttpResponse::Forbidden().body("Invalid or missing stream token")),
     }
 
@@ -610,7 +610,7 @@ async fn hls_segment(
 
     // Validate token
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => return HttpResponse::Forbidden().body("Invalid or missing stream token"),
     };
 
@@ -1989,11 +1989,40 @@ pub fn ensure_init_prefix_no_rewrite(
                 pat_pmt_buf.clone()
             };
             if !init_prefix_raw.is_empty() {
-                // NO REWRITE — keep original PMT PID intact for mpegts.js compatibility
-                cache_mgr.cache_init_prefix(message_id, init_prefix_raw.clone());
-                log::info!("[HLS-INIT] Cached init prefix (NO-REWRITE) for msg {}: {} bytes, m2ts={}, original_pmt_pid=0x{:04X}",
-                    message_id, init_prefix_raw.len(), is_m2ts, original_pmt_pid);
-                return init_prefix_raw;
+                // Apply stream_type rewrite (0x15→0x11) to the init-prefix so mpegts.js
+                // routes audio to parseLOASAACPayload instead of kMetadata/ID3.
+                // The init-prefix is the first thing mpegts.js reads — if it has 0x15,
+                // mpegts.js maps it to kMetadata and drops all audio PES packets.
+                // PMT PID is NOT rewritten (mpegts.js handles any PMT PID natively).
+                let mut init_prefix_rewritten = init_prefix_raw.clone();
+                let ps: usize = 188;
+                for pkt_offset in (0..init_prefix_rewritten.len()).step_by(ps) {
+                    if pkt_offset + ps > init_prefix_rewritten.len() { break; }
+                    if init_prefix_rewritten[pkt_offset] != 0x47 { continue; }
+                    let pid = ((init_prefix_rewritten[pkt_offset + 1] as u16 & 0x1F) << 8) | init_prefix_rewritten[pkt_offset + 2] as u16;
+                    if pid == 0x0000 { continue; } // PAT
+                    let pusi = (init_prefix_rewritten[pkt_offset + 1] >> 6) & 0x01;
+                    if pusi != 1 { continue; }
+                    let afc = (init_prefix_rewritten[pkt_offset + 3] >> 4) & 0x03;
+                    let mut payload_offset = pkt_offset + 4;
+                    if afc & 0x02 != 0 {
+                        if payload_offset >= pkt_offset + ps { continue; }
+                        let af_len = init_prefix_rewritten[payload_offset] as usize;
+                        payload_offset += 1 + af_len;
+                    }
+                    if payload_offset >= pkt_offset + ps { continue; }
+                    let pointer_field = init_prefix_rewritten[payload_offset] as usize;
+                    let section_start = payload_offset + 1 + pointer_field;
+                    let pkt_end = pkt_offset + ps;
+                    let rewritten = rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_end);
+                    if rewritten > 0 {
+                        log::info!("[HLS-INIT] Rewrote {} stream_type(s) 0x15→0x11 in init-prefix PMT for msg {}", message_id, rewritten);
+                    }
+                }
+                cache_mgr.cache_init_prefix(message_id, init_prefix_rewritten.clone());
+                log::info!("[HLS-INIT] Cached init prefix (stream_type rewritten) for msg {}: {} bytes, m2ts={}, original_pmt_pid=0x{:04X}",
+                    message_id, init_prefix_rewritten.len(), is_m2ts, original_pmt_pid);
+                return init_prefix_rewritten;
             }
         }
     }
@@ -2008,10 +2037,32 @@ pub fn ensure_init_prefix_no_rewrite(
                 raw_buf
             };
             if !init_prefix_raw.is_empty() {
-                cache_mgr.cache_init_prefix(message_id, init_prefix_raw.clone());
-                log::info!("[HLS-INIT] Cached init prefix (NO-REWRITE, raw fallback) for msg {}: {} bytes",
-                    message_id, init_prefix_raw.len());
-                return init_prefix_raw;
+                // Apply stream_type rewrite to the fallback raw bytes too
+                let mut init_prefix_rewritten = init_prefix_raw.clone();
+                let ps: usize = 188;
+                for pkt_offset in (0..init_prefix_rewritten.len()).step_by(ps) {
+                    if pkt_offset + ps > init_prefix_rewritten.len() { break; }
+                    if init_prefix_rewritten[pkt_offset] != 0x47 { continue; }
+                    let pid = ((init_prefix_rewritten[pkt_offset + 1] as u16 & 0x1F) << 8) | init_prefix_rewritten[pkt_offset + 2] as u16;
+                    if pid == 0x0000 { continue; }
+                    let pusi = (init_prefix_rewritten[pkt_offset + 1] >> 6) & 0x01;
+                    if pusi != 1 { continue; }
+                    let afc = (init_prefix_rewritten[pkt_offset + 3] >> 4) & 0x03;
+                    let mut payload_offset = pkt_offset + 4;
+                    if afc & 0x02 != 0 {
+                        if payload_offset >= pkt_offset + ps { continue; }
+                        let af_len = init_prefix_rewritten[payload_offset] as usize;
+                        payload_offset += 1 + af_len;
+                    }
+                    if payload_offset >= pkt_offset + ps { continue; }
+                    let pointer_field = init_prefix_rewritten[payload_offset] as usize;
+                    let section_start = payload_offset + 1 + pointer_field;
+                    rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_offset + ps);
+                }
+                cache_mgr.cache_init_prefix(message_id, init_prefix_rewritten.clone());
+                log::info!("[HLS-INIT] Cached init prefix (stream_type rewritten, raw fallback) for msg {}: {} bytes",
+                    message_id, init_prefix_rewritten.len());
+                return init_prefix_rewritten;
             }
         }
     }

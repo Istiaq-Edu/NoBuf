@@ -34,7 +34,7 @@ pub async fn ensure_client_initialized(
     // CRITICAL: Shutdown existing runner before creating a new one
     // This prevents runner task accumulation which causes stack overflow
     let did_shutdown_old_runner = {
-        let mut guard = state.runner_shutdown.lock().unwrap();
+        let mut guard = state.runner_shutdown.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(shutdown_tx) = guard.take() {
             log::info!("Signaling old runner to shutdown...");
             let _ = shutdown_tx.send(());
@@ -48,7 +48,7 @@ pub async fn ensure_client_initialized(
     }
 
     let runner_num = state.runner_count.fetch_add(1, Ordering::SeqCst) + 1;
-    log::info!("Initializing Telegram Client #{} with API ID: {}", runner_num, api_id);
+    log::info!("Initializing Telegram Client #{}", runner_num);
     
     // Resolve session path safely
     let app_data_dir = app_handle.path().app_data_dir()
@@ -61,7 +61,14 @@ pub async fn ensure_client_initialized(
     
     let session_path = app_data_dir.join("telegram.session");
     let session_path_str = session_path.to_string_lossy().to_string();
-    log::info!("Opening session at: {}", session_path_str);
+    log::info!("Opening session in app data directory");
+    
+    // Security: Restrict session file permissions to current user only (Unix)
+    #[cfg(unix)]
+    {
+        // The session file may not exist yet — SqliteSession::open creates it.
+        // We set permissions after opening to ensure the file exists.
+    }
     
     // Grammers initialization with corruption recovery
     let session = match SqliteSession::open(&session_path_str).map_err(|e| e.to_string()) {
@@ -76,14 +83,23 @@ pub async fn ensure_client_initialized(
                 .map_err(|e| format!("Failed to open session after recreation: {}", e))?
         }
     };
-        
+    
+    // Security: Restrict session file permissions to current user only (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(format!("{}-wal", session_path_str), std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(format!("{}-shm", session_path_str), std::fs::Permissions::from_mode(0o600));
+    }
+    
     let session = Arc::new(session);
     let pool = SenderPool::new(session, api_id);
     let client = Client::new(&pool);
     
     // Create shutdown channel for this runner
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    *state.runner_shutdown.lock().unwrap() = Some(shutdown_tx);
+    *state.runner_shutdown.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
     
     // Spawn the network runner with shutdown support
     let SenderPool { runner, .. } = pool;
@@ -190,7 +206,7 @@ pub async fn cmd_logout(
     
     // 1. Shutdown the network runner FIRST to prevent any operations
     {
-        let mut shutdown_guard = state.runner_shutdown.lock().unwrap();
+        let mut shutdown_guard = state.runner_shutdown.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(shutdown_tx) = shutdown_guard.take() {
             log::info!("Signaling runner shutdown for logout...");
             let _ = shutdown_tx.send(());
@@ -252,7 +268,7 @@ pub async fn cmd_auth_request_code(
 
     let client_handle = ensure_client_initialized(&app_handle, &state, api_id).await?;
     
-    log::info!("Requesting code for {}", phone);
+    log::info!("Requesting login code");
     
     let mut last_error = String::new();
     

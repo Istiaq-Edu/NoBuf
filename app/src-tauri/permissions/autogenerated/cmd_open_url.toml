@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-open-url"
+description = "Enables the cmd_open_url command without any pre-configured scope."
+commands.allow = ["cmd_open_url"]
+
+[[permission]]
+identifier = "deny-cmd-open-url"
+description = "Denies the cmd_open_url command without any pre-configured scope."
+commands.deny = ["cmd_open_url"]

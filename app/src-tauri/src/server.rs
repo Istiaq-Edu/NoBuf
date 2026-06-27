@@ -41,9 +41,9 @@ fn detect_ts_packet_size(data_path: &std::path::Path) -> Option<(u64, bool)> {
 /// Rewrite TS stream data in a buffer for mediabunny compatibility.
 /// Two types of rewriting:
 /// 1. Init-prefix overlap (bytes 0-375): replace with cached rewritten init_prefix
-///    (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x0F)
+///    (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x11)
 /// 2. Inline PAT/PMT packets beyond the init_prefix: rewrite PID 0x0FFF→0x1000
-///    and stream_type 0x15→0x0F. Mediabunny may re-read inline PAT packets and
+///    and stream_type 0x15→0x11. Mediabunny may re-read inline PAT packets and
 ///    would fail to find PMT on PID 0x0FFF (which is null stuffing in TS).
 ///
 /// If init_prefix is not cached yet, attempts on-the-fly extraction from the
@@ -97,13 +97,12 @@ fn rewrite_ts_stream_in_buf(
         }
     }
 
-    // Step 3: Rewrite PMT stream_type 0x15 (AAC-LATM) → 0x0F (AAC) in inline
-    // PMT packets. mpegts.js maps stream_type 0x15 to kMetadata (ID3), not
-    // kADTSAAC, so audio PES packets on those PIDs are silently dropped and
-    // METADATA_PARSED never fires. The HLS segment handler already does this
-    // via rewrite_segment_pids(), but /stream/ data is served raw — we must
-    // fix stream_types inline here. PMT PID rewriting (0x0FFF→0x1000) is NOT
-    // needed; mpegts.js handles any PMT PID correctly.
+    // Step 3: Rewrite PMT stream_type entries in inline PMT packets.
+    // stream_type 0x15 (AAC-LATM) is mapped to kMetadata by mpegts.js, which
+    // drops audio PES. We rewrite 0x15→0x11 (kLOASAAC) so mpegts.js uses
+    // parseLOASAACPayload for native LATM/LOAS audio parsing.
+    // Previous rewrite to 0x0F (kADTSAAC) caused ADTS parser to parse LATM
+    // frames as ADTS → audio corruption → PIPELINE_ERROR_DECODE crashes.
     //
     // Extract PMT PID from the init_prefix (contains PAT+PMT from file start).
     // The PAT declares the PMT PID — scan the prefix for the PAT packet.
@@ -186,7 +185,7 @@ fn rewrite_ts_stream_in_buf(
 
             let rewritten = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
             if rewritten > 0 {
-                log::info!("[STREAM-TS] Rewrote {} stream_type(s) 0x15→0x0F in PMT at buf_offset={} (file_offset={})",
+                log::info!("[STREAM-TS] Rewrote {} stream_type(s) 0x15→0x11 (kLOASAAC) in PMT at buf_offset={} (file_offset={})",
                     rewritten, pkt_offset, buf_start + pkt_offset as u64);
                 did_rewrite = true;
             }
@@ -252,6 +251,7 @@ pub(crate) struct StreamTokenData {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct StreamQuery {
     pub(crate) token: Option<String>,
     /// When true, only serve data that is already cached on disk.
@@ -356,7 +356,7 @@ pub(crate) async fn resolve_media_from_path(
 ) -> Result<(Media, u64), HttpResponse> {
     // Validate session token
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("Stream request failed: Invalid or missing stream token for msg {}", message_id);
             return Err(HttpResponse::Forbidden().body("Invalid or missing stream token"));
@@ -579,7 +579,7 @@ async fn stream_media(
                     Ok(mut slice) => {
                         // Rewrite init_prefix in the response if this range covers the
                         // first bytes of a TS file. The init_prefix contains rewritten
-                        // PAT+PMT packets (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x0F)
+                        // PAT+PMT packets (PMT PID 0x0FFF→0x1000, stream_type 0x15→0x11)
                         // that mediabunny's TS demuxer needs. Without rewriting, the raw
                         // TS data has PMT PID 0x0FFF (null PID) which prevents demuxing.
                         if let Some(ref cache_mgr) = **cache {
@@ -1353,12 +1353,14 @@ struct Fmp4ByteTimeCacheData(StdMutex<Fmp4ByteTimeCache>);
 /// seamlessly across segment boundaries. Without this, each segment request
 /// creates a fresh demuxer that drops partial PES packets at the boundary,
 /// causing 0.5-2s gaps in the PTS timeline.
+#[allow(dead_code)]
 struct Fmp4DemuxerCache {
     /// (demuxer, last_end_byte_offset) — the offset where the demuxer
     /// stopped processing.  If the next request's byte_offset doesn't match,
     /// the cache entry is stale (seek happened) and we create a fresh demuxer.
     entries: HashMap<i32, (TsDemuxer, u64)>,
 }
+#[allow(dead_code)]
 struct Fmp4DemuxerCacheData(StdMutex<Fmp4DemuxerCache>);
 
 /// Caches TsStreamInfo per message_id so fmp4_segment doesn't need to
@@ -1731,7 +1733,7 @@ async fn fmp4_keyframe_at(
     let (_folder_id_str, message_id) = path.into_inner();
 
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("[FMP4-KF-AT] Invalid or missing stream token for msg {}", message_id);
             return HttpResponse::Forbidden().body("Invalid or missing stream token");
@@ -1973,11 +1975,8 @@ async fn remux_ts_to_mp4(
         log::info!("[REMUX] msg {}: using cached file {:?}", message_id, cache_path);
         input_source = cache_path.to_string_lossy().to_string();
     } else {
-        let host = req.headers().get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("127.0.0.1:14201");
         let token = query.token.as_deref().unwrap_or("");
-        input_source = format!("http://{}/stream/{}/{}?token={}", host, folder_id_str, message_id, token);
+        input_source = format!("http://127.0.0.1:{}/stream/{}/{}?token={}", crate::STREAM_PORT, folder_id_str, message_id, token);
         log::info!("[REMUX] msg {}: using stream URL", message_id);
     }
 
@@ -2424,7 +2423,7 @@ async fn fmp4_init(
     let (_folder_id_str, message_id) = path.into_inner();
 
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("[FMP4-INIT] Invalid or missing stream token for msg {}", message_id);
             return HttpResponse::Forbidden().body("Invalid or missing stream token");
@@ -2605,12 +2604,12 @@ async fn fmp4_segment(
     _fmp4_cache: web::Data<Fmp4InitCacheData>,
     stream_info_cache: web::Data<Fmp4StreamInfoCacheData>,
     byte_time_cache: web::Data<Fmp4ByteTimeCacheData>,
-    demuxer_cache: web::Data<Fmp4DemuxerCacheData>,
+    _demuxer_cache: web::Data<Fmp4DemuxerCacheData>,
 ) -> impl Responder {
     let (folder_id_str, message_id) = path.into_inner();
 
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("[FMP4-SEG] Invalid or missing stream token for msg {}", message_id);
             return HttpResponse::Forbidden().body("Invalid or missing stream token");
@@ -3249,7 +3248,7 @@ async fn fmp4_metadata(
     let (folder_id_str, message_id) = path.into_inner();
 
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("[FMP4-META] Invalid or missing stream token for msg {}", message_id);
             return HttpResponse::Forbidden().body("Invalid or missing stream token");
@@ -3285,7 +3284,7 @@ async fn fmp4_metadata(
     // hasn't started), skip local codec detection and use defaults.
     // Duration will still be computed from Telegram API + PTS tail download.
     let cache_file_available = data_path.exists();
-    let (ts_packet_size, is_m2ts) = if cache_file_available {
+    let (_ts_packet_size, is_m2ts) = if cache_file_available {
         match detect_ts_packet_size(&data_path) {
             Some(result) => result,
             None => {
@@ -3926,7 +3925,7 @@ async fn fmp4_keyframes(
     let (_folder_id_str, message_id) = path.into_inner();
 
     match &query.token {
-        Some(t) if t == &token_data.token => {},
+        Some(t) if constant_time_eq::constant_time_eq(t.as_bytes(), token_data.token.as_bytes()) => {},
         _ => {
             log::error!("[FMP4-KF] Invalid or missing stream token for msg {}", message_id);
             return HttpResponse::Forbidden().body("Invalid or missing stream token");
@@ -4238,11 +4237,12 @@ pub async fn start_streaming_server(
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
-            .allow_any_origin()
+            .allowed_origin("http://localhost:1420")
+            .allowed_origin("http://localhost:14200")
+            .allowed_origin("http://nobuf-stream.localhost")
             .allow_any_method()
             .allow_any_header()
             .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed"])
-            .allow_private_network_access()
             .max_age(3600);
 
         App::new()

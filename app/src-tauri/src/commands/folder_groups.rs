@@ -72,7 +72,11 @@ pub fn cmd_create_group(name: String, color_hex: String, app: AppHandle) -> Resu
         let mut c = stmt.iter();
         if let Some(Ok(row)) = c.next() { vi(&row[0]) } else { -1 }
     };
-    conn.execute(format!("INSERT INTO groups (name, color_hex, display_order) VALUES ('{}', '{}', {})", name.replace("'", "''"), color_hex.replace("'", "''"), max_order + 1)).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("INSERT INTO groups (name, color_hex, display_order) VALUES (?, ?, ?)").map_err(|e| e.to_string())?;
+    stmt.bind((1, name.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((2, color_hex.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((3, max_order + 1)).map_err(|e| e.to_string())?;
+    stmt.iter().next();
     let mut stmt = conn.prepare("SELECT last_insert_rowid()").map_err(|e| e.to_string())?;
     let mut c = stmt.iter();
     if let Some(Ok(row)) = c.next() { Ok(vi(&row[0])) } else { Err("Failed to get inserted ID".to_string()) }
@@ -81,15 +85,23 @@ pub fn cmd_create_group(name: String, color_hex: String, app: AppHandle) -> Resu
 #[tauri::command]
 pub fn cmd_update_group(id: i64, name: String, color_hex: String, app: AppHandle) -> Result<bool, String> {
     let conn = get_connection(&app)?;
-    conn.execute(format!("UPDATE groups SET name = '{}', color_hex = '{}' WHERE id = {}", name.replace("'", "''"), color_hex.replace("'", "''"), id)).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("UPDATE groups SET name = ?, color_hex = ? WHERE id = ?").map_err(|e| e.to_string())?;
+    stmt.bind((1, name.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((2, color_hex.as_str())).map_err(|e| e.to_string())?;
+    stmt.bind((3, id)).map_err(|e| e.to_string())?;
+    stmt.iter().next();
     Ok(true)
 }
 
 #[tauri::command]
 pub fn cmd_delete_group(id: i64, app: AppHandle) -> Result<bool, String> {
     let conn = get_connection(&app)?;
-    conn.execute(format!("DELETE FROM groups WHERE id = {}", id)).map_err(|e| e.to_string())?;
-    conn.execute(format!("UPDATE folder_metadata SET group_id = NULL WHERE group_id = {}", id)).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("DELETE FROM groups WHERE id = ?").map_err(|e| e.to_string())?;
+    stmt.bind((1, id)).map_err(|e| e.to_string())?;
+    stmt.iter().next();
+    let mut stmt = conn.prepare("UPDATE folder_metadata SET group_id = NULL WHERE group_id = ?").map_err(|e| e.to_string())?;
+    stmt.bind((1, id)).map_err(|e| e.to_string())?;
+    stmt.iter().next();
     Ok(true)
 }
 
@@ -97,9 +109,19 @@ pub fn cmd_delete_group(id: i64, app: AppHandle) -> Result<bool, String> {
 pub fn cmd_assign_folder_to_group(channel_id: i64, group_id: Option<i64>, app: AppHandle) -> Result<bool, String> {
     let conn = get_connection(&app)?;
     match group_id {
-        Some(gid) => conn.execute(format!("INSERT INTO folder_metadata (channel_id, name, display_order, group_id) VALUES ({}, '', 0, {}) ON CONFLICT(channel_id) DO UPDATE SET group_id = {}", channel_id, gid, gid)),
-        None => conn.execute(format!("INSERT INTO folder_metadata (channel_id, name, display_order, group_id) VALUES ({}, '', 0, NULL) ON CONFLICT(channel_id) DO UPDATE SET group_id = NULL", channel_id)),
-    }.map_err(|e| e.to_string())?;
+        Some(gid) => {
+            let mut stmt = conn.prepare("INSERT INTO folder_metadata (channel_id, name, display_order, group_id) VALUES (?, '', 0, ?) ON CONFLICT(channel_id) DO UPDATE SET group_id = ?").map_err(|e| e.to_string())?;
+            stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+            stmt.bind((2, gid)).map_err(|e| e.to_string())?;
+            stmt.bind((3, gid)).map_err(|e| e.to_string())?;
+            stmt.iter().next();
+        }
+        None => {
+            let mut stmt = conn.prepare("INSERT INTO folder_metadata (channel_id, name, display_order, group_id) VALUES (?, '', 0, NULL) ON CONFLICT(channel_id) DO UPDATE SET group_id = NULL").map_err(|e| e.to_string())?;
+            stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+            stmt.iter().next();
+        }
+    }
     Ok(true)
 }
 
@@ -107,7 +129,10 @@ pub fn cmd_assign_folder_to_group(channel_id: i64, group_id: Option<i64>, app: A
 pub fn cmd_update_group_order(group_orders: Vec<(i64, i64)>, app: AppHandle) -> Result<bool, String> {
     let conn = get_connection(&app)?;
     for (id, order) in group_orders {
-        conn.execute(format!("UPDATE groups SET display_order = {} WHERE id = {}", order, id)).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("UPDATE groups SET display_order = ? WHERE id = ?").map_err(|e| e.to_string())?;
+        stmt.bind((1, order)).map_err(|e| e.to_string())?;
+        stmt.bind((2, id)).map_err(|e| e.to_string())?;
+        stmt.iter().next();
     }
     Ok(true)
 }

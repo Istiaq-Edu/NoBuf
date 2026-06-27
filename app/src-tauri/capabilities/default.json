@@ -8,13 +8,9 @@
   },
   "permissions": [
     "core:default",
-    "shell:allow-open",
     "store:default",
     "dialog:default",
     "fs:default",
-    "fs:allow-appdata-read-recursive",
-    "fs:allow-appdata-write-recursive",
-    "fs:allow-appdata-meta-recursive",
     "updater:default",
     "process:allow-restart",
     "allow-cmd-auth-request-code",
@@ -75,6 +71,8 @@
     "allow-cmd-assign-folder-to-group",
     "allow-cmd-update-group-order",
     "allow-cmd-get-enriched-folders",
+    "allow-cmd-open-url",
+    "allow-cmd-get-cache-total-size",
     "allow-cmd-detect-vpn"
   ]
 }

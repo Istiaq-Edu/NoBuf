@@ -54,29 +54,10 @@ fn ensure_ffmpeg() -> Result<std::path::PathBuf, String> {
         }
     }
 
-    // Try auto_download
-    log::info!("Attempting ffmpeg auto_download...");
-    if let Err(e) = ffmpeg_sidecar::download::auto_download() {
-        log::warn!("ffmpeg auto_download failed: {}", e);
-    }
-
-    // Re-check after download
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let sidecar = exe_dir.join(if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" });
-            if sidecar.exists() {
-                return Ok(sidecar);
-            }
-        }
-    }
-
-    if let Ok(sidecar_path) = ffmpeg_sidecar::paths::sidecar_path() {
-        if sidecar_path.exists() {
-            return Ok(sidecar_path);
-        }
-    }
-
-    Err("ffmpeg not found. Install ffmpeg and add it to PATH, or place ffmpeg.exe next to the app executable.".to_string())
+    // Auto-download removed for security — user must install ffmpeg manually.
+    // A MITM on the auto-download could deliver a malicious binary (RCE).
+    log::warn!("ffmpeg not found. Install ffmpeg and add it to PATH, or place ffmpeg.exe next to the app executable.");
+    return Err("ffmpeg not found. Install ffmpeg and add it to PATH.".to_string());
 }
 
 /// Run ffprobe to get video duration in seconds
@@ -129,8 +110,8 @@ pub async fn cmd_generate_sprite_sheet(
     );
 
     log::info!(
-        "Generating sprite sheet for msg_id={} url={}",
-        message_id, stream_url
+        "Generating sprite sheet for msg_id={} (stream URL contains token, redacted)",
+        message_id
     );
 
     // Ensure ffmpeg is available
@@ -173,7 +154,7 @@ pub async fn cmd_generate_sprite_sheet(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    log::info!("Running ffmpeg: {:?}", cmd);
+    log::info!("Running ffmpeg for msg_id={}", message_id);
 
     let mut child = cmd
         .spawn()
