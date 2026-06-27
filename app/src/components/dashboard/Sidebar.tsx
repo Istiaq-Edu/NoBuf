@@ -26,6 +26,7 @@ interface SidebarProps {
     publicChannels: PublicChannel[];
     onSelectPublicChannel: (channelId: number) => void;
     onPublicChannelsChanged: () => void;
+    onRemovePublicChannel?: (channelId: number) => void;
 }
 
 /**
@@ -39,7 +40,7 @@ export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
-    activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged
+    activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
@@ -270,6 +271,7 @@ export function Sidebar({
                 collapsed={collapsed}
                 onSelect={onSelectPublicChannel}
                 onRemoved={onPublicChannelsChanged}
+                onRemove={onRemovePublicChannel}
             />
 
             {/* Create Folder + New Group — bottom row */}

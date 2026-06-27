@@ -10,9 +10,10 @@ interface Props {
     collapsed: boolean;
     onSelect: (channelId: number) => void;
     onRemoved: () => void;
+    onRemove?: (channelId: number) => void;
 }
 
-export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved }: Props) {
+export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove }: Props) {
     const [showAddModal, setShowAddModal] = useState(false);
 
     const activeChannelId = activeView.type === 'public' ? activeView.channelId : null;
@@ -54,7 +55,9 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                         collapsed={collapsed}
                         onClick={() => onSelect(channel.channel_id)}
                         onRemove={() => {
-                            onSelect(channel.channel_id);
+                            if (onRemove) {
+                                onRemove(channel.channel_id);
+                            }
                         }}
                     />
                 ))}
