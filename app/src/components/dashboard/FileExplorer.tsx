@@ -1,5 +1,5 @@
 ﻿import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
-import { Plus, ArrowUpDown, ArrowUp, ArrowDown, Lock } from 'lucide-react';
+import { Plus, ArrowUpDown, ArrowUp, ArrowDown, Lock, AlertCircle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -31,6 +31,10 @@ interface FileExplorerProps {
     readOnly?: boolean;
     hasMore?: boolean;
     onLoadMore?: () => void;
+    onForwardToFolder?: () => void;
+    showForwardOption?: boolean;
+    notAMember?: boolean;
+    onRemoveChannel?: () => void;
 }
 
 
@@ -119,7 +123,9 @@ function useGridColumns(density: GridDensity) {
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
     onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd,
-    readOnly, hasMore, onLoadMore
+    readOnly, hasMore, onLoadMore,
+    onForwardToFolder, showForwardOption,
+    notAMember, onRemoveChannel
 }: FileExplorerProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [channelUsername, setChannelUsername] = useState<string | null>(null);
@@ -311,6 +317,24 @@ export function FileExplorer({
                 if (onDrop) onDrop(e, activeFolderId ?? 0);
             }}
         >
+            {notAMember && (
+                <div className="flex flex-col items-center justify-center h-full gap-3 py-12">
+                    <AlertCircle className="w-12 h-12 text-red-500/50" />
+                    <p className="text-sm text-nobuf-subtext">
+                        You're no longer a member of this channel.
+                    </p>
+                    {onRemoveChannel && (
+                        <button
+                            onClick={onRemoveChannel}
+                            className="px-4 py-2 rounded-lg bg-nobuf-primary text-white text-sm font-medium hover:bg-nobuf-primary/90 transition-colors"
+                        >
+                            Remove from NoBuf
+                        </button>
+                    )}
+                </div>
+            )}
+            {!notAMember && (
+            <>
             {readOnly && (
                 <div className="flex items-center gap-2 px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/20">
                     <Lock className="w-4 h-4 text-amber-500 shrink-0" />
@@ -498,7 +522,11 @@ export function FileExplorer({
                     }}
                     onCopyLink={handleCopyLink}
                     channelIsPublic={!!channelUsername}
+                    showForwardOption={showForwardOption}
+                    onForwardToFolder={onForwardToFolder}
                 />
+            )}
+            </>
             )}
         </div>
     )

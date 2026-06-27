@@ -835,7 +835,7 @@ pub async fn cmd_update_nb_pub_sync(
     let temp_path = std::env::temp_dir().join("nb_pub_sync.json");
     std::fs::write(&temp_path, &json_bytes).map_err(|e| e.to_string())?;
 
-    let uploaded = client.upload_file(&temp_path).await.map_err(|e| e.to_string())?;
+    let uploaded = client.upload_file(&temp_path).await.map_err(map_error)?;
 
     use grammers_client::InputMessage;
     let input_peer = build_input_peer(nb_pub_id, ah);
