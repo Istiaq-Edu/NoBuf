@@ -58,3 +58,48 @@ pub struct Drive {
     pub name: String,
     pub icon: Option<String>,
 }
+
+/// A public Telegram channel added to NoBuf for read-only browsing.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PublicChannel {
+    pub channel_id: i64,
+    pub name: String,
+    pub username: Option<String>,
+    pub access_hash: i64,
+    pub is_private: bool,
+    pub added_at: i64,
+    pub is_member: bool,
+}
+
+/// Preview info for a channel before joining (from ResolveUsername or CheckChatInvite).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChannelPreview {
+    pub title: String,
+    pub about: Option<String>,
+    pub participants_count: i32,
+    pub is_channel: bool,
+    pub is_private: bool,
+    pub already_joined: bool,
+    pub channel_id: Option<i64>,
+    pub access_hash: Option<i64>,
+    pub username: Option<String>,
+}
+
+/// A joined channel entry for the browse-joined modal.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JoinedChannel {
+    pub channel_id: i64,
+    pub name: String,
+    pub username: Option<String>,
+    pub access_hash: i64,
+    pub already_added: bool,
+    pub is_nb_folder: bool,
+}
+
+/// Result of forwarding files to a [NB] folder.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ForwardResult {
+    pub success: bool,
+    pub forwarded_count: i32,
+    pub errors: Vec<String>,
+}
