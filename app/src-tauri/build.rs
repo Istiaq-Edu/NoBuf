@@ -61,7 +61,8 @@ fn main() {
                 "cmd_assign_folder_to_group",
                 "cmd_update_group_order",
                 "cmd_get_enriched_folders",
+                "cmd_open_url",
             ])),
     )
-    .unwrap();
+    .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");
 }

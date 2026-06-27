@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use tauri::{AppHandle, Manager};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Lock to serialize config file access (prevents TOCTOU race between update + regenerate)
+pub struct ConfigLock(pub Mutex<()>);
 
 /// Persisted API settings (written to api_settings.json in the app data dir)
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -50,7 +54,27 @@ pub fn load_settings(app: &AppHandle) -> ApiSettingsFile {
 fn save_settings(app: &AppHandle, settings: &ApiSettingsFile) -> Result<(), String> {
     let path = settings_path(app)?;
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    // Atomic write: write to .tmp, sync, then rename
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut tmp_file = std::fs::File::create(&tmp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        tmp_file.write_all(json.as_bytes()).map_err(|e| format!("Failed to write temp file: {}", e))?;
+        tmp_file.sync_all().map_err(|e| format!("Failed to sync temp file: {}", e))?;
+    }
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to rename config file: {}", e)
+    })?;
+
+    // Security: Restrict config file permissions to current user only (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
 }
 
 fn hash_key(key: &str) -> String {
@@ -130,6 +154,10 @@ pub async fn cmd_update_api_settings(
         return Err(format!("Port {} is used by the media streaming server", port));
     }
 
+    // Acquire config lock to prevent TOCTOU race with cmd_regenerate_api_key
+    let config_lock = app.state::<ConfigLock>();
+    let _config_guard = config_lock.0.lock().map_err(|e| format!("Config lock error: {}", e))?;
+
     let mut settings = load_settings(&app);
     let port_changed = settings.port != port;
     let enabled_changed = settings.enabled != enabled;
@@ -160,6 +188,10 @@ pub async fn cmd_update_api_settings(
 pub async fn cmd_regenerate_api_key(
     app: AppHandle,
 ) -> Result<String, String> {
+    // Acquire config lock to prevent TOCTOU race with cmd_update_api_settings
+    let config_lock = app.state::<ConfigLock>();
+    let _config_guard = config_lock.0.lock().map_err(|e| format!("Config lock error: {}", e))?;
+
     let mut settings = load_settings(&app);
 
     // Generate a secure 32-byte random key as hex

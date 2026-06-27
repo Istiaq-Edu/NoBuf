@@ -115,7 +115,22 @@ fn detect_vpn_impl() -> Result<bool, String> {
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str() {
             if vpn_prefixes.iter().any(|p| name.starts_with(p)) {
-                return Ok(true);
+                // Check if interface is actually UP
+                let operstate_path = format!("/sys/class/net/{}/operstate", name);
+                if let Ok(state) = fs::read_to_string(&operstate_path) {
+                    if state.trim() == "up" {
+                        return Ok(true);
+                    }
+                } else {
+                    // Some VPN interfaces (e.g. wireguard) may not have operstate
+                    // Fall back to checking carrier
+                    let carrier_path = format!("/sys/class/net/{}/carrier", name);
+                    if let Ok(carrier) = fs::read_to_string(&carrier_path) {
+                        if carrier.trim() == "1" {
+                            return Ok(true);
+                        }
+                    }
+                }
             }
         }
     }
@@ -131,7 +146,13 @@ fn detect_vpn_impl() -> Result<bool, String> {
         .map_err(|e| format!("Failed to run ifconfig: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
     let vpn_prefixes = ["utun", "tun", "wg", "ppp", "tap", "ipsec"];
-    Ok(vpn_prefixes.iter().any(|p| stdout.contains(p)))
+    // Split interface list and check each name with starts_with (not contains)
+    for iface in stdout.split_whitespace() {
+        if vpn_prefixes.iter().any(|p| iface.starts_with(p)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]

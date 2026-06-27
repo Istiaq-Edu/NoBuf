@@ -150,6 +150,8 @@ export function createChunkedFetchLoader(mpegts: any): any {
             // transmuxer pipeline (TSDemuxer → MP4Remuxer → SourceBuffer.appendBuffer),
             // blocking the main thread and freezing the UI.
             await new Promise<void>(resolve => setTimeout(resolve, 0));
+            // Hard-stop: if a fatal decode error occurred, stop serving cache chunks too
+            if ((window as any).__nobuf_mpegtsFatalAbort) return;
             continue;
           }
         }
@@ -201,6 +203,14 @@ export function createChunkedFetchLoader(mpegts: any): any {
         if (done) break;
 
         const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        // Hard-stop: if a fatal decode error occurred, stop feeding data to
+        // the transmuxer immediately. Without this, _onDataArrival keeps
+        // producing segments that try to appendBuffer, which keeps failing
+        // and triggering our error handler in a loop.
+        if ((window as any).__nobuf_mpegtsFatalAbort) {
+          await reader.cancel().catch(() => {});
+          return;
+        }
         if (this._shadowCache) {
           this._shadowCache.put(offset, chunk);
         }

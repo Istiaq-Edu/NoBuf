@@ -209,6 +209,10 @@ class ThumbnailPipeline {
 
     // Wait for loadedmetadata (video.src is already set)
     await new Promise<boolean>((resolve) => {
+      if (!this.video || !this.active) {
+        resolve(false);
+        return;
+      }
       if (this.video.readyState >= 1) {
         resolve(true);
         return;
@@ -217,20 +221,26 @@ class ThumbnailPipeline {
       const onLoaded = () => {
         if (done) return;
         done = true;
-        this.video.removeEventListener('loadedmetadata', onLoaded);
+        if (videoRef) videoRef.removeEventListener('loadedmetadata', onLoaded);
         resolve(true);
       };
-      this.video.addEventListener('loadedmetadata', onLoaded);
+      if (this.video) {
+        this.video.addEventListener('loadedmetadata', onLoaded);
+      } else {
+        resolve(false);
+        return;
+      }
+      const videoRef = this.video;
       setTimeout(() => {
         if (!done) {
           done = true;
-          this.video.removeEventListener('loadedmetadata', onLoaded);
+          if (videoRef) videoRef.removeEventListener('loadedmetadata', onLoaded);
           resolve(false);
         }
       }, 10000);
     });
 
-    if (!this.active) return false;
+    if (!this.active || !this.video) return false;
 
     this.duration = this.video.duration;
     this.bitrate = this.fileLength / this.duration;
@@ -1080,6 +1090,10 @@ class Fmp4ThumbnailPipeline {
 
     // Wait for loadedmetadata
     await new Promise<boolean>((resolve) => {
+      if (!this.video || !this.active) {
+        resolve(false);
+        return;
+      }
       if (this.video.readyState >= 1) {
         resolve(true);
         return;
@@ -1486,8 +1500,18 @@ export function useThumbnailExtractor(
   // where moov extends beyond the first chunk, moovBufferRef is set AFTER
   // onReady fires (by fetchMoovForFaststarted). Without this check, the
   // pipeline effect fires with moovBuf=null and returns early, never retrying.
+  // Uses ref for mseGetters to prevent infinite init→destroy→init loop
+  // (mseGetters gets a new object reference on every parent render).
+  const mseGettersRefForMSE = useRef(mseGetters);
+  mseGettersRefForMSE.current = mseGetters;
+  const pipelineInitializedRef = useRef(false);
   useEffect(() => {
-    if (useNative || !streamUrl || !mseGetters || !thumbnailDataReady || !moovBufferReady) return;
+    if (useNative || !streamUrl || !thumbnailDataReady || !moovBufferReady) return;
+    // Hard guard: only initialize once per video. Prevents infinite init→destroy→init loop.
+    if (pipelineInitializedRef.current || pipelineRef.current) return;
+    pipelineInitializedRef.current = true;
+    const mseGetters = mseGettersRefForMSE.current;
+    if (!mseGetters) return;
 
     let cancelled = false;
 
@@ -1533,12 +1557,13 @@ export function useThumbnailExtractor(
     return () => {
       cancelled = true;
       console.log('[ThumbnailExtractor] Pipeline init effect cleanup — destroying pipeline');
+      pipelineInitializedRef.current = false;
       if (pipelineRef.current) {
         pipelineRef.current.destroy();
         pipelineRef.current = null;
       }
     };
-  }, [useNative, streamUrl, mseGetters, thumbnailDataReady, moovBufferReady]);
+  }, [useNative, streamUrl, thumbnailDataReady, moovBufferReady]); // mseGetters excluded — uses ref to prevent infinite re-init loop
 
   // ─── Transmuxer Thumbnail Pipeline Setup (MKV/TS on-demand thumbnails) ────
   // Creates a second Input + VideoDecoder for thumbnail extraction at any position.

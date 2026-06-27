@@ -113,15 +113,8 @@ export class MP4Player extends EventEmitter {
     try {
       const mod = await import(/* webpackIgnore: true */ 'mp4box');
       return mod.default || mod;
-    } catch {
-      // If import fails, try loading from CDN
-      return new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = 'https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.js';
-        script.onload = () => resolve((window as any).MP4Box);
-        script.onerror = reject;
-        document.head.appendChild(script);
-      });
+    } catch (e) {
+      throw new Error('mp4box module not available — ensure it is installed and bundled by Vite');
     }
   }
 

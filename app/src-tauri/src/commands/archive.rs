@@ -135,6 +135,20 @@ pub async fn cmd_list_archive_contents(
                 "",
             ).map_err(|e| format!("RAR extract error: {}", e))?;
 
+            // Security: Verify no files were written outside the extract directory (path traversal check)
+            let extract_canonical = extract_dir.canonicalize().map_err(|e| e.to_string())?;
+            for f in &archive.files {
+                let extracted_path = extract_dir.join(&f.name);
+                if let Ok(canonical) = extracted_path.canonicalize() {
+                    if !canonical.starts_with(&extract_canonical) {
+                        // Path traversal detected — clean up and reject
+                        let _ = std::fs::remove_dir_all(&extract_dir);
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Err(format!("Archive contains path traversal entry: '{}'", f.name));
+                    }
+                }
+            }
+
             // Build entries from the archive's file list
             let mut entries = Vec::new();
             for f in &archive.files {
@@ -292,11 +306,17 @@ pub async fn cmd_zip_folder(
     let zip_options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    // Walk the directory tree
-    for entry in walkdir::WalkDir::new(&folder_path) {
+    // Walk the directory tree — DO NOT follow symlinks (security: prevents including files outside the folder)
+    for entry in walkdir::WalkDir::new(&folder_path).follow_links(false) {
         let entry = entry.map_err(|e| format!("Walk error: {}", e))?;
         let path = entry.path();
         let relative = path.strip_prefix(source).map_err(|e| e.to_string())?;
+
+        // Skip symlinks entirely
+        if entry.file_type().is_symlink() {
+            log::warn!("[ZIP] Skipping symlink: {}", path.display());
+            continue;
+        }
 
         if path.is_dir() {
             if relative.as_os_str().is_empty() {

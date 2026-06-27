@@ -67,6 +67,15 @@ pub fn cmd_log(message: String) {
     log::info!("[FRONTEND] {}", message);
 }
 
+/// Open a URL in the system's default browser. Only HTTP(S) URLs are allowed.
+#[tauri::command]
+pub async fn cmd_open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Only HTTP(S) URLs can be opened".to_string());
+    }
+    tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn cmd_get_bandwidth(bw_state: State<'_, BandwidthManager>) -> crate::bandwidth::BandwidthStats {
     bw_state.get_stats()
@@ -252,10 +261,28 @@ pub fn cmd_save_network_settings(
     state.keep_alive_interval_sec.store(keep_alive_interval_sec, Ordering::Relaxed);
     state.prebuffer_speed_limit_kb.store(prebuffer_speed_limit_kb, Ordering::Relaxed);
     state.download_speed_limit_kb.store(download_speed_limit_kb, Ordering::Relaxed);
-    // Persist to disk
+    // Persist to disk (atomic write: temp + sync + rename)
     let path = network_settings_path(&app)?;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut tmp_file = std::fs::File::create(&tmp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        tmp_file.write_all(json.as_bytes()).map_err(|e| format!("Failed to write temp file: {}", e))?;
+        tmp_file.sync_all().map_err(|e| format!("Failed to sync temp file: {}", e))?;
+    }
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to rename config file: {}", e)
+    })?;
+
+    // Security: Restrict config file permissions to current user only (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
     log::info!("Network settings saved to disk");
     Ok(true)
 }

@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, ReactNode, useCallback } from 'react';
+import { createContext, useContext, useState, useRef, ReactNode, useCallback } from 'react';
 
 interface CacheEntry {
     percentage: number;
@@ -36,9 +36,12 @@ export function CacheSessionProvider({ children }: { children: ReactNode }) {
         });
     }, []);
 
+    const cacheMapRef = useRef(cacheMap);
+    cacheMapRef.current = cacheMap;
+
     const getCacheInfo = useCallback((messageId: number): CacheEntry | null => {
-        return cacheMap.get(messageId) ?? null;
-    }, [cacheMap]);
+        return cacheMapRef.current.get(messageId) ?? null;
+    }, []);
 
     const updateCachePercent = useCallback((messageId: number, percentage: number) => {
         // console.log(`[CACHE-SESSION] updateCachePercent: msg=${messageId} percent=${percentage}%`);

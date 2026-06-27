@@ -360,6 +360,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tokio",
  "ureq 2.12.1",
+ "url",
  "walkdir",
  "zip 2.4.2",
 ]
