@@ -53,3 +53,45 @@ export interface DownloadItem {
     cacheInfo?: string; // "From cache" or "Using cache (67%)"
     fromCachePercent?: number; // Initial progress from cached video data (e.g. 45)
 }
+
+export interface PublicChannel {
+    channel_id: number;
+    name: string;
+    username: string | null;
+    access_hash: number;
+    is_private: boolean;
+    added_at: number;
+    is_member: boolean;
+}
+
+export interface ChannelPreview {
+    title: string;
+    about: string | null;
+    participants_count: number;
+    is_channel: boolean;
+    is_private: boolean;
+    already_joined: boolean;
+    channel_id: number | null;
+    access_hash: number | null;
+    username: string | null;
+}
+
+export interface JoinedChannel {
+    channel_id: number;
+    name: string;
+    username: string | null;
+    access_hash: number;
+    already_added: boolean;
+    is_nb_folder: boolean;
+}
+
+export interface ForwardResult {
+    success: boolean;
+    forwarded_count: number;
+    errors: string[];
+}
+
+export type ActiveView =
+    | { type: 'saved' }
+    | { type: 'folder'; folderId: number }
+    | { type: 'public'; channelId: number };
