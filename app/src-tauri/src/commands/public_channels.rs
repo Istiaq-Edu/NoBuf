@@ -349,3 +349,152 @@ pub async fn cmd_join_channel_by_link(
         is_member: true,
     })
 }
+
+// ─── List joined channels from dialogs ───────────────────────────
+
+#[tauri::command]
+pub async fn cmd_list_joined_channels(
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<Vec<JoinedChannel>, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        return Ok(Vec::new());
+    }
+    let client = client_opt.unwrap();
+
+    // Get already-added public channel IDs from DB
+    let added_ids: std::collections::HashSet<i64> = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT channel_id FROM public_channels")
+            .map_err(|e| e.to_string())?;
+        let mut ids = std::collections::HashSet::new();
+        while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            ids.insert(vi(&stmt.read(0).map_err(|e| e.to_string())?));
+        }
+        ids
+    };
+
+    let mut channels = Vec::new();
+    let mut dialogs = client.iter_dialogs();
+
+    while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+        if let Peer::Channel(c) = &dialog.peer {
+            if !c.raw.broadcast {
+                continue;
+            }
+            let id = c.raw.id;
+            let is_nb = c.raw.title.to_lowercase().contains("[nb]");
+            channels.push(JoinedChannel {
+                channel_id: id,
+                name: c.raw.title.clone(),
+                username: c.raw.username.clone(),
+                access_hash: c.raw.access_hash.unwrap_or(0),
+                already_added: added_ids.contains(&id),
+                is_nb_folder: is_nb,
+            });
+        }
+    }
+
+    channels.sort_by(|a, b| {
+        match (a.is_nb_folder, b.is_nb_folder) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(channels)
+}
+
+// ─── Add a joined channel to NoBuf ───────────────────────────────
+
+#[tauri::command]
+pub async fn cmd_add_joined_channel(
+    channel_id: i64,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<PublicChannel, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    // Deduplication check
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT channel_id FROM public_channels WHERE channel_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            return Err("ALREADY_ADDED: This channel is already added to NoBuf".to_string());
+        }
+    }
+
+    // Resolve the channel from peer cache or dialog scan
+    let peer = {
+        let cache = state.peer_cache.read().await;
+        cache.get(&channel_id).cloned()
+    };
+
+    let (name, username, access_hash) = if let Some(Peer::Channel(c)) = peer {
+        (c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0))
+    } else {
+        let mut dialogs = client.iter_dialogs();
+        let mut found = None;
+        while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+            if let Peer::Channel(c) = &dialog.peer {
+                if c.raw.id == channel_id {
+                    found = Some((c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0)));
+                    break;
+                }
+            }
+        }
+        found.ok_or("Channel not found in your dialogs")?
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let is_private = username.is_none();
+
+    let conn = get_connection(&app)?;
+    conn.execute(format!(
+        "INSERT INTO public_channels (channel_id, name, username, access_hash, is_private, added_at, is_member) VALUES ({}, '{}', {}, {}, {}, {}, 1)",
+        channel_id,
+        name.replace("'", "''"),
+        username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
+        access_hash,
+        if is_private { 1 } else { 0 },
+        now,
+    )).map_err(|e| e.to_string())?;
+
+    Ok(PublicChannel {
+        channel_id,
+        name,
+        username,
+        access_hash,
+        is_private,
+        added_at: now,
+        is_member: true,
+    })
+}
+
+// ─── Get all public channels from DB ─────────────────────────────
+
+#[tauri::command]
+pub fn cmd_get_public_channels(
+    app: AppHandle,
+) -> Result<Vec<PublicChannel>, String> {
+    let conn = get_connection(&app)?;
+    let mut stmt = conn.prepare(
+        "SELECT channel_id, name, username, access_hash, is_private, added_at, is_member FROM public_channels ORDER BY added_at"
+    ).map_err(|e| e.to_string())?;
+
+    let mut channels = Vec::new();
+    while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let row: Vec<Value> = (0..7).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        channels.push(row_to_public_channel(&row));
+    }
+    Ok(channels)
+}
