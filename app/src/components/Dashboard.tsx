@@ -101,7 +101,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
     const isPublicView = activeView.type === 'public';
-    const { files: pubChannelFiles, isLoading: pubFilesLoading } = usePublicChannelFiles(
+    const isReadOnly = isPublicView;
+    const { files: pubChannelFiles, isLoading: pubFilesLoading, hasMore: pubHasMore, lastOffsetId: pubLastOffsetId, loadMore } = usePublicChannelFiles(
         isPublicView ? activeView.channelId : null
     );
 
@@ -606,6 +607,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDrop={handleDropOnFolder}
                     onDragStart={(fileId) => setInternalDragFileId(fileId)}
                     onDragEnd={() => setTimeout(() => setInternalDragFileId(null), 50)}
+                    readOnly={isReadOnly}
+                    hasMore={isPublicView ? pubHasMore : false}
+                    onLoadMore={isPublicView && pubLastOffsetId
+                        ? () => loadMore.mutate(pubLastOffsetId)
+                        : undefined}
                 />
             </main>
 
