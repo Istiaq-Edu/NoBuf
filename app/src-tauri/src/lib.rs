@@ -93,9 +93,11 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
 
             match actix_web::HttpServer::new(move || {
                 let cors = actix_cors::Cors::default()
-                    .allow_any_origin()
-                    .allow_any_method()
-                    .allow_any_header();
+                        .allowed_origin("http://localhost:1420")
+                        .allowed_origin("http://localhost:14200")
+                        .allowed_origin("http://nobuf-stream.localhost")
+                        .allow_any_method()
+                        .allow_any_header();
 
                 actix_web::App::new()
                     .wrap(cors)
@@ -106,7 +108,7 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
             .bind(("127.0.0.1", api_port)) {
                 Ok(bound) => {
                     let server = bound.run();
-                    *handle_for_thread.lock().unwrap() = Some(server.handle());
+                    *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.handle());
                     running_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     log::info!("REST API server started on http://127.0.0.1:{}", api_port);
                     server.await.ok();
@@ -205,7 +207,11 @@ fn handle_nobuf_stream_protocol(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(debug_assertions)]
+    let default_log_level = "info";
+    #[cfg(not(debug_assertions))]
+    let default_log_level = "warn";
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_log_level)).init();
 
     let stream_token = generate_stream_token();
 
@@ -244,7 +250,7 @@ pub fn run() {
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                download_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
                 rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
                 prebuffer_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_speed_limit_kb: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -262,6 +268,7 @@ pub fn run() {
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
+            app.manage(commands::api_settings::ConfigLock(std::sync::Mutex::new(())));
 
             // Initialize stream cache manager
             // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
@@ -345,7 +352,7 @@ pub fn run() {
                     match server::start_server(state, STREAM_PORT, token_for_server, cache_mgr, 0).await {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
-                            *handle_for_thread.lock().unwrap() = Some(streaming_server.handle());
+                            *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(streaming_server.handle());
                             // Now await the server â€” blocks until stopped
                             streaming_server.await.ok();
                         }
@@ -419,8 +426,6 @@ pub fn run() {
             commands::cmd_delete_cache,
             commands::cmd_start_background_cache,
             commands::cmd_stop_background_cache,
-            commands::cmd_rename_folder,
-            commands::cmd_start_auto_sync,
             commands::cmd_probe_duration,
             commands::cmd_get_cache_total_size,
             commands::cmd_report_playback_position,
@@ -440,6 +445,7 @@ pub fn run() {
             commands::cmd_assign_folder_to_group,
             commands::cmd_update_group_order,
             commands::cmd_get_enriched_folders,
+            commands::cmd_open_url,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
@@ -471,11 +477,11 @@ pub fn run() {
                 // and close all file handles before we clear the cache.
                 // On Windows, open handles (from open_data_file_write with
                 // FILE_SHARE_READ | FILE_SHARE_WRITE) block remove_dir_all()
-                // with ERROR_SHARING_VIOLATION. 2 seconds is enough for the
+                // with ERROR_SHARING_VIOLATION. 500ms is enough for the
                 // Actix worker threads to drop StreamingGuard → close file
                 // handles. If this still fails, the startup orphan cleanup
                 // will catch it on next launch.
-                std::thread::sleep(std::time::Duration::from_millis(2000));
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
 
             // 3. Stop the API server (graceful)

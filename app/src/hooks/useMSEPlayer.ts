@@ -1216,6 +1216,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       (window as any).__nobuf_evictionResumeByte = 0;
       (window as any).__nobuf_nuclearRecoveryInProgress = false;
       (window as any).__nobuf_userSeekInProgress = false;
+      (window as any).__nobuf_mpegtsFatalAbort = false;
       // Stop proactive disk prebuffer for this file
       const _ppMsgId = proactivePrebufferMsgIdRef.current;
       if (_ppMsgId) {
@@ -1299,6 +1300,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     (window as any).__nobuf_evictionResumeByte = 0;
     (window as any).__nobuf_nuclearRecoveryInProgress = false;
     (window as any).__nobuf_userSeekInProgress = false;
+    (window as any).__nobuf_mpegtsFatalAbort = false;
     // Stop proactive disk prebuffer
     const _ppMsgId2 = proactivePrebufferMsgIdRef.current;
     if (_ppMsgId2) {
@@ -2045,6 +2047,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
 
     mpegtsPlayerRef.current = player;
+    // Reset fatal abort flag and failed flag for the new player instance
+    (window as any).__nobuf_mpegtsFatalAbort = false;
+    mpegtsFailedRef.current = false;
 
     // ── Shadow cache: JS-side byte cache for instant seeks ──
     // Caches raw TS bytes in JS memory (no SourceBuffer quota limit).
@@ -2088,6 +2093,73 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // branch which emits MSEvents.ERROR instead of BUFFER_FULL.
           // Our BUFFER_FULL handler never fires. So we handle it HERE.
           diagLog(`[MPEGTS] MediaMSEError: _errorInfo=${JSON.stringify(_errorInfo)} (code=${_errorInfo?.code}, name=${_errorInfo?.name})`);
+
+          // Re-entry guard: if we already detected a fatal error, don't process again.
+          // mpegts.js keeps emitting ERROR events as buffered data tries to appendBuffer.
+          // Without this guard, we'd schedule 6+ setTimeout destroys.
+          if (mpegtsFailedRef.current) {
+            return;
+          }
+
+          // Check if video.error is already set — if so, this is a FATAL decode
+          // error, NOT a SourceBuffer quota issue. appendBuffer fails because
+          // the media element is in an error state. Recovery is impossible.
+          if (video.error) {
+            diagLog(`[MPEGTS] FATAL: video.error is set (code=${video.error.code}), aborting — not a quota issue`);
+            (window as any).__nobuf_bufferFullDetected = false;
+            mpegtsFailedRef.current = true;
+            mpegtsPlayerRef.current = null;
+
+            // Hard-stop the chunk loader: set a global flag that _fetchRange checks
+            // before each _onDataArrival call. This stops the data flow immediately.
+            (window as any).__nobuf_mpegtsFatalAbort = true;
+
+            // Abort the chunk loader's current fetch to stop new data from arriving.
+            try {
+              const engine = (player as any)?._player_engine;
+              const ioctl = engine?._transmuxer?._controller?._ioctl;
+              if (ioctl) {
+                ioctl._requestAbort = true;
+                if (ioctl._abortController) {
+                  ioctl._abortController.abort();
+                }
+              }
+            } catch (_) {}
+
+            // Destroy asynchronously on the next tick — not synchronously here.
+            // mpegts.js has pending Promise chains in transmuxer.js that fire
+            // after the current event handler returns. If we destroy now, those
+            // promises access null player/engine/transmuxer objects and crash
+            // with "Cannot read properties of null (reading 'emit')".
+            // setTimeout(0) lets the current Promise chain drain before we destroy.
+            setTimeout(() => {
+              try {
+                player.detachMediaElement();
+                player.unload();
+                player.destroy();
+              } catch (_) {}
+              (window as any).__nobuf_mpegtsFatalAbort = false;
+              diagLog('[MPEGTS] FATAL cleanup complete — player destroyed');
+
+              // Fall back to /remux/ (ffmpeg TS→MP4) since mpegts.js can't handle
+              // this file (e.g., AAC-LATM/LOAS parser bugs produce corrupted audio).
+              // The /remux/ endpoint uses ffmpeg which handles all audio formats correctly.
+              const video2 = videoRef.current;
+              if (video2) {
+                try {
+                  video2.src = '';
+                  video2.removeAttribute('src');
+                  video2.load();
+                } catch (_) {}
+              }
+              const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+              diagLog(`[MPEGTS] FATAL: falling back to ffmpeg remux: ${remuxUrl}`);
+              remuxUrlRef.current = remuxUrl;
+              setUseNative(true);
+            }, 0);
+            return;
+          }
+
           // Set our flag — the quota guard (100ms tick) will detect it,
           // evict, and resume. Do NOT schedule separate eviction here.
           (window as any).__nobuf_bufferFullDetected = true;
@@ -5376,11 +5448,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             console.warn('[MSE] Video error (code', err.code, ') during transmuxer init — ignoring (expected, blob URL has no data yet)');
             return;
           }
-          if (!cancelledRef.current && !useNative && !mpegtsPlayerRef.current) {
-            // Only fall back to native for MP4/MSE errors, NOT mpegts.js.
-            // mpegts.js handles SourceBuffer quota errors internally (suspend/resume).
-            console.warn('[MSE] Fatal video error (code', err.code, ') — falling back to native playback');
-            setUseNative(true);
+          if (!cancelledRef.current && !useNative) {
+            // Fall back to native for MP4/MSE errors AND mpegts.js fatal errors.
+            // For mpegts.js, the FATAL handler in the ERROR event already destroyed
+            // the player and set mpegtsPlayerRef.current = null. Falling back to
+            // native playback uses the /remux/ endpoint to convert TS→MP4 server-side.
+            if (mpegtsPlayerRef.current) {
+              // mpegts.js player still active — the FATAL handler hasn't run yet.
+              // This is a non-fatal error during mpegts.js playback (e.g., quota).
+              // Let mpegts.js handle it internally (suspend/resume).
+            } else {
+              console.warn('[MSE] Fatal video error (code', err.code, ') — falling back to native playback');
+              setUseNative(true);
+            }
           }
         }
       });

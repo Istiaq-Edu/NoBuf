@@ -26,6 +26,7 @@ class FragmentStore {
   private ranges = new Map<string, ByteRange[]>();
   private db: IDBDatabase | null = null;
   private dbReady: Promise<void>;
+  private static MAX_CACHE_ENTRIES = 200; // LRU eviction limit
 
   constructor() {
     this.dbReady = this.initDB();
@@ -69,8 +70,16 @@ class FragmentStore {
   put(url: string, start: number, end: number, data: ArrayBuffer): void {
     const key = this.getKey(url, start, end);
 
-    // Memory cache (fast)
+    // Memory cache (fast) — with LRU eviction
     this.cache.set(key, data);
+
+    // Evict oldest entries if cache exceeds limit
+    if (this.cache.size > FragmentStore.MAX_CACHE_ENTRIES) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) {
+        this.cache.delete(oldestKey);
+      }
+    }
 
     // Track range
     const ranges = this.ranges.get(url) ?? [];
@@ -135,7 +144,7 @@ class FragmentStore {
       const tx = this.db.transaction(STORE_NAME, 'readwrite');
       tx.objectStore(STORE_NAME).put({ key, url, start, end, data } as FragmentEntry);
     } catch (e) {
-      // Silent fail - memory cache still works
+      console.warn('[FragmentStore] IndexedDB write failed, memory-only:', e);
     }
   }
 

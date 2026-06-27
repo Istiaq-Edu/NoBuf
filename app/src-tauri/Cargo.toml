@@ -55,3 +55,11 @@ walkdir = "2"
 sqlite = { version = "0.37", features = ["bundled"] }
 rar = "0.4"
 sevenz-rust2 = "0.7"
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
+overflow-checks = true

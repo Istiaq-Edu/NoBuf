@@ -256,9 +256,8 @@ impl DownloadPool {
                         }
                     }
                     Err(e) => {
-                        if tx_clone.send(Err(e)).is_err() {
-                            return;
-                        }
+                        let _ = tx_clone.send(Err(e));
+                        return; // Break on error — prevents next_yield from getting stuck at gap
                     }
                 }
             }
