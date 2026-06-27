@@ -22,8 +22,10 @@ import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
 import { AboutPage } from './dashboard/AboutPage';
+import { ForwardToFolderModal } from './dashboard/ForwardToFolderModal';
 import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
 import { ActiveView } from '../types';
+import { useConfirm } from '../context/ConfirmContext';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -47,7 +49,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
-    const { publicChannels, syncFromRemote } = usePublicChannels();
+    const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
+    const [showForwardModal, setShowForwardModal] = useState(false);
+    const { confirm } = useConfirm();
 
     // Sync activeFolderId with activeView for backward compat
     useEffect(() => {
@@ -102,7 +106,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const isPublicView = activeView.type === 'public';
     const isReadOnly = isPublicView;
-    const { files: pubChannelFiles, isLoading: pubFilesLoading, hasMore: pubHasMore, lastOffsetId: pubLastOffsetId, loadMore } = usePublicChannelFiles(
+    const { files: pubChannelFiles, isLoading: pubFilesLoading, hasMore: pubHasMore, lastOffsetId: pubLastOffsetId, notAMember: pubNotAMember, loadMore } = usePublicChannelFiles(
         isPublicView ? activeView.channelId : null
     );
 
@@ -441,6 +445,34 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }
 
+    const handleRemovePublicChannel = async (channelId: number) => {
+        const channel = publicChannels.find(c => c.channel_id === channelId);
+        if (!channel) return;
+
+        const shouldRemove = await confirm({
+            title: `Remove "${channel.name}" from NoBuf?`,
+            message: 'This will remove the channel from your NoBuf sidebar.',
+            confirmText: 'Remove',
+            cancelText: 'Cancel'
+        });
+        
+        if (!shouldRemove) return;
+        
+        const shouldLeave = await confirm({
+            title: 'Also leave on Telegram?',
+            message: 'You will no longer receive messages from this channel on Telegram.',
+            confirmText: 'Leave Channel',
+            cancelText: 'Keep Subscribed'
+        });
+        
+        removeChannel.mutate({ channelId, leaveOnTelegram: shouldLeave });
+        toast.success(`Removed "${channel.name}" from NoBuf.`);
+        
+        if (activeView.type === 'public' && activeView.channelId === channelId) {
+            setActiveView({ type: 'saved' });
+        }
+    };
+
     const currentFolderName = activeView.type === 'public'
         ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
         : activeFolderId === null
@@ -555,6 +587,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 publicChannels={publicChannels}
                 onSelectPublicChannel={(channelId) => setActiveView({ type: 'public', channelId })}
                 onPublicChannelsChanged={() => syncFromRemote.mutate()}
+                onRemovePublicChannel={handleRemovePublicChannel}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
@@ -612,6 +645,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onLoadMore={isPublicView && pubLastOffsetId
                         ? () => loadMore.mutate(pubLastOffsetId)
                         : undefined}
+                    notAMember={isPublicView ? pubNotAMember : false}
+                    onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
+                    showForwardOption={isReadOnly}
+                    onForwardToFolder={() => setShowForwardModal(true)}
                 />
             </main>
 
