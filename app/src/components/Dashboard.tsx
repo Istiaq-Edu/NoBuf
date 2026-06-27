@@ -693,6 +693,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <AboutPage onClose={() => setShowAbout(false)} />
                 )}
             </AnimatePresence>
+
+            <ForwardToFolderModal
+                open={showForwardModal}
+                onClose={() => setShowForwardModal(false)}
+                sourceChannelId={activeView.type === 'public' ? activeView.channelId : 0}
+                selectedFileIds={selectedIds}
+                folders={folders}
+                onForwarded={() => {
+                    queryClient.invalidateQueries({ queryKey: ['files'] });
+                }}
+            />
         </div>
     );
 }

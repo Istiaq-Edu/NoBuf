@@ -1,5 +1,5 @@
 ﻿import { useEffect, useRef, useState } from 'react';
-import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText, FileArchive, Link } from 'lucide-react';
+import { Eye, HardDrive, Trash2, FolderOpen, Pencil, Play, FileText, FileArchive, Link, ArrowRightLeft } from 'lucide-react';
 import { TelegramFile } from '../../types';
 import { isMediaFile, isPdfFile, isArchiveFile } from '../../utils';
 
@@ -13,9 +13,11 @@ interface ContextMenuProps {
     onPreview: () => void;
     onCopyLink?: () => void;
     channelIsPublic?: boolean;
+    onForwardToFolder?: () => void;
+    showForwardOption?: boolean;
 }
 
-export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onCopyLink, channelIsPublic }: ContextMenuProps) {
+export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onCopyLink, channelIsPublic, onForwardToFolder, showForwardOption }: ContextMenuProps) {
     const [adjustedPos, setAdjustedPos] = useState({ x, y });
     const menuRef = useRef<HTMLDivElement>(null);
 
@@ -97,6 +99,16 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 </button>
             )}
 
+            {showForwardOption && onForwardToFolder && (
+                <button
+                    onClick={onForwardToFolder}
+                    className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-text hover:bg-nobuf-hover rounded transition-colors text-left w-full"
+                >
+                    <ArrowRightLeft className="w-4 h-4 text-nobuf-primary" />
+                    Forward to folder...
+                </button>
+            )}
+
             <button onClick={onDownload} className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-text hover:bg-nobuf-hover rounded transition-colors text-left w-full">
                 <HardDrive className="w-4 h-4 text-green-500" />
                 Download
@@ -119,12 +131,16 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 Rename
             </button>
 
-            <div className="h-px bg-nobuf-border my-1" />
+            {(!showForwardOption) && (
+                <>
+                    <div className="h-px bg-nobuf-border my-1" />
 
-            <button onClick={onDelete} className="flex items-center gap-2 px-2 py-1.5 text-sm text-red-500 hover:bg-red-500/10 rounded transition-colors text-left w-full">
-                <Trash2 className="w-4 h-4" />
-                Delete
-            </button>
+                    <button onClick={onDelete} className="flex items-center gap-2 px-2 py-1.5 text-sm text-red-500 hover:bg-red-500/10 rounded transition-colors text-left w-full">
+                        <Trash2 className="w-4 h-4" />
+                        Delete
+                    </button>
+                </>
+            )}
         </div>
     );
 }
