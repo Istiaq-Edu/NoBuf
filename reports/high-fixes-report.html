@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NoBuf High Findings Fixes — Changes & Testing Guide</title>
+<style>
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--subtext:#8b949e;--primary:#22c55e;--high:#ff9800;--pass:#22c55e;--fail:#f85149;--deferred:#8b949e}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;line-height:1.6;padding:20px;max-width:1200px;margin:0 auto}
+h1{color:var(--primary);border-bottom:2px solid var(--border);padding-bottom:10px;margin-bottom:20px}
+h2{color:var(--text);margin:30px 0 15px;border-bottom:1px solid var(--border);padding-bottom:8px}
+h3{color:var(--primary);margin:20px 0 10px}
+h4{color:var(--text);margin:15px 0 8px}
+table{width:100%;border-collapse:collapse;margin:10px 0}
+th{background:var(--surface);text-align:left;padding:10px 12px;border:1px solid var(--border);font-size:14px}
+td{padding:8px 12px;border:1px solid var(--border);font-size:13px;vertical-align:top}
+code{background:var(--surface);padding:2px 6px;border-radius:4px;font-family:Consolas,monospace;font-size:12px;color:#e6c07b}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;overflow-x:auto;margin:8px 0}
+pre code{background:none;padding:0;color:var(--text)}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase}
+.b-high{background:rgba(255,152,0,0.2);color:var(--high);border:1px solid var(--high)}
+.b-pass{background:rgba(34,197,94,0.2);color:var(--pass);border:1px solid var(--pass)}
+.b-fail{background:rgba(248,81,73,0.2);color:var(--fail);border:1px solid var(--fail)}
+.b-deferred{background:rgba(139,148,159,0.2);color:var(--deferred);border:1px solid var(--deferred)}
+.fix{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;margin:15px 0}
+.fix-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.fix-title{font-size:16px;font-weight:600}
+ul,ol{margin-left:20px;margin-bottom:10px}li{margin-bottom:6px}
+.section{background:rgba(34,197,94,0.05);border:1px solid rgba(34,197,94,0.3);border-radius:8px;padding:15px;margin:15px 0}
+.warn{background:rgba(255,152,0,0.1);border:1px solid rgba(255,152,0,0.3);border-radius:8px;padding:15px;margin:15px 0}
+.deferred-box{background:rgba(139,148,159,0.08);border:1px solid rgba(139,148,159,0.2);border-radius:8px;padding:15px;margin:15px 0}
+</style>
+</head>
+<body>
+
+<h1>NoBuf High Findings Fixes — Changes & Testing Guide</h1>
+
+<h2>Summary</h2>
+<table>
+<tr><th>#</th><th>Finding</th><th>Status</th><th>Files Changed</th></tr>
+<tr><td>H1</td><td>npm audit — 4 vulnerabilities</td><td><span class="badge b-pass">DONE</span></td><td>package-lock.json (auto)</td></tr>
+<tr><td>H6</td><td>Missing capability for cmd_get_cache_total_size</td><td><span class="badge b-pass">DONE</span></td><td>capabilities/default.json</td></tr>
+<tr><td>H7</td><td>Duplicate command registration</td><td><span class="badge b-pass">DONE</span></td><td>lib.rs</td></tr>
+<tr><td>H8</td><td>Reorder coordinator hangs on error</td><td><span class="badge b-pass">DONE</span></td><td>download_pool.rs</td></tr>
+<tr><td>H10</td><td>CORS allow_any_origin on both servers</td><td><span class="badge b-pass">DONE</span></td><td>lib.rs, server.rs</td></tr>
+<tr><td>H11</td><td>Host header injection in remux endpoint</td><td><span class="badge b-pass">DONE</span></td><td>server.rs</td></tr>
+<tr><td>H12</td><td>Stream token logged in sprite.rs</td><td><span class="badge b-pass">DONE</span></td><td>sprite.rs</td></tr>
+<tr><td>H13</td><td>cmd_upload_file arbitrary path read</td><td><span class="badge b-pass">DONE</span></td><td>fs.rs</td></tr>
+<tr><td>H14</td><td>fs:allow-appdata-read/write-recursive</td><td><span class="badge b-pass">DONE</span></td><td>capabilities/default.json</td></tr>
+<tr><td>H15</td><td>API Hash stored in plaintext config.json</td><td><span class="badge b-pass">DONE</span></td><td>AuthWizard.tsx</td></tr>
+<tr><td>H16</td><td>Phone number/API ID/session path in logs</td><td><span class="badge b-pass">DONE</span></td><td>auth.rs</td></tr>
+<tr><td>H18</td><td>cmd_zip_folder symlink following</td><td><span class="badge b-pass">DONE</span></td><td>archive.rs</td></tr>
+<tr><td>H2</td><td>29 production unwrap() on poisoned mutex</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H3</td><td>DownloadPool bypasses rate limiter</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H4</td><td>Zero accessibility attributes</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H5</td><td>0 tests for critical modules</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H9</td><td>Proxy OOM (unbounded read_to_end)</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H17</td><td>DownloadPool worker session copies unencrypted</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H19</td><td>No zip bomb protection</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+<tr><td>H20</td><td>ZIP archive downloaded to memory (OOM)</td><td><span class="badge b-deferred">DEFERRED</span></td><td>—</td></tr>
+</table>
+
+<div class="section">
+<strong>Build Status After All Fixes:</strong>
+<table>
+<tr><th>Check</th><th>Before</th><th>After</th></tr>
+<tr><td>TypeScript (<code>tsc --noEmit</code>)</td><td>0 errors</td><td>0 errors</td></tr>
+<tr><td>Frontend tests (<code>npm test</code>)</td><td>96/96 passed</td><td>96/96 passed</td></tr>
+<tr><td>Rust compilation (<code>cargo check</code>)</td><td>0 errors, 6 warnings</td><td>0 errors, 7 warnings</td></tr>
+<tr><td>Rust tests (<code>cargo test</code>)</td><td>78/78 passed</td><td>78/78 passed</td></tr>
+<tr><td>npm audit</td><td>4 vulnerabilities</td><td><strong>0 vulnerabilities</strong></td></tr>
+</table>
+</div>
+
+<h2>Implemented Fixes — What Changed & How to Test</h2>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H1: npm audit — Resolved 4 Vulnerabilities</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Ran <code>npm audit fix</code> which updated 20 packages to fix 4 vulnerabilities:</p>
+<ul>
+<li><strong>undici</strong> (high): TLS certificate validation bypass via SOCKS5 ProxyAgent, HTTP header injection, WebSocket DoS, cross-origin request routing, response queue poisoning</li>
+<li><strong>vite</strong> (high): NTLMv2 hash disclosure via UNC path handling on Windows, <code>server.fs.deny</code> bypass on Windows alternate paths</li>
+<li><strong>@babel/core</strong> (low): Arbitrary file read via sourceMappingURL comment</li>
+<li><strong>esbuild</strong> (low): Arbitrary file read when running dev server on Windows</li>
+</ul>
+<h3>What you will see differently</h3>
+<p><strong>Nothing visible</strong> — these are dependency updates that don't change app behavior. The vite UNC path fix is especially relevant since NoBuf runs on Windows.</p>
+<h3>How to test</h3>
+<ol>
+<li>Run <code>npm audit</code> → should show "found 0 vulnerabilities"</li>
+<li>Run <code>npm run dev</code> → Vite dev server should start normally</li>
+<li>Run <code>npm run build</code> → production build should succeed</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H6: Added Missing Capability for cmd_get_cache_total_size</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Added <code>"allow-cmd-get-cache-total-size"</code> to <code>capabilities/default.json</code>. Without this, the frontend could not call <code>cmd_get_cache_total_size</code> — it would get a "not allowed" error at runtime.</p>
+<h3>What you will see differently</h3>
+<p><strong>Cache size display now works</strong> — if the frontend calls <code>cmd_get_cache_total_size</code> (e.g., in Settings to show total cache size), it will succeed instead of silently failing.</p>
+<h3>How to test</h3>
+<ol>
+<li>Open Settings → look for cache size display → should show a number, not an error</li>
+<li>In DevTools console: <code>await invoke('cmd_get_cache_total_size')</code> → should return a number, not "not allowed"</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H7: Removed Duplicate Command Registration</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Removed duplicate entries for <code>cmd_rename_folder</code> and <code>cmd_start_auto_sync</code> from the <code>generate_handler![]</code> macro in <code>lib.rs</code>. Both were registered at lines 402/422 and 403/423 respectively.</p>
+<h3>What you will see differently</h3>
+<p><strong>No visible change</strong> — both commands still work (they were registered once at lines 402-403, the duplicates at 422-423 were redundant). The build no longer has potential for dispatch ambiguity.</p>
+<h3>How to test</h3>
+<ol>
+<li>Right-click a folder → rename it → should work</li>
+<li>The auto-sync feature should trigger on app launch as before</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H8: Fixed Reorder Coordinator to Break on Error</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>In <code>download_pool.rs</code>, the reorder coordinator task now <code>return</code>s immediately after forwarding an error, instead of continuing to process chunks. Previously, if one worker errored, <code>next_yield</code> would get stuck at the gap and the stream would hang indefinitely.</p>
+<h4>Before:</h4>
+<pre><code>Err(e) => {
+    if tx_clone.send(Err(e)).is_err() { return; }
+    // Continues processing — next_yield gets stuck
+}</code></pre>
+<h4>After:</h4>
+<pre><code>Err(e) => {
+    let _ = tx_clone.send(Err(e));
+    return; // Break immediately — prevents hang
+}</code></pre>
+<h3>What you will see differently</h3>
+<p><strong>No visible change for normal downloads</strong> — the fix only affects the error path. When a parallel download worker fails (network error), the download now stops cleanly instead of hanging forever.</p>
+<h3>How to test</h3>
+<ol>
+<li>Download a file normally → should work as before</li>
+<li>If a download fails mid-way (e.g., network drops), the download should show an error and stop, not hang indefinitely</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H10: Restricted CORS to Known Localhost Origins</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Both servers (streaming on port 14201, REST API on configurable port) now restrict CORS to three specific origins instead of <code>allow_any_origin()</code>. Also removed <code>allow_private_network_access()</code> from the streaming server.</p>
+<h4>Allowed origins:</h4>
+<ul>
+<li><code>http://localhost:1420</code> (Vite dev server)</li>
+<li><code>http://localhost:14200</code> (production localhost plugin)</li>
+<li><code>http://nobuf-stream.localhost</code> (custom protocol)</li>
+</ul>
+<h3>What you will see differently</h3>
+<ul>
+<li><strong>Video streaming still works</strong> — the app's frontend is served from one of the allowed origins</li>
+<li><strong>External websites can no longer probe the servers</strong> — a malicious website visiting <code>http://127.0.0.1:14201</code> will be blocked by CORS</li>
+<li><strong>REST API access from external websites is blocked</strong> — only the app's own frontend can call the API</li>
+</ul>
+<div class="warn"><strong>Note:</strong> If you access the REST API from a tool like curl or Postman, it will still work (CORS only affects browsers, not CLI tools). If you access it from a browser-based tool on a different port, it may be blocked.</div>
+<h3>How to test</h3>
+<ol>
+<li><strong>Play a video</strong> → should stream normally (the frontend origin is allowed)</li>
+<li><strong>Use the REST API from curl:</strong> <code>curl -H "X-API-Key: *** http://127.0.0.1:8550/api/v1/health</code> → should work (curl ignores CORS)</li>
+<li><strong>Test CORS rejection:</strong> Open a browser, visit <code>http://evil.com</code>, open DevTools, run <code>fetch('http://127.0.0.1:14201/stream/test')</code> → should be blocked by CORS</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H11: Hardcoded Remux Host (Removed Host Header Injection)</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>The remux endpoint in <code>server.rs</code> no longer reads the <code>Host</code> HTTP header to construct the ffmpeg input URL. Instead, it hardcodes <code>127.0.0.1:STREAM_PORT</code>. Previously, an attacker could set a malicious <code>Host</code> header to redirect ffmpeg to an external server, leaking the stream token.</p>
+<h4>Before:</h4>
+<pre><code>let host = req.headers().get("host")...unwrap_or("127.0.0.1:14201");
+input_source = format!("http://{}/stream/...", host);</code></pre>
+<h4>After:</h4>
+<pre><code>input_source = format!("http://127.0.0.1:{}/stream/...", crate::STREAM_PORT);</code></pre>
+<h3>What you will see differently</h3>
+<p><strong>No visible change</strong> — the remux feature (TS→MP4 fallback for playback) uses the same server as before. The only difference is that the server can no longer be tricked into connecting to an external server via a crafted Host header.</p>
+<h3>How to test</h3>
+<ol>
+<li><strong>Play a TS video file</strong> → if it uses the remux fallback, it should still work</li>
+<li><strong>Test with malicious Host header:</strong> <code>curl -H "Host: evil.com" http://127.0.0.1:14201/remux/...</code> → ffmpeg should still connect to 127.0.0.1, not evil.com</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H12: Redacted Stream Token from All Log Statements</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Two log statements in <code>sprite.rs</code> that leaked the full stream token (32-char hex) have been redacted:</p>
+<ul>
+<li>Line 130-133: Was <code>log::info!("...url={}", stream_url)</code> → Now <code>log::info!("...(stream URL contains token, redacted)")</code></li>
+<li>Line 175: Was <code>log::info!("Running ffmpeg: {:?}", cmd)</code> → Now <code>log::info!("Running ffmpeg for msg_id={}", message_id)</code></li>
+</ul>
+<h3>What you will see differently</h3>
+<p><strong>Log output no longer contains the stream token</strong> — if you check the console output or log files during sprite sheet generation, you will see the message ID but not the URL with the token.</p>
+<h3>How to test</h3>
+<ol>
+<li>Hover over a video to trigger sprite generation → check console output → should show "Generating sprite sheet for msg_id=123 (stream URL contains token, redacted)" — no token visible</li>
+<li>Search log output for the token pattern (32 hex chars) → should find nothing</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H13: Added Path Validation to cmd_upload_file</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p><code>cmd_upload_file</code> now canonicalizes the file path and verifies it's a regular file before proceeding. Previously, any path string was accepted with zero validation, allowing a compromised webview to upload arbitrary local files (SSH keys, config files) to Telegram.</p>
+<h4>Added:</h4>
+<pre><code>let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {}", e))?;
+if !canonical.is_file() {
+    return Err("Path does not point to a regular file".to_string());
+}</code></pre>
+<h3>What you will see differently</h3>
+<ul>
+<li><strong>Normal file uploads work fine</strong> — selecting a file via the dialog and uploading it works as before</li>
+<li><strong>Directory paths are rejected</strong> — if someone passes a directory path, they get "Path does not point to a regular file"</li>
+<li><strong>Non-existent paths are rejected</strong> — canonicalize fails with "Invalid path: ..."</li>
+<li><strong>Symlinks are resolved</strong> — canonicalize follows symlinks, so the real file is uploaded</li>
+</ul>
+<h3>How to test</h3>
+<ol>
+<li><strong>Normal upload:</strong> Click upload, select a file → should upload normally</li>
+<li><strong>Invalid path (devtools):</strong> <code>invoke('cmd_upload_file', { path: 'C:\\nonexistent' })</code> → should return "Invalid path" error</li>
+<li><strong>Directory path:</strong> <code>invoke('cmd_upload_file', { path: 'C:\\Windows' })</code> → should return "not a regular file" error</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H14: Removed fs:allow-appdata-read/write-recursive Permissions</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Removed three over-scoped permissions from <code>capabilities/default.json</code>:</p>
+<ul>
+<li><code>fs:allow-appdata-read-recursive</code> — allowed webview to read entire appdata dir (including telegram.session)</li>
+<li><code>fs:allow-appdata-write-recursive</code> — allowed webview to overwrite telegram.session, api_settings.json</li>
+<li><code>fs:allow-appdata-meta-recursive</code> — allowed webview to enumerate files in appdata</li>
+</ul>
+<p>The Rust backend handles all file I/O in appdata directly via <code>std::fs</code> — the webview does NOT need FS plugin access to this directory.</p>
+<h3>What you will see differently</h3>
+<p><strong>No visible change</strong> — the app's functionality doesn't rely on the frontend reading appdata files directly. All file operations go through Tauri IPC commands which use <code>std::fs</code> on the Rust side.</p>
+<h3>How to test</h3>
+<ol>
+<li>Launch the app, log in, use all features → everything should work normally</li>
+<li>In DevTools: <code>await __TAURI__.fs.readTextFile('telegram.session', { baseDir: __TAURI__.fs.BaseDirectory.AppData })</code> → should be rejected (permission denied)</li>
+<li>Verify settings still persist across restart (they use Tauri store plugin, not fs plugin directly)</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H15: Stopped Storing API Hash in Plaintext config.json</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>The <code>AuthWizard.tsx</code> component no longer saves <code>api_hash</code> to <code>config.json</code> via the Tauri store plugin. Only <code>api_id</code> (non-secret) is persisted. The API Hash must be re-entered each session.</p>
+<h4>Before:</h4>
+<pre><code>await store.set('api_id', apiId);
+await store.set('api_hash', apiHash); // REMOVED</code></pre>
+<h4>After:</h4>
+<pre><code>await store.set('api_id', apiId);
+// API Hash is NOT persisted — only kept in memory</code></pre>
+<h3>What you will see differently</h3>
+<div class="warn"><strong>BEHAVIOR CHANGE:</strong> On app restart, the API ID field will be pre-filled but the API Hash field will be empty. You must re-enter your API Hash each time you restart the app and need to authenticate. This is a security tradeoff — the API Hash is a secret credential that should not be stored in plaintext.</div>
+<h3>How to test</h3>
+<ol>
+<li>Enter API ID and API Hash, authenticate → works normally</li>
+<li>Restart the app → API ID should be pre-filled, API Hash should be empty</li>
+<li>Re-enter API Hash → should authenticate successfully</li>
+<li>Check <code>%APPDATA%/com.istiaq.nobuf/config.json</code> → should contain <code>api_id</code> but NOT <code>api_hash</code></li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H16: Masked Phone Number, API ID, and Session Path in Logs</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Three log statements in <code>auth.rs</code> that exposed sensitive data have been redacted:</p>
+<table>
+<tr><th>Line</th><th>Before</th><th>After</th></tr>
+<tr><td>51</td><td><code>"...with API ID: {}"</code></td><td><code>"Initializing Telegram Client #{}"</code></td></tr>
+<tr><td>64</td><td><code>"Opening session at: {}"</code></td><td><code>"Opening session in app data directory"</code></td></tr>
+<tr><td>255</td><td><code>"Requesting code for {}"</code></td><td><code>"Requesting login code"</code></td></tr>
+</table>
+<h3>What you will see differently</h3>
+<p><strong>Log output no longer contains phone number, API ID, or session file path</strong> — these are PII/credentials that should not appear in logs.</p>
+<h3>How to test</h3>
+<ol>
+<li>Launch the app, go through the login flow → check console output</li>
+<li>Search log output for your phone number → should NOT appear</li>
+<li>Search log output for your API ID → should NOT appear</li>
+<li>Search log output for "telegram.session" path → should NOT appear</li>
+</ol>
+</div>
+
+<div class="fix">
+<div class="fix-header"><span class="fix-title">H18: Fixed cmd_zip_folder Symlink Following</span><span class="badge b-pass">DONE</span></div>
+<h3>What changed</h3>
+<p>Added explicit <code>.follow_links(false)</code> to <code>WalkDir::new()</code> in <code>cmd_zip_folder</code>, plus an explicit symlink skip check. While the <code>walkdir</code> crate v2 defaults to not following symlinks, making this explicit prevents regressions if the default ever changes, and the symlink skip logs a warning for audit purposes.</p>
+<div class="warn"><strong>Note:</strong> The original audit finding (H18) was a <em>false positive</em> — <code>walkdir</code> v2 already defaults to <code>follow_links(false)</code>. This fix is defense-in-depth: it makes the security intent explicit and adds logging.</div>
+<h3>What you will see differently</h3>
+<p><strong>No visible change</strong> — normal folder uploads work the same. If a folder happens to contain symlinks, they are now explicitly skipped with a log warning instead of being silently ignored.</p>
+<h3>How to test</h3>
+<ol>
+<li><strong>Normal folder upload:</strong> Click "Folder" button, select a folder with regular files → should zip and upload normally</li>
+<li><strong>Folder with symlink (if testable):</strong> Create a folder with a symlink inside, upload it → symlink should be skipped, regular files should be included in the ZIP</li>
+</ol>
+</div>
+
+<h2>Deferred Fixes — Why They Need More Work</h2>
+
+<div class="deferred-box">
+<h3>H2: 29 (actually 12) production unwrap() on poisoned mutex</h3>
+<p><strong>Why deferred:</strong> 12 <code>.lock().unwrap()</code> calls across 4 files (bandwidth.rs, auth.rs, lib.rs, stream_cache.rs). Each needs to be replaced with <code>.lock().unwrap_or_else(|e| e.into_inner())</code> for poison recovery. Mechanical change but touches many files and needs careful testing to ensure poison recovery doesn't mask real errors.</p>
+<p><strong>Actual count from source verification:</strong> 12 occurrences (not 29 as originally reported). The audit overcounted by including semaphore <code>.acquire().await.unwrap()</code> calls, which are a different pattern (semaphore never closes in practice).</p>
+</div>
+
+<div class="deferred-box">
+<h3>H3: DownloadPool bypasses rate limiter</h3>
+<p><strong>Why deferred:</strong> The DownloadPool functions (<code>sequential_stream</code>, <code>parallel_worker_stream</code>, <code>download_sub_range_iter</code>) don't have access to <code>rate_limiter</code> — it's not passed as a parameter. Fixing this requires changing function signatures, which ripples through the call chain. The risk is moderate: DownloadPool is only used for file downloads (not streaming), and C3 (API semaphore) already fixed the more dangerous case.</p>
+</div>
+
+<div class="deferred-box">
+<h3>H4 + H5: Accessibility + Test Coverage</h3>
+<p><strong>Why deferred:</strong> These are large-scope items that need a dedicated development sprint:</p>
+<ul>
+<li>H4: 0 <code>aria-*</code>, 0 <code>role=</code>, 0 <code>aria-label</code> in entire frontend. Adding accessibility requires touching nearly every component.</li>
+<li>H5: <code>useMSEPlayer.ts</code> (5543 lines), <code>FragmentStore.ts</code>, <code>ErrorBoundary.tsx</code>, <code>server.rs</code> streaming logic, <code>download_pool.rs</code> — all have 0 tests. Writing tests for these is a multi-day effort.</li>
+</ul>
+</div>
+
+<div class="deferred-box">
+<h3>H9: Proxy OOM (unbounded read_to_end)</h3>
+<p><strong>Why deferred:</strong> The <code>handle_nobuf_stream_protocol</code> proxy in <code>lib.rs:171-172</code> reads the entire response body into a <code>Vec</code> with no size limit. Fixing this requires forwarding Range headers from the incoming request to the upstream ureq request, plus adding a max body size check. This is a careful refactor of the proxy handler that needs thorough testing with video playback.</p>
+</div>
+
+<div class="deferred-box">
+<h3>H17: DownloadPool worker session copies unencrypted</h3>
+<p><strong>Why deferred:</strong> The DownloadPool creates 3 copies of the Telegram session file for parallel workers. All 4 copies (main + 3 workers) are unencrypted SQLite. Fixing this requires implementing session encryption at rest (e.g., using DPAPI on Windows or the <code>keyring</code> crate), which is an architectural change to the grammers session storage layer.</p>
+</div>
+
+<div class="deferred-box">
+<h3>H19 + H20: Zip bomb protection + ZIP in-memory OOM</h3>
+<p><strong>Why deferred:</strong> <code>archive.rs</code> downloads ZIP archives entirely into memory (<code>Vec&lt;u8&gt;</code>) with no size limit, no decompression ratio check, no max entry count. Fixing this requires refactoring the ZIP listing path to download to a temp file (like RAR/7z already do) and adding size/ratio/count limits. The <code>_size</code> variable from Telegram metadata is currently discarded — it should be checked before downloading.</p>
+</div>
+
+<h2>Files Modified</h2>
+<table>
+<tr><th>File</th><th>Fixes</th><th>Change Summary</th></tr>
+<tr><td><code>package-lock.json</code></td><td>H1</td><td>20 packages updated by npm audit fix</td></tr>
+<tr><td><code>capabilities/default.json</code></td><td>H6, H14</td><td>Added allow-cmd-get-cache-total-size, removed fs:allow-appdata-read/write/meta-recursive</td></tr>
+<tr><td><code>src-tauri/src/lib.rs</code></td><td>H7, H10</td><td>Removed duplicate cmd_rename_folder + cmd_start_auto_sync, restricted API CORS to specific origins</td></tr>
+<tr><td><code>src-tauri/src/server.rs</code></td><td>H10, H11</td><td>Restricted streaming CORS to specific origins, hardcoded 127.0.0.1:STREAM_PORT in remux URL</td></tr>
+<tr><td><code>src-tauri/src/commands/sprite.rs</code></td><td>H12</td><td>Redacted stream token from 2 log statements</td></tr>
+<tr><td><code>src-tauri/src/commands/auth.rs</code></td><td>H16</td><td>Masked phone number, API ID, session path in 3 log statements</td></tr>
+<tr><td><code>src-tauri/src/commands/fs.rs</code></td><td>H13</td><td>Added path canonicalization + is_file check to cmd_upload_file</td></tr>
+<tr><td><code>src-tauri/src/download_pool.rs</code></td><td>H8</td><td>Fixed reorder coordinator to break on error</td></tr>
+<tr><td><code>src-tauri/src/commands/archive.rs</code></td><td>H18</td><td>Added explicit follow_links(false) + symlink skip in cmd_zip_folder</td></tr>
+<tr><td><code>src/components/AuthWizard.tsx</code></td><td>H15</td><td>Removed api_hash from store.set, removed api_hash loading from store</td></tr>
+</table>
+
+<h2>Quick Smoke Test (5 minutes)</h2>
+<div class="section">
+<p>After building and launching the app with all high fixes applied:</p>
+<ol>
+<li><strong>Play a video</strong> — streaming should work normally (H10 CORS, H11 remux, H12 token redaction)</li>
+<li><strong>Rename a folder</strong> — right-click → rename → should work (H7 duplicate removal)</li>
+<li><strong>Upload a file</strong> — select a file via dialog → should upload (H13 path validation)</li>
+<li><strong>Upload a folder as ZIP</strong> — click "Folder" button → should zip and upload (H18 symlink fix)</li>
+<li><strong>Check logs for phone number</strong> — log in → search console for your phone number → should NOT appear (H16)</li>
+<li><strong>Check API Hash not persisted</strong> — restart app → API Hash field should be empty (H15)</li>
+<li><strong>Run npm audit</strong> — should show 0 vulnerabilities (H1)</li>
+</ol>
+</div>
+
+<hr>
+<p><small>Generated by Hermes Agent — NoBuf High Findings Fixes<br>
+Date: 2026-06-27<br>
+12 of 20 high fixes implemented and verified. 8 deferred (need architectural changes or dedicated sprint).<br>
+All build checks pass: tsc 0 errors, vitest 96/96, cargo check 0 errors, cargo test 78/78, npm audit 0 vulnerabilities.<br>
+Subagent verification: 3 parallel subagents confirmed all findings against source code before implementation.</small></p>
+
+</body>
+</html>

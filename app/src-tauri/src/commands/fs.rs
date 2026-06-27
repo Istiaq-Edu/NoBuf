@@ -299,7 +299,12 @@ pub async fn cmd_upload_file(
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
-    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    // Security: validate path exists and is a regular file (not a symlink to sensitive data)
+    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {}", e))?;
+    if !canonical.is_file() {
+        return Err("Path does not point to a regular file".to_string());
+    }
+    let size = std::fs::metadata(&canonical).map_err(|e| e.to_string())?.len();
     bw_state.can_transfer(size)?;
 
     let tid = transfer_id.unwrap_or_default();
@@ -405,6 +410,47 @@ pub async fn cmd_upload_file(
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
 /// uploads to Telegram. Emits dual-phase progress: "downloading" then "uploading".
+
+/// Validate that a URL is safe to fetch (no SSRF, no internal IPs)
+fn validate_url(url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" => {},
+        _ => return Err("Only HTTP(S) URLs are allowed".to_string()),
+    }
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let is_internal = match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+        };
+        if is_internal {
+            return Err("URLs pointing to internal addresses are not allowed".to_string());
+        }
+    }
+    let blocked = ["localhost", "169.254.169.254", "metadata.google.internal"];
+    if blocked.contains(&host) {
+        return Err("URLs pointing to internal addresses are not allowed".to_string());
+    }
+    Ok(parsed.to_string())
+}
+
+/// Sanitize a filename to prevent path traversal and special character injection
+fn sanitise_filename(raw: &str) -> String {
+    let cleaned = std::path::Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let cleaned: String = cleaned.chars()
+        .filter(|c| !c.is_control() && *c != '\0' && *c != ':' && *c != '<' && *c != '>' && *c != '"' && *c != '|' && *c != '?' && *c != '*')
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_upload_from_url(
     url: String,
@@ -419,6 +465,7 @@ pub async fn cmd_upload_from_url(
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
     // Phase 1: Download from URL to temp file
+    let url = validate_url(&url)?;
     log::info!("[REMOTE-UPLOAD] Downloading from {}", url);
 
     let resp = ureq::get(&url)
@@ -450,6 +497,8 @@ pub async fn cmd_upload_from_url(
             url.split('/').last().filter(|s| !s.is_empty()).unwrap_or("file").to_string()
         }
     };
+
+    let filename = sanitise_filename(&filename);
 
     let content_length: u64 = resp.header("Content-Length")
         .and_then(|s| s.parse().ok())

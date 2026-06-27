@@ -5,6 +5,16 @@ import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, Externa
 import { load } from '@tauri-apps/plugin-store';
 import { useTheme } from '../context/ThemeContext';
 import { open } from '@tauri-apps/plugin-shell';
+// Safe URL opening via custom command (validates HTTP(S) only)
+async function safeOpenUrl(url: string) {
+    try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('cmd_open_url', { url });
+    } catch {
+        // Fallback: if cmd_open_url not available, use shell.open (legacy)
+        open(url);
+    }
+}
 import { QRCodeSVG } from 'qrcode.react';
 
 type Step = "setup" | "phone" | "code" | "password";
@@ -43,7 +53,7 @@ function SetupGuide() {
                         Go to Telegram's Developer Portal
                     </h3>
                     <p className="text-sm text-nobuf-subtext ml-8">
-                        Visit <button type="button" onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }} className="text-nobuf-primary underline hover:text-nobuf-text cursor-pointer">my.telegram.org</button> and log in with your phone number.
+                        Visit <button type="button" onClick={(e) => { e.preventDefault(); safeOpenUrl('https://my.telegram.org'); }} className="text-nobuf-primary underline hover:text-nobuf-text cursor-pointer">my.telegram.org</button> and log in with your phone number.
                     </p>
                 </div>
 
@@ -76,7 +86,7 @@ function SetupGuide() {
 
             <button
                 type="button"
-                onClick={(e) => { e.preventDefault(); open('https://my.telegram.org'); }}
+                onClick={(e) => { e.preventDefault(); safeOpenUrl('https://my.telegram.org'); }}
                 className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-semibold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-nobuf-primary/90 transition-colors"
             >
                 <ExternalLink className="w-4 h-4" />
@@ -285,11 +295,10 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
             try {
                 const store = await load('config.json');
                 const savedId = await store.get<string>('api_id');
-                const savedHash = await store.get<string>('api_hash');
-                if (savedId && savedHash) {
+                if (savedId) {
                     setApiId(savedId);
-                    setApiHash(savedHash);
                 }
+                // API Hash is NOT loaded from storage — user must re-enter it each session for security
             } catch {
                 // config not found, starting fresh
             }
@@ -301,7 +310,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         try {
             const store = await load('config.json');
             await store.set('api_id', apiId);
-            await store.set('api_hash', apiHash);
+            // API Hash is NOT persisted to config.json for security — only kept in memory
             await store.save();
         } catch {
             // store write failure, non-critical

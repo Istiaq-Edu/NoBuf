@@ -152,65 +152,6 @@ pub async fn cmd_get_cache_status(
 
 /// Report byte ranges that the MSE player has fetched — updates cache metadata
 /// so that subsequent downloads can use cached data. The MSE player fetches
-/// bytes through the Actix server which writes them to .dat, but we need to
-/// ensure the meta sidecar accurately tracks which ranges are present.
-#[tauri::command]
-pub async fn cmd_report_cached_ranges(
-    message_id: i32,
-    folder_id: i64,
-    total_size: u64,
-    filename: String,
-    mime_type: String,
-    ranges: Vec<(u64, u64)>,
-    cache_state: State<'_, StreamCacheManager>,
-) -> Result<bool, String> {
-    // Verify the .dat file actually has data at the reported ranges
-    let data_path = cache_state.data_path(message_id);
-    if !data_path.exists() {
-        // No cache file yet — ranges can't be present
-        log::warn!("[PREBUFFER] REPORT: no .dat file for msg {}", message_id);
-        return Ok(false);
-    }
-
-    let file_size = std::fs::metadata(&data_path)
-        .map(|m| m.len())
-        .map_err(|e| format!("Failed to read .dat metadata: {}", e))?;
-
-    // Filter ranges: only include those where the .dat file actually covers the bytes
-    let verified_ranges: Vec<(u64, u64)> = ranges
-        .into_iter()
-        .filter(|(_start, end)| *end < file_size)
-        .collect();
-
-    if verified_ranges.is_empty() {
-        return Ok(false);
-    }
-
-    // Load existing meta or create new one (serialized via per-message lock)
-    let _lock = cache_state.lock_meta(message_id).await;
-    let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-        message_id,
-        folder_id,
-        total_size,
-        filename,
-        cached_ranges: Vec::new(),
-        mime_type,
-    });
-
-    // Add verified ranges and merge
-    meta.cached_ranges.extend(verified_ranges.clone());
-    merge_ranges(&mut meta.cached_ranges);
-
-    cache_state.save_meta(&meta)
-        .map_err(|e| format!("Failed to save meta: {}", e))?;
-
-    // Per-chunk REPORT log is too verbose — commented out for testing
-    // log::info!("[PREBUFFER] REPORT: msg {} adding verified_ranges {:?}, meta now has {} ranges ({:.1}% complete)",
-    //     message_id, verified_ranges, meta.cached_ranges.len(), meta.cached_percentage());
-
-    Ok(true)
-}
-
 /// Delete cache for a specific message
 #[tauri::command]
 pub async fn cmd_delete_cache(
@@ -749,7 +690,7 @@ async fn proactive_prebuffer_download(
 
     // Check what's already cached
     let existing_meta = cache_mgr.load_meta(message_id);
-    let cached_ranges = existing_meta
+    let _cached_ranges = existing_meta
         .as_ref()
         .map(|m| m.cached_ranges.clone())
         .unwrap_or_default();

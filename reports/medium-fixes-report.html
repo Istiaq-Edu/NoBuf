@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NoBuf Medium Findings Fixes — Changes & Testing Guide</title>
+<style>
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--subtext:#8b949e;--primary:#22c55e;--medium:#facc15;--deferred:#8b949e}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;line-height:1.6;padding:20px;max-width:1200px;margin:0 auto}
+h1{color:var(--primary);border-bottom:2px solid var(--border);padding-bottom:10px;margin-bottom:20px}
+h2{color:var(--text);margin:30px 0 15px;border-bottom:1px solid var(--border);padding-bottom:8px}
+h3{color:var(--primary);margin:20px 0 10px}
+table{width:100%;border-collapse:collapse;margin:10px 0}
+th{background:var(--surface);text-align:left;padding:10px 12px;border:1px solid var(--border);font-size:14px}
+td{padding:8px 12px;border:1px solid var(--border);font-size:13px;vertical-align:top}
+code{background:var(--surface);padding:2px 6px;border-radius:4px;font-family:Consolas,monospace;font-size:12px;color:#e6c07b}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase}
+.b-done{background:rgba(34,197,94,0.2);color:var(--primary);border:1px solid var(--primary)}
+.b-doc{background:rgba(121,192,255,0.15);color:#79c0ff;border:1px solid #79c0ff}
+.b-deferred{background:rgba(139,148,159,0.15);color:var(--deferred);border:1px solid var(--deferred)}
+.b-mitigated{background:rgba(34,197,94,0.15);color:var(--primary);border:1px solid var(--primary)}
+.fix{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;margin:15px 0}
+ul,ol{margin-left:20px;margin-bottom:10px}li{margin-bottom:6px}
+.section{background:rgba(34,197,94,0.05);border:1px solid rgba(34,197,94,0.3);border-radius:8px;padding:15px;margin:15px 0}
+.deferred-box{background:rgba(139,148,159,0.08);border:1px solid rgba(139,148,159,0.2);border-radius:8px;padding:15px;margin:15px 0}
+</style>
+</head>
+<body>
+
+<h1>NoBuf Medium Findings Fixes — Changes & Testing Guide</h1>
+
+<h2>Summary</h2>
+<table>
+<tr><th>#</th><th>Finding</th><th>Status</th><th>Action</th></tr>
+<tr><td>M1</td><td>Stream token non-constant-time comparison</td><td><span class="badge b-done">DONE</span></td><td>Replaced == with constant_time_eq at 8 sites</td></tr>
+<tr><td>M2</td><td>Token in URL query params</td><td><span class="badge b-doc">DOCUMENTED</span></td><td>Architectural — requires custom header migration</td></tr>
+<tr><td>M3</td><td>Proxy doesn't forward Range headers</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs careful testing with video playback</td></tr>
+<tr><td>M4</td><td>Telegram session unencrypted at rest</td><td><span class="badge b-doc">DOCUMENTED</span></td><td>Architectural — needs grammers session wrapper</td></tr>
+<tr><td>M5</td><td>RAR extract_all to list</td><td><span class="badge b-mitigated">MITIGATED</span></td><td>Path traversal check added in C4</td></tr>
+<tr><td>M6</td><td>No [profile.release]</td><td><span class="badge b-done">DONE</span></td><td>Added LTO, strip, codegen-units, overflow-checks</td></tr>
+<tr><td>M7</td><td>181 console.log in production</td><td><span class="badge b-done">DONE</span></td><td>Added dropConsole to vite build config</td></tr>
+<tr><td>M8</td><td>API ID logged</td><td><span class="badge b-mitigated">MITIGATED</span></td><td>Fixed in H16</td></tr>
+<tr><td>M9</td><td>20+ as any casts</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Large scope — needs typed Window interface</td></tr>
+<tr><td>M10</td><td>Semaphore::new(1) vs comments</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs investigation — may break concurrency</td></tr>
+<tr><td>M11</td><td>DownloadPool workers never shut down</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs shutdown signal architecture</td></tr>
+<tr><td>M12</td><td>2s blocking sleep on shutdown</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs async refactor of exit handler</td></tr>
+<tr><td>M13</td><td>FragmentStore memory cache unbounded</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs LRU eviction implementation + testing</td></tr>
+<tr><td>M14</td><td>Sync disk I/O in async path</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs spawn_blocking refactor</td></tr>
+<tr><td>M15</td><td>166 any types</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Incremental — 119 in useMSEPlayer.ts alone</td></tr>
+<tr><td>M16</td><td>Non-atomic config writes</td><td><span class="badge b-done">DONE</span></td><td>Both config files now use temp+sync+rename</td></tr>
+<tr><td>M17</td><td>TOCTOU race in config</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs Mutex around config access</td></tr>
+<tr><td>M18</td><td>No file permission hardening</td><td><span class="badge b-done">DONE</span></td><td>Added chmod 0600 on Unix for session files</td></tr>
+<tr><td>M19</td><td>Default log level info in release</td><td><span class="badge b-done">DONE</span></td><td>Changed to warn in release, info in debug</td></tr>
+<tr><td>M20</td><td>jassub on main thread</td><td><span class="badge b-doc">DOCUMENTED</span></td><td>Requires worker migration</td></tr>
+<tr><td>M21</td><td>No update rollback</td><td><span class="badge b-doc">DOCUMENTED</span></td><td>Requires binary backup architecture</td></tr>
+<tr><td>M22</td><td>Config injection via key_hash</td><td><span class="badge b-deferred">DEFERRED</span></td><td>Needs ACL approach</td></tr>
+<tr><td>M23</td><td>No symlink protection in RAR</td><td><span class="badge b-mitigated">MITIGATED</span></td><td>Path traversal check added in C4</td></tr>
+<tr><td>M24</td><td>Content-Disposition header injection</td><td><span class="badge b-done">DONE</span></td><td>Sanitized quotes, CRLF in filename</td></tr>
+<tr><td>M25</td><td>String error type</td><td><span class="badge b-doc">DOCUMENTED</span></td><td>Large refactor — 88 signatures to change</td></tr>
+</table>
+
+<div class="section">
+<strong>Build Status:</strong> tsc 0 errors, vitest 96/96, cargo check 0 errors, cargo test 78/78.
+</div>
+
+<h2>Implemented Fixes — What Changed & How to Test</h2>
+
+<div class="fix">
+<h3>M1: Stream Token — Constant-Time Comparison</h3>
+<p><strong>What changed:</strong> All 8 token comparison sites in <code>server.rs</code> (6 sites) and <code>hls/manifest.rs</code> (2 sites) now use <code>constant_time_eq::constant_time_eq()</code> instead of <code>==</code>. The dependency was already in Cargo.toml (used for API key verification) — just wasn't applied to stream tokens.</p>
+<p><strong>What you'll see:</strong> No visible change — all valid tokens still work, invalid tokens still rejected. The fix prevents timing side-channel attacks that could theoretically recover the token byte-by-byte.</p>
+<p><strong>How to test:</strong> Play a video (streaming uses token) → should work normally. The token validation is identical in behavior, just constant-time in execution.</p>
+</div>
+
+<div class="fix">
+<h3>M6: Added [profile.release] to Cargo.toml</h3>
+<p><strong>What changed:</strong> Added release profile with <code>lto = true</code>, <code>codegen-units = 1</code>, <code>strip = "symbols"</code>, <code>overflow-checks = true</code>.</p>
+<p><strong>What you'll see:</strong> Production builds will be ~10-20% smaller (LTO + strip), ~5-15% faster (LTO + single codegen unit), and will detect integer overflows (overflow-checks). Debug builds are unaffected.</p>
+<p><strong>How to test:</strong> <code>cargo build --release</code> → should compile (slower than debug due to LTO). Check binary size — should be smaller than before. <code>file target/release/app_lib</code> → should show "stripped".</p>
+</div>
+
+<div class="fix">
+<h3>M7: dropConsole in Vite Production Build</h3>
+<p><strong>What changed:</strong> Added <code>build: { sourcemap: false, dropConsole: true }</code> to <code>vite.config.ts</code>. This removes all <code>console.*</code> calls from the production JS bundle.</p>
+<p><strong>What you'll see:</strong> In production builds, no <code>console.log</code> output will appear in DevTools. In development mode (<code>npm run dev</code>), console logs still work normally.</p>
+<p><strong>How to test:</strong> <code>npm run build</code> → check <code>dist/assets/*.js</code> with grep for "console.log" → should find 0 matches. Run <code>npm run dev</code> → console logs should still appear.</p>
+</div>
+
+<div class="fix">
+<h3>M16: Atomic Config Writes</h3>
+<p><strong>What changed:</strong> Both <code>api_settings.json</code> and <code>network_settings.json</code> now use the atomic write pattern (write to <code>.tmp</code>, <code>sync_all()</code>, then <code>rename()</code>) instead of direct <code>std::fs::write()</code>. If the app crashes mid-write, the old file is preserved — no truncated JSON.</p>
+<p><strong>What you'll see:</strong> No visible change. If the app crashes while saving settings, the previous settings are preserved instead of being corrupted.</p>
+<p><strong>How to test:</strong> Change API settings → should save normally. Change network settings → should save normally. Restart app → settings should persist.</p>
+</div>
+
+<div class="fix">
+<h3>M18: File Permission Hardening (Unix)</h3>
+<p><strong>What changed:</strong> After opening the Telegram session file, the app now sets permissions to <code>0o600</code> (owner read/write only) on Unix systems. WAL and SHM files are also restricted.</p>
+<p><strong>What you'll see:</strong> On Linux/macOS, the session file is now only readable by the current user. On Windows, this is a no-op (Windows uses ACLs, not Unix permissions).</p>
+<p><strong>How to test:</strong> On Linux: <code>ls -la ~/.local/share/com.istiaq.nobuf/telegram.session</code> → should show <code>-rw-------</code> permissions.</p>
+</div>
+
+<div class="fix">
+<h3>M19: Log Level Changed to Warn in Release</h3>
+<p><strong>What changed:</strong> In release builds, the default log level is now <code>warn</code> instead of <code>info</code>. In debug builds, it remains <code>info</code>.</p>
+<p><strong>What you'll see:</strong> In production, only warnings and errors will appear in logs — not info-level messages. This reduces log noise and prevents sensitive info-level messages from appearing in production.</p>
+<p><strong>How to test:</strong> Build in release mode → check console output → should only see warnings/errors, not info messages. Build in debug mode → info messages should appear.</p>
+</div>
+
+<div class="fix">
+<h3>M24: Content-Disposition Header Sanitized</h3>
+<p><strong>What changed:</strong> The filename in the Content-Disposition header of API download responses now strips <code>"</code>, <code>\r</code>, and <code>\n</code> characters to prevent header injection.</p>
+<p><strong>What you'll see:</strong> No visible change for normal filenames. Files with quotes or newlines in their names will have those characters stripped in the download header.</p>
+<p><strong>How to test:</strong> Download a file via API with a normal name → should work. The header is now safe from injection even with malicious filenames.</p>
+</div>
+
+<h2>Documented (Architectural — Can't Fix Without Major Refactor)</h2>
+
+<div class="deferred-box">
+<h3>M2: Token in URL Query Parameters</h3>
+<p>The stream token is passed as <code>?token=...</code> in all streaming URLs. This exposes it via Referer headers, server logs, and HLS playlist content. Fixing this requires migrating to custom headers (e.g., <code>X-Stream-Token</code>) which breaks <code>&lt;video src=...&gt;</code> that can't set custom headers. The nobuf-stream:// custom protocol is a partial workaround but doesn't cover all cases.</p>
+</div>
+
+<div class="deferred-box">
+<h3>M4: Telegram Session Unencrypted at Rest</h3>
+<p>The session file is plain SQLite with the MTProto auth key in cleartext. Encrypting it requires wrapping <code>grammers_session::storages::SqliteSession</code> with an encryption layer, using OS keychain (DPAPI on Windows, Keychain on macOS). This is a significant architectural change.</p>
+</div>
+
+<div class="deferred-box">
+<h3>M20: jassub WASM on Main Thread</h3>
+<p>jassub (WASM subtitle renderer) runs on the main thread, giving it DOM access. Migrating to a Web Worker would isolate it but requires testing with various subtitle formats (ASS, SSA, SRT, VTT).</p>
+</div>
+
+<div class="deferred-box">
+<h3>M21: No Update Rollback</h3>
+<p>If an update installs but the new version crashes on startup, there's no automatic rollback. Implementing this requires a binary backup + canary flag + restore-on-crash mechanism. Tauri v2 doesn't provide built-in rollback.</p>
+</div>
+
+<div class="deferred-box">
+<h3>M25: String Error Type</h3>
+<p>88 <code>Result&lt;_, String&gt;</code> signatures across 15 files. Migrating to a proper error enum (<code>thiserror</code>) would give structured error codes but is a large refactor that touches every command and every frontend error handler.</p>
+</div>
+
+<h2>Deferred (Need Implementation Work)</h2>
+<div class="deferred-box">
+<p><strong>M3, M9, M10, M11, M12, M13, M14, M15, M17, M22</strong> — These require varying degrees of implementation work ranging from medium (M10: change semaphore count) to large (M15: 166 any type replacements). Each needs careful testing to avoid regressions. They should be addressed in a follow-up sprint with dedicated testing time.</p>
+</div>
+
+<h2>Files Modified</h2>
+<table>
+<tr><th>File</th><th>Fixes</th></tr>
+<tr><td><code>server.rs</code></td><td>M1 (6 token comparisons → constant_time_eq)</td></tr>
+<tr><td><code>hls/manifest.rs</code></td><td>M1 (2 token comparisons → constant_time_eq)</td></tr>
+<tr><td><code>Cargo.toml</code></td><td>M6 ([profile.release] added)</td></tr>
+<tr><td><code>vite.config.ts</code></td><td>M7 (dropConsole + sourcemap false)</td></tr>
+<tr><td><code>api_settings.rs</code></td><td>M16 (atomic write)</td></tr>
+<tr><td><code>utils.rs</code></td><td>M16 (atomic write for network settings)</td></tr>
+<tr><td><code>api_routes.rs</code></td><td>M24 (Content-Disposition sanitized)</td></tr>
+<tr><td><code>auth.rs</code></td><td>M18 (chmod 0600 on Unix)</td></tr>
+<tr><td><code>lib.rs</code></td><td>M19 (log level warn in release)</td></tr>
+</table>
+
+<h2>Quick Smoke Test (3 minutes)</h2>
+<div class="section">
+<ol>
+<li><strong>Play a video</strong> → should stream normally (M1 token comparison still works)</li>
+<li><strong>Change API settings</strong> → should save and persist (M16 atomic write)</li>
+<li><strong>Change network settings</strong> → should save and persist (M16 atomic write)</li>
+<li><strong>Download a file via API</strong> → should download with correct filename (M24 header sanitized)</li>
+<li><strong>Build production</strong> → <code>npm run build</code> → check dist for console.log → should be 0 (M7)</li>
+</ol>
+</div>
+
+<hr>
+<p><small>Generated by Hermes Agent — NoBuf Medium Findings Fixes<br>
+Date: 2026-06-27<br>
+7 implemented, 5 documented (architectural), 2 already mitigated by C4, 10 deferred.<br>
+All build checks pass: tsc 0 errors, vitest 96/96, cargo check 0 errors, cargo test 78/78.<br>
+Subagent verification: 2 parallel subagents confirmed findings against source code.</small></p>
+
+</body>
+</html>

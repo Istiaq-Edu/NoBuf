@@ -995,7 +995,7 @@ impl StreamCacheManager {
     /// Track that a message is currently being streamed (Actix response active).
     /// Synchronous so it can be used in Drop guards.
     pub fn track_streaming(&self, message_id: i32) {
-        self.streaming_active.lock().unwrap().push(message_id);
+        self.streaming_active.lock().unwrap_or_else(|e| e.into_inner()).push(message_id);
     }
 
     /// Untrack a streaming message (called when stream ends or client disconnects).
