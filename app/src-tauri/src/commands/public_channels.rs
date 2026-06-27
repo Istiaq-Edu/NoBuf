@@ -151,3 +151,105 @@ fn extract_duration_from_doc(doc: &grammers_tl_types::enums::Document) -> Option
     }
     None
 }
+
+// ─── Channel link resolution (preview before join) ───────────────
+
+#[tauri::command]
+pub async fn cmd_resolve_channel_link(
+    link: String,
+    state: State<'_, TelegramState>,
+) -> Result<ChannelPreview, String> {
+    let (kind, value) = parse_channel_link(&link)?;
+
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    match kind.as_str() {
+        "username" => {
+            let raw_result = client.invoke(&grammers_tl_types::functions::contacts::ResolveUsername {
+                username: value.clone(),
+                referer: None,
+            }).await.map_err(map_error)?;
+
+            // ResolveUsername returns contacts::ResolvedPeer enum — unwrap to struct
+            let result = grammers_tl_types::types::contacts::ResolvedPeer::from(raw_result);
+
+            let mut found_channel: Option<(i64, i64, String)> = None;
+            for chat in &result.chats {
+                if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                    if c.broadcast {
+                        found_channel = Some((
+                            c.id,
+                            c.access_hash.unwrap_or(0),
+                            c.title.clone(),
+                        ));
+                    }
+                }
+            }
+
+            let (channel_id, access_hash, title) = found_channel
+                .ok_or("No channel found with this username. It may be a group, not a channel.")?;
+
+            // Check if already joined: the resolved peer matches the channel
+            let already_joined = if let grammers_tl_types::enums::Peer::Channel(pc) = &result.peer {
+                pc.channel_id == channel_id
+            } else {
+                false
+            };
+
+            Ok(ChannelPreview {
+                title,
+                about: None,
+                participants_count: 0,
+                is_channel: true,
+                is_private: false,
+                already_joined,
+                channel_id: Some(channel_id),
+                access_hash: Some(access_hash),
+                username: Some(value),
+            })
+        }
+        "invite_hash" => {
+            let result = client.invoke(&grammers_tl_types::functions::messages::CheckChatInvite {
+                hash: value,
+            }).await.map_err(map_error)?;
+
+            match result {
+                grammers_tl_types::enums::ChatInvite::Invite(invite) => {
+                    Ok(ChannelPreview {
+                        title: invite.title,
+                        about: invite.about,
+                        participants_count: invite.participants_count,
+                        is_channel: invite.channel,
+                        is_private: true,
+                        already_joined: false,
+                        channel_id: None,
+                        access_hash: None,
+                        username: None,
+                    })
+                }
+                grammers_tl_types::enums::ChatInvite::Already(already) => {
+                    if let grammers_tl_types::enums::Chat::Channel(c) = &already.chat {
+                        Ok(ChannelPreview {
+                            title: c.title.clone(),
+                            about: None,
+                            participants_count: 0,
+                            is_channel: c.broadcast,
+                            is_private: true,
+                            already_joined: true,
+                            channel_id: Some(c.id),
+                            access_hash: c.access_hash,
+                            username: None,
+                        })
+                    } else {
+                        Err("Already joined but not a channel".to_string())
+                    }
+                }
+                grammers_tl_types::enums::ChatInvite::Peek(_) => {
+                    Err("This channel allows peeking but NoBuf does not support peek-only access. Please join the channel first.".to_string())
+                }
+            }
+        }
+        _ => Err("Unknown link type".to_string()),
+    }
+}
