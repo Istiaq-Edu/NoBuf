@@ -253,3 +253,99 @@ pub async fn cmd_resolve_channel_link(
         _ => Err("Unknown link type".to_string()),
     }
 }
+
+// ─── Join channel by link + DB insert ─────────────────────────────
+
+#[tauri::command]
+pub async fn cmd_join_channel_by_link(
+    link: String,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<PublicChannel, String> {
+    let (kind, value) = parse_channel_link(&link)?;
+
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let (channel_id, access_hash, title, username, is_private) = match kind.as_str() {
+        "username" => {
+            let raw_result = client.invoke(&grammers_tl_types::functions::contacts::ResolveUsername {
+                username: value.clone(),
+                referer: None,
+            }).await.map_err(map_error)?;
+            let result = grammers_tl_types::types::contacts::ResolvedPeer::from(raw_result);
+
+            let mut found: Option<(i64, i64, String)> = None;
+            for chat in &result.chats {
+                if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                    if c.broadcast {
+                        found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
+                    }
+                }
+            }
+            let (cid, ah, t) = found.ok_or("No channel found with this username")?;
+
+            client.invoke(&grammers_tl_types::functions::channels::JoinChannel {
+                channel: build_input_channel(cid, ah),
+            }).await.map_err(map_error)?;
+
+            (cid, ah, t, Some(value), false)
+        }
+        "invite_hash" => {
+            let result = client.invoke(&grammers_tl_types::functions::messages::ImportChatInvite {
+                hash: value,
+            }).await.map_err(map_error)?;
+
+            let mut found: Option<(i64, i64, String)> = None;
+            if let grammers_tl_types::enums::Updates::Updates(u) = result {
+                for chat in &u.chats {
+                    if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                        if c.broadcast {
+                            found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
+                        }
+                    }
+                }
+            }
+            let (cid, ah, t) = found.ok_or("Joined but could not identify channel")?;
+            (cid, ah, t, None, true)
+        }
+        _ => return Err("Unknown link type".to_string()),
+    };
+
+    // Deduplication check
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT channel_id FROM public_channels WHERE channel_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            return Err("ALREADY_ADDED: This channel is already added to NoBuf".to_string());
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let conn = get_connection(&app)?;
+    conn.execute(format!(
+        "INSERT INTO public_channels (channel_id, name, username, access_hash, is_private, added_at, is_member) VALUES ({}, '{}', {}, {}, {}, {}, 1)",
+        channel_id,
+        title.replace("'", "''"),
+        username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
+        access_hash,
+        if is_private { 1 } else { 0 },
+        now,
+    )).map_err(|e| e.to_string())?;
+
+    Ok(PublicChannel {
+        channel_id,
+        name: title,
+        username,
+        access_hash,
+        is_private,
+        added_at: now,
+        is_member: true,
+    })
+}

@@ -447,6 +447,7 @@ pub fn run() {
             commands::cmd_get_enriched_folders,
             commands::cmd_open_url,
             commands::cmd_resolve_channel_link,
+            commands::cmd_join_channel_by_link,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
