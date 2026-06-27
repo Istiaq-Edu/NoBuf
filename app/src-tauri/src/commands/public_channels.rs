@@ -498,3 +498,196 @@ pub fn cmd_get_public_channels(
     }
     Ok(channels)
 }
+
+// ─── Get files from a public channel (paginated, 50 per page) ───
+
+#[tauri::command]
+pub async fn cmd_get_public_channel_files(
+    channel_id: i64,
+    offset_id: Option<i32>,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<(Vec<FileMetadata>, bool), String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let access_hash = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT access_hash, is_member FROM public_channels WHERE channel_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+            return Err("Channel not found in NoBuf database".to_string());
+        }
+        let ah = vi(&stmt.read(0).map_err(|e| e.to_string())?);
+        let is_member = vb(&stmt.read(1).map_err(|e| e.to_string())?);
+        if !is_member {
+            return Err("NOT_A_MEMBER: You are no longer a member of this channel".to_string());
+        }
+        ah
+    };
+
+    let input_peer = build_input_peer(channel_id, access_hash);
+
+    let result = client.invoke(&grammers_tl_types::functions::messages::GetHistory {
+        peer: input_peer,
+        offset_id: offset_id.unwrap_or(0),
+        offset_date: 0,
+        add_offset: 0,
+        limit: 51,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    }).await.map_err(|e| {
+        let err = e.to_string();
+        if err.contains("CHANNEL_PRIVATE") || err.contains("CHANNEL_INVALID") {
+            "NOT_A_MEMBER: You are no longer a member of this channel".to_string()
+        } else {
+            map_error(e)
+        }
+    })?;
+
+    let (messages, _) = match result {
+        grammers_tl_types::enums::messages::Messages::Messages(msgs) => (msgs.messages, false),
+        grammers_tl_types::enums::messages::Messages::Slice(msgs) => (msgs.messages, true),
+        _ => (Vec::new(), false),
+    };
+
+    let mut files = Vec::new();
+    let limit = 50;
+    let mut count = 0;
+    let has_more = messages.len() > limit;
+
+    for msg in messages {
+        if count >= limit {
+            break;
+        }
+        if let grammers_tl_types::enums::Message::Message(m) = msg {
+            if let Some(media) = &m.media {
+                let (name, size, mime, ext, duration) = match media {
+                    grammers_tl_types::enums::MessageMedia::Document(d) => {
+                        if let Some(grammers_tl_types::enums::Document::Document(doc)) = &d.document {
+                            let n = doc.attributes.iter().find_map(|a| match a {
+                                grammers_tl_types::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
+                                _ => None,
+                            }).unwrap_or_else(|| "Unknown".to_string());
+                            let s = doc.size as u64;
+                            let mi = doc.mime_type.clone();
+                            let e = std::path::Path::new(&n).extension().map(|os| os.to_str().unwrap_or("").to_string());
+                            (n, s, Some(mi), e, extract_duration_from_doc(&grammers_tl_types::enums::Document::Document(doc.clone())))
+                        } else {
+                            continue;
+                        }
+                    }
+                    grammers_tl_types::enums::MessageMedia::Photo(_) => {
+                        ("Photo.jpg".to_string(), 0, Some("image/jpeg".to_string()), Some("jpg".to_string()), None)
+                    }
+                    _ => continue,
+                };
+                files.push(FileMetadata {
+                    id: m.id as i64,
+                    folder_id: Some(channel_id),
+                    name,
+                    size,
+                    mime_type: mime,
+                    file_ext: ext,
+                    created_at: m.date.to_string(),
+                    icon_type: "file".to_string(),
+                    duration,
+                });
+                count += 1;
+            }
+        }
+    }
+
+    Ok((files, has_more))
+}
+
+// ─── Remove a public channel from NoBuf (+ optionally leave on Telegram) ───
+
+#[tauri::command]
+pub async fn cmd_remove_public_channel(
+    channel_id: i64,
+    leave_on_telegram: bool,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    let access_hash = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT access_hash FROM public_channels WHERE channel_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+            return Err("Channel not found in NoBuf database".to_string());
+        }
+        vi(&stmt.read(0).map_err(|e| e.to_string())?)
+    };
+
+    if leave_on_telegram {
+        let client_opt = { state.client.lock().await.clone() };
+        if let Some(client) = client_opt {
+            client.invoke(&grammers_tl_types::functions::channels::LeaveChannel {
+                channel: build_input_channel(channel_id, access_hash),
+            }).await.map_err(map_error)?;
+        }
+    }
+
+    let conn = get_connection(&app)?;
+    conn.execute(format!("DELETE FROM public_channels WHERE channel_id = {}", channel_id))
+        .map_err(|e| e.to_string())?;
+
+    state.peer_cache.write().await.remove(&channel_id);
+
+    Ok(true)
+}
+
+// ─── Forward files from a public channel to a [NB] folder ───
+
+#[tauri::command]
+pub async fn cmd_forward_to_folder(
+    source_channel_id: i64,
+    message_ids: Vec<i32>,
+    target_folder_id: i64,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<ForwardResult, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let source_access_hash = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("SELECT access_hash FROM public_channels WHERE channel_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, source_channel_id)).map_err(|e| e.to_string())?;
+        if stmt.next().map_err(|e| e.to_string())? != sqlite::State::Row {
+            return Err("Source channel not found".to_string());
+        }
+        vi(&stmt.read(0).map_err(|e| e.to_string())?)
+    };
+
+    let target_peer = crate::commands::utils::resolve_peer(&client, Some(target_folder_id), &state.peer_cache).await?;
+    let source_input_peer = build_input_peer(source_channel_id, source_access_hash);
+
+    let mut errors = Vec::new();
+    let mut forwarded = 0;
+
+    match client.forward_messages(&target_peer, &message_ids, &source_input_peer).await {
+        Ok(_) => {
+            forwarded = message_ids.len() as i32;
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("FLOOD_WAIT") {
+                errors.push(map_error(e));
+            } else {
+                errors.push(format!("Forward failed: {}", err_str));
+            }
+        }
+    }
+
+    Ok(ForwardResult {
+        success: errors.is_empty(),
+        forwarded_count: forwarded,
+        errors,
+    })
+}

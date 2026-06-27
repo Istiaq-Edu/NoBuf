@@ -451,6 +451,9 @@ pub fn run() {
             commands::cmd_list_joined_channels,
             commands::cmd_add_joined_channel,
             commands::cmd_get_public_channels,
+            commands::cmd_get_public_channel_files,
+            commands::cmd_remove_public_channel,
+            commands::cmd_forward_to_folder,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
