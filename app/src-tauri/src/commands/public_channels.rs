@@ -691,3 +691,313 @@ pub async fn cmd_forward_to_folder(
         errors,
     })
 }
+
+// ─── [NB-PUB] helper functions ───────────────────────────────────
+
+fn get_setting(app: &AppHandle, key: &str) -> Option<String> {
+    let conn = get_connection(app).ok()?;
+    let mut stmt = conn.prepare("SELECT value FROM nb_pub_settings WHERE key = ?").ok()?;
+    stmt.bind((1, key)).ok()?;
+    if stmt.next().ok()? == sqlite::State::Row {
+        Some(vs(&stmt.read(0).ok()?))
+    } else {
+        None
+    }
+}
+
+fn set_setting(app: &AppHandle, key: &str, value: &str) {
+    if let Ok(conn) = get_connection(app) {
+        let _ = conn.execute(format!(
+            "INSERT INTO nb_pub_settings (key, value) VALUES ('{}', '{}') ON CONFLICT(key) DO UPDATE SET value = '{}'",
+            key.replace("'", "''"), value.replace("'", "''"), value.replace("'", "''")
+        ));
+    }
+}
+
+async fn find_or_create_nb_pub_channel(
+    client: &Client,
+    app: &AppHandle,
+    state: &TelegramState,
+) -> Result<i64, String> {
+    if let Some(id_str) = get_setting(app, "nb_pub_channel_id") {
+        if let Ok(id) = id_str.parse::<i64>() {
+            return Ok(id);
+        }
+    }
+
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+        if let Peer::Channel(c) = &dialog.peer {
+            if c.raw.title.eq_ignore_ascii_case("[NB-PUB]") {
+                set_setting(app, "nb_pub_channel_id", &c.raw.id.to_string());
+                state.peer_cache.write().await.insert(c.raw.id, dialog.peer.clone());
+                return Ok(c.raw.id);
+            }
+        }
+    }
+
+    let result = client.invoke(&grammers_tl_types::functions::channels::CreateChannel {
+        broadcast: true,
+        megagroup: false,
+        title: "[NB-PUB]".to_string(),
+        about: "NoBuf sync data — do not delete".to_string(),
+        geo_point: None,
+        address: None,
+        for_import: false,
+        forum: false,
+        ttl_period: None,
+    }).await.map_err(map_error)?;
+
+    let chat_id = match result {
+        grammers_tl_types::enums::Updates::Updates(u) => {
+            let chat = u.chats.first().ok_or("No chat in CreateChannel response")?;
+            if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                c.id
+            } else {
+                return Err("Created chat is not a channel".to_string());
+            }
+        }
+        _ => return Err("Unexpected CreateChannel response".to_string()),
+    };
+
+    set_setting(app, "nb_pub_channel_id", &chat_id.to_string());
+    Ok(chat_id)
+}
+
+async fn get_nb_pub_access_hash(
+    client: &Client,
+    channel_id: i64,
+    state: &TelegramState,
+) -> Result<i64, String> {
+    {
+        let cache = state.peer_cache.read().await;
+        if let Some(Peer::Channel(c)) = cache.get(&channel_id) {
+            return Ok(c.raw.access_hash.unwrap_or(0));
+        }
+    }
+
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+        if let Peer::Channel(c) = &dialog.peer {
+            if c.raw.id == channel_id {
+                let ah = c.raw.access_hash.unwrap_or(0);
+                state.peer_cache.write().await.insert(channel_id, dialog.peer.clone());
+                return Ok(ah);
+            }
+        }
+    }
+
+    Err("Could not find [NB-PUB] channel access hash".to_string())
+}
+
+// ─── Update [NB-PUB] sync (upload current public_channels to NB-PUB channel) ───
+
+#[tauri::command]
+pub async fn cmd_update_nb_pub_sync(
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let channels: Vec<PublicChannel> = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, name, username, access_hash, is_private, added_at, is_member FROM public_channels WHERE is_member = 1"
+        ).map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            let row: Vec<Value> = (0..7).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+            result.push(row_to_public_channel(&row));
+        }
+        result
+    };
+
+    let json_data = serde_json::to_string(&channels).map_err(|e| e.to_string())?;
+    let json_bytes = json_data.as_bytes().to_vec();
+
+    let nb_pub_id = find_or_create_nb_pub_channel(&client, &app, &state).await?;
+    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &state).await?;
+
+    // Delete old sync message if exists
+    if let Some(old_msg_id_str) = get_setting(&app, "nb_pub_message_id") {
+        if let Ok(old_id) = old_msg_id_str.parse::<i32>() {
+            if old_id > 0 {
+                let _ = client.invoke(&grammers_tl_types::functions::channels::DeleteMessages {
+                    channel: build_input_channel(nb_pub_id, ah),
+                    id: vec![old_id],
+                }).await;
+            }
+        }
+    }
+
+    // Upload new JSON file
+    let temp_path = std::env::temp_dir().join("nb_pub_sync.json");
+    std::fs::write(&temp_path, &json_bytes).map_err(|e| e.to_string())?;
+
+    let uploaded = client.upload_file(&temp_path).await.map_err(|e| e.to_string())?;
+
+    use grammers_client::InputMessage;
+    let input_peer = build_input_peer(nb_pub_id, ah);
+    let message = InputMessage::new().text("").document(uploaded);
+    let sent = client.send_message(&input_peer, message).await.map_err(map_error)?;
+
+    set_setting(&app, "nb_pub_message_id", &sent.id().to_string());
+
+    Ok(true)
+}
+
+// ─── Sync public channels (download from NB-PUB and reconcile with local DB) ───
+
+#[tauri::command]
+pub async fn cmd_sync_public_channels(
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<Vec<PublicChannel>, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        return cmd_get_public_channels(app);
+    }
+    let client = client_opt.unwrap();
+
+    // Try to find [NB-PUB] channel
+    let nb_pub_id = if let Some(id_str) = get_setting(&app, "nb_pub_channel_id") {
+        id_str.parse::<i64>().ok()
+    } else {
+        None
+    };
+
+    let nb_pub_id = match nb_pub_id {
+        Some(id) => id,
+        None => {
+            let mut found = None;
+            let mut dialogs = client.iter_dialogs();
+            while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+                if let Peer::Channel(c) = &dialog.peer {
+                    if c.raw.title.eq_ignore_ascii_case("[NB-PUB]") {
+                        found = Some(c.raw.id);
+                        state.peer_cache.write().await.insert(c.raw.id, dialog.peer.clone());
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(id) => {
+                    set_setting(&app, "nb_pub_channel_id", &id.to_string());
+                    id
+                }
+                None => return cmd_get_public_channels(app),
+            }
+        }
+    };
+
+    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &state).await?;
+    let input_peer = build_input_peer(nb_pub_id, ah);
+
+    let result = client.invoke(&grammers_tl_types::functions::messages::GetHistory {
+        peer: input_peer,
+        offset_id: 0,
+        offset_date: 0,
+        add_offset: 0,
+        limit: 1,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    }).await.map_err(map_error)?;
+
+    let messages = match result {
+        grammers_tl_types::enums::messages::Messages::Messages(m) => m.messages,
+        grammers_tl_types::enums::messages::Messages::Slice(m) => m.messages,
+        _ => Vec::new(),
+    };
+
+    if messages.is_empty() {
+        return cmd_get_public_channels(app);
+    }
+
+    let msg = match &messages[0] {
+        grammers_tl_types::enums::Message::Message(m) => m,
+        _ => return cmd_get_public_channels(app),
+    };
+
+    let media = match &msg.media {
+        Some(grammers_tl_types::enums::MessageMedia::Document(d)) => d,
+        _ => return cmd_get_public_channels(app),
+    };
+
+    let _doc = match &media.document {
+        Some(grammers_tl_types::enums::Document::Document(d)) => d,
+        _ => return cmd_get_public_channels(app),
+    };
+
+    // Download the JSON file content
+    let media_enum = grammers_tl_types::enums::MessageMedia::Document(media.clone());
+    let media_obj = grammers_client::types::Media::from_raw(media_enum)
+        .ok_or("Failed to construct Media from sync document")?;
+
+    let mut iter = client.iter_download(&media_obj).chunk_size(64 * 1024);
+    let mut file_data = Vec::new();
+    loop {
+        let chunk_result = {
+            let _permit = state.download_semaphore.acquire().await.unwrap();
+            iter.next().await
+        };
+        let chunk = match chunk_result {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => return Err(format!("Download error: {}", e)),
+        };
+        file_data.extend_from_slice(&chunk);
+        tokio::task::yield_now().await;
+    }
+
+    let remote_channels: Vec<PublicChannel> = serde_json::from_slice(&file_data)
+        .map_err(|e| format!("Failed to parse sync JSON: {}", e))?;
+
+    // Reconcile with local DB
+    let conn = get_connection(&app)?;
+
+    let mut local_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT channel_id FROM public_channels").map_err(|e| e.to_string())?;
+        while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            local_ids.insert(vi(&stmt.read(0).map_err(|e| e.to_string())?));
+        }
+    }
+
+    let remote_ids: std::collections::HashSet<i64> = remote_channels.iter().map(|c| c.channel_id).collect();
+
+    for ch in &remote_channels {
+        if !local_ids.contains(&ch.channel_id) {
+            conn.execute(format!(
+                "INSERT INTO public_channels (channel_id, name, username, access_hash, is_private, added_at, is_member) VALUES ({}, '{}', {}, {}, {}, {}, 1)",
+                ch.channel_id,
+                ch.name.replace("'", "''"),
+                ch.username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
+                ch.access_hash,
+                if ch.is_private { 1 } else { 0 },
+                ch.added_at,
+            )).map_err(|e| e.to_string())?;
+        }
+    }
+
+    for local_id in &local_ids {
+        if !remote_ids.contains(local_id) {
+            conn.execute(format!("DELETE FROM public_channels WHERE channel_id = {}", local_id))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    set_setting(&app, "nb_pub_message_id", &msg.id.to_string());
+
+    // Return reconciled list
+    let mut stmt = conn.prepare(
+        "SELECT channel_id, name, username, access_hash, is_private, added_at, is_member FROM public_channels ORDER BY added_at"
+    ).map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let row: Vec<Value> = (0..7).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        result.push(row_to_public_channel(&row));
+    }
+    Ok(result)
+}
