@@ -4,7 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
 import { FolderGroupTabs } from './FolderGroupTabs';
-import { TelegramFolder, BandwidthStats } from '../../types';
+import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel } from '../../types';
+import { PublicChannelSidebarSection } from './PublicChannelSidebarSection';
 
 interface SidebarProps {
     folders: TelegramFolder[];
@@ -21,6 +22,10 @@ interface SidebarProps {
     onToggleCollapse: () => void;
     mobileOpen?: boolean;
     onMobileClose?: () => void;
+    activeView: ActiveView;
+    publicChannels: PublicChannel[];
+    onSelectPublicChannel: (channelId: number) => void;
+    onPublicChannelsChanged: () => void;
 }
 
 /**
@@ -33,7 +38,8 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     isConnected, bandwidth, collapsed, onToggleCollapse,
-    mobileOpen, onMobileClose: _onMobileClose
+    mobileOpen, onMobileClose: _onMobileClose,
+    activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
@@ -256,6 +262,15 @@ export function Sidebar({
                     />
                 ))}
             </nav>
+
+            {/* Public Channels section */}
+            <PublicChannelSidebarSection
+                channels={publicChannels}
+                activeView={activeView}
+                collapsed={collapsed}
+                onSelect={onSelectPublicChannel}
+                onRemoved={onPublicChannelsChanged}
+            />
 
             {/* Create Folder + New Group — bottom row */}
             <div className={`border-b border-nobuf-border shrink-0 space-y-2 pb-2 ${collapsed ? 'flex flex-col px-4' : 'px-3'}`}>
