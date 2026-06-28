@@ -54,13 +54,15 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const { confirm } = useConfirm();
 
     // Sync activeFolderId with activeView for backward compat
-    useEffect(() => {
-        if (activeView.type === 'saved') {
-            setActiveFolderId(null);
-        } else if (activeView.type === 'folder') {
-            setActiveFolderId(activeView.folderId);
-        }
-    }, [activeView, setActiveFolderId]);
+        useEffect(() => {
+            if (activeView.type === 'saved') {
+                setActiveFolderId(null);
+            } else if (activeView.type === 'folder') {
+                setActiveFolderId(activeView.folderId);
+            } else if (activeView.type === 'public') {
+                setActiveFolderId(activeView.channelId);
+            }
+        }, [activeView, setActiveFolderId]);
 
 
     const { settings, updateSetting } = useSettings();
