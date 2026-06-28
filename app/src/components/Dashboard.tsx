@@ -539,17 +539,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 />
                 {playingFile && (
                     <MediaPlayer
-                        file={playingFile}
-                        onClose={() => setPlayingFile(null)}
-                        onNext={handleNextPreview}
-                        onPrev={handlePrevPreview}
-                        currentIndex={previewContextIndex}
-                        totalItems={previewContextFiles.length}
-                        activeFolderId={activeFolderId}
-                        onContinueToDownload={handleContinueToDownload}
-                        isAlreadyDownloading={playingFile ? downloadQueue.some(i => i.messageId === playingFile.id && (i.status === 'pending' || i.status === 'downloading')) : false}
-                        key="media-player"
-                    />
+                                            file={playingFile}
+                                            onClose={() => setPlayingFile(null)}
+                                            onNext={handleNextPreview}
+                                            onPrev={handlePrevPreview}
+                                            currentIndex={previewContextIndex}
+                                            totalItems={previewContextFiles.length}
+                                            activeFolderId={activeFolderId}
+                                            onContinueToDownload={handleContinueToDownload}
+                                            isAlreadyDownloading={playingFile ? downloadQueue.some(i => i.messageId === playingFile.id && (i.status === 'pending' || i.status === 'downloading')) : false}
+                                            isPublicChannel={isPublicView}
+                                            key="media-player"
+                                        />
                 )}
                 {pdfFile && (
                     <PdfViewer
