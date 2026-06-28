@@ -255,7 +255,7 @@ export function Sidebar({
                             )}
 
                             {/* Folder list — conditional render (no max-h clipping) */}
-                                                        {foldersExpanded && !collapsed && (
+                                                        {(foldersExpanded || collapsed) && (
                                                             <>
                                                                 {filteredFolders.map((folder, index) => (
                                                                     <SidebarItem
