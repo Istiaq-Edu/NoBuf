@@ -7,9 +7,11 @@ export function usePublicChannels() {
     const queryClient = useQueryClient();
 
     const { data: publicChannels = [], isLoading } = useQuery<PublicChannel[]>({
-        queryKey: ['publicChannels'],
-        queryFn: () => invoke<PublicChannel[]>('cmd_get_public_channels'),
-    });
+            queryKey: ['publicChannels'],
+            queryFn: () => invoke<PublicChannel[]>('cmd_get_public_channels'),
+            staleTime: 30_000,
+            refetchOnWindowFocus: false,
+        });
 
     const resolveLink = useMutation({
         mutationFn: (link: string) => invoke<ChannelPreview>('cmd_resolve_channel_link', { link }),
@@ -106,26 +108,34 @@ export function usePublicChannelFiles(channelId: number | null) {
         });
 
     const loadMore = useMutation({
-        mutationFn: async (offsetId: number) => {
-            const [files, hasMore] = await invoke<[any[], boolean]>('cmd_get_public_channel_files', {
-                channelId: channelId!,
-                offsetId,
-            });
-            return {
-                files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
-                hasMore,
-                lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
-            };
-        },
-        onSuccess: (newData) => {
-            queryClient.setQueryData(['publicChannelFiles', channelId, 0], (prev: any) => ({
-                files: [...(prev?.files || []), ...newData.files],
-                hasMore: newData.hasMore,
-                lastOffsetId: newData.lastOffsetId,
-                notAMember: false,
-            }));
-        },
-    });
+            mutationFn: async (offsetId: number) => {
+                try {
+                    const [files, hasMore] = await invoke<[any[], boolean]>('cmd_get_public_channel_files', {
+                        channelId: channelId!,
+                        offsetId,
+                    });
+                    return {
+                        files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
+                        hasMore,
+                        lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
+                        notAMember: false,
+                    };
+                } catch (e: any) {
+                    if (String(e).includes('NOT_A_MEMBER')) {
+                        return { files: [], hasMore: false, lastOffsetId: null, notAMember: true };
+                    }
+                    throw e;
+                }
+            },
+            onSuccess: (newData) => {
+                queryClient.setQueryData(['publicChannelFiles', channelId, 0], (prev: any) => ({
+                    files: [...(prev?.files || []), ...newData.files],
+                    hasMore: newData.hasMore,
+                    lastOffsetId: newData.lastOffsetId,
+                    notAMember: newData.notAMember || prev?.notAMember || false,
+                }));
+            },
+        });
 
     return {
         files: data?.files || [],
