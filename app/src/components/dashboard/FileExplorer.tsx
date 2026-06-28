@@ -494,7 +494,7 @@ export function FileExplorer({
 
             {hasMore && (
                 <div ref={loadMoreRef} className="flex justify-center py-4">
-                    <span className="text-sm text-nobuf-subtext">Loading more...</span>
+                    <span className="text-sm text-nobuf-subtext animate-pulse">Loading more...</span>
                 </div>
             )}
 

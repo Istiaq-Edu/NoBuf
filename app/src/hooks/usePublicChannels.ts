@@ -20,7 +20,7 @@ export function usePublicChannels() {
         mutationFn: (link: string) => invoke<PublicChannel>('cmd_join_channel_by_link', { link }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['publicChannels'] });
-            invoke('cmd_update_nb_pub_sync').catch(() => {});
+            invoke('cmd_update_nb_pub_sync').catch((e: any) => { console.warn('[Public Channels] Sync update failed:', e); toast.error('Sync update failed — changes are local only.'); });
         },
         onError: (e: string) => {
             if (e.startsWith('ALREADY_ADDED')) {
@@ -35,7 +35,7 @@ export function usePublicChannels() {
         mutationFn: (channelId: number) => invoke<PublicChannel>('cmd_add_joined_channel', { channelId }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['publicChannels'] });
-            invoke('cmd_update_nb_pub_sync').catch(() => {});
+            invoke('cmd_update_nb_pub_sync').catch((e: any) => { console.warn('[Public Channels] Sync update failed:', e); toast.error('Sync update failed — changes are local only.'); });
         },
         onError: (e: string) => {
             if (e.startsWith('ALREADY_ADDED')) {
@@ -51,7 +51,7 @@ export function usePublicChannels() {
             invoke<boolean>('cmd_remove_public_channel', { channelId, leaveOnTelegram }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['publicChannels'] });
-            invoke('cmd_update_nb_pub_sync').catch(() => {});
+            invoke('cmd_update_nb_pub_sync').catch((e: any) => { console.warn('[Public Channels] Sync update failed:', e); toast.error('Sync update failed — changes are local only.'); });
         },
         onError: (e: string) => toast.error(e),
     });
