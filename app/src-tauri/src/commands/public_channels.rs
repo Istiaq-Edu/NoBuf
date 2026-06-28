@@ -82,12 +82,8 @@ pub fn parse_channel_link(link: &str) -> Result<(String, String), String> {
     };
     
     let path = stripped.split('?').next().unwrap_or(stripped).split('#').next().unwrap_or(stripped);
-    
-    // Take only the first path segment (handles trailing slashes and message permalinks
-    // like t.me/channelname/123 → channelname)
-    let path = path.split('/').next().unwrap_or(path);
-    
-    if path.starts_with('+') {
+
+        if path.starts_with('+') {
         let hash = path[1..].to_string();
         if hash.is_empty() {
             return Err("Empty invite hash".to_string());
@@ -532,41 +528,37 @@ pub async fn cmd_get_public_channel_files(
 
     let input_peer = build_input_peer(channel_id, access_hash);
 
-    let result = client.invoke(&grammers_tl_types::functions::messages::Search {
+    let result = client.invoke(&grammers_tl_types::functions::messages::GetHistory {
             peer: input_peer,
-            q: String::new(),
-            from_id: None,
-            saved_peer_id: None,
-            saved_reaction: None,
-            top_msg_id: None,
-            filter: grammers_tl_types::enums::MessagesFilter::InputMessagesFilterDocument,
-            min_date: 0,
-            max_date: 0,
             offset_id: offset_id.unwrap_or(0),
+            offset_date: 0,
             add_offset: 0,
-            limit: 51,
+            limit: 100,
             max_id: 0,
             min_id: 0,
             hash: 0,
         }).await.map_err(|e| {
-        let err = e.to_string();
-        if err.contains("CHANNEL_PRIVATE") || err.contains("CHANNEL_INVALID") {
-            "NOT_A_MEMBER: You are no longer a member of this channel".to_string()
-        } else {
-            map_error(e)
-        }
-    })?;
+            let err = e.to_string();
+            if err.contains("CHANNEL_PRIVATE") || err.contains("CHANNEL_INVALID") {
+                "NOT_A_MEMBER: You are no longer a member of this channel".to_string()
+            } else {
+                map_error(e)
+            }
+        })?;
 
-    let (messages, _) = match result {
-        grammers_tl_types::enums::messages::Messages::Messages(msgs) => (msgs.messages, false),
-        grammers_tl_types::enums::messages::Messages::Slice(msgs) => (msgs.messages, true),
-        _ => (Vec::new(), false),
-    };
+        let messages = match result {
+            grammers_tl_types::enums::messages::Messages::Messages(msgs) => msgs.messages,
+            grammers_tl_types::enums::messages::Messages::Slice(msgs) => msgs.messages,
+            grammers_tl_types::enums::messages::Messages::ChannelMessages(msgs) => msgs.messages,
+            _ => Vec::new(),
+        };
+
+        log::info!("[Public Channel] GetHistory returned {} messages for channel {}", messages.len(), channel_id);
 
     let mut files = Vec::new();
     let limit = 50;
     let mut count = 0;
-    let has_more = messages.len() > limit;
+    let has_more = messages.len() >= 100;
 
     for msg in messages {
         if count >= limit {
@@ -609,6 +601,8 @@ pub async fn cmd_get_public_channel_files(
             }
         }
     }
+
+    log::info!("[Public Channel] Extracted {} files (has_more={}) for channel {}", files.len(), has_more, channel_id);
 
     Ok((files, has_more))
 }
