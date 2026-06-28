@@ -3955,32 +3955,59 @@ async fn fmp4_keyframes(
     };
 
     let data_path = cache_mgr.data_path(message_id);
-    let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
-        Some(result) => result,
-        None => {
-            // The data file may not exist yet (cold start) or be too small for
-            // packet-size detection. Return an empty partial index so the
-            // frontend can fall back to linear byte mapping and retry later.
-            log::info!("[FMP4-KF] Data file not ready for msg {} — returning empty partial index", message_id);
-            let response = Fmp4KeyframeResponse {
-                keyframes: vec![],
-                total_size: 0,
-                partial: true,
-            };
-            return match serde_json::to_vec(&response) {
-                Ok(body) => HttpResponse::Ok()
-                    .content_type("application/json")
-                    .insert_header(("X-Cache", "MISS"))
-                    .insert_header(("X-Partial", "true"))
-                    .insert_header(("X-Reason", "data-not-ready"))
-                    .body(body),
-                Err(e) => {
-                    log::error!("[FMP4-KF] Failed to serialize empty partial response for msg {}: {}", message_id, e);
-                    HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+        let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
+            Some(result) => result,
+            None => {
+                // detect_ts_packet_size returns None when:
+                // 1. File doesn't exist yet (cold start) → partial: true, retry later
+                // 2. File exists but isn't TS (MP4/MKV/etc) → partial: false, stop retrying
+                if data_path.exists() {
+                    let file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+                    if file_size >= 193 {
+                        // File exists and has enough data — it's simply not a TS file.
+                        // Return partial: false so the frontend stops polling and uses
+                        // linear byte mapping for seeking.
+                        log::info!("[FMP4-KF] msg {} is not a TS stream ({} bytes) — returning empty final index", message_id, file_size);
+                        let response = Fmp4KeyframeResponse {
+                            keyframes: vec![],
+                            total_size: file_size,
+                            partial: false,
+                        };
+                        return match serde_json::to_vec(&response) {
+                            Ok(body) => HttpResponse::Ok()
+                                .content_type("application/json")
+                                .insert_header(("X-Cache", "HIT"))
+                                .insert_header(("X-Partial", "false"))
+                                .insert_header(("X-Reason", "not-ts-format"))
+                                .body(body),
+                            Err(e) => {
+                                log::error!("[FMP4-KF] Failed to serialize empty final response for msg {}: {}", message_id, e);
+                                HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+                            }
+                        };
+                    }
                 }
-            };
-        }
-    };
+                // File doesn't exist or is too small — genuinely not ready
+                log::info!("[FMP4-KF] Data file not ready for msg {} — returning empty partial index", message_id);
+                let response = Fmp4KeyframeResponse {
+                    keyframes: vec![],
+                    total_size: 0,
+                    partial: true,
+                };
+                return match serde_json::to_vec(&response) {
+                    Ok(body) => HttpResponse::Ok()
+                        .content_type("application/json")
+                        .insert_header(("X-Cache", "MISS"))
+                        .insert_header(("X-Partial", "true"))
+                        .insert_header(("X-Reason", "data-not-ready"))
+                        .body(body),
+                    Err(e) => {
+                        log::error!("[FMP4-KF] Failed to serialize empty partial response for msg {}: {}", message_id, e);
+                        HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+                    }
+                };
+            }
+        };
 
     // Load meta to know what's cached
     let _lock = cache_mgr.lock_meta(message_id).await;

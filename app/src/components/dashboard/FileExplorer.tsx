@@ -1,5 +1,5 @@
 ﻿import { useState, useMemo, useCallback, useRef, useEffect, type RefCallback } from 'react';
-import { Plus, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
+import { Plus, ArrowUpDown, ArrowUp, ArrowDown, Lock, AlertCircle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -28,6 +28,13 @@ interface FileExplorerProps {
     onDrop?: (e: React.DragEvent, folderId: number) => void;
     onDragStart?: (fileId: number) => void;
     onDragEnd?: () => void;
+    readOnly?: boolean;
+    hasMore?: boolean;
+    onLoadMore?: () => void;
+    onForwardToFolder?: () => void;
+    showForwardOption?: boolean;
+    notAMember?: boolean;
+    onRemoveChannel?: () => void;
 }
 
 
@@ -115,10 +122,30 @@ function useGridColumns(density: GridDensity) {
 
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
-    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd
+    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd,
+    readOnly, hasMore, onLoadMore,
+    onForwardToFolder, showForwardOption,
+    notAMember, onRemoveChannel
 }: FileExplorerProps) {
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [channelUsername, setChannelUsername] = useState<string | null>(null);
+
+    const loadMoreRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (!loadMoreRef.current || !hasMore || !onLoadMore) return;
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                if (entries[0].isIntersecting && hasMore) {
+                    onLoadMore();
+                }
+            },
+            { rootMargin: '100px' }
+        );
+        observer.observe(loadMoreRef.current);
+        return () => observer.disconnect();
+    }, [hasMore, onLoadMore]);
 
     // Fetch channel username when active folder changes (for copy-link feature)
     useEffect(() => {
@@ -285,7 +312,37 @@ export function FileExplorer({
             onClick={(e) => {
                 if (e.target === e.currentTarget) onSelectionClear();
             }}
+            onDrop={(e) => {
+                if (readOnly) return;
+                if (onDrop) onDrop(e, activeFolderId ?? 0);
+            }}
         >
+            {notAMember && (
+                <div className="flex flex-col items-center justify-center h-full gap-3 py-12">
+                    <AlertCircle className="w-12 h-12 text-red-500/50" />
+                    <p className="text-sm text-nobuf-subtext">
+                        You're no longer a member of this channel.
+                    </p>
+                    {onRemoveChannel && (
+                        <button
+                            onClick={onRemoveChannel}
+                            className="px-4 py-2 rounded-lg bg-nobuf-primary text-white text-sm font-medium hover:bg-nobuf-primary/90 transition-colors"
+                        >
+                            Remove from NoBuf
+                        </button>
+                    )}
+                </div>
+            )}
+            {!notAMember && (
+            <>
+            {readOnly && (
+                <div className="flex items-center gap-2 px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/20">
+                    <Lock className="w-4 h-4 text-amber-500 shrink-0" />
+                    <span className="text-xs text-amber-400">
+                        Read-only channel — upload, move, rename, and delete are disabled
+                    </span>
+                </div>
+            )}
             {viewMode === 'grid' ? (
                 <>
 
@@ -314,14 +371,16 @@ export function FileExplorer({
                         <div className="flex items-center gap-1.5">
                             <button
                                 onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
+                                disabled={readOnly}
+                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}`}
                             >
                                 <Plus className="w-3.5 h-3.5" />
                                 <span className="hidden sm:inline">Upload</span>
                             </button>
                             <button
                                 onClick={(e) => { e.stopPropagation(); onFolderUpload(); }}
-                                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-nobuf-hover text-nobuf-text hover:brightness-110 active:scale-95 transition-all border border-nobuf-border"
+                                disabled={readOnly}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-nobuf-hover text-nobuf-text hover:brightness-110 active:scale-95 transition-all border border-nobuf-border ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 title="Upload Folder (zipped)"
                             >
                                 <Plus className="w-3.5 h-3.5" />
@@ -386,7 +445,8 @@ export function FileExplorer({
                             </button>
                             <button
                                 onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
-                                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine"
+                                disabled={readOnly}
+                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}`}
                             >
                                 <Plus className="w-3.5 h-3.5" />
                                 <span className="hidden sm:inline">Upload</span>
@@ -432,6 +492,12 @@ export function FileExplorer({
                 </div>
             )}
 
+            {hasMore && (
+                <div ref={loadMoreRef} className="flex justify-center py-4">
+                    <span className="text-sm text-nobuf-subtext animate-pulse">Loading more...</span>
+                </div>
+            )}
+
             {contextMenu && (
                 <ContextMenu
                     x={contextMenu.x}
@@ -456,7 +522,11 @@ export function FileExplorer({
                     }}
                     onCopyLink={handleCopyLink}
                     channelIsPublic={!!channelUsername}
+                    showForwardOption={showForwardOption}
+                    onForwardToFolder={onForwardToFolder}
                 />
+            )}
+            </>
             )}
         </div>
     )

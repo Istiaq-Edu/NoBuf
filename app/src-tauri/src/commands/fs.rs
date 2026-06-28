@@ -1445,7 +1445,7 @@ pub async fn cmd_scan_folders(
 
                 let title = c.raw.title.clone();
                 // Match only by [NB] in title (case-insensitive)
-                if title.to_lowercase().contains("[nb]") {
+                if title.to_lowercase().contains("[nb]") && !title.to_lowercase().contains("[nb-pub]") {
                     let display_name = title
                         .replace(" [NB]", "").replace(" [nb]", "")
                         .replace("[NB]", "").replace("[nb]", "")

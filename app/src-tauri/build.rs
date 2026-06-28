@@ -62,7 +62,17 @@ fn main() {
                 "cmd_update_group_order",
                 "cmd_get_enriched_folders",
                 "cmd_open_url",
-            ])),
+                                "cmd_resolve_channel_link",
+                                "cmd_join_channel_by_link",
+                                "cmd_list_joined_channels",
+                                "cmd_add_joined_channel",
+                                "cmd_get_public_channels",
+                                "cmd_get_public_channel_files",
+                                "cmd_remove_public_channel",
+                                "cmd_forward_to_folder",
+                                "cmd_update_nb_pub_sync",
+                                "cmd_sync_public_channels",
+                            ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");
 }
