@@ -852,8 +852,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         .map(kf => [kf.byteOffset, kf.timestamp] as [number, number])
         .sort((a, b) => a[0] - b[0]);
     }
-    // Return true when index is complete (not partial) and has data
-    return !partial && keyframes.length > 0;
+    // Return true when index is complete (not partial).
+        // For non-TS files (MP4), the backend returns partial:false + empty keyframes.
+        // That means "index is complete, file is not TS" — stop polling.
+        // For TS files, partial:false + keyframes.length>0 means "full index ready".
+        return !partial;
   }, [parseStreamUrl, streamUrl]);
 
   // Ref to track whether the TS→fMP4 backend pipeline is active (not mux.js transmuxer)
