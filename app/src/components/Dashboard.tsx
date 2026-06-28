@@ -49,12 +49,25 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
-    const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
-    const [showForwardModal, setShowForwardModal] = useState(false);
-    const { confirm } = useConfirm();
+        const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
+        const [showForwardModal, setShowForwardModal] = useState(false);
+        const { confirm } = useConfirm();
 
-    // Sync activeFolderId with activeView for backward compat
-        useEffect(() => {
+        // Wrapper: updates both activeView and activeFolderId atomically.
+        // Sidebar calls this instead of raw setActiveFolderId so that clicking
+        // a private folder switches activeView away from 'public' — otherwise
+        // the useEffect below would immediately reset activeFolderId back.
+        const handleSelectFolder = useCallback((id: number | null) => {
+            if (id === null) {
+                setActiveView({ type: 'saved' });
+            } else {
+                setActiveView({ type: 'folder', folderId: id });
+            }
+            setActiveFolderId(id);
+        }, [setActiveFolderId]);
+
+        // Sync activeFolderId with activeView for backward compat
+            useEffect(() => {
             if (activeView.type === 'saved') {
                 setActiveFolderId(null);
             } else if (activeView.type === 'folder') {
@@ -580,7 +593,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <Sidebar
                 folders={folders}
                 activeFolderId={activeFolderId}
-                setActiveFolderId={setActiveFolderId}
+                setActiveFolderId={handleSelectFolder}
                 onDrop={handleDropOnFolder}
                 onDelete={handleFolderDelete}
                 onRename={handleFolderRename}
