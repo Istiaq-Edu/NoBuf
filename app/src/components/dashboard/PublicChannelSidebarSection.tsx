@@ -63,8 +63,8 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
             )}
 
             {/* Channel list — conditional render (no max-h clipping) */}
-                        {expanded && !collapsed && (
-                            <div className="flex flex-col gap-0.5 px-3 pb-2">
+                        {(expanded || collapsed) && (
+                                                    <div className={`flex flex-col gap-0.5 ${collapsed ? 'px-0' : 'px-3'} pb-2`}>
                                 {channels.map(channel => (
                                     <PublicChannelItem
                                         key={channel.channel_id}
@@ -79,7 +79,7 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                                         }}
                                     />
                                 ))}
-                                {channels.length === 0 && (
+                                {!collapsed && channels.length === 0 && (
                                     <div className="px-3 py-2 text-xs text-nobuf-subtext">
                                         No public channels added.
                                     </div>
