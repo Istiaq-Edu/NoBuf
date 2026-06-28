@@ -20,11 +20,12 @@ interface FastStreamPlayerProps {
   activeFolderId: number | null;
   onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
   isAlreadyDownloading?: boolean;
-}
+    isPublicChannel?: boolean;
+  }
 
-const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
+  const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
+  export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -104,7 +105,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // keyframe seeking instead of hls.js. This eliminates MISS-FAR targeted
   // downloads at seek positions — same "seek poison" approach as .mp4 files.
 
-  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId);
+  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId, isPublicChannel);
 
   // MSE player handles ALL formats (MP4, TS, MKV, WebM).
   // TS files use MediabunnyTransmuxer instead of hls.js.

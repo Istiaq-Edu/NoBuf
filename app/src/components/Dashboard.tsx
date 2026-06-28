@@ -22,6 +22,10 @@ import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
 import { AboutPage } from './dashboard/AboutPage';
+import { ForwardToFolderModal } from './dashboard/ForwardToFolderModal';
+import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
+import { ActiveView } from '../types';
+import { useConfirm } from '../context/ConfirmContext';
 
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
@@ -43,6 +47,35 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         store, folders, activeFolderId, setActiveFolderId, isConnected,
         handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
     } = useTelegramConnection(onLogout);
+
+    const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
+        const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
+        const [showForwardModal, setShowForwardModal] = useState(false);
+        const { confirm } = useConfirm();
+
+        // Wrapper: updates both activeView and activeFolderId atomically.
+        // Sidebar calls this instead of raw setActiveFolderId so that clicking
+        // a private folder switches activeView away from 'public' — otherwise
+        // the useEffect below would immediately reset activeFolderId back.
+        const handleSelectFolder = useCallback((id: number | null) => {
+            if (id === null) {
+                setActiveView({ type: 'saved' });
+            } else {
+                setActiveView({ type: 'folder', folderId: id });
+            }
+            setActiveFolderId(id);
+        }, [setActiveFolderId]);
+
+        // Sync activeFolderId with activeView for backward compat
+            useEffect(() => {
+            if (activeView.type === 'saved') {
+                setActiveFolderId(null);
+            } else if (activeView.type === 'folder') {
+                setActiveFolderId(activeView.folderId);
+            } else if (activeView.type === 'public') {
+                setActiveFolderId(activeView.channelId);
+            }
+        }, [activeView, setActiveFolderId]);
 
 
     const { settings, updateSetting } = useSettings();
@@ -86,15 +119,24 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
-    const { data: allFiles = [], isLoading, error } = useQuery({
+    const isPublicView = activeView.type === 'public';
+    const isReadOnly = isPublicView;
+    const { files: pubChannelFiles, isLoading: pubFilesLoading, hasMore: pubHasMore, lastOffsetId: pubLastOffsetId, notAMember: pubNotAMember, loadMore } = usePublicChannelFiles(
+        isPublicView ? activeView.channelId : null
+    );
+
+    const { data: nbFiles = [], isLoading: nbFilesLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
         queryFn: () => invoke<any[]>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
             ...f,
             sizeStr: formatBytes(f.size),
             type: f.icon_type || (f.name.endsWith('/') ? 'folder' : 'file')
         }))),
-        enabled: !!store,
+        enabled: !!store && !isPublicView,
     });
+
+    const allFiles = isPublicView ? pubChannelFiles : nbFiles;
+    const isLoading = isPublicView ? pubFilesLoading : nbFilesLoading;
 
     const displayedFiles = (() => {
         // 1. Apply search filter
@@ -418,9 +460,45 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }
 
-    const currentFolderName = activeFolderId === null
-        ? "Saved Messages"
-        : folders.find(f => f.id === activeFolderId)?.name || "Folder";
+    const handleLoadMore = useCallback(() => {
+            if (!loadMore.isPending && pubLastOffsetId) {
+                loadMore.mutate(pubLastOffsetId);
+            }
+        }, [loadMore, pubLastOffsetId]);
+
+        const handleRemovePublicChannel = async (channelId: number) => {
+            const channel = publicChannels.find(c => c.channel_id === channelId);
+        if (!channel) return;
+
+        const shouldRemove = await confirm({
+            title: `Remove "${channel.name}" from NoBuf?`,
+            message: 'This will remove the channel from your NoBuf sidebar.',
+            confirmText: 'Remove',
+            cancelText: 'Cancel'
+        });
+        
+        if (!shouldRemove) return;
+        
+        const shouldLeave = await confirm({
+            title: 'Also leave on Telegram?',
+            message: 'You will no longer receive messages from this channel on Telegram.',
+            confirmText: 'Leave Channel',
+            cancelText: 'Keep Subscribed'
+        });
+        
+        removeChannel.mutate({ channelId, leaveOnTelegram: shouldLeave });
+        toast.success(`Removed "${channel.name}" from NoBuf.`);
+        
+        if (activeView.type === 'public' && activeView.channelId === channelId) {
+            setActiveView({ type: 'saved' });
+        }
+    };
+
+    const currentFolderName = activeView.type === 'public'
+        ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
+        : activeFolderId === null
+            ? "Saved Messages"
+            : folders.find(f => f.id === activeFolderId)?.name || "Folder";
 
 
     const handleRootDragOver = (e: React.DragEvent) => {
@@ -474,17 +552,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 />
                 {playingFile && (
                     <MediaPlayer
-                        file={playingFile}
-                        onClose={() => setPlayingFile(null)}
-                        onNext={handleNextPreview}
-                        onPrev={handlePrevPreview}
-                        currentIndex={previewContextIndex}
-                        totalItems={previewContextFiles.length}
-                        activeFolderId={activeFolderId}
-                        onContinueToDownload={handleContinueToDownload}
-                        isAlreadyDownloading={playingFile ? downloadQueue.some(i => i.messageId === playingFile.id && (i.status === 'pending' || i.status === 'downloading')) : false}
-                        key="media-player"
-                    />
+                                            file={playingFile}
+                                            onClose={() => setPlayingFile(null)}
+                                            onNext={handleNextPreview}
+                                            onPrev={handlePrevPreview}
+                                            currentIndex={previewContextIndex}
+                                            totalItems={previewContextFiles.length}
+                                            activeFolderId={activeFolderId}
+                                            onContinueToDownload={handleContinueToDownload}
+                                            isAlreadyDownloading={playingFile ? downloadQueue.some(i => i.messageId === playingFile.id && (i.status === 'pending' || i.status === 'downloading')) : false}
+                                            isPublicChannel={isPublicView}
+                                            key="media-player"
+                                        />
                 )}
                 {pdfFile && (
                     <PdfViewer
@@ -514,7 +593,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <Sidebar
                 folders={folders}
                 activeFolderId={activeFolderId}
-                setActiveFolderId={setActiveFolderId}
+                setActiveFolderId={handleSelectFolder}
                 onDrop={handleDropOnFolder}
                 onDelete={handleFolderDelete}
                 onRename={handleFolderRename}
@@ -526,6 +605,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onToggleCollapse={toggleSidebar}
                 mobileOpen={mobileSidebarOpen}
                 onMobileClose={() => setMobileSidebarOpen(false)}
+                activeView={activeView}
+                publicChannels={publicChannels}
+                onSelectPublicChannel={(channelId) => setActiveView({ type: 'public', channelId })}
+                onPublicChannelsChanged={() => syncFromRemote.mutate()}
+                onRemovePublicChannel={handleRemovePublicChannel}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
@@ -578,6 +662,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDrop={handleDropOnFolder}
                     onDragStart={(fileId) => setInternalDragFileId(fileId)}
                     onDragEnd={() => setTimeout(() => setInternalDragFileId(null), 50)}
+                    readOnly={isReadOnly}
+                    hasMore={isPublicView ? pubHasMore : false}
+                                        onLoadMore={isPublicView ? handleLoadMore : undefined}
+                    notAMember={isPublicView ? pubNotAMember : false}
+                    onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
+                    showForwardOption={isReadOnly}
+                    onForwardToFolder={() => setShowForwardModal(true)}
                 />
             </main>
 
@@ -622,6 +713,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <AboutPage onClose={() => setShowAbout(false)} />
                 )}
             </AnimatePresence>
+
+            <ForwardToFolderModal
+                open={showForwardModal}
+                onClose={() => setShowForwardModal(false)}
+                sourceChannelId={activeView.type === 'public' ? activeView.channelId : 0}
+                selectedFileIds={selectedIds}
+                folders={folders}
+                onForwarded={() => {
+                    queryClient.invalidateQueries({ queryKey: ['files'] });
+                }}
+            />
         </div>
     );
 }
