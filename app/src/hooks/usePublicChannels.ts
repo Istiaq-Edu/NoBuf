@@ -87,7 +87,7 @@ export function usePublicChannelFiles(channelId: number | null) {
                     offsetId: null,
                 });
                 return {
-                    files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size) })),
+                    files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
                     hasMore,
                     lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
                     notAMember: false,
@@ -109,7 +109,7 @@ export function usePublicChannelFiles(channelId: number | null) {
                 offsetId,
             });
             return {
-                files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size) })),
+                files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
                 hasMore,
                 lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
             };
