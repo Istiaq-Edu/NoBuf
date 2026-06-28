@@ -223,7 +223,7 @@ export function Sidebar({
             )}
 
             {/* Scrollable area — both Private and Public sections share flex-1 space */}
-                        <nav className={`flex-1 flex flex-col overflow-y-auto overflow-x-hidden min-h-0 sidebar-scroll py-2 ${collapsed ? 'px-4' : 'px-3'}`}>
+                        <nav className={`flex-1 flex flex-col overflow-y-auto overflow-x-hidden min-h-0 sidebar-scroll py-2 ${collapsed ? 'px-2' : 'px-3'}`}>
                             {/* Saved Messages — always visible */}
                             <SidebarItem
                                 icon={HardDrive}
@@ -290,9 +290,12 @@ export function Sidebar({
                                                                     />
                                                                 ))}
                                                             </>
-                                                        )}
+                                                                                        )}
 
-                            {/* Public Channels section — inside nav so it shares scroll space */}
+                                                                                        {/* Divider between Private and Public sections */}
+                                                                                        <div className="h-px bg-nobuf-border mx-2 my-2 shrink-0" />
+
+                                                                                        {/* Public Channels section — inside nav so it shares scroll space */}
                             <PublicChannelSidebarSection
                                 channels={publicChannels}
                                 activeView={activeView}

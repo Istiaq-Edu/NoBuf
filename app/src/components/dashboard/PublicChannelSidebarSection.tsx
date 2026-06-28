@@ -51,16 +51,16 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
 
             {/* Collapsed sidebar — just the + icon */}
             {collapsed && (
-                <div className="px-4 pt-3 pb-1 shrink-0">
-                    <button
-                        onClick={() => setShowAddModal(true)}
-                        className="text-nobuf-subtext hover:text-nobuf-primary transition-colors"
-                        title="Add public channel"
-                    >
-                        <Plus className="w-4 h-4" />
-                    </button>
-                </div>
-            )}
+                            <div className="px-4 pt-3 pb-1 shrink-0 flex justify-center">
+                                <button
+                                    onClick={() => setShowAddModal(true)}
+                                    className="w-8 h-8 flex items-center justify-center rounded-lg text-nobuf-subtext hover:text-nobuf-primary hover:bg-nobuf-hover transition-colors"
+                                    title="Add public channel"
+                                >
+                                    <Plus className="w-4 h-4" />
+                                </button>
+                            </div>
+                        )}
 
             {/* Channel list — conditional render (no max-h clipping) */}
                         {(expanded || collapsed) && (
