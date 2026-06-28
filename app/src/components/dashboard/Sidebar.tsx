@@ -222,8 +222,8 @@ export function Sidebar({
                 </div>
             )}
 
-            {/* Scrollable folder list */}
-                        <nav className={`flex-1 flex flex-col gap-0.5 overflow-y-auto overflow-x-hidden min-h-0 sidebar-scroll py-2 ${collapsed ? 'px-4' : 'px-3'}`}>
+            {/* Scrollable area — both Private and Public sections share flex-1 space */}
+                        <nav className={`flex-1 flex flex-col overflow-y-auto overflow-x-hidden min-h-0 sidebar-scroll py-2 ${collapsed ? 'px-4' : 'px-3'}`}>
                             {/* Saved Messages — always visible */}
                             <SidebarItem
                                 icon={HardDrive}
@@ -239,66 +239,69 @@ export function Sidebar({
                             {!collapsed && (
                                 <button
                                     onClick={() => setFoldersExpanded(e => !e)}
-                                    className="flex items-center gap-1.5 px-1 pt-3 pb-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors w-full text-left"
+                                    className="flex items-center gap-1.5 px-1 pt-3 pb-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors w-full text-left group"
                                 >
                                     {foldersExpanded
-                                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0" />
-                                        : <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0 transition-transform" />
+                                        : <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform" />
                                     }
-                                    <span>Private Channels</span>
+                                    <span className="flex-1">Private Channels</span>
+                                    {filteredFolders.length > 0 && (
+                                        <span className="text-[10px] font-normal text-nobuf-subtext/60 bg-nobuf-hover px-1.5 py-0.5 rounded-full">
+                                            {filteredFolders.length}
+                                        </span>
+                                    )}
                                 </button>
                             )}
 
-                            {/* Folder list — hidden when section collapsed */}
-                            {foldersExpanded && (
-                                <>
-                                    {filteredFolders.map((folder, index) => (
-                                        <SidebarItem
-                                            key={folder.id}
-                                            icon={Folder}
-                                            label={folder.name}
-                                            active={activeFolderId === folder.id}
-                                            onClick={() => setActiveFolderId(folder.id)}
-                                            onDrop={(e: React.DragEvent) => {
-                                                const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
-                                                if (reorderData) {
-                                                    handleReorderDrop(Number(reorderData));
-                                                    return;
-                                                }
-                                                onDrop(e, folder.id);
-                                            }}
-                                            onDelete={() => onDelete(folder.id, folder.name)}
-                                            onRename={(newName: string) => onRename(folder.id, newName)}
-                                            onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
-                                            currentGroupId={folderGroupMap[folder.id]?.id ?? null}
-                                            groupColor={folderGroupMap[folder.id]?.color ?? null}
-                                            onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
-                                            onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
-                                            onFolderDragLeave={handleFolderDragLeave}
-                                            onFolderDrop={(e: React.DragEvent) => handleFolderDrop(e)}
-                                            onFolderDragEnd={handleDragEnd}
-                                            reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
-                                            isFirst={index === 0}
-                                            isLast={index === filteredFolders.length - 1}
-                                            folderId={folder.id}
-                                            collapsed={collapsed}
-                                        />
-                                    ))}
-                                </>
-                            )}
-                        </nav>
+                            {/* Folder list — smooth collapse */}
+                            <div className={`overflow-hidden transition-all duration-200 ${foldersExpanded && !collapsed ? 'max-h-[1000px] opacity-100' : 'max-h-0 opacity-0'}`}>
+                                {filteredFolders.map((folder, index) => (
+                                    <SidebarItem
+                                        key={folder.id}
+                                        icon={Folder}
+                                        label={folder.name}
+                                        active={activeFolderId === folder.id}
+                                        onClick={() => setActiveFolderId(folder.id)}
+                                        onDrop={(e: React.DragEvent) => {
+                                            const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
+                                            if (reorderData) {
+                                                handleReorderDrop(Number(reorderData));
+                                                return;
+                                            }
+                                            onDrop(e, folder.id);
+                                        }}
+                                        onDelete={() => onDelete(folder.id, folder.name)}
+                                        onRename={(newName: string) => onRename(folder.id, newName)}
+                                        onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
+                                        currentGroupId={folderGroupMap[folder.id]?.id ?? null}
+                                        groupColor={folderGroupMap[folder.id]?.color ?? null}
+                                        onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
+                                        onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
+                                        onFolderDragLeave={handleFolderDragLeave}
+                                        onFolderDrop={(e: React.DragEvent) => handleFolderDrop(e)}
+                                        onFolderDragEnd={handleDragEnd}
+                                        reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
+                                        isFirst={index === 0}
+                                        isLast={index === filteredFolders.length - 1}
+                                        folderId={folder.id}
+                                        collapsed={collapsed}
+                                    />
+                                ))}
+                            </div>
 
-            {/* Public Channels section */}
-                        <PublicChannelSidebarSection
-                            channels={publicChannels}
-                            activeView={activeView}
-                            collapsed={collapsed}
-                            onSelect={onSelectPublicChannel}
-                            onRemoved={onPublicChannelsChanged}
-                            onRemove={onRemovePublicChannel}
-                            expanded={pubExpanded}
-                            onToggleExpand={() => setPubExpanded(e => !e)}
-                        />
+                            {/* Public Channels section — inside nav so it shares scroll space */}
+                            <PublicChannelSidebarSection
+                                channels={publicChannels}
+                                activeView={activeView}
+                                collapsed={collapsed}
+                                onSelect={onSelectPublicChannel}
+                                onRemoved={onPublicChannelsChanged}
+                                onRemove={onRemovePublicChannel}
+                                expanded={pubExpanded}
+                                onToggleExpand={() => setPubExpanded(e => !e)}
+                            />
+                        </nav>
 
             {/* Create Folder + New Group — bottom row */}
             <div className={`border-b border-nobuf-border shrink-0 space-y-2 pb-2 ${collapsed ? 'flex flex-col px-4' : 'px-3'}`}>

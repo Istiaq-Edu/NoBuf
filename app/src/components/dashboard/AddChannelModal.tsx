@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
+import { Link as LinkIcon, Compass, Loader2, Search, X, Check, Radio } from 'lucide-react';
 import { ChannelPreview, JoinedChannel, PublicChannel } from '../../types';
 import { ChannelPreviewCard } from './ChannelPreviewCard';
 
@@ -19,6 +20,13 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
     const [joinedChannels, setJoinedChannels] = useState<JoinedChannel[]>([]);
     const [browseSearch, setBrowseSearch] = useState('');
     const [browseLoading, setBrowseLoading] = useState(false);
+    const [browseFetched, setBrowseFetched] = useState(false);
+
+    // Fetch joined channels once when modal opens (not on every tab switch)
+    useEffect(() => {
+        if (!open || browseFetched) return;
+        loadJoinedChannels();
+    }, [open]);
 
     if (!open) return null;
 
@@ -81,6 +89,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         try {
             const channels = await invoke<JoinedChannel[]>('cmd_list_joined_channels');
             setJoinedChannels(channels);
+            setBrowseFetched(true);
         } catch (e: any) {
             toast.error(String(e));
         } finally {
@@ -110,7 +119,6 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         setLinkInput('');
         setPreview(null);
         setBrowseSearch('');
-        setJoinedChannels([]);
         onClose();
     };
 
@@ -119,41 +127,46 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         : joinedChannels;
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={handleClose}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={handleClose}>
             <div
-                className="bg-nobuf-bg rounded-2xl border border-nobuf-border w-full max-w-lg max-h-[80vh] flex flex-col"
+                className="bg-nobuf-bg rounded-2xl border border-nobuf-border w-full max-w-lg max-h-[80vh] flex flex-col shadow-2xl"
                 onClick={e => e.stopPropagation()}
             >
+                {/* Header */}
                 <div className="flex items-center justify-between p-4 border-b border-nobuf-border shrink-0">
                     <h3 className="font-semibold text-nobuf-text">Add Public Channel</h3>
-                    <button onClick={handleClose} className="text-nobuf-subtext hover:text-nobuf-text transition-colors">
-                        ✕
+                    <button onClick={handleClose} className="text-nobuf-subtext hover:text-nobuf-text transition-colors p-1 rounded hover:bg-nobuf-hover">
+                        <X className="w-4 h-4" />
                     </button>
                 </div>
 
+                {/* Segmented tab control */}
                 <div className="flex gap-1 p-3 border-b border-nobuf-border shrink-0">
                     <button
                         onClick={() => setTab('link')}
-                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                        className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                             tab === 'link'
                                 ? 'bg-nobuf-primary text-white'
                                 : 'text-nobuf-subtext hover:bg-nobuf-hover'
                         }`}
                     >
+                        <LinkIcon className="w-4 h-4" />
                         Paste Link
                     </button>
                     <button
-                        onClick={() => { setTab('browse'); if (joinedChannels.length === 0) loadJoinedChannels(); }}
-                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                        onClick={() => setTab('browse')}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                             tab === 'browse'
                                 ? 'bg-nobuf-primary text-white'
                                 : 'text-nobuf-subtext hover:bg-nobuf-hover'
                         }`}
                     >
+                        <Compass className="w-4 h-4" />
                         Browse Joined
                     </button>
                 </div>
 
+                {/* Content */}
                 <div className="flex-1 overflow-y-auto p-4 sidebar-scroll">
                     {tab === 'link' && (
                         <div className="space-y-4">
@@ -164,7 +177,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
                                         type="text"
                                         autoFocus
                                         className="flex-1 bg-nobuf-hover rounded-lg px-3 py-2.5 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 border border-nobuf-border"
-                                        placeholder="t.me/channelname, t.me/+invite, or @username"
+                                        placeholder="t.me/channelname or @channel"
                                         value={linkInput}
                                         onChange={e => setLinkInput(e.target.value)}
                                         onKeyDown={e => { if (e.key === 'Enter') handleResolve(); }}
@@ -172,9 +185,14 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
                                     <button
                                         onClick={handleResolve}
                                         disabled={resolving || !linkInput.trim()}
-                                        className="px-4 py-2.5 rounded-lg bg-nobuf-primary text-white text-sm font-medium hover:bg-nobuf-primary/90 transition-colors disabled:opacity-50"
+                                        className="px-4 py-2.5 rounded-lg bg-nobuf-primary text-white text-sm font-medium hover:brightness-110 active:scale-95 transition-all disabled:opacity-50 flex items-center gap-2"
                                     >
-                                        {resolving ? '...' : 'Preview'}
+                                        {resolving ? (
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                            <Search className="w-4 h-4" />
+                                        )}
+                                        <span className="hidden sm:inline">Preview</span>
                                     </button>
                                 </div>
                                 <p className="text-xs text-nobuf-subtext mt-1.5">
@@ -194,59 +212,89 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
 
                     {tab === 'browse' && (
                         <div className="space-y-3">
-                            <input
-                                type="text"
-                                className="w-full bg-nobuf-hover rounded-lg px-3 py-2.5 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 border border-nobuf-border"
-                                placeholder="Search joined channels..."
-                                value={browseSearch}
-                                onChange={e => setBrowseSearch(e.target.value)}
-                            />
+                            {/* Search input with icon */}
+                            <div className="relative">
+                                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-nobuf-subtext pointer-events-none" />
+                                <input
+                                    type="text"
+                                    className="w-full bg-nobuf-hover rounded-lg pl-9 pr-3 py-2.5 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 border border-nobuf-border"
+                                    placeholder="Search joined channels..."
+                                    value={browseSearch}
+                                    onChange={e => setBrowseSearch(e.target.value)}
+                                />
+                            </div>
+
+                            {/* Loading state */}
                             {browseLoading && (
-                                <div className="text-center py-8 text-nobuf-subtext text-sm">Loading channels...</div>
-                            )}
-                            {!browseLoading && filteredJoined.length === 0 && (
-                                <div className="text-center py-8 text-nobuf-subtext text-sm">
-                                    {joinedChannels.length === 0 ? 'No joined channels found.' : 'No channels match your search.'}
+                                <div className="flex flex-col items-center justify-center py-12 gap-2">
+                                    <Loader2 className="w-6 h-6 animate-spin text-nobuf-primary" />
+                                    <span className="text-sm text-nobuf-subtext">Loading channels...</span>
                                 </div>
                             )}
-                            <div className="space-y-1.5">
-                                {filteredJoined.map(channel => (
-                                    <div
-                                        key={channel.channel_id}
-                                        className={`flex items-center gap-3 p-3 rounded-lg border transition-all ${
-                                            channel.already_added || channel.is_nb_folder
-                                                ? 'border-nobuf-border bg-nobuf-hover/50 opacity-60'
-                                                : 'border-nobuf-border hover:bg-nobuf-hover cursor-pointer'
-                                        }`}
-                                        onClick={() => {
-                                            if (!channel.already_added && !channel.is_nb_folder) {
-                                                handleAddFromBrowse(channel);
-                                            }
-                                        }}
-                                    >
-                                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-nobuf-primary to-blue-500 flex items-center justify-center shrink-0">
-                                            <span className="text-white font-bold text-xs">
-                                                {channel.name.charAt(0).toUpperCase()}
-                                            </span>
-                                        </div>
-                                        <div className="flex-1 min-w-0">
-                                            <span className="text-sm font-medium text-nobuf-text block truncate">{channel.name}</span>
-                                            {channel.username && (
-                                                <span className="text-xs text-nobuf-subtext">@{channel.username}</span>
-                                            )}
-                                        </div>
-                                        {channel.is_nb_folder && (
-                                            <span className="text-xs text-nobuf-subtext px-2 py-0.5 rounded bg-nobuf-bg">NoBuf folder</span>
-                                        )}
-                                        {channel.already_added && !channel.is_nb_folder && (
-                                            <span className="text-xs text-nobuf-subtext px-2 py-0.5 rounded bg-nobuf-bg">Added</span>
-                                        )}
-                                        {!channel.already_added && !channel.is_nb_folder && (
-                                            <span className="text-xs text-nobuf-primary font-medium">+ Add</span>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
+
+                            {/* Empty states */}
+                            {!browseLoading && filteredJoined.length === 0 && (
+                                <div className="flex flex-col items-center justify-center py-12 gap-2">
+                                    <Compass className="w-8 h-8 text-nobuf-subtext/40" />
+                                    <span className="text-sm text-nobuf-subtext">
+                                        {joinedChannels.length === 0 ? 'No joined channels found.' : 'No channels match your search.'}
+                                    </span>
+                                </div>
+                            )}
+
+                            {/* Channel list */}
+                            {!browseLoading && filteredJoined.length > 0 && (
+                                <div className="space-y-1">
+                                    {filteredJoined.map(channel => {
+                                        const disabled = channel.already_added || channel.is_nb_folder;
+                                        return (
+                                            <div
+                                                key={channel.channel_id}
+                                                className={`flex items-center gap-3 p-2.5 rounded-lg border transition-all ${
+                                                    disabled
+                                                        ? 'border-nobuf-border bg-nobuf-hover/30 opacity-50'
+                                                        : 'border-nobuf-border hover:bg-nobuf-hover hover:border-nobuf-primary/30 cursor-pointer'
+                                                }`}
+                                                onClick={() => {
+                                                    if (!disabled) handleAddFromBrowse(channel);
+                                                }}
+                                            >
+                                                {/* Avatar */}
+                                                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-nobuf-primary to-blue-500 flex items-center justify-center shrink-0">
+                                                    <span className="text-white font-bold text-xs">
+                                                        {channel.name.charAt(0).toUpperCase()}
+                                                    </span>
+                                                </div>
+                                                {/* Name + username */}
+                                                <div className="flex-1 min-w-0">
+                                                    <span className="text-sm font-medium text-nobuf-text block truncate">{channel.name}</span>
+                                                    {channel.username && (
+                                                        <span className="text-xs text-nobuf-subtext">@{channel.username}</span>
+                                                    )}
+                                                </div>
+                                                {/* Status badge */}
+                                                {channel.is_nb_folder && (
+                                                    <span className="flex items-center gap-1 text-xs text-nobuf-subtext px-2 py-1 rounded bg-nobuf-bg shrink-0">
+                                                        <Radio className="w-3 h-3" />
+                                                        NoBuf
+                                                    </span>
+                                                )}
+                                                {channel.already_added && !channel.is_nb_folder && (
+                                                    <span className="flex items-center gap-1 text-xs text-green-400 px-2 py-1 rounded bg-green-400/10 shrink-0">
+                                                        <Check className="w-3 h-3" />
+                                                        Added
+                                                    </span>
+                                                )}
+                                                {!channel.already_added && !channel.is_nb_folder && (
+                                                    <span className="text-xs text-nobuf-primary font-medium px-2 py-1 rounded bg-nobuf-primary/10 shrink-0">
+                                                        + Add
+                                                    </span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>
