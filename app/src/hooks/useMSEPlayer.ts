@@ -614,7 +614,14 @@ interface MSEState {
   pendingSeek: number;
 }
 
-export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null, activeFolderId: number | null) {
+export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null, activeFolderId: number | null, isPublicChannel?: boolean) {
+  // Public channels get larger buffers to reduce buffering on large 1080p MP4s.
+  // Telegram download speed (~400KB/s) is below 1080p bitrate (~1MB/s), so
+  // a bigger buffer builds a larger cushion during speed spikes.
+  const minColdStartBytes = isPublicChannel ? alignChunkSize(20 * 1024 * 1024) : MIN_COLD_START_BUFFER_BYTES;
+  const maxBufferAhead = isPublicChannel ? 120 : MAX_BUFFER_AHEAD_SECONDS;
+  const maxBufferBytes = isPublicChannel ? 80 * 1024 * 1024 : MAX_BUFFER_BYTES;
+
   const [mseUrl, setMseUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [useNative, setUseNative] = useState(false); // Fallback flag
@@ -643,7 +650,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const [isColdStartBuffering, setIsColdStartBuffering] = useState(false);
   const [coldStartProgress, setColdStartProgress] = useState<{ bytes: number; targetBytes: number }>({
     bytes: 0,
-    targetBytes: MIN_COLD_START_BUFFER_BYTES,
+    targetBytes: minColdStartBytes,
   });
   // Deferred promise resolved when the first 5MB is in the shadow cache (or timeout).
   const coldStartDeferredRef = useRef<{ resolve: () => void; promise: Promise<void> } | null>(null);
@@ -1661,7 +1668,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (sbAudio) checkBuffered(sbAudio);
 
     // Only evict if buffer exceeds threshold (rough estimate: seconds * bitrate)
-    if (totalBuffered * state.current.bitrate < MAX_BUFFER_BYTES) return;
+    if (totalBuffered * state.current.bitrate < maxBufferBytes) return;
 
     const currentTime = video.currentTime;
     const evictBefore = currentTime > 0
@@ -1798,7 +1805,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         coldStartDeferredRef.current = { resolve: coldStartResolve, promise: coldStartPromise };
         // Show the cold-start overlay while the first chunk is being pulled into the shadow cache.
         setIsColdStartBuffering(true);
-        setColdStartProgress({ bytes: 0, targetBytes: MIN_COLD_START_BUFFER_BYTES });
+        setColdStartProgress({ bytes: 0, targetBytes: minColdStartBytes });
         // Start mpegts.js immediately, but playback is gated on the first 5MB.
         const initPromise = initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
         await initPromise;
@@ -4541,7 +4548,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // and triggering QuotaExceededError.
       while (!cancelledRef.current && state.current.downloading && gen === loopGeneration.current) {
         const ahead = getBufferedAheadSeconds();
-        if (ahead <= MAX_BUFFER_AHEAD_SECONDS) break;
+        if (ahead <= maxBufferAhead) break;
         // Sleep 2s — let playback consume buffered data before downloading more
         await new Promise(r => setTimeout(r, 2000));
         // Proactively evict during the wait to free space
@@ -5527,9 +5534,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const interval = setInterval(() => {
       const cache = shadowCacheRef.current;
       const run = cache?.cachedRunFrom(0);
-      const bytes = run ? Math.min(run.end + 1, MIN_COLD_START_BUFFER_BYTES) : 0;
-      setColdStartProgress({ bytes, targetBytes: MIN_COLD_START_BUFFER_BYTES });
-      const ready = bytes >= MIN_COLD_START_BUFFER_BYTES || Date.now() - startTime >= COLD_START_TIMEOUT_MS;
+      const bytes = run ? Math.min(run.end + 1, minColdStartBytes) : 0;
+            setColdStartProgress({ bytes, targetBytes: minColdStartBytes });
+            const ready = bytes >= minColdStartBytes || Date.now() - startTime >= COLD_START_TIMEOUT_MS;
       if (ready) {
         coldStartDeferredRef.current?.resolve();
       }
@@ -5543,7 +5550,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       coldStartDeferredRef.current?.resolve();
       coldStartDeferredRef.current = null;
       setIsColdStartBuffering(false);
-      setColdStartProgress({ bytes: 0, targetBytes: MIN_COLD_START_BUFFER_BYTES });
+      setColdStartProgress({ bytes: 0, targetBytes: minColdStartBytes });
     };
   }, [streamUrl]);
 
