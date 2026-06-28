@@ -83,6 +83,10 @@ pub fn parse_channel_link(link: &str) -> Result<(String, String), String> {
     
     let path = stripped.split('?').next().unwrap_or(stripped).split('#').next().unwrap_or(stripped);
     
+    // Take only the first path segment (handles trailing slashes and message permalinks
+    // like t.me/channelname/123 → channelname)
+    let path = path.split('/').next().unwrap_or(path);
+    
     if path.starts_with('+') {
         let hash = path[1..].to_string();
         if hash.is_empty() {
@@ -528,16 +532,23 @@ pub async fn cmd_get_public_channel_files(
 
     let input_peer = build_input_peer(channel_id, access_hash);
 
-    let result = client.invoke(&grammers_tl_types::functions::messages::GetHistory {
-        peer: input_peer,
-        offset_id: offset_id.unwrap_or(0),
-        offset_date: 0,
-        add_offset: 0,
-        limit: 51,
-        max_id: 0,
-        min_id: 0,
-        hash: 0,
-    }).await.map_err(|e| {
+    let result = client.invoke(&grammers_tl_types::functions::messages::Search {
+            peer: input_peer,
+            q: String::new(),
+            from_id: None,
+            saved_peer_id: None,
+            saved_reaction: None,
+            top_msg_id: None,
+            filter: grammers_tl_types::enums::MessagesFilter::InputMessagesFilterDocument,
+            min_date: 0,
+            max_date: 0,
+            offset_id: offset_id.unwrap_or(0),
+            add_offset: 0,
+            limit: 51,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        }).await.map_err(|e| {
         let err = e.to_string();
         if err.contains("CHANNEL_PRIVATE") || err.contains("CHANNEL_INVALID") {
             "NOT_A_MEMBER: You are no longer a member of this channel".to_string()
