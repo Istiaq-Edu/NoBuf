@@ -72,7 +72,17 @@
     "allow-cmd-update-group-order",
     "allow-cmd-get-enriched-folders",
     "allow-cmd-open-url",
-    "allow-cmd-get-cache-total-size",
-    "allow-cmd-detect-vpn"
-  ]
-}
+        "allow-cmd-get-cache-total-size",
+        "allow-cmd-detect-vpn",
+        "allow-cmd-resolve-channel-link",
+        "allow-cmd-join-channel-by-link",
+        "allow-cmd-list-joined-channels",
+        "allow-cmd-add-joined-channel",
+        "allow-cmd-get-public-channels",
+        "allow-cmd-get-public-channel-files",
+        "allow-cmd-remove-public-channel",
+        "allow-cmd-forward-to-folder",
+        "allow-cmd-update-nb-pub-sync",
+        "allow-cmd-sync-public-channels"
+      ]
+    }
