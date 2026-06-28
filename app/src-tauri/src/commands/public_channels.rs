@@ -187,11 +187,9 @@ pub async fn cmd_resolve_channel_link(
                 .ok_or("No channel found with this username. It may be a group, not a channel.")?;
 
             // Check if already joined: the resolved peer matches the channel
-            let already_joined = if let grammers_tl_types::enums::Peer::Channel(pc) = &result.peer {
-                pc.channel_id == channel_id
-            } else {
-                false
-            };
+            // ResolveUsername returns the resolved peer, not membership status.
+                        // JoinChannel is idempotent, so always use the join flow.
+                        let already_joined = false;
 
             Ok(ChannelPreview {
                 title,
