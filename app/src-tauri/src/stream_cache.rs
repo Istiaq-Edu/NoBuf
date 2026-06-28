@@ -652,25 +652,40 @@ impl StreamCacheManager {
             return None;
         }
         // Cancel old downloads for the same message with different ranges.
-        // When a new /stream request arrives (seek or VBR correction), the old
-        // download from a different byte range is no longer needed. Without this,
-        // the old download continues for 2-4 seconds (zombie) competing for the
-        // rate limiter, slowing down the new download.
-        //
-        // source_id isolation: only cancel zombies from the SAME source_id.
-        // This prevents the thumbnail pipeline's seek from cancelling the main
-        // player's active download (and vice versa). When source_id is None
-        // (backward compat), cancel any same-message download with a different
-        // start_byte — same as the original behaviour.
-        if let Some(dls) = downloads.get_mut(&message_id) {
-            for dl in dls.iter() {
-                if dl.start_byte != start_byte && source_ids_match(&dl.source_id, &source_id) {
-                    log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?})",
-                        message_id, dl.start_byte, dl.end_byte, start_byte, source_id);
-                    dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                // When a new /stream request arrives (seek or VBR correction), the old
+                // download from a different byte range is no longer needed. Without this,
+                // the old download continues for 2-4 seconds (zombie) competing for the
+                // rate limiter, slowing down the new download.
+                //
+                // source_id isolation: only cancel zombies from the SAME source_id.
+                // This prevents the thumbnail pipeline's seek from cancelling the main
+                // player's active download (and vice versa). When source_id is None
+                // (backward compat), cancel any same-message download with a different
+                // start_byte — same as the original behaviour.
+                //
+                // Distance check: only cancel if the new request is FAR from the existing
+                // download (>8MB). This prevents the death spiral where the MSE player
+                // issues overlapping/nearby range requests during normal playback — each
+                // new request cancels the previous one before it can make progress.
+                const CANCEL_DISTANCE_BYTES: u64 = 8 * 1024 * 1024; // 8 MB
+                if let Some(dls) = downloads.get_mut(&message_id) {
+                    for dl in dls.iter() {
+                        if dl.start_byte != start_byte && source_ids_match(&dl.source_id, &source_id) {
+                            let distance = if start_byte > dl.end_byte {
+                                start_byte.saturating_sub(dl.end_byte)
+                            } else if end_byte < dl.start_byte {
+                                dl.start_byte.saturating_sub(end_byte)
+                            } else {
+                                0 // overlap or adjacent — don't cancel
+                            };
+                            if distance > CANCEL_DISTANCE_BYTES {
+                                log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?}, distance={}MB)",
+                                    message_id, dl.start_byte, dl.end_byte, start_byte, source_id, distance / (1024*1024));
+                                dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
-            }
-        }
         // Initialize watch channel with initial_progress (not start_byte).
         // For regular downloads, initial_progress = start_byte (no data yet).
         // For continuations, initial_progress = current_offset (prebuffer already on disk).

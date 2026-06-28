@@ -78,29 +78,32 @@ export function usePublicChannelFiles(channelId: number | null) {
     const queryClient = useQueryClient();
 
     const { data, isLoading, error } = useQuery({
-        queryKey: ['publicChannelFiles', channelId, 0],
-        queryFn: async () => {
-            if (!channelId) return { files: [], hasMore: false, lastOffsetId: null, notAMember: false };
-            try {
-                const [files, hasMore] = await invoke<[any[], boolean]>('cmd_get_public_channel_files', {
-                    channelId,
-                    offsetId: null,
-                });
-                return {
-                    files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
-                    hasMore,
-                    lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
-                    notAMember: false,
-                };
-            } catch (e: any) {
-                if (String(e).includes('NOT_A_MEMBER')) {
-                    return { files: [], hasMore: false, lastOffsetId: null, notAMember: true };
+            queryKey: ['publicChannelFiles', channelId, 0],
+            queryFn: async () => {
+                if (!channelId) return { files: [], hasMore: false, lastOffsetId: null, notAMember: false };
+                try {
+                    const [files, hasMore] = await invoke<[any[], boolean]>('cmd_get_public_channel_files', {
+                        channelId,
+                        offsetId: null,
+                    });
+                    return {
+                        files: files.map((f: any) => ({ ...f, sizeStr: formatBytesLocal(f.size), type: f.icon_type || 'file' })),
+                        hasMore,
+                        lastOffsetId: files.length > 0 ? files[files.length - 1].id : null,
+                        notAMember: false,
+                    };
+                } catch (e: any) {
+                    if (String(e).includes('NOT_A_MEMBER')) {
+                        return { files: [], hasMore: false, lastOffsetId: null, notAMember: true };
+                    }
+                    throw e;
                 }
-                throw e;
-            }
-        },
-        enabled: channelId !== null,
-    });
+            },
+            enabled: channelId !== null,
+            staleTime: 60_000,        // Don't refetch for 60s after a successful fetch
+            gcTime: 5 * 60_000,       // Keep cached data for 5min after unmount
+            refetchOnWindowFocus: false,  // Don't refetch when window regains focus
+        });
 
     const loadMore = useMutation({
         mutationFn: async (offsetId: number) => {
