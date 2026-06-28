@@ -254,41 +254,43 @@ export function Sidebar({
                                 </button>
                             )}
 
-                            {/* Folder list — smooth collapse */}
-                            <div className={`overflow-hidden transition-all duration-200 ${foldersExpanded && !collapsed ? 'max-h-[1000px] opacity-100' : 'max-h-0 opacity-0'}`}>
-                                {filteredFolders.map((folder, index) => (
-                                    <SidebarItem
-                                        key={folder.id}
-                                        icon={Folder}
-                                        label={folder.name}
-                                        active={activeFolderId === folder.id}
-                                        onClick={() => setActiveFolderId(folder.id)}
-                                        onDrop={(e: React.DragEvent) => {
-                                            const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
-                                            if (reorderData) {
-                                                handleReorderDrop(Number(reorderData));
-                                                return;
-                                            }
-                                            onDrop(e, folder.id);
-                                        }}
-                                        onDelete={() => onDelete(folder.id, folder.name)}
-                                        onRename={(newName: string) => onRename(folder.id, newName)}
-                                        onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
-                                        currentGroupId={folderGroupMap[folder.id]?.id ?? null}
-                                        groupColor={folderGroupMap[folder.id]?.color ?? null}
-                                        onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
-                                        onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
-                                        onFolderDragLeave={handleFolderDragLeave}
-                                        onFolderDrop={(e: React.DragEvent) => handleFolderDrop(e)}
-                                        onFolderDragEnd={handleDragEnd}
-                                        reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
-                                        isFirst={index === 0}
-                                        isLast={index === filteredFolders.length - 1}
-                                        folderId={folder.id}
-                                        collapsed={collapsed}
-                                    />
-                                ))}
-                            </div>
+                            {/* Folder list — conditional render (no max-h clipping) */}
+                                                        {foldersExpanded && !collapsed && (
+                                                            <>
+                                                                {filteredFolders.map((folder, index) => (
+                                                                    <SidebarItem
+                                                                        key={folder.id}
+                                                                        icon={Folder}
+                                                                        label={folder.name}
+                                                                        active={activeFolderId === folder.id}
+                                                                        onClick={() => setActiveFolderId(folder.id)}
+                                                                        onDrop={(e: React.DragEvent) => {
+                                                                            const reorderData = e.dataTransfer.getData(FOLDER_REORDER_MIME);
+                                                                            if (reorderData) {
+                                                                                handleReorderDrop(Number(reorderData));
+                                                                                return;
+                                                                            }
+                                                                            onDrop(e, folder.id);
+                                                                        }}
+                                                                        onDelete={() => onDelete(folder.id, folder.name)}
+                                                                        onRename={(newName: string) => onRename(folder.id, newName)}
+                                                                        onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
+                                                                        currentGroupId={folderGroupMap[folder.id]?.id ?? null}
+                                                                        groupColor={folderGroupMap[folder.id]?.color ?? null}
+                                                                        onFolderDragStart={(e: React.DragEvent) => handleFolderDragStart(e, folder.id)}
+                                                                        onFolderDragOver={(e: React.DragEvent) => handleFolderDragOver(e, folder.id)}
+                                                                        onFolderDragLeave={handleFolderDragLeave}
+                                                                        onFolderDrop={(e: React.DragEvent) => handleFolderDrop(e)}
+                                                                        onFolderDragEnd={handleDragEnd}
+                                                                        reorderIndicator={dragOverFolderId === folder.id ? dragOverPosition : null}
+                                                                        isFirst={index === 0}
+                                                                        isLast={index === filteredFolders.length - 1}
+                                                                        folderId={folder.id}
+                                                                        collapsed={collapsed}
+                                                                    />
+                                                                ))}
+                                                            </>
+                                                        )}
 
                             {/* Public Channels section — inside nav so it shares scroll space */}
                             <PublicChannelSidebarSection

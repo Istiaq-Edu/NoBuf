@@ -62,30 +62,30 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                 </div>
             )}
 
-            {/* Channel list — smooth collapse */}
-            <div className={`overflow-hidden transition-all duration-200 ${expanded && !collapsed ? 'max-h-[1000px] opacity-100' : 'max-h-0 opacity-0'}`}>
-                <div className="flex flex-col gap-0.5 px-3 pb-2">
-                    {channels.map(channel => (
-                        <PublicChannelItem
-                            key={channel.channel_id}
-                            channel={channel}
-                            active={activeChannelId === channel.channel_id}
-                            collapsed={collapsed}
-                            onClick={() => onSelect(channel.channel_id)}
-                            onRemove={() => {
-                                if (onRemove) {
-                                    onRemove(channel.channel_id);
-                                }
-                            }}
-                        />
-                    ))}
-                    {channels.length === 0 && (
-                        <div className="px-3 py-2 text-xs text-nobuf-subtext">
-                            No public channels added.
-                        </div>
-                    )}
-                </div>
-            </div>
+            {/* Channel list — conditional render (no max-h clipping) */}
+                        {expanded && !collapsed && (
+                            <div className="flex flex-col gap-0.5 px-3 pb-2">
+                                {channels.map(channel => (
+                                    <PublicChannelItem
+                                        key={channel.channel_id}
+                                        channel={channel}
+                                        active={activeChannelId === channel.channel_id}
+                                        collapsed={collapsed}
+                                        onClick={() => onSelect(channel.channel_id)}
+                                        onRemove={() => {
+                                            if (onRemove) {
+                                                onRemove(channel.channel_id);
+                                            }
+                                        }}
+                                    />
+                                ))}
+                                {channels.length === 0 && (
+                                    <div className="px-3 py-2 text-xs text-nobuf-subtext">
+                                        No public channels added.
+                                    </div>
+                                )}
+                            </div>
+                        )}
 
             <AddChannelModal
                 open={showAddModal}
