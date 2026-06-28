@@ -447,8 +447,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }
 
-    const handleRemovePublicChannel = async (channelId: number) => {
-        const channel = publicChannels.find(c => c.channel_id === channelId);
+    const handleLoadMore = useCallback(() => {
+            if (!loadMore.isPending && pubLastOffsetId) {
+                loadMore.mutate(pubLastOffsetId);
+            }
+        }, [loadMore, pubLastOffsetId]);
+
+        const handleRemovePublicChannel = async (channelId: number) => {
+            const channel = publicChannels.find(c => c.channel_id === channelId);
         if (!channel) return;
 
         const shouldRemove = await confirm({
@@ -644,9 +650,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDragEnd={() => setTimeout(() => setInternalDragFileId(null), 50)}
                     readOnly={isReadOnly}
                     hasMore={isPublicView ? pubHasMore : false}
-                    onLoadMore={isPublicView && pubLastOffsetId
-                        ? () => loadMore.mutate(pubLastOffsetId)
-                        : undefined}
+                                        onLoadMore={isPublicView ? handleLoadMore : undefined}
                     notAMember={isPublicView ? pubNotAMember : false}
                     onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
                     showForwardOption={isReadOnly}

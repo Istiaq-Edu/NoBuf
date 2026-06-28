@@ -5503,11 +5503,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     let timer: number;
     let cancelled = false;
     const tick = async () => {
-      const complete = await refreshTsKeyframeIndex();
-      if (cancelled) return;
-      // Fast retry (2s) while incomplete, slow retry (15s) once complete
-      timer = window.setTimeout(tick, complete ? 15000 : 2000);
-    };
+          const complete = await refreshTsKeyframeIndex();
+          if (cancelled) return;
+          // Stop polling once the index is complete.
+          // For TS files: complete means full keyframe index is built.
+          // For non-TS files (MP4/MKV): complete means backend confirmed it's not TS.
+          // In both cases, no further polling is needed.
+          if (complete) return;
+          // Only retry if incomplete (data file not ready yet)
+          timer = window.setTimeout(tick, 2000);
+        };
     tick();
     return () => { cancelled = true; clearTimeout(timer); };
   }, [streamUrl, refreshTsKeyframeIndex]);
