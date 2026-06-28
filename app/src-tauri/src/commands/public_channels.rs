@@ -329,15 +329,20 @@ pub async fn cmd_join_channel_by_link(
         .as_secs() as i64;
 
     let conn = get_connection(&app)?;
-    conn.execute(format!(
-        "INSERT INTO public_channels (channel_id, name, username, access_hash, is_private, added_at, is_member) VALUES ({}, '{}', {}, {}, {}, {}, 1)",
-        channel_id,
-        title.replace("'", "''"),
-        username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
-        access_hash,
-        if is_private { 1 } else { 0 },
-        now,
-    )).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO public_channels (channel_id, name, username, access_hash, is_private, added_at, is_member) VALUES (?, ?, ?, ?, ?, ?, 1)"
+        ).map_err(|e| e.to_string())?;
+        stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+        stmt.bind((2, title.as_str())).map_err(|e| e.to_string())?;
+        if let Some(ref un) = username {
+            stmt.bind((3, un.as_str())).map_err(|e| e.to_string())?;
+        } else {
+            stmt.bind((3, Value::Null)).map_err(|e| e.to_string())?;
+        }
+        stmt.bind((4, access_hash)).map_err(|e| e.to_string())?;
+        stmt.bind((5, if is_private { 1i64 } else { 0 })).map_err(|e| e.to_string())?;
+        stmt.bind((6, now)).map_err(|e| e.to_string())?;
+        stmt.next().map_err(|e| e.to_string())?;
 
     Ok(PublicChannel {
         channel_id,
@@ -633,10 +638,14 @@ pub async fn cmd_remove_public_channel(
     }
 
     let conn = get_connection(&app)?;
-    conn.execute(format!("DELETE FROM public_channels WHERE channel_id = {}", channel_id))
-        .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = conn.prepare("DELETE FROM public_channels WHERE channel_id = ?")
+                .map_err(|e| e.to_string())?;
+            stmt.bind((1, channel_id)).map_err(|e| e.to_string())?;
+            stmt.next().map_err(|e| e.to_string())?;
+        }
 
-    state.peer_cache.write().await.remove(&channel_id);
+        state.peer_cache.write().await.remove(&channel_id);
 
     Ok(true)
 }
@@ -982,11 +991,13 @@ pub async fn cmd_sync_public_channels(
     }
 
     for local_id in &local_ids {
-        if !remote_ids.contains(local_id) {
-            conn.execute(format!("DELETE FROM public_channels WHERE channel_id = {}", local_id))
-                .map_err(|e| e.to_string())?;
+            if !remote_ids.contains(local_id) {
+                let mut stmt = conn.prepare("DELETE FROM public_channels WHERE channel_id = ?")
+                    .map_err(|e| e.to_string())?;
+                stmt.bind((1, *local_id)).map_err(|e| e.to_string())?;
+                stmt.next().map_err(|e| e.to_string())?;
+            }
         }
-    }
 
     set_setting(&app, "nb_pub_message_id", &msg.id.to_string());
 

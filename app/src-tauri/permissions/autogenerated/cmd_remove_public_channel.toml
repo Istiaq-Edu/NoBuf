@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-remove-public-channel"
+description = "Enables the cmd_remove_public_channel command without any pre-configured scope."
+commands.allow = ["cmd_remove_public_channel"]
+
+[[permission]]
+identifier = "deny-cmd-remove-public-channel"
+description = "Denies the cmd_remove_public_channel command without any pre-configured scope."
+commands.deny = ["cmd_remove_public_channel"]
