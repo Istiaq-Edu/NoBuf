@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, ChevronDown, ChevronRight } from 'lucide-react';
 import { PublicChannel, ActiveView } from '../../types';
 import { PublicChannelItem } from './PublicChannelItem';
 import { AddChannelModal } from './AddChannelModal';
@@ -11,9 +11,11 @@ interface Props {
     onSelect: (channelId: number) => void;
     onRemoved: () => void;
     onRemove?: (channelId: number) => void;
+    expanded?: boolean;
+    onToggleExpand?: () => void;
 }
 
-export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove }: Props) {
+export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, expanded = true, onToggleExpand }: Props) {
     const [showAddModal, setShowAddModal] = useState(false);
 
     const activeChannelId = activeView.type === 'public' ? activeView.channelId : null;
@@ -22,9 +24,16 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
         <>
             {!collapsed && (
                 <div className="flex items-center justify-between px-3 pt-3 pb-1 shrink-0">
-                    <span className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider">
-                        Public Channels
-                    </span>
+                    <button
+                        onClick={onToggleExpand}
+                        className="flex items-center gap-1.5 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors text-left"
+                    >
+                        {expanded
+                            ? <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+                            : <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                        }
+                        <span>Public Channels</span>
+                    </button>
                     <button
                         onClick={() => setShowAddModal(true)}
                         className="text-nobuf-subtext hover:text-nobuf-primary transition-colors"
@@ -46,27 +55,29 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                 </div>
             )}
 
-            <div className={`flex flex-col gap-0.5 ${collapsed ? 'px-0' : 'px-3'} pb-2`}>
-                {channels.map(channel => (
-                    <PublicChannelItem
-                        key={channel.channel_id}
-                        channel={channel}
-                        active={activeChannelId === channel.channel_id}
-                        collapsed={collapsed}
-                        onClick={() => onSelect(channel.channel_id)}
-                        onRemove={() => {
-                            if (onRemove) {
-                                onRemove(channel.channel_id);
-                            }
-                        }}
-                    />
-                ))}
-                {!collapsed && channels.length === 0 && (
-                    <div className="px-3 py-2 text-xs text-nobuf-subtext">
-                        No public channels added.
-                    </div>
-                )}
-            </div>
+            {expanded && (
+                <div className={`flex flex-col gap-0.5 ${collapsed ? 'px-0' : 'px-3'} pb-2`}>
+                    {channels.map(channel => (
+                        <PublicChannelItem
+                            key={channel.channel_id}
+                            channel={channel}
+                            active={activeChannelId === channel.channel_id}
+                            collapsed={collapsed}
+                            onClick={() => onSelect(channel.channel_id)}
+                            onRemove={() => {
+                                if (onRemove) {
+                                    onRemove(channel.channel_id);
+                                }
+                            }}
+                        />
+                    ))}
+                    {!collapsed && channels.length === 0 && (
+                        <div className="px-3 py-2 text-xs text-nobuf-subtext">
+                            No public channels added.
+                        </div>
+                    )}
+                </div>
+            )}
 
             <AddChannelModal
                 open={showAddModal}
