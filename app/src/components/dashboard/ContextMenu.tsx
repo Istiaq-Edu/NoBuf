@@ -126,10 +126,12 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 </button>
             )}
 
-            <button disabled className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-subtext hover:bg-nobuf-hover rounded transition-colors text-left w-full cursor-not-allowed opacity-50">
-                <Pencil className="w-4 h-4" />
-                Rename
-            </button>
+            {!showForwardOption && (
+                            <button disabled className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-subtext hover:bg-nobuf-hover rounded transition-colors text-left w-full cursor-not-allowed opacity-50">
+                                <Pencil className="w-4 h-4" />
+                                Rename
+                            </button>
+                        )}
 
             {(!showForwardOption) && (
                 <>

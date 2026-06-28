@@ -1,15 +1,11 @@
 use grammers_client::Client;
 use grammers_client::types::Peer;
 use tauri::{State, AppHandle, Manager};
-use serde::{Deserialize, Serialize};
 use sqlite::{Connection, Value};
 use std::path::PathBuf;
 use crate::commands::TelegramState;
 use crate::commands::utils::map_error;
 use crate::models::{PublicChannel, ChannelPreview, JoinedChannel, ForwardResult, FileMetadata};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 // ─── SQLite helpers ──────────────────────────────────────────────
 
@@ -710,6 +706,7 @@ fn get_setting(app: &AppHandle, key: &str) -> Option<String> {
     if stmt.next().ok()? == sqlite::State::Row {
         Some(vs(&stmt.read(0).ok()?))
     } else {
+        log::debug!("[NB-PUB] get_setting: no row for key '{}'", key);
         None
     }
 }
@@ -944,21 +941,41 @@ pub async fn cmd_sync_public_channels(
     let media_obj = grammers_client::types::Media::from_raw(media_enum)
         .ok_or("Failed to construct Media from sync document")?;
 
-    let mut iter = client.iter_download(&media_obj).chunk_size(64 * 1024);
     let mut file_data = Vec::new();
-    loop {
-        let chunk_result = {
-            let _permit = state.download_semaphore.acquire().await.unwrap();
-            iter.next().await
-        };
-        let chunk = match chunk_result {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => return Err(format!("Download error: {}", e)),
-        };
-        file_data.extend_from_slice(&chunk);
-        tokio::task::yield_now().await;
-    }
+        let mut download_attempts = 0;
+        let max_download_attempts = 3;
+        loop {
+            download_attempts += 1;
+            let mut iter = client.iter_download(&media_obj).chunk_size(64 * 1024);
+            let mut success = true;
+            file_data.clear();
+            loop {
+                let chunk_result = {
+                    let _permit = state.download_semaphore.acquire().await.unwrap();
+                    iter.next().await
+                };
+                let chunk = match chunk_result {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("[NB-PUB] Sync download error (attempt {}): {}", download_attempts, e);
+                        success = false;
+                        break;
+                    }
+                };
+                file_data.extend_from_slice(&chunk);
+                tokio::task::yield_now().await;
+            }
+            if success {
+                break;
+            }
+            if download_attempts >= max_download_attempts {
+                return Err(format!("Sync download failed after {} attempts", max_download_attempts));
+            }
+            let delay = std::time::Duration::from_secs(2u64.pow(download_attempts as u32));
+            log::info!("[NB-PUB] Retrying sync download in {}s...", delay.as_secs());
+            tokio::time::sleep(delay).await;
+        }
 
     let remote_channels: Vec<PublicChannel> = serde_json::from_slice(&file_data)
         .map_err(|e| format!("Failed to parse sync JSON: {}", e))?;
