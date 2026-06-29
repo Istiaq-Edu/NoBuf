@@ -759,7 +759,7 @@ async fn proactive_prebuffer_download(
         // position after a backward seek — the user sees "old prebuffers still growing."
         if latest_current_byte > start_byte {
             start_byte = latest_current_byte;
-        } else if latest_current_byte + 10 * 1024 * 1024 < start_byte {
+        } else if latest_current_byte + 50 * 1024 * 1024 < start_byte {
             // Backward seek detected — target moved >10MB backward.
             // This is typically a VBR correction that moved the target.
             // Set jumped=true so the 2s sleep runs, giving /stream time to
@@ -954,7 +954,7 @@ async fn proactive_prebuffer_download(
                             );
                             jumped = true;
                             break;
-                        } else if target_byte + 10 * 1024 * 1024 < offset
+                        } else if target_byte + 50 * 1024 * 1024 < offset
                                    && target_changed {
                             // Backward seek — but ONLY if the target changed (new seek).
                             // If target hasn't changed, PROACTIVE is just ahead of the

@@ -1722,13 +1722,13 @@ async fn find_keyframe_at_or_before_time(
 
         window_size *= 2;
 
-        // Search deadline: if the search has been running for >30s (due to
+        // Search deadline: if the search has been running for >15s (due to
         // FLOOD_PREMIUM_WAIT on each download), stop expanding and return None.
         // The caller returns a linear byte estimate fallback. The frontend's
         // 5s AbortController has already fired by this point, but the backend
         // keeps running and caches the result for future seeks.
         if search_start.elapsed() >= search_deadline {
-            log::warn!("[FMP4-KF-AT] Search deadline (30s) exceeded for msg {} at {}s, returning fallback",
+            log::warn!("[FMP4-KF-AT] Search deadline (15s) exceeded for msg {} at {}s, returning fallback",
                 message_id, target_time_s);
             return None;
         }
