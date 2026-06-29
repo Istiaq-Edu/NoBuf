@@ -719,6 +719,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const mpegtsFailedRef = useRef(false);     // Set true if mpegts.js fails, skip retry
   const mpegtsDurationRef = useRef<number>(0); // Duration from metadata for mpegts.js
   const proactivePrebufferMsgIdRef = useRef<number>(0); // msg_id being proactively prebuffered
+  const proactiveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // 10s position reporting interval
   const independentPrebufferRef = useRef<{
     abortController: AbortController | null;
     active: boolean;
@@ -1235,6 +1236,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         invoke('cmd_stop_proactive_prebuffer', { messageId: _ppMsgId }).catch(() => {});
         proactivePrebufferMsgIdRef.current = 0;
       }
+      if (proactiveIntervalRef.current) {
+        clearInterval(proactiveIntervalRef.current);
+        proactiveIntervalRef.current = null;
+      }
       // Revoke blob URL on cleanup (always the currently active one)
       const currentBlobUrl = blobUrlRef.current;
       if (currentBlobUrl) {
@@ -1319,6 +1324,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (_ppMsgId2) {
       invoke('cmd_stop_proactive_prebuffer', { messageId: _ppMsgId2 }).catch(() => {});
       proactivePrebufferMsgIdRef.current = 0;
+    }
+    if (proactiveIntervalRef.current) {
+      clearInterval(proactiveIntervalRef.current);
+      proactiveIntervalRef.current = null;
     }
   };
 
@@ -2764,6 +2773,41 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // pause/resume via lazyLoad and SourceBuffer cleanup via autoCleanup.
       diagLog('[MPEGTS] Pipeline initialized: custom chunk loader, lazyLoad max=180s recover=120s, autoCleanup behind=60s');
 
+      // Start periodic position reporting for proactive prebuffer (TS files).
+      // Reports every 10s so the backend prebuffer slides its window ahead
+      // of the playhead. is_player_downloading is set based on whether the
+      // IOController is actively fetching (buffer not full).
+      const _fileIdForProactive = file?.id;
+      const _folderIdForProactive = activeFolderId;
+      const _fileSizeForProactive = state.current.fileLength;
+      if (_fileIdForProactive && _folderIdForProactive && _fileSizeForProactive) {
+        proactivePrebufferMsgIdRef.current = _fileIdForProactive;
+        const proactiveInterval = setInterval(async () => {
+          const v = videoRef.current;
+          if (!v || v.paused || v.ended) return;
+          const eng = (mpegtsPlayerRef.current as any)?._player_engine;
+          // is_player_downloading: true when IOController is actively fetching
+          // (buffer not full, player needs more data). This tells the prebuffer
+          // to yield so /stream gets 100% of the rate limiter budget.
+          const ioctl = eng?._ioctl;
+          const isDownloading = ioctl ? !ioctl.paused : false;
+          try {
+            await invoke('cmd_report_playback_position', {
+              messageId: _fileIdForProactive,
+              folderId: _folderIdForProactive,
+              currentTimeS: v.currentTime,
+              durationS: mpegtsDurationRef.current || v.duration || 0,
+              fileSize: _fileSizeForProactive,
+              isPlayerDownloading: isDownloading,
+              playbackRate: v.playbackRate || 1.0,
+              byteOffset: null, // periodic reports use linear estimate
+            });
+          } catch { /* ignore */ }
+        }, 10000); // 10s interval
+        // Store interval ID for cleanup
+        proactiveIntervalRef.current = proactiveInterval;
+      }
+
       return true;
 
     } catch (e: any) {
@@ -3482,12 +3526,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // 5. Report the new playback position to the backend so the proactive
       //    prebuffer adjusts its sliding window to start from the seek byte.
-      //    The existing proactive task reads proactive_targets on its next loop
-      //    iteration and slides start_byte forward to the seek position. This
-      //    avoids the race condition of stop+restart (cmd_stop clears the flag,
-      // PROACTIVE prebuffer disabled for TS — no cmd_report_playback_position.
-      // /stream handles on-demand downloads. Reporting position would spawn
-      // the PROACTIVE background download which causes FLOOD_PREMIUM_WAIT.
+      //    The prebuffer uses try_acquire + player_actively_downloading to yield
+      //    to /stream, so it won't compete for the rate limiter budget.
+      const _fileId = file?.id;
+      const _folderId = activeFolderId;
+      const _fileSize = state.current.fileLength;
+      if (_fileId && _folderId && _fileSize && mpegtsDurationRef.current > 0) {
+        invoke('cmd_report_playback_position', {
+          messageId: _fileId,
+          folderId: _folderId,
+          currentTimeS: timeSeconds,
+          durationS: mpegtsDurationRef.current,
+          fileSize: _fileSize,
+          isPlayerDownloading: true,
+          playbackRate: 1.0,
+          byteOffset: byteOffset,
+        }).catch(() => {});
+        if (proactivePrebufferMsgIdRef.current !== _fileId) {
+          proactivePrebufferMsgIdRef.current = _fileId;
+        }
+        diagLog(`[MPEGTS] Reported seek position to proactive prebuffer: byte ${byteOffset} (${(byteOffset/1024/1024).toFixed(1)}MB)`);
+      }
 
     } catch (e: any) {
       diagLog(`[MPEGTS] Unbuffered seek failed: ${e.message}`);

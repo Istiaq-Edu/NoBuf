@@ -969,13 +969,28 @@ async fn proactive_prebuffer_download(
                     }
                 }
 
-                // Use blocking acquire — the 250ms global rate limiter ensures
-                // no FLOOD_PREMIUM_WAIT. After a playhead jump (seek), yield to
-                // /stream for 5 seconds so the seek download gets exclusive
-                // access to the rate limiter. Without this, the proactive and
-                // /stream alternate rate-limited calls, making seeks 2x slower.
+                // Yield to /stream: use try_acquire instead of blocking acquire.
+                // When /stream is actively downloading (holding a permit or
+                // player_actively_downloading is true), the prebuffer yields
+                // instead of competing for the rate limiter budget. This gives
+                // /stream 100% of the API call budget during seeks and active
+                // playback, while the prebuffer fills disk only during idle time.
                 let chunk_result = {
-                    let _permit = state.download_semaphore.acquire().await.unwrap();
+                    // Secondary throttle: check if the player's IOController is
+                    // actively downloading. This flag is set by the frontend via
+                    // cmd_report_playback_position(is_player_downloading=true).
+                    if state.player_actively_downloading.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    let _permit = match state.download_semaphore.try_acquire() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // /stream is holding all permits — yield
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    };
                     throttle_api_calls(&state.rate_limiter).await;
                     iter.next().await
                 };
