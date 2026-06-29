@@ -265,7 +265,7 @@ interface FastStreamPlayerProps {
       if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
         onClose();
         const tryDelete = (attempt: number) => {
-          invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+          invoke('cmd_delete_cache', { messageId: file.id, reason: 'player-close-zero-cache' }).catch(() => {
             if (attempt < 5) {
               setTimeout(() => tryDelete(attempt + 1), 2000);
             }
@@ -290,7 +290,7 @@ interface FastStreamPlayerProps {
     // to drop its StreamingGuard and file handle. cmd_delete_cache now returns
     // an error when streaming is still active, so retries properly handle this.
     const tryDelete = (attempt: number) => {
-      invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+      invoke('cmd_delete_cache', { messageId: file.id, reason: 'cache-dialog-discard' }).catch(() => {
         if (attempt < 5) {
           setTimeout(() => tryDelete(attempt + 1), 2000);
         }

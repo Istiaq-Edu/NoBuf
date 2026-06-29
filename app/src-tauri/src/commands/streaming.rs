@@ -156,12 +156,21 @@ pub async fn cmd_get_cache_status(
 #[tauri::command]
 pub async fn cmd_delete_cache(
     message_id: i32,
+    reason: Option<String>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
+    let reason_str = reason.unwrap_or_else(|| "unknown".to_string());
+    let has_active_dl = cache_state.has_active_download(message_id).await;
+    let is_streaming = cache_state.is_streaming(message_id);
+    log::info!(
+        "[CACHE] cmd_delete_cache called for msg {} reason={} active_dl={} streaming={}",
+        message_id, reason_str, has_active_dl, is_streaming
+    );
+
     // Check for active downloads BEFORE attempting deletion.
     // The download coordinator uses async mutex, so we check here
     // (in the async Tauri command) rather than in the sync delete_cache method.
-    if cache_state.has_active_download(message_id).await {
+    if has_active_dl {
         return Err("Cache has active download — retry later".to_string());
     }
 
@@ -171,6 +180,7 @@ pub async fn cmd_delete_cache(
     if !deleted {
         return Err("Cache is still streaming — retry later".to_string());
     }
+    log::info!("[CACHE] cmd_delete_cache succeeded for msg {} reason={}", message_id, reason_str);
     Ok(true)
 }
 

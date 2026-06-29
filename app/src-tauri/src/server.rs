@@ -285,11 +285,11 @@ const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 /// Minimum interval between upload.GetFile API calls on the main client.
 /// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. With
-/// Semaphore(1), the actual API call rate is 1/(interval + network_latency).
-/// At 150ms interval + ~150ms network = 300ms per call = 3.3 req/s — safely
-/// under the threshold. Throughput: 512KB / 300ms = 1.71 MB/s.
-/// Previous 250ms gave 1.28 MB/s — too slow for practical playback.
-const MIN_API_CALL_INTERVAL_MS: u64 = 150;
+/// Semaphore(2), the actual API call rate is 2/(interval + network_latency).
+/// At 200ms interval + ~150ms network = 350ms per call = 2.86 req/s — safely
+/// under the threshold. Throughput: 512KB / 350ms = 1.46 MB/s.
+/// Previous 150ms gave 3.3 req/s — too close to the FLOOD threshold.
+const MIN_API_CALL_INTERVAL_MS: u64 = 200;
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -2827,41 +2827,74 @@ async fn fmp4_segment(
 
     if !is_range_cached(&meta.cached_ranges, read_start, read_end) {
         let dl_info = cache_mgr.find_best_covering_download(message_id, read_start, read_end).await;
-        if let Some(dl) = dl_info {
-            let current_progress = *dl.progress_rx.borrow();
-            if current_progress >= read_start {
-                let mut progress_rx = dl.progress_rx.clone();
-                let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-                loop {
-                    let progress = *progress_rx.borrow();
-                    if is_range_cached(
-                        &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
-                        read_start, read_end
-                    ) {
-                        break;
-                    }
-                    if progress >= read_end {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= timeout {
-                        log::warn!("[FMP4-SEG] Timeout waiting for download for msg {}", message_id);
+        let mut need_own_download = false;
+
+        if let Some(dl) = &dl_info {
+            let mut progress_rx = dl.progress_rx.clone();
+            let cancel_flag = dl.cancel_flag.clone();
+            let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+
+            loop {
+                let progress = *progress_rx.borrow();
+
+                // Check if the range is now fully cached
+                if is_range_cached(
+                    &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
+                    read_start, read_end
+                ) {
+                    break;
+                }
+
+                // Download has progressed past our range end — data should be cached
+                if progress >= read_end {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    break;
+                }
+
+                // Timeout — if download hasn't reached read_start yet, fall through
+                // to own-download. If it has reached read_start but range isn't cached,
+                // return 503 (same as original behavior).
+                if tokio::time::Instant::now() >= timeout {
+                    if progress < read_start {
+                        log::warn!("[FMP4-SEG] Timeout waiting for download to reach read_start {} (progress={}) for msg {}", read_start, progress, message_id);
+                        need_own_download = true;
+                    } else {
+                        log::warn!("[FMP4-SEG] Timeout waiting for cache fill for msg {}", message_id);
                         return HttpResponse::ServiceUnavailable()
                             .insert_header(("Retry-After", "2"))
                             .body("Waiting for download");
                     }
-                    match progress_rx.changed().await {
-                        Ok(()) => {},
-                        Err(_) => break,
+                    break;
+                }
+
+                // Download was cancelled — fall through to own-download
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("[FMP4-SEG] Active download cancelled for msg {}, falling through to own-download", message_id);
+                    need_own_download = true;
+                    break;
+                }
+
+                // Wait for progress update
+                match progress_rx.changed().await {
+                    Ok(()) => {},
+                    Err(_) => {
+                        // Download ended (sender dropped). Check if range is cached
+                        // before falling through.
+                        if is_range_cached(
+                            &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
+                            read_start, read_end
+                        ) {
+                            break;
+                        }
+                        log::info!("[FMP4-SEG] Active download ended for msg {}, falling through to own-download", message_id);
+                        need_own_download = true;
+                        break;
                     }
                 }
-            } else {
-                log::info!("[FMP4-SEG] Active download progress {} < read_start {} for msg {}", current_progress, read_start, message_id);
-                return HttpResponse::ServiceUnavailable()
-                    .insert_header(("Retry-After", "3"))
-                    .body("Download not yet at requested offset");
             }
-        } else {
+        }
+
+        if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
                 let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
@@ -2883,8 +2916,8 @@ async fn fmp4_segment(
                     }
                 };
 
-                // Blocking acquire — with Semaphore(1), all download paths
-                // serialize. The 250ms rate limiter spaces API calls.
+                // Blocking acquire — with Semaphore(2), /stream and fMP4 segment
+                // downloads can run concurrently. The 200ms rate limiter spaces API calls.
                 // Thumbnail downloads briefly pause /stream (400ms per chunk),
                 // but the 180s buffer ahead absorbs this.
                 let mut iter = download_iter;
