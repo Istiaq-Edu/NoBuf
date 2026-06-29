@@ -4850,6 +4850,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           mpegtsSeekDebounceRef.current = null;
         }
 
+        // Set seek-in-progress flag BEFORE the debounce timer — prevents
+        // thumbnail captures during the 400ms debounce window before
+        // _mpegtsUnbufferedSeek runs. The flag is cleared in _mpegtsUnbufferedSeek's
+        // finally block (line ~3489) after the seek completes.
+        (window as any).__nobuf_userSeekInProgress = true;
+
         mpegtsSeekDebounceRef.current = window.setTimeout(() => {
           mpegtsSeekDebounceRef.current = null;
           const seekInProgressNow = (window as any).__nobuf_userSeekInProgress === true;
