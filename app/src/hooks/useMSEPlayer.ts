@@ -1142,6 +1142,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // seek-in-progress flag so future seeks aren't blocked.
       mpegtsUnbufferedSeekGenerationRef.current++;
       (window as any).__nobuf_userSeekInProgress = false;
+      (window as any).__nobuf_seekRequestedAt = 0;
       // Stop streaming chain
       stopStreamingChain();
       refillInProgressRef.current = false;
@@ -1226,6 +1227,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       (window as any).__nobuf_evictionResumeByte = 0;
       (window as any).__nobuf_nuclearRecoveryInProgress = false;
       (window as any).__nobuf_userSeekInProgress = false;
+      (window as any).__nobuf_seekRequestedAt = 0;
       (window as any).__nobuf_mpegtsFatalAbort = false;
       // Stop proactive disk prebuffer for this file
       const _ppMsgId = proactivePrebufferMsgIdRef.current;
@@ -1310,6 +1312,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     (window as any).__nobuf_evictionResumeByte = 0;
     (window as any).__nobuf_nuclearRecoveryInProgress = false;
     (window as any).__nobuf_userSeekInProgress = false;
+    (window as any).__nobuf_seekRequestedAt = 0;
     (window as any).__nobuf_mpegtsFatalAbort = false;
     // Stop proactive disk prebuffer
     const _ppMsgId2 = proactivePrebufferMsgIdRef.current;
@@ -3487,6 +3490,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // the most recent seek generation, otherwise a later seek needs the flag.
       if (mpegtsUnbufferedSeekGenerationRef.current === seekGen) {
         (window as any).__nobuf_userSeekInProgress = false;
+        (window as any).__nobuf_seekRequestedAt = 0;
 
         // If a new seek target was queued during this seek (user scrubbed
         // while this seek was executing), execute it now. The pending ref
@@ -4850,11 +4854,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           mpegtsSeekDebounceRef.current = null;
         }
 
-        // Set seek-in-progress flag BEFORE the debounce timer — prevents
-        // thumbnail captures during the 400ms debounce window before
-        // _mpegtsUnbufferedSeek runs. The flag is cleared in _mpegtsUnbufferedSeek's
-        // finally block (line ~3489) after the seek completes.
-        (window as any).__nobuf_userSeekInProgress = true;
+        // Record seek-request timestamp for thumbnail suppression.
+        // __nobuf_userSeekInProgress is NOT set here — it's only set inside
+        // _mpegtsUnbufferedSeek() and cleared in its finally block. Setting
+        // it here would deadlock the debounce callback (which checks the flag
+        // to decide whether to queue or execute).
+        (window as any).__nobuf_seekRequestedAt = Date.now();
 
         mpegtsSeekDebounceRef.current = window.setTimeout(() => {
           mpegtsSeekDebounceRef.current = null;

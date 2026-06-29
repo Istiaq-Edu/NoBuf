@@ -41,21 +41,32 @@ const MAX_BUFFER_SIZE = 5000;
 let _seekFlagFirstSeen: number | null = null;
 
 function isSeekInProgress(): boolean {
-  const flag = (window as any).__nobuf_userSeekInProgress === true;
-  if (!flag) {
+  // Check if a seek is actively executing (__nobuf_userSeekInProgress)
+  // OR if a seek was recently requested (__nobuf_seekRequestedAt covers
+  // the 400ms debounce window before _mpegtsUnbufferedSeek runs).
+  const executing = (window as any).__nobuf_userSeekInProgress === true;
+  const requestedAt = (window as any).__nobuf_seekRequestedAt || 0;
+  const requestedRecently = Date.now() - requestedAt < 600; // 400ms debounce + 200ms margin
+
+  if (!executing && !requestedRecently) {
     _seekFlagFirstSeen = null;
     return false;
   }
-  if (_seekFlagFirstSeen === null) {
-    _seekFlagFirstSeen = Date.now();
+
+  // Stuck-flag safety only applies to __nobuf_userSeekInProgress
+  // (the debounce timestamp is transient and always cleared within 400ms).
+  if (executing) {
+    if (_seekFlagFirstSeen === null) {
+      _seekFlagFirstSeen = Date.now();
+    }
+    if (Date.now() - _seekFlagFirstSeen > 30000) {
+      _seekFlagFirstSeen = null;
+      return false;
+    }
+    return true;
   }
-  if (Date.now() - _seekFlagFirstSeen > 30000) {
-    // Stuck flag — seek completion callback never fired. Treat as
-    // not-in-progress so thumbnails resume. Do NOT clear the global
-    // flag — other components (FastStreamPlayer, useMSEPlayer) rely on it.
-    _seekFlagFirstSeen = null;
-    return false;
-  }
+
+  // requestedRecently but not executing — suppress thumbnails
   return true;
 }
 
