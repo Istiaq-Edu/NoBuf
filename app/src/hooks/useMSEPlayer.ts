@@ -2811,6 +2811,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     mpegtsUnbufferedSeekGenerationRef.current = (mpegtsUnbufferedSeekGenerationRef.current || 0) + 1;
     const seekGen = mpegtsUnbufferedSeekGenerationRef.current;
     (window as any).__nobuf_userSeekInProgress = true;
+    // Refresh the seek-requested timestamp so it covers the entire seek
+    // duration (execution + align poll). The finally block does NOT clear
+    // this timestamp — it's cleared when the align poll completes.
+    (window as any).__nobuf_seekRequestedAt = Date.now();
 
     // Clear cachedTimeRanges immediately to prevent flicker when suppression ends.
     // Without this, the old ranges flash for 1-2 frames before the new poll data arrives.
@@ -3337,6 +3341,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const correctedByte = Math.max(0, byteOffset - correctionBytes);
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
               clearInterval(alignInterval);
+              (window as any).__nobuf_seekRequestedAt = 0;
               seekKeyframeAdjusted = true;
               _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
@@ -3352,6 +3357,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const correctedByte = Math.min(filesize - 1, byteOffset + correctionBytes);
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: backward gap ${gap.toFixed(1)}s (audio) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB forward)`);
               clearInterval(alignInterval);
+              (window as any).__nobuf_seekRequestedAt = 0;
               seekKeyframeAdjusted = true;
               _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
@@ -3371,6 +3377,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const correctedByte = Math.max(0, byteOffset - correctionBytes);
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB back)`);
               clearInterval(alignInterval);
+              (window as any).__nobuf_seekRequestedAt = 0;
               seekKeyframeAdjusted = true;
               _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
@@ -3422,6 +3429,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const correctedByte = Math.min(filesize - 1, byteOffset + correctionBytes);
               diagLog(`[MPEGTS] VBR correction #${vbrCorrectionDepth}: backward gap ${gap.toFixed(1)}s (video) → re-seek from ${(byteOffset/1024/1024).toFixed(1)}MB to ${(correctedByte/1024/1024).toFixed(1)}MB (${(correctionBytes/1024/1024).toFixed(1)}MB forward)`);
               clearInterval(alignInterval);
+              (window as any).__nobuf_seekRequestedAt = 0;
               seekKeyframeAdjusted = true;
               _mpegtsUnbufferedSeek(timeSeconds, duration, correctedByte, vbrCorrectionDepth);
               return;
@@ -3462,10 +3470,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
           if (seekKeyframeAdjusted) {
             clearInterval(alignInterval);
+            (window as any).__nobuf_seekRequestedAt = 0;
           }
         }
         if (alignAttempts > 150) { // 30s
           clearInterval(alignInterval);
+          (window as any).__nobuf_seekRequestedAt = 0;
           diagLog(`[MPEGTS] Keyframe alignment poll timed out after 30s`);
         }
       }, 200);
@@ -3481,6 +3491,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     } catch (e: any) {
       diagLog(`[MPEGTS] Unbuffered seek failed: ${e.message}`);
+      (window as any).__nobuf_seekRequestedAt = 0;
       video.currentTime = seekTime;
     }
     } finally {
@@ -3490,7 +3501,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // the most recent seek generation, otherwise a later seek needs the flag.
       if (mpegtsUnbufferedSeekGenerationRef.current === seekGen) {
         (window as any).__nobuf_userSeekInProgress = false;
-        (window as any).__nobuf_seekRequestedAt = 0;
+        // NOTE: __nobuf_seekRequestedAt is NOT cleared here — it survives
+        // the function return to cover the align poll phase. It's cleared
+        // when the align poll completes (clearInterval sites below).
 
         // If a new seek target was queued during this seek (user scrubbed
         // while this seek was executing), execute it now. The pending ref

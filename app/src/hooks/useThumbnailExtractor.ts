@@ -46,7 +46,7 @@ function isSeekInProgress(): boolean {
   // the 400ms debounce window before _mpegtsUnbufferedSeek runs).
   const executing = (window as any).__nobuf_userSeekInProgress === true;
   const requestedAt = (window as any).__nobuf_seekRequestedAt || 0;
-  const requestedRecently = Date.now() - requestedAt < 600; // 400ms debounce + 200ms margin
+  const requestedRecently = Date.now() - requestedAt < 30000; // covers debounce + execution + align poll (typically 5-15s)
 
   if (!executing && !requestedRecently) {
     _seekFlagFirstSeen = null;
