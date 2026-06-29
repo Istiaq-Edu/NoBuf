@@ -286,11 +286,11 @@ const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 /// Minimum interval between upload.GetFile API calls on the main client.
 /// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. The rate
 /// limiter serializes ALL API calls (regardless of Semaphore count), so the
-/// effective rate is 1/interval = 1/250ms = 4 req/s — safely under the
-/// 5-6 req/s FLOOD threshold. Throughput: 512KB / 400ms = 1.28 MB/s.
-/// Previous 200ms gave 5 req/s — right at the threshold, still triggered
-/// FLOOD_PREMIUM_WAIT. 150ms gave 6.67 req/s — over the threshold.
-const MIN_API_CALL_INTERVAL_MS: u64 = 250;
+/// effective rate is 1/interval = 1/300ms = 3.33 req/s — safely under the
+/// 5-6 req/s FLOOD threshold. Throughput: 512KB / 450ms = 1.14 MB/s.
+/// 250ms gave 4 req/s — still triggered FLOOD_PREMIUM_WAIT (25 occurrences
+/// in 4 min). 300ms gives more headroom at the cost of ~10% throughput.
+const MIN_API_CALL_INTERVAL_MS: u64 = 300;
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -1448,8 +1448,11 @@ async fn download_and_cache_range(
     let client = client.ok_or("Telegram client not available")?;
 
     // Per-chunk try_acquire + rate limiter. The keyframe search is a BACKGROUND
-    // task — try_acquire ensures it doesn't block /stream. The rate limiter
-    // ensures ≥250ms between ALL API calls globally, preventing FLOOD_WAIT.
+    // task — try_acquire ensures it doesn't block /stream. When /stream is
+    // actively downloading (holding a permit), the keyframe search yields
+    // instead of competing for the rate limiter budget. This gives /stream
+    // priority and prevents FLOOD_PREMIUM_WAIT from the keyframe search
+    // stealing bandwidth from playback.
     let chunk_size: i32 = 512 * 1024;
     let skip_chunks = (start / chunk_size as u64) as i32;
     let bytes_to_discard = start % chunk_size as u64;
@@ -1463,10 +1466,27 @@ async fn download_and_cache_range(
     let mut downloaded = Vec::new();
     let mut first_chunk = true;
     let mut dac_retries = 0u32;
+    let mut yield_count = 0u32;
 
     loop {
         let chunk_result = {
-            let _permit = data.download_semaphore.acquire().await.unwrap();
+            // try_acquire: if /stream is using all permits, yield instead of
+            // blocking. This gives /stream priority for the rate limiter budget.
+            let _permit = match data.download_semaphore.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    yield_count += 1;
+                    // After 100 yields (~50s at 500ms each), give up and block
+                    // to ensure the keyframe search eventually completes.
+                    if yield_count > 100 {
+                        log::info!("[DAC] Keyframe search yielded {} times, now blocking for permit", yield_count);
+                        data.download_semaphore.acquire().await.unwrap()
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
+            };
             throttle_api_calls(&data.rate_limiter).await;
             iter.next().await
         };
@@ -1603,7 +1623,7 @@ async fn find_keyframe_at_or_before_time(
     let mut window_size: u64 = 4 * 1024 * 1024; // 4MB initial
     let max_window: u64 = 256 * 1024 * 1024; // 256MB max (for extreme VBR offsets up to ~128MB forward)
     let search_start = std::time::Instant::now();
-    let search_deadline = std::time::Duration::from_secs(30);
+    let search_deadline = std::time::Duration::from_secs(15);
 
     while window_size <= max_window {
         // Symmetric search: 50% backward, 50% forward.
