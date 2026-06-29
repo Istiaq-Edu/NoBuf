@@ -284,12 +284,13 @@ pub(crate) struct StreamQuery {
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 /// Minimum interval between upload.GetFile API calls on the main client.
-/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. With
-/// Semaphore(2), the actual API call rate is 2/(interval + network_latency).
-/// At 200ms interval + ~150ms network = 350ms per call = 2.86 req/s — safely
-/// under the threshold. Throughput: 512KB / 350ms = 1.46 MB/s.
-/// Previous 150ms gave 3.3 req/s — too close to the FLOOD threshold.
-const MIN_API_CALL_INTERVAL_MS: u64 = 200;
+/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. The rate
+/// limiter serializes ALL API calls (regardless of Semaphore count), so the
+/// effective rate is 1/interval = 1/250ms = 4 req/s — safely under the
+/// 5-6 req/s FLOOD threshold. Throughput: 512KB / 400ms = 1.28 MB/s.
+/// Previous 200ms gave 5 req/s — right at the threshold, still triggered
+/// FLOOD_PREMIUM_WAIT. 150ms gave 6.67 req/s — over the threshold.
+const MIN_API_CALL_INTERVAL_MS: u64 = 250;
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -2917,7 +2918,7 @@ async fn fmp4_segment(
                 };
 
                 // Blocking acquire — with Semaphore(2), /stream and fMP4 segment
-                // downloads can run concurrently. The 200ms rate limiter spaces API calls.
+                // downloads can run concurrently. The 250ms rate limiter spaces API calls.
                 // Thumbnail downloads briefly pause /stream (400ms per chunk),
                 // but the 180s buffer ahead absorbs this.
                 let mut iter = download_iter;
