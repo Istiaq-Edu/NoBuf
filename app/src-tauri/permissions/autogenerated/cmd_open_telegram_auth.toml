@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-open-telegram-auth"
+description = "Enables the cmd_open_telegram_auth command without any pre-configured scope."
+commands.allow = ["cmd_open_telegram_auth"]
+
+[[permission]]
+identifier = "deny-cmd-open-telegram-auth"
+description = "Denies the cmd_open_telegram_auth command without any pre-configured scope."
+commands.deny = ["cmd_open_telegram_auth"]

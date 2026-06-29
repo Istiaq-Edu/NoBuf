@@ -78,6 +78,22 @@ pub struct TelegramState {
     /// to FLOOD_PREMIUM_WAIT). The media object doesn't change between requests
     /// for the same message, so caching is safe.
     pub media_cache: Arc<tokio::sync::RwLock<HashMap<i32, (grammers_client::types::Media, u64)>>>,
+    /// QR login token bytes (from auth.exportLoginToken). Stored here so
+    /// cmd_auth_qr_poll can call auth.importLoginToken with the same token
+    /// to claim the authorization after the user scans the QR code.
+    /// Without this, polling only checks is_authorized() which never
+    /// transitions to true because the desktop client must explicitly
+    /// import the login token to complete the QR handshake.
+    pub qr_token: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+    /// Stored API hash for QR poll finalization (exportLoginToken needs it)
+    pub stored_api_hash: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Stored API id for QR poll finalization
+    pub stored_api_id: Arc<std::sync::atomic::AtomicI32>,
+    /// Whether we've already called exportLoginToken to finalize QR login
+        pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,
+        /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
+        /// Used to throttle calls to every ~15 seconds to avoid flood waits.
+        pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
 }
 
 pub mod auth;

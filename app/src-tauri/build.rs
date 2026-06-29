@@ -31,6 +31,7 @@ fn main() {
                 "cmd_cancel_transfer",
                 "cmd_auth_qr_login",
                 "cmd_auth_qr_poll",
+                "cmd_open_telegram_auth",
                 "cmd_get_api_settings",
                 "cmd_update_api_settings",
                 "cmd_regenerate_api_key",
@@ -62,6 +63,7 @@ fn main() {
                 "cmd_update_group_order",
                 "cmd_get_enriched_folders",
                 "cmd_open_url",
+                "cmd_open_telegram_auth",
             ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");
