@@ -241,6 +241,23 @@ body,
   color: rgba(64, 165, 127, 0.5);
 }
 
+/* Country code dropdown scrollbar */
+.country-dropdown-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-nobuf-primary, #1dfc9f) transparent;
+}
+.country-dropdown-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.country-dropdown-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.country-dropdown-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-nobuf-primary, #1dfc9f);
+  border-radius: 4px;
+  opacity: 0.5;
+}
+
 /* Auth primary button hover shine effect */
 .auth-btn-shine {
   position: relative;

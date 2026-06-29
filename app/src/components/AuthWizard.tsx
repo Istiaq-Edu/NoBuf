@@ -4,18 +4,9 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, ExternalLink, QrCode, Cloud, Play, HardDrive } from "lucide-react";
 import { load } from '@tauri-apps/plugin-store';
 import { useTheme } from '../context/ThemeContext';
-import { open } from '@tauri-apps/plugin-shell';
-// Safe URL opening via custom command (validates HTTP(S) only)
-async function safeOpenUrl(url: string) {
-    try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('cmd_open_url', { url });
-    } catch {
-        // Fallback: if cmd_open_url not available, use shell.open (legacy)
-        open(url);
-    }
-}
 import { QRCodeSVG } from 'qrcode.react';
+import { CountryCodeSelect, useDetectedCountry } from './CountryCodeSelect';
+import { listen } from '@tauri-apps/api/event';
 
 type Step = "setup" | "phone" | "code" | "password";
 
@@ -42,7 +33,7 @@ function SetupGuide() {
         <div className="space-y-6">
             <div className="p-4 bg-nobuf-primary/10 border border-nobuf-primary/20 rounded-xl">
                 <p className="text-sm text-nobuf-subtext">
-                    <strong className="text-nobuf-primary">NoBuf</strong> uses your Telegram account as secure cloud storage. You'll need a Telegram account and API credentials to get started.
+                    <strong className="text-nobuf-primary">NoBuf</strong> uses your Telegram account as secure cloud storage. Click <strong className="text-nobuf-primary">"Login with Telegram"</strong> on the left to automatically get your API credentials.
                 </p>
             </div>
 
@@ -50,30 +41,30 @@ function SetupGuide() {
                 <div className="space-y-2">
                     <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
                         <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">1</span>
-                        Go to Telegram's Developer Portal
+                        Click "Login with Telegram"
                     </h3>
                     <p className="text-sm text-nobuf-subtext ml-8">
-                        Visit <button type="button" onClick={(e) => { e.preventDefault(); safeOpenUrl('https://my.telegram.org'); }} className="text-nobuf-primary underline hover:text-nobuf-text cursor-pointer">my.telegram.org</button> and log in with your phone number.
+                        A secure window will open where you log in to your Telegram account. NoBuf will automatically detect your API credentials.
                     </p>
                 </div>
 
                 <div className="space-y-2">
                     <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
                         <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">2</span>
-                        Create a New Application
+                        Scan the QR Code
                     </h3>
                     <p className="text-sm text-nobuf-subtext ml-8">
-                        Click on <strong>"API development tools"</strong> and create a new application. Use any name and description you like.
+                        After credentials are found, scan the QR code with your Telegram app (Settings &gt; Devices &gt; Link Desktop Device) to connect.
                     </p>
                 </div>
 
                 <div className="space-y-2">
                     <h3 className="font-semibold flex items-center gap-2 text-nobuf-text">
                         <span className="w-6 h-6 bg-nobuf-primary text-nobuf-county-green text-xs font-bold rounded-full flex items-center justify-center">3</span>
-                        Copy Your Credentials
+                        Done!
                     </h3>
                     <p className="text-sm text-nobuf-subtext ml-8">
-                        After creating the app, you'll see your <strong>API ID</strong> (a number) and <strong>API Hash</strong> (a string). Copy both and paste them into the fields on the left.
+                        NoBuf will connect to your Telegram account and you can start uploading and streaming files.
                     </p>
                 </div>
             </div>
@@ -83,15 +74,6 @@ function SetupGuide() {
                     <strong>🔒 Privacy:</strong> Your credentials are stored locally on your device and are never sent to any third-party servers. All data goes directly between you and Telegram.
                 </p>
             </div>
-
-            <button
-                type="button"
-                onClick={(e) => { e.preventDefault(); safeOpenUrl('https://my.telegram.org'); }}
-                className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-semibold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-nobuf-primary/90 transition-colors"
-            >
-                <ExternalLink className="w-4 h-4" />
-                Open my.telegram.org
-            </button>
         </div>
     );
 }
@@ -278,9 +260,52 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     const [qrUrl, setQrUrl] = useState<string | null>(null);
     const [qrPolling, setQrPolling] = useState(false);
     const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const [selectedCountry, setSelectedCountry] = useDetectedCountry();
+    const [phoneInput, setPhoneInput] = useState("");
+    const [authWindowLoading, setAuthWindowLoading] = useState(false);
 
+    // Listen for credentials extracted from the Telegram auth webview
     useEffect(() => {
-        if (!floodWait) return;
+        const unlisten = listen<{ api_id?: string; api_hash?: string; timeout?: boolean; cancelled?: boolean }>('telegram-credentials', (event) => {
+            console.log('[telegram-auth] Event received:', JSON.stringify(event.payload));
+            const { api_id, api_hash, timeout, cancelled } = event.payload;
+
+            if (timeout) {
+                setAuthWindowLoading(false);
+                setError("Login timed out. Please try again or enter credentials manually.");
+                return;
+            }
+
+            if (cancelled) {
+                setAuthWindowLoading(false);
+                console.log('[telegram-auth] Window cancelled by user');
+                return;
+            }
+
+            if (api_id && api_hash) {
+                console.log('[telegram-auth] Credentials received:', api_id, api_hash);
+                setApiId(api_id);
+                setApiHash(api_hash);
+                setAuthWindowLoading(false);
+                // Auto-advance to QR login step
+                setStep("phone");
+                setLoginMethod('qr');
+            } else {
+                console.warn('[telegram-auth] Event received but no credentials:', JSON.stringify(event.payload));
+            }
+        });
+        return () => { unlisten.then(fn => fn()); };
+    }, []);
+
+    // Auto-trigger QR login when we have credentials and are on the phone step with QR selected
+        useEffect(() => {
+            if (step === "phone" && loginMethod === 'qr' && apiId && apiHash && !qrUrl && !loading) {
+                handleQrLogin();
+            }
+        }, [step, loginMethod, apiId, apiHash, qrUrl, loading]);
+
+        useEffect(() => {
+            if (!floodWait) return;
         const interval = setInterval(() => {
             setFloodWait(prev => {
                 if (prev === null || prev <= 1) return null;
@@ -297,8 +322,10 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 const savedId = await store.get<string>('api_id');
                 if (savedId) {
                     setApiId(savedId);
+                    // If we have a saved API ID, skip setup and go straight to login
+                    setStep("phone");
+                    setLoginMethod('qr');
                 }
-                // API Hash is NOT loaded from storage — user must re-enter it each session for security
             } catch {
                 // config not found, starting fresh
             }
@@ -330,9 +357,20 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         await saveCredentials();
         setStep("phone");
-        setLoginMethod('phone');
+        setLoginMethod('qr');
         setQrUrl(null);
         setQrPolling(false);
+    };
+
+    const handleTelegramAuth = async () => {
+        setError(null);
+        setAuthWindowLoading(true);
+        try {
+            await invoke("cmd_open_telegram_auth");
+        } catch (err: unknown) {
+            setAuthWindowLoading(false);
+            setError(err instanceof Error ? err.message : String(err));
+        }
     };
 
     const handleQrLogin = async () => {
@@ -362,17 +400,26 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         }
         qrPollRef.current = setInterval(async () => {
             try {
-                const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_qr_poll");
+                const res = await invoke<{ success: boolean; next_step?: string; error?: string }>("cmd_auth_qr_poll");
                 if (res.success) {
                     setQrPolling(false);
                     if (res.next_step === "password") { setStep("password"); } else { onLogin(); }
+                } else if (res.next_step === "expired") {
+                    // QR token expired — stop polling, show refresh prompt
+                    setQrPolling(false);
+                    setQrUrl(null);
+                    if (res.error) setError(res.error);
+                } else if (res.next_step === "password") {
+                    // 2FA required after QR scan
+                    setQrPolling(false);
+                    setStep("password");
                 }
             } catch {
                 // Polling error — keep trying silently
             }
-        }, 3000);
+        }, 5000);
         return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } };
-    }, [qrPolling, apiId, apiHash]);
+    }, [qrPolling, apiId, apiHash, onLogin]);
 
     const handlePhoneSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -381,7 +428,15 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         try {
             const idInt = parseInt(apiId, 10);
             if (isNaN(idInt)) throw new Error("API ID must be a number");
-            await invoke("cmd_auth_request_code", { phone, apiId: idInt, apiHash: apiHash });
+
+            // Combine country dial code + phone input into full international format
+            // Strip any leading 0 or + from the user input, then prepend the dial code
+            const cleanPhone = phoneInput.replace(/^0+/, "").replace(/\D/g, "");
+            if (!cleanPhone) throw new Error("Please enter your phone number");
+            const fullPhone = `${selectedCountry.dialCode}${cleanPhone}`;
+            setPhone(fullPhone);
+
+            await invoke("cmd_auth_request_code", { phone: fullPhone, apiId: idInt, apiHash: apiHash });
             setStep("code");
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : JSON.stringify(err);
@@ -477,7 +532,40 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                     onSubmit={handleSetupSubmit}
                                     className="flex-1 flex flex-col items-center justify-center space-y-5"
                                 >
-                                    <h2 className="text-lg font-semibold text-nobuf-text mb-2">Configure Your Credentials</h2>
+                                    <h2 className="text-lg font-semibold text-nobuf-text mb-2">Connect Your Account</h2>
+
+                                    {/* Primary: Login with Telegram button */}
+                                    <button
+                                        type="button"
+                                        onClick={handleTelegramAuth}
+                                        disabled={authWindowLoading}
+                                        className="auth-btn-shine w-full max-w-sm bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-nobuf-primary/20 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        {authWindowLoading ? (
+                                            <>
+                                                <div className="w-5 h-5 border-2 border-nobuf-county-green border-t-transparent rounded-full animate-spin" />
+                                                Waiting for login...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <ExternalLink className="w-5 h-5" />
+                                                Login with Telegram
+                                            </>
+                                        )}
+                                    </button>
+
+                                    <p className="text-xs text-nobuf-subtext text-center max-w-sm">
+                                        Opens Telegram's website — log in and we'll automatically get your API credentials.
+                                    </p>
+
+                                    {/* Divider */}
+                                    <div className="flex items-center gap-3 w-full max-w-sm">
+                                        <div className="flex-1 h-px bg-nobuf-border" />
+                                        <span className="text-xs text-nobuf-subtext">or enter manually</span>
+                                        <div className="flex-1 h-px bg-nobuf-border" />
+                                    </div>
+
+                                    {/* Secondary: Manual credential entry */}
                                     <div className="w-full max-w-sm space-y-4">
                                         <div>
                                             <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider mb-2">API ID</label>
@@ -548,21 +636,24 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                             <form onSubmit={handlePhoneSubmit} className="space-y-5">
                                                 <div className="space-y-2">
                                                     <label className="block text-xs font-semibold text-nobuf-subtext uppercase tracking-wider">Phone Number</label>
-                                                    <div className="relative">
-                                                        <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
-                                                        <input
-                                                            type="tel"
-                                                            value={phone}
-                                                            onChange={(e) => setPhone(e.target.value)}
-                                                            placeholder="+1 234 567 8900"
-                                                            className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all text-lg tracking-wide"
-                                                        />
+                                                    <div className="flex gap-2">
+                                                        <CountryCodeSelect value={selectedCountry} onChange={setSelectedCountry} />
+                                                        <div className="relative flex-1">
+                                                            <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 auth-form-icon" />
+                                                            <input
+                                                                type="tel"
+                                                                value={phoneInput}
+                                                                onChange={(e) => setPhoneInput(e.target.value)}
+                                                                placeholder="234 567 8900"
+                                                                className="w-full glass-input rounded-xl pl-12 pr-4 py-4 text-nobuf-text placeholder-nobuf-subtext/50 focus:outline-none focus:border-nobuf-primary transition-all text-lg tracking-wide"
+                                                            />
+                                                        </div>
                                                     </div>
                                                 </div>
                                                 <div className="flex flex-col gap-3">
                                                     <button
                                                         type="submit"
-                                                        disabled={loading}
+                                                        disabled={loading || !phoneInput.trim()}
                                                         className="auth-btn-shine w-full bg-nobuf-primary text-nobuf-county-green font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
                                                     >
                                                         {loading ? "Connecting..." : <>Continue <ArrowRight className="w-5 h-5" /></>}
