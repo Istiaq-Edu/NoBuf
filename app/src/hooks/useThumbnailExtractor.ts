@@ -28,6 +28,37 @@ const THUMBNAIL_WIDTH = 114;
 const THUMBNAIL_HEIGHT = 64;
 const BUCKET_SIZE = 2;
 const MAX_BUFFER_SIZE = 5000;
+
+// ─── Seek-in-progress suppression ─────────────────────────────────────
+// Prevents thumbnail capture from firing during seeks, which causes
+// concurrent fMP4 segment downloads that trigger FLOOD_PREMIUM_WAIT and
+// 503 errors. The __nobuf_userSeekInProgress flag is set true by
+// useMSEPlayer at seek start and cleared on seek completion. If the seek
+// completion callback never fires (component unmount, error), the flag
+// stays stuck — the 30s safety timeout below treats it as not-in-progress
+// so thumbnails resume. We do NOT mutate the global flag (other components
+// read it for cache polling suppression).
+let _seekFlagFirstSeen: number | null = null;
+
+function isSeekInProgress(): boolean {
+  const flag = (window as any).__nobuf_userSeekInProgress === true;
+  if (!flag) {
+    _seekFlagFirstSeen = null;
+    return false;
+  }
+  if (_seekFlagFirstSeen === null) {
+    _seekFlagFirstSeen = Date.now();
+  }
+  if (Date.now() - _seekFlagFirstSeen > 30000) {
+    // Stuck flag — seek completion callback never fired. Treat as
+    // not-in-progress so thumbnails resume. Do NOT clear the global
+    // flag — other components (FastStreamPlayer, useMSEPlayer) rely on it.
+    _seekFlagFirstSeen = null;
+    return false;
+  }
+  return true;
+}
+
 const CAPTURE_DELAY_MS = 2000;
 const MIN_HOVER_FETCH_SIZE = 256 * 1024; // 256KB minimum per hover position
 const MAX_HOVER_FETCH_SIZE = 5 * 1024 * 1024; // 5MB maximum — covers large keyframe gaps
@@ -1939,6 +1970,15 @@ export function useThumbnailExtractor(
           // segments from the server by timestamp, no byte-offset seeking needed.
           if (transmuxerPipeline && getters && getters.getFormat() === 'ts' && !getters.isFmp4Stream() && !getters.keyframeIndexReady) {
             await new Promise(r => setTimeout(r, 200));
+            continue;
+          }
+
+          // Suppress thumbnail capture during seeks — prevents concurrent
+          // fMP4 segment downloads that trigger FLOOD_PREMIUM_WAIT and 503
+          // errors. The 30s stuck-flag safety in isSeekInProgress() ensures
+          // thumbnails resume even if the seek completion callback never fires.
+          if (isSeekInProgress()) {
+            await new Promise(r => setTimeout(r, 500));
             continue;
           }
 
