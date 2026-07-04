@@ -675,6 +675,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // overlapping downloads on unbuffered parts
   const seekDebounceTimerRef = useRef<number | null>(null);
   const mpegtsUnbufferedSeekGenerationRef = useRef<number>(0);
+  // Per-effect generation counter — every useEffect run bumps this. Async
+  // callbacks captured by an effect run compare their captured generation
+  // against the live value to detect that a newer effect run has started
+  // (e.g. user switched files mid-init). This is more reliable than
+  // cancelledRef alone, which gets reset to false at line 1017 every time
+  // the effect re-runs — defeating cleanup-based cancellation under React
+  // StrictMode and rapid file switches.
+  const effectGenerationRef = useRef<number>(0);
+  // Authoritative current stream URL for the *latest* effect run. Async
+  // callbacks must use this ref (not a closed-over `url` argument) when
+  // they need to build a URL for the file the user is currently watching
+  // — e.g. the remux fallback that previously built `/remux/5` for msg 2
+  // because it parsed a stale closure-captured URL from a prior effect run.
+  const streamUrlRef = useRef<string | null>(null);
   // Timer for the delayed background keyframe fetch — cancelled on new seek
   // so rapid seeks don't spawn multiple concurrent fetchMpegtsKeyframeAt calls.
   const bgKeyframeTimerRef = useRef<number | null>(null);
@@ -1016,7 +1030,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     prevUrlRef.current = streamUrl;
     cancelledRef.current = false;
     transmuxerInitInProgressRef.current = false;
+    // Bump effect-generation: any async callback captured by a prior effect
+    // run will now see its captured generation != current, and bail out.
+    // Also update streamUrlRef so any callback that needs the *current*
+    // URL (not the one captured at the start of the prior effect) can read it.
+    effectGenerationRef.current += 1;
+    streamUrlRef.current = streamUrl;
+    const currentGeneration = effectGenerationRef.current;
     setUseNative(false);
+    // Clear stale PTS duration from a previous file so it doesn't clamp the
+    // duration floor for the next file (e.g., switching from a 5471s file to
+    // a 30-min file would otherwise show 5471s until the new fetch resolves).
+    (window as any).__nobuf_ptsDuration = 0;
     setUnsupportedCodec(null);
 
     // Reset state
@@ -1070,7 +1095,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       state.current.mediaSource = mediaSource;
 
       const onSourceOpen = () => {
+        // Guard against stale firings from a prior effect run. Three checks:
+        //   1. cancelledRef — covers same-effect cleanup
+        //   2. effectGenerationRef !== captured — covers React StrictMode
+        //      double-invoke and rapid file switches where cancelledRef gets
+        //      reset to false at line ~1031 before the prior sourceopen fires
+        //   3. state.current.mediaSource !== mediaSource — covers the case
+        //      where the *same* effect run has swapped in a new MediaSource
+        //      (e.g. TS fallback path creates a fresh one)
         if (cancelledRef.current) return;
+        if (effectGenerationRef.current !== currentGeneration) {
+          diagLog(`[MSE] sourceopen ignored — stale generation (captured=${currentGeneration}, current=${effectGenerationRef.current})`);
+          return;
+        }
+        if (state.current.mediaSource !== mediaSource) {
+          diagLog('[MSE] sourceopen ignored — MediaSource was swapped (stale instance)');
+          return;
+        }
         diagLog('[MSE] sourceopen event fired — starting format detection and player init');
         initMP4Box(streamUrl, mediaSource, blobUrl!);
       };
@@ -1083,7 +1124,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // transmuxerInitInProgressRef and extends itself by 20s if the
       // transmuxer is still initializing, up to a maximum of 60s total.
       const MSE_INIT_TIMEOUT_MS = 20000;
-      const MSE_INIT_MAX_TIMEOUT_MS = 60000;
+      const MSE_INIT_MAX_TIMEOUT_MS = 120000;
       let timeoutElapsed = 0;
       const checkInitTimeout = () => {
         if (state.current.initialized || cancelledRef.current) {
@@ -1802,6 +1843,59 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       if (format === 'ts') {
+        // timed_id3 metadata streams (stream_type=0x15 alongside real audio) are
+        // incompatible with mpegts.js — they cause AAC PTS drift → PIPELINE_ERROR_DECODE.
+        // The backend detects these during init-prefix creation and exposes
+        // `has_timed_id3` in the /fmp4/metadata response. We fetch metadata early
+        // and route to ffmpeg remux if flagged.
+        // NOTE: we can't detect timed_id3 from the stream data here because the
+        // backend already strips the 0x15 entry from the PMT before serving it.
+        const fallbackUrl = streamUrlRef.current ?? url;
+        const parsed = parseStreamUrl(fallbackUrl);
+
+        // Fire metadata fetch — needed for duration AND timed_id3 detection
+        let metaPromise: Promise<any> | null = null;
+        if (parsed && !(window as any).__nobuf_ptsDuration) {
+          const metaUrl = `${parsed.baseUrl}/fmp4/metadata/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&file_size=${state.current.fileLength}`;
+          const fetchGen = effectGenerationRef.current;
+          metaPromise = fetch(metaUrl)
+            .then(resp => resp.ok ? resp.json() : null)
+            .then(json => {
+              if (effectGenerationRef.current !== fetchGen) return null;
+              if (json?.duration_s && json.duration_s > 0) {
+                (window as any).__nobuf_ptsDuration = json.duration_s;
+                diagLog(`[MSE] Got accurate duration from backend: ${json.duration_s.toFixed(1)}s`);
+              }
+              return json;
+            })
+            .catch(e => { diagLog(`[MSE] Metadata fetch failed: ${e}`); return null; });
+        }
+
+        // Check for timed_id3 flag from metadata (async — resolve before proceeding)
+        if (metaPromise) {
+          const meta = await metaPromise;
+          if (meta?.has_timed_id3 && parsed) {
+            diagLog('[MSE] Backend reports timed_id3 metadata stream — using ffmpeg remux (mpegts output) via mpegts.js');
+            const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+            diagLog(`[MSE] Routing to remux: ${remuxUrl}`);
+            remuxUrlRef.current = remuxUrl;
+            // Don't use native fallback — the /remux endpoint now outputs MPEG-TS
+            // which mpegts.js can play directly with full features (seeking, progress bar).
+            // Fall through to the mpegts.js init path below with the remux URL.
+            if (!shadowCacheRef.current) {
+              shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
+            }
+            const urlKey2 = new URL(remuxUrl).pathname;
+            shadowCacheRef.current.reset(urlKey2, 0);
+            // Mark transmuxer init in progress so the MSE init timeout extends
+            // instead of firing at 20s (remux needs: download + ffprobe + ffmpeg startup).
+            transmuxerInitInProgressRef.current = true;
+            // Start mpegts.js with the remux URL
+            await _initMpegtsPlayer(remuxUrl, mediaSource, blobUrl, parsed);
+            return;
+          }
+        }
+
         diagLog(`[MSE] Detected ${format} format — starting cold-start buffer + mpegts.js init in parallel, fileLength=${state.current.fileLength}`);
         // Create the shadow cache once here so both parallel tasks share the same instance
         // and the interceptor is installed before any /stream fetches are issued.
@@ -1993,7 +2087,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     // Construct the stream URL that mpegts.js will fetch from.
     // It reads TS bytes via HTTP Range requests from our /stream/ endpoint.
-    const streamUrl = `${parsed.baseUrl}/stream/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+    // For timed_id3 files, the caller passes a remux URL (/remux/) which
+    // outputs clean MPEG-TS (re-encoded audio, no metadata stream).
+    const streamUrl = _url || `${parsed.baseUrl}/stream/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
 
     // ── PROACTIVE PREBUFFER DISABLED for TS files ──
     // The PROACTIVE prebuffer downloads the ENTIRE file to disk on every
@@ -2050,6 +2146,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       enableWorker: false,           // Workers may not work in Tauri WebView2
       enableStashBuffer: true,       // Buffer for smooth playback
       stashInitialSize: 2048 * 1024, // 2MB initial stash — faster ramp-up for VOD startup
+      fixAudioTimestampGap: false,   // CRITICAL: disable PTS gap "fixing" for TS files with
+                                      // timed_id3 metadata. mpegts.js miscounts AAC frames when
+                                      // the audio PTS has a fixed offset from its frame counter,
+                                      // inserting silence that causes cumulative drift →
+                                      // PIPELINE_ERROR_DECODE after ~100 PES packets.
       lazyLoad: true,                // ENABLED: let mpegts.js native timeupdate listener auto-resume.
                                       // Fixed 180s ahead target (not scaled by playbackRate).
                                       // SourceBuffer behind-window cleanup is handled by autoCleanupSourceBuffer.
@@ -2174,7 +2275,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   video2.load();
                 } catch (_) {}
               }
-              const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+              // Defence-in-depth: prefer the live streamUrlRef over the
+              // closure-captured `parsed` if the user has switched files since
+              // this FATAL handler was registered. Falls back to `parsed` if
+              // streamUrlRef is somehow null or unparseable.
+              const liveUrl = streamUrlRef.current;
+              const liveParsed = liveUrl ? parseStreamUrl(liveUrl) : null;
+              const useParsed = liveParsed ?? parsed;
+              const remuxUrl = `${useParsed.baseUrl}/remux/${useParsed.folderId}/${useParsed.messageId}?token=${encodeURIComponent(useParsed.token)}`;
+              if (liveParsed && liveParsed.messageId !== parsed.messageId) {
+                diagLog(`[MPEGTS] FATAL: file switched mid-handler — using live URL (msg ${liveParsed.messageId}, not stale msg ${parsed.messageId})`);
+              }
               diagLog(`[MPEGTS] FATAL: falling back to ffmpeg remux: ${remuxUrl}`);
               remuxUrlRef.current = remuxUrl;
               setUseNative(true);
@@ -2355,9 +2466,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // maps 0x15 to kMetadata (ID3), drops audio PES, and MEDIA_INFO never fires.
       let mediaInfo: any = null;
       await new Promise<void>((resolve, reject) => {
+        // 60s timeout: for /remux URLs (timed_id3 files), the backend must
+        // download the full file + ffprobe + start ffmpeg before producing
+        // the first TS packet. Large files (1.3GB+) can take 30+ seconds.
+        // The outer MSE init timeout extends up to 120s; this inner timeout
+        // must be long enough to not fire before the remux pipeline starts.
         const timeout = setTimeout(() => {
-          reject(new Error('mpegts.js initialization timeout (10s)'));
-        }, 10000);
+          reject(new Error('mpegts.js initialization timeout (60s)'));
+        }, 60000);
 
         player.on(MpegtsPlayer.Events.MEDIA_INFO, (info: any) => {
           clearTimeout(timeout);
@@ -3629,6 +3745,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         enableWorker: false,
         enableStashBuffer: true,
         stashInitialSize: 1024 * 1024,
+        fixAudioTimestampGap: false,
         lazyLoad: true,
         lazyLoadMaxDuration: 180,
         lazyLoadRecoverDuration: 120,
@@ -3773,9 +3890,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Revoke the now-closed original blob URL so it doesn't leak.
       try { URL.revokeObjectURL(blobUrl); } catch (_) {}
 
-      const parsedFallback = parseStreamUrl(url);
+      // BUGFIX: was `parseStreamUrl(url)` — `url` is closure-captured from
+      // when this callback was originally registered, which can be a prior
+      // file when the user switches mid-init. Use streamUrlRef for the live
+      // URL so we build /remux/<currentMsgId>, not /remux/<staleMsgId>.
+      const fallbackUrl = streamUrlRef.current ?? url;
+      const parsedFallback = parseStreamUrl(fallbackUrl);
       if (parsedFallback) {
         const remuxUrl = `${parsedFallback.baseUrl}/remux/${parsedFallback.folderId}/${parsedFallback.messageId}?token=${encodeURIComponent(parsedFallback.token)}`;
+        if (fallbackUrl !== url) {
+          diagLog(`[MSE] fallback: file switched mid-init — using live URL for /remux (was ${url}, now ${fallbackUrl})`);
+        }
         diagLog(`[MSE] Using ffmpeg remux fallback: ${remuxUrl}`);
         remuxUrlRef.current = remuxUrl;
         setUseNative(true);

@@ -266,6 +266,10 @@ pub struct StreamCacheManager {
     /// This cache works independently of hls_layout_cache — init_prefix can be
     /// cached even without the HLS manifest endpoint being called (MSE mode).
     init_prefix_cache: Arc<std::sync::Mutex<HashMap<i32, Vec<u8>>>>,
+    /// PIDs stripped from PMT by timed_id3 detection — these PIDs' TS packets
+    /// should be nulled (PID→0x1FFF) in the stream response so mpegts.js
+    /// never sees their PES data.
+    stripped_pids_cache: Arc<std::sync::Mutex<HashMap<i32, Vec<u16>>>>,
 }
 
 /// Cached HLS layout info for a message, including the Media object
@@ -301,6 +305,7 @@ impl StreamCacheManager {
             pending_deletions: Arc::new(std::sync::Mutex::new(Vec::new())),
             hls_layout_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             init_prefix_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stripped_pids_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -385,7 +390,21 @@ impl StreamCacheManager {
         self.hls_layout_cache.lock().ok().and_then(|cache| cache.get(&message_id).map(|info| info.init_prefix.clone()))
     }
 
-    /// Retrieve the full cached HLS layout info (including Media) for a message.
+    /// Store PIDs that were stripped from the PMT (timed_id3 metadata streams).
+    /// These PIDs' TS packets should be nulled in the stream response.
+    pub fn cache_stripped_pids(&self, message_id: i32, pids: Vec<u16>) {
+        if pids.is_empty() { return; }
+        if let Ok(mut cache) = self.stripped_pids_cache.lock() {
+            cache.insert(message_id, pids);
+        }
+    }
+
+    /// Get stripped PIDs for a message (empty vec if none).
+    pub fn get_stripped_pids(&self, message_id: i32) -> Vec<u16> {
+        self.stripped_pids_cache.lock().ok()
+            .and_then(|cache| cache.get(&message_id).cloned())
+            .unwrap_or_default()
+    }
     /// Used by the segment handler to spawn targeted downloads for missing data.
     pub fn get_hls_layout_full(&self, message_id: i32) -> Option<HlsLayoutInfo> {
         self.hls_layout_cache.lock().ok().and_then(|cache| cache.get(&message_id).cloned())

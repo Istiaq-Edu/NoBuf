@@ -183,10 +183,34 @@ fn rewrite_ts_stream_in_buf(
             let section_start = payload_offset + 1 + pointer_field;
             let pkt_end = pkt_offset + ps;
 
-            let rewritten = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
+            let (rewritten, stripped_inline) = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
             if rewritten > 0 {
-                log::info!("[STREAM-TS] Rewrote {} stream_type(s) 0x15→0x11 (kLOASAAC) in PMT at buf_offset={} (file_offset={})",
-                    rewritten, pkt_offset, buf_start + pkt_offset as u64);
+                log::info!("[STREAM-TS] Rewrote/stripped {} stream entry(s) in PMT at buf_offset={} (file_offset={}, stripped_pids={:?})",
+                    rewritten, pkt_offset, buf_start + pkt_offset as u64, stripped_inline);
+                did_rewrite = true;
+            }
+        }
+    }
+
+    // Step 4: Null out TS packets from stripped PIDs (timed_id3 metadata streams).
+    // Even after stripping the entry from the PMT, the raw TS stream still
+    // contains PES packets for the stripped PID. mpegts.js will skip them
+    // (PID not in PMT) but only if it parsed the STRIPPED PMT first. If any
+    // code path serves raw data before the PMT rewrite takes effect, or if
+    // mpegts.js re-parses an inline unrewritten PMT, the metadata PES packets
+    // cause AAC PTS drift. Belt-and-suspenders: null the PID at transport level.
+    let stripped_pids = cache_mgr.get_stripped_pids(message_id);
+    if !stripped_pids.is_empty() {
+        let ps: usize = 188;
+        let align_offset = (buf_start % ps as u64) as usize;
+        for pkt_offset in (align_offset..buf.len()).step_by(ps) {
+            if pkt_offset + ps > buf.len() { break; }
+            if buf[pkt_offset] != 0x47 { continue; }
+            let pid = ((buf[pkt_offset + 1] as u16 & 0x1F) << 8) | buf[pkt_offset + 2] as u16;
+            if stripped_pids.contains(&pid) {
+                // Overwrite PID to 0x1FFF (null packet) — mpegts.js skips null PIDs
+                buf[pkt_offset + 1] = (buf[pkt_offset + 1] & 0xE0) | 0x1F;
+                buf[pkt_offset + 2] = 0xFF;
                 did_rewrite = true;
             }
         }
@@ -1401,6 +1425,8 @@ struct Fmp4MetadataResponse {
     video_codec_string: String,
     audio_codec_string: String,
     total_size: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_timed_id3: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2087,19 +2113,12 @@ async fn remux_ts_to_mp4(
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
-            "-ignore_unknown",
-            "-probesize", "50000000",
-            "-analyzeduration", "50000000",
             "-i", &input_source,
-        ]);
-        cmd.args(["-map", &format!("0:{}", video_stream_idx)]);
-        cmd.args(["-map", &format!("0:{}", audio_stream_idx)]);
-        cmd.args([
+            "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
-            "-c:a", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-f", "mp4",
-            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "192k",
+            "-f", "mpegts",
+            "-mpegts_flags", "resend_headers",
         ]);
         cmd.arg(&remux_tmp);
         cmd.stdout(std::process::Stdio::null());
@@ -2190,19 +2209,12 @@ async fn remux_ts_to_mp4(
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
-            "-ignore_unknown",
-            "-probesize", "50000000",
-            "-analyzeduration", "50000000",
             "-i", &input_source,
-        ]);
-        cmd.args(["-map", &format!("0:{}", video_stream_idx)]);
-        cmd.args(["-map", &format!("0:{}", audio_stream_idx)]);
-        cmd.args([
+            "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
-            "-c:a", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-f", "mp4",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-c:a", "aac", "-b:a", "192k",
+            "-f", "mpegts",
+            "-mpegts_flags", "resend_headers",
             "-",
         ]);
         cmd.stdout(std::process::Stdio::piped());
@@ -2296,6 +2308,7 @@ async fn remux_ts_to_mp4(
                         bg_cmd.args(["-map", &format!("0:{}", bg_vid_idx)]);
                         bg_cmd.args(["-map", &format!("0:{}", bg_aud_idx)]);
                         bg_cmd.args([
+                            "-sn",
                             "-c:v", "copy", "-c:a", "copy",
                             "-bsf:a", "aac_adtstoasc",
                             "-f", "mp4",
@@ -3895,6 +3908,8 @@ async fn fmp4_metadata(
         0.0
     };
 
+    let has_timed_id3 = !cache_mgr.get_stripped_pids(message_id).is_empty();
+
     let response = Fmp4MetadataResponse {
         duration_s,
         video_codec: video_codec_str.to_string(),
@@ -3904,6 +3919,7 @@ async fn fmp4_metadata(
         video_codec_string,
         audio_codec_string,
         total_size,
+        has_timed_id3,
     };
 
     let body = match serde_json::to_vec(&response) {
@@ -4500,3 +4516,11 @@ mod tests {
 // Continuation tests removed — ContinuationGuard and continuation_should_run
 // have been removed. The proactive prebuffer is now the ONLY path that
 // downloads from Telegram; /stream reads exclusively from disk cache.
+
+
+
+
+
+
+
+
