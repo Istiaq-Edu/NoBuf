@@ -3917,6 +3917,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // The seek-recreated player uses the same custom loader as the initial player,
       // so native lazyLoad and autoCleanupSourceBuffer manage the buffer window.
 
+      // Video-only mode: suppress mpegts.js warn-level logging. The TSDemuxer still
+      // parses orphaned audio PID packets (even though PMT strips them) and logs
+      // thousands of "AAC: Detected pts overlapped" warnings. These are harmless in
+      // video-only mode since audio never reaches a SourceBuffer.
+      if (videoOnly) {
+        try {
+          const LoggingControl = (mpegts as any).LoggingControl || (mpegts as any).default?.LoggingControl;
+          if (LoggingControl) {
+            LoggingControl.enableWarn = false;
+          }
+        } catch (_) {}
+      }
+
       newPlayer.on(MpegtsPlayer.Events.ERROR, (_type: string, detail: string) => {
         diagLog(`[MPEGTS] Recreated player error: ${detail}`);
       });
