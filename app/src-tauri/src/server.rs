@@ -2210,6 +2210,7 @@ async fn remux_ts_to_mp4(
             message_id, video_stream_idx, audio_stream_idx, probed_duration);
 
         let mut cmd = TokioCommand::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "warning"]);
         // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking
         let ss_secs = query.ss.unwrap_or(0.0);
         if ss_secs > 0.0 {
@@ -2217,20 +2218,28 @@ async fn remux_ts_to_mp4(
             log::info!("[REMUX] msg {}: seeking to {}s before remux", message_id, ss_str);
             cmd.args(["-ss", &ss_str]);
         }
+        // +genpts: regenerate PTS from DTS (fixes non-monotonic audio timestamps)
+        // +discardcorrupt: drop damaged packets before they reach the filter chain
         cmd.args([
-            "-hide_banner",
-            "-loglevel", "warning",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", &input_source,
             "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
-            "-af", "aresample=async=1",
+            // asetpts=N/SR/TB: force monotonically increasing audio PTS by construction.
+            // The source TS has AAC frames with overlapping PTS that crash the mpegts
+            // output muxer. This filter rewrites PTS from sample count, guaranteeing
+            // forward progression regardless of source corruption.
+            "-af", "asetpts=N/SR/TB",
         ]);
         // Preserve original timestamps so MSE timeline matches video.currentTime
         if ss_secs > 0.0 {
             cmd.args(["-copyts", "-start_at_zero"]);
         }
         cmd.args([
+            // Disable interleave check: prevent muxer from rejecting audio packets
+            // that arrive slightly out-of-order relative to video DTS
+            "-max_interleave_delta", "0",
             "-f", "mpegts",
             "-mpegts_flags", "resend_headers",
             "-",

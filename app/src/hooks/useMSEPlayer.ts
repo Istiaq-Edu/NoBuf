@@ -3617,10 +3617,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // VBR CORRECTION: use audio OR video, whichever appears first (>5s gap only)
         // Forward: audio > target + 5 → download too far BACK → re-seek backward
         // Backward: audio < target - 5 → download too far FORWARD → re-seek forward
+        // Cap: gaps >120s are physically impossible from VBR — they indicate stale
+        // pre-seek buffer data (from byte-0 load before ioctl.seek took effect).
+        const MAX_VBR_GAP = 120;
         if (v && audioBufferStart !== null) {
           if (audioBufferStart > v.currentTime + 5) {
             // Audio arrived early with large forward gap → VBR correction before video shows
             const gap = audioBufferStart - v.currentTime;
+            if (gap > MAX_VBR_GAP) {
+              // Stale pre-seek buffer — ignore and wait for real data
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              return;
+            }
             if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
               vbrCorrectionDepth++;
               const bitrate = filesize / duration;
@@ -3637,6 +3646,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // Audio arrived with large backward gap → download too far FORWARD
             // → re-seek forward so data arrives closer to target
             const gap = v.currentTime - audioBufferStart;
+            if (gap > MAX_VBR_GAP) {
+              // Stale pre-seek buffer — ignore and wait for real data
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              return;
+            }
             if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
               vbrCorrectionDepth++;
               const bitrate = filesize / duration;
@@ -3656,6 +3671,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         if (v && videoBufferStart !== null) {
           if (videoBufferStart > v.currentTime + 0.5) {
             const gap = videoBufferStart - v.currentTime;
+            if (gap > MAX_VBR_GAP) {
+              // Stale pre-seek buffer — ignore and wait for real data
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              return;
+            }
             if (gap > 5 && vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
               // Video gap > 5s → VBR correction (re-seek to corrected byte)
               vbrCorrectionDepth++;
@@ -3709,6 +3730,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // closer to the target. Without this, the user waits 10-20s for
             // the buffer to expand forward to the target.
             const gap = v.currentTime - videoBufferStart;
+            if (gap > MAX_VBR_GAP) {
+              // Stale pre-seek buffer — ignore and wait for real data
+              clearInterval(alignInterval);
+              seekKeyframeAdjusted = true;
+              return;
+            }
             if (vbrCorrectionDepth < MAX_VBR_CORRECTIONS && duration > 0 && filesize > 0) {
               vbrCorrectionDepth++;
               const bitrate = filesize / duration;
