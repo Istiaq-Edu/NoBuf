@@ -3086,6 +3086,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       independentPrebufferRef.current.abortController = null;
     }
 
+    // Guard: don't seek until the transmuxer pipeline (demuxer + remuxer) is ready.
+    // Before MEDIA_INFO, the TSDemuxer/MP4Remuxer don't exist yet. Seeking during
+    // this phase causes _onInitChunkArrival to call _demuxer.bindDataSource(null)
+    // and our reset code to hit null._remuxer.insertDiscontinuity().
+    if (transmuxerInitInProgressRef.current) {
+      diagLog(`[MPEGTS] Seek to ${timeSeconds.toFixed(1)}s deferred — pipeline not initialized yet`);
+      pendingSeekTargetRef.current = { time: timeSeconds, dur: duration };
+      (window as any).__nobuf_userSeekInProgress = false;
+      return;
+    }
+
     // Serialize on any pending MSE remove/append. mpegts.js MSEController.flush()
     // calls sb.abort(), which throws if the SourceBuffer is running an asynchronous
     // remove() (e.g. from the quota guard). Skipping the flush leaves the old buffer
@@ -3275,6 +3286,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       if (!player || !engine) {
         diagLog(`[MPEGTS] No player/engine for seek — falling back to video.currentTime (player=${!!player}, engine=${!!engine})`);
         video.currentTime = seekTime;
+        return;
+      }
+
+      // ── REMUX SEEK GUARD ──
+      // The /remux/ endpoint is a non-seekable ffmpeg pipe — IOController.seek()
+      // can't work against it. For timed_id3 files, the raw /stream/ audio has
+      // PTS drift + different AAC config that causes PIPELINE_ERROR_DECODE and
+      // CHUNK_DEMUXER_ERROR_APPEND_FAILED. No amount of in-place patching can
+      // reliably prevent this — mpegts.js has too many internal callback chains
+      // that re-initialize audio state.
+      // Fix: recreate the player entirely from /stream/ URL in video-only mode.
+      // The MSE controller is patched BEFORE load() to never create an audio
+      // SourceBuffer. No audio = no PTS drift = no decode errors.
+      if (remuxUrlRef.current && streamUrl) {
+        diagLog(`[MPEGTS] Seek to ${seekTime.toFixed(1)}s: recreating player from /stream/ (video-only)`);
+        remuxUrlRef.current = null;
+        video.muted = true;
+        _mpegtsRecreatePlayerForSeek(byteOffset, seekTime, true);
         return;
       }
 
@@ -3509,7 +3538,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               byteToTimeTableRef.current = btFiltered;
               diagLog(`[MPEGTS] VBR-corrected keyframe cached: ${videoBufferStart.toFixed(1)}s -> byte ${byteOffset} (for future seeks)`);
             }
-          } else if (videoBufferStart >= v.currentTime - 5 && videoBufferStart <= v.currentTime + 0.5) {
+          } else if (videoBufferStart >= v.currentTime - 5 && videoBufferStart <= v.currentTime + (v.muted ? 30 : 15)) {
             // Backward gap within 5s or at currentTime — jump to videoBufferStart
             // so video plays immediately from the keyframe. Also handle small
             // forward gaps (≤0.5s) — without this, currentTime stays just before
@@ -3804,7 +3833,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   /** Last-resort: recreate mpegts.js player for seek when IOController is null.
    *  Destroys the current player and creates a new one that starts from byteOffset.
    */
-  const _mpegtsRecreatePlayerForSeek = async (byteOffset: number, timeSeconds: number) => {
+  const _mpegtsRecreatePlayerForSeek = async (byteOffset: number, timeSeconds: number, videoOnly?: boolean) => {
     const video = videoRef.current;
     const player = mpegtsPlayerRef.current;
     if (!video || !player) return;
@@ -3864,6 +3893,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       newPlayer.attachMediaElement(video);
       mpegtsPlayerRef.current = newPlayer;
 
+      // Video-only mode: patch MSE controller BEFORE load() to prevent audio
+      // SourceBuffer creation. appendInitSegment creates SBs — blocking audio
+      // init means _sourceBuffers['audio'] stays null, and _doAppendSegments
+      // silently skips audio media segments (it checks `if (!sb) continue`).
+      if (videoOnly) {
+        const engine = (newPlayer as any)?._player_engine;
+        const mseCtrl = engine?._mse_controller;
+        if (mseCtrl) {
+          const origInitSeg = mseCtrl.appendInitSegment.bind(mseCtrl);
+          mseCtrl.appendInitSegment = (seg: any, deferred?: any) => {
+            if (seg.type === 'audio') return;
+            origInitSeg(seg, deferred);
+          };
+          const origMediaSeg = mseCtrl.appendMediaSegment.bind(mseCtrl);
+          mseCtrl.appendMediaSegment = (seg: any) => {
+            if (seg.type === 'audio') return;
+            origMediaSeg(seg);
+          };
+        }
+      }
+
       // The seek-recreated player uses the same custom loader as the initial player,
       // so native lazyLoad and autoCleanupSourceBuffer manage the buffer window.
 
@@ -3871,15 +3921,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         diagLog(`[MPEGTS] Recreated player error: ${detail}`);
       });
 
+      if (shadowCacheRef.current) {
+        const cache = shadowCacheRef.current;
+        cache.reset(cache.urlKey, cache.fileLength);
+      }
+
       newPlayer.load();
 
-      // After load, the IOController is created — seek to the byte offset
+      // load() creates the transmuxing controller/ioctl synchronously enough for a
+      // short poll. Do not wait for a metadata event here: after a seek-recreate we
+      // must seek before the loader spends time downloading byte 0 again, and video-only
+      // mode can delay metadata events behind the audio init we intentionally drop.
       await new Promise<void>(resolve => {
-        const timeout = setTimeout(() => resolve(), 5000);
-        newPlayer.on(MpegtsPlayer.Events.METADATA_ARRIVED, () => {
-          clearTimeout(timeout);
-          resolve();
-        });
+        let ticks = 0;
+        const iv = setInterval(() => {
+          ticks++;
+          const ioctl = (newPlayer as any)?._player_engine?._transmuxer?._controller?._ioctl;
+          if (ioctl || ticks >= 20) {
+            clearInterval(iv);
+            resolve();
+          }
+        }, 50);
       });
 
       // Seek via internal IOController — reset stale demuxer/remuxer state first
@@ -3918,6 +3980,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
         video.currentTime = timeSeconds;
         diagLog(`[MPEGTS] Recreated player — seeked to byte ${byteOffset}`);
+
+        // For video-only seek: set up a lightweight align poll that jumps
+        // currentTime to the first video buffer start (since keyframes can
+        // be up to 10s after the requested position).
+        if (videoOnly) {
+          let alignTicks = 0;
+          const alignIv = setInterval(() => {
+            alignTicks++;
+            if (alignTicks > 30 || !videoRef.current) { clearInterval(alignIv); return; }
+            const v = videoRef.current;
+            if (v.buffered.length > 0) {
+              const bufStart = v.buffered.start(0);
+              if (bufStart > v.currentTime + 0.05) {
+                diagLog(`[MPEGTS] Align (recreated): jumping from ${v.currentTime.toFixed(1)}s to buffer start ${bufStart.toFixed(1)}s`);
+                v.currentTime = bufStart;
+              }
+              clearInterval(alignIv);
+            }
+          }, 500);
+        }
       } else {
         diagLog('[MPEGTS] Recreated player — IOController still null');
       }
