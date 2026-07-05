@@ -2224,6 +2224,7 @@ async fn remux_ts_to_mp4(
             "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
+            "-af", "aresample=async=1",
         ]);
         // Preserve original timestamps so MSE timeline matches video.currentTime
         if ss_secs > 0.0 {
@@ -2319,6 +2320,7 @@ async fn remux_ts_to_mp4(
                         bg_cmd.args([
                             "-hide_banner", "-loglevel", "warning",
                             "-ignore_unknown",
+                            "-fflags", "+genpts+discardcorrupt",
                             "-probesize", "50000000", "-analyzeduration", "50000000",
                             "-i", &bg_input,
                         ]);
@@ -4533,6 +4535,7 @@ mod tests {
 // Continuation tests removed — ContinuationGuard and continuation_should_run
 // have been removed. The proactive prebuffer is now the ONLY path that
 // downloads from Telegram; /stream reads exclusively from disk cache.
+
 
 
 
