@@ -464,8 +464,56 @@ const MAX_BUFFER_AHEAD_SECONDS = 30; // Backpressure — stop downloading when >
 // Cold-start overlay thresholds: show the overlay while the first chunk is being
 // pulled into the shadow cache, then fade it out once the player can start.
 // Align to the 188-byte TS packet size so the cache stays contiguous.
-const MIN_COLD_START_BUFFER_BYTES = alignChunkSize(5 * 1024 * 1024); // ~5 MB
+const MIN_COLD_START_BUFFER_BYTES = alignChunkSize(5 * 1024 * 1024); // ~5 MB fallback
 const COLD_START_TIMEOUT_MS = 10000;                   // never wait longer than 10 s
+
+/** Cold-start overlay phases — tells the UI what's happening and why. */
+export type ColdStartPhase = 'none' | 'fetching_metadata' | 'buffering' | 'initializing_player';
+
+/**
+ * Compute a dynamic cold-start buffer threshold based on available video metadata.
+ *
+ * Strategy:
+ * - If duration + file size are known → estimate bitrate, buffer ~3s of video
+ *   (clamped between 2 MB and 30 MB)
+ * - If only file size is known → scale logarithmically (bigger files = higher bitrate)
+ * - Fallback → 5 MB (the old hardcoded default)
+ *
+ * TS files always align to 188-byte packet boundaries.
+ */
+function computeColdStartThreshold(
+  fileSize: number,
+  duration: number | undefined,
+  format: string,
+  isPublicChannel: boolean,
+): number {
+  const MIN_THRESHOLD = 2 * 1024 * 1024;   // 2 MB floor
+  const MAX_THRESHOLD = 30 * 1024 * 1024;  // 30 MB ceiling
+  const PUBLIC_MULTIPLIER = 2;              // public channels get 2x buffer
+  const BUFFER_SECONDS = 3;                 // target 3s of video data
+
+  let threshold: number;
+
+  if (duration && duration > 0 && fileSize > 0) {
+    // Best case: we know bitrate → buffer BUFFER_SECONDS of video
+    const bytesPerSecond = fileSize / duration;
+    threshold = Math.floor(bytesPerSecond * BUFFER_SECONDS);
+  } else if (fileSize > 0) {
+    // No duration → scale by file size (log curve: 10MB→3MB, 100MB→5MB, 1GB→8MB, 5GB→12MB)
+    const sizeMB = fileSize / (1024 * 1024);
+    threshold = Math.floor((2 + Math.log10(Math.max(1, sizeMB)) * 2.5) * 1024 * 1024);
+  } else {
+    threshold = MIN_COLD_START_BUFFER_BYTES;
+  }
+
+  if (isPublicChannel) threshold *= PUBLIC_MULTIPLIER;
+  threshold = Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, threshold));
+
+  // TS format: align to 188-byte packet boundaries
+  if (format === 'ts') threshold = alignChunkSize(threshold);
+
+  return threshold;
+}
 
 /** Round a byte budget down to a multiple of the TS packet size (188). */
 function alignChunkSize(size: number): number {
@@ -618,9 +666,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Public channels get larger buffers to reduce buffering on large 1080p MP4s.
   // Telegram download speed (~400KB/s) is below 1080p bitrate (~1MB/s), so
   // a bigger buffer builds a larger cushion during speed spikes.
-  const minColdStartBytes = isPublicChannel ? alignChunkSize(20 * 1024 * 1024) : MIN_COLD_START_BUFFER_BYTES;
+  // Dynamic cold-start threshold is computed after format detection; this is
+  // the initial fallback used until we know the format.
+  const fallbackColdStartBytes = isPublicChannel ? alignChunkSize(20 * 1024 * 1024) : MIN_COLD_START_BUFFER_BYTES;
+  const [minColdStartBytes, setMinColdStartBytes] = useState(fallbackColdStartBytes);
   const maxBufferAhead = isPublicChannel ? 120 : MAX_BUFFER_AHEAD_SECONDS;
   const maxBufferBytes = isPublicChannel ? 80 * 1024 * 1024 : MAX_BUFFER_BYTES;
+  // Phase tracking for cold-start overlay — tells UI what is happening and why
+  const [coldStartPhase, setColdStartPhase] = useState<ColdStartPhase>('none');
+  // Detected format state — exposed to UI for format-aware overlay messaging
+  const [detectedFormat, setDetectedFormat] = useState<string>('unknown');
 
   const [mseUrl, setMseUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1811,7 +1866,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Detect file format from first bytes
       const format = detectFormat(data, file?.name);
       formatRef.current = format;
+      setDetectedFormat(format);
       diagLog(`[MSE] detectFormat result: ${format}`);
+
+      // Compute dynamic cold-start threshold now that we know the format + file size
+      const dynamicThreshold = computeColdStartThreshold(
+        state.current.fileLength,
+        file?.duration,
+        format,
+        !!isPublicChannel,
+      );
+      setMinColdStartBytes(dynamicThreshold);
+      diagLog(`[MSE] Dynamic cold-start threshold: ${formatBytes(dynamicThreshold)} (file=${formatBytes(state.current.fileLength)}, duration=${file?.duration ?? 'unknown'}s, format=${format})`);
 
       if (format === 'unknown') {
         diagLog('[MSE] Unknown format — falling back to native playback');
@@ -1890,6 +1956,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // Mark transmuxer init in progress so the MSE init timeout extends
             // instead of firing at 20s (remux needs: download + ffprobe + ffmpeg startup).
             transmuxerInitInProgressRef.current = true;
+            // Clear mseUrl BEFORE mpegts.js init — mpegts.js creates its own
+            // MediaSource and sets video.src internally. If we leave mseUrl set
+            // to our empty blob URL, FastStreamPlayer will overwrite video.src
+            // on the next render, causing ERR_FILE_NOT_FOUND on the data-less blob.
+            setMseUrl(null);
+            // Show the cold-start overlay during remux startup (download + ffprobe + ffmpeg
+            // spawn + first fragments). The MEDIA_INFO handler resolves the deferred and
+            // dismisses the overlay once the player is ready.
+            let remuxColdStartResolve: () => void = () => {};
+            const remuxColdStartPromise = new Promise<void>((resolve) => { remuxColdStartResolve = resolve; });
+            coldStartDeferredRef.current = { resolve: remuxColdStartResolve, promise: remuxColdStartPromise };
+            setIsColdStartBuffering(true);
+            setColdStartPhase('initializing_player');
+            setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for remux
             // Start mpegts.js with the remux URL
             await _initMpegtsPlayer(remuxUrl, mediaSource, blobUrl, parsed);
             return;
@@ -1909,9 +1989,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         let coldStartResolve: () => void = () => {};
         const coldStartPromise = new Promise<void>((resolve) => { coldStartResolve = resolve; });
         coldStartDeferredRef.current = { resolve: coldStartResolve, promise: coldStartPromise };
+        // Clear mseUrl BEFORE mpegts.js init — mpegts.js creates its own
+        // MediaSource and sets video.src internally. If we leave mseUrl set
+        // to our empty blob URL, FastStreamPlayer will overwrite video.src
+        // on the next render, causing ERR_FILE_NOT_FOUND on the data-less blob.
+        setMseUrl(null);
         // Show the cold-start overlay while the first chunk is being pulled into the shadow cache.
         setIsColdStartBuffering(true);
-        setColdStartProgress({ bytes: 0, targetBytes: minColdStartBytes });
+        setColdStartPhase('buffering');
+        setColdStartProgress({ bytes: 0, targetBytes: dynamicThreshold });
         // Start mpegts.js immediately, but playback is gated on the first 5MB.
         const initPromise = initTransmuxerPlayer(url, mediaSource, blobUrl!, format);
         await initPromise;
@@ -1926,6 +2012,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // MP4 format — proceed with MP4Box.js
       console.log('[MSE] Detected MP4 format — proceeding with MP4Box.js');
+
+      // Show cold-start overlay during MP4 initialization (moov fetch + mp4box setup).
+      // For MP4 files, the overlay covers the initial metadata parsing phase.
+      setIsColdStartBuffering(true);
+      setColdStartPhase('fetching_metadata');
+      setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for MP4 metadata
 
       // Report initial chunk range to cache backend (even if we don't feed to mp4box yet)
       reportRangesToBackend(0, firstChunkSize - 1);
@@ -1992,6 +2084,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       console.error('[MSE] Setup failed:', e);
       if (!cancelledRef.current) {
         diagLog(`[MSE] Setup failed: ${e.message} — falling back to native`);
+        setIsColdStartBuffering(false);
+        setColdStartPhase('none');
         setUseNative(true);
       }
     }
@@ -2523,8 +2617,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       const coldStartDeferred = coldStartDeferredRef.current;
       if (coldStartDeferred) {
+        // For buffering phase the progress poller already resolved;
+        // for initializing_player (remux), MEDIA_INFO IS the ready signal.
+        coldStartDeferred.resolve();
         await coldStartDeferred.promise;
         setIsColdStartBuffering(false);
+        setColdStartPhase('none');
       }
       await player.play();
 
@@ -4656,6 +4754,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         clearTimeout(initTimeoutRef.current);
         initTimeoutRef.current = null;
       }
+      // Dismiss cold-start overlay now that MP4 metadata is parsed and player is ready
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
       setIsPrefetching(true);
 
       // Set up mp4box callback for segments
@@ -5738,19 +5839,38 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // by initTransmuxerPlayer after awaiting the same promise.
   useEffect(() => {
     if (!isColdStartBuffering) return;
-    const startTime = Date.now();
-    const interval = setInterval(() => {
-      const cache = shadowCacheRef.current;
-      const run = cache?.cachedRunFrom(0);
-      const bytes = run ? Math.min(run.end + 1, minColdStartBytes) : 0;
-            setColdStartProgress({ bytes, targetBytes: minColdStartBytes });
-            const ready = bytes >= minColdStartBytes || Date.now() - startTime >= COLD_START_TIMEOUT_MS;
-      if (ready) {
-        coldStartDeferredRef.current?.resolve();
-      }
-    }, 250);
-    return () => clearInterval(interval);
-  }, [isColdStartBuffering]);
+    if (coldStartPhase === 'none') return;
+
+    // For buffering phase: poll shadow cache progress
+    if (coldStartPhase === 'buffering') {
+      const startTime = Date.now();
+      const target = minColdStartBytes;
+      const interval = setInterval(() => {
+        const cache = shadowCacheRef.current;
+        const run = cache?.cachedRunFrom(0);
+        const bytes = run ? Math.min(run.end + 1, target) : 0;
+        setColdStartProgress({ bytes, targetBytes: target });
+        const ready = bytes >= target || Date.now() - startTime >= COLD_START_TIMEOUT_MS;
+        if (ready) {
+          coldStartDeferredRef.current?.resolve();
+        }
+      }, 250);
+      return () => clearInterval(interval);
+    }
+
+    // For initializing_player / fetching_metadata: safety timeout only.
+    // MEDIA_INFO or onMP4BoxReady resolves the deferred normally;
+    // this is a fallback if those never fire (e.g. remux ffmpeg errors).
+    const INIT_OVERLAY_TIMEOUT_MS = 45000;
+    const timer = setTimeout(() => {
+      diagLog(`[MSE] Cold-start overlay safety timeout (${INIT_OVERLAY_TIMEOUT_MS / 1000}s) for phase=${coldStartPhase} — dismissing`);
+      coldStartDeferredRef.current?.resolve();
+      coldStartDeferredRef.current = null;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+    }, INIT_OVERLAY_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [isColdStartBuffering, coldStartPhase, minColdStartBytes]);
 
   // Reset cold-start overlay state when the stream changes or hook unmounts.
   useEffect(() => {
@@ -5758,7 +5878,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       coldStartDeferredRef.current?.resolve();
       coldStartDeferredRef.current = null;
       setIsColdStartBuffering(false);
-      setColdStartProgress({ bytes: 0, targetBytes: minColdStartBytes });
+      setColdStartPhase('none');
+      setColdStartProgress({ bytes: 0, targetBytes: 0 });
     };
   }, [streamUrl]);
 
@@ -5811,6 +5932,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     getFmp4Config: getFmp4ConfigCb,
     isColdStartBuffering,
     coldStartProgress,
+    coldStartPhase,
+    detectedFormat,
     keyframeIndexReady,
     thumbnailDataReady,
     moovBufferReady,

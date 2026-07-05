@@ -138,6 +138,8 @@ interface FastStreamPlayerProps {
     keyframeIndexReady: msePlayer.keyframeIndexReady,
     coldStartProgress: msePlayer.coldStartProgress,
     isColdStartBuffering: msePlayer.isColdStartBuffering,
+    coldStartPhase: msePlayer.coldStartPhase,
+    detectedFormat: msePlayer.detectedFormat,
     getMoovBuffer: msePlayer.getMoovBuffer,
     getFirstChunk: msePlayer.getFirstChunk,
     getInitSegments: msePlayer.getInitSegments,
@@ -178,6 +180,8 @@ interface FastStreamPlayerProps {
     keyframeIndexReady: _keyframeIndexReady,
     isColdStartBuffering,
     coldStartProgress,
+    coldStartPhase,
+    detectedFormat,
   } = player;
 
   // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
@@ -1308,25 +1312,54 @@ interface FastStreamPlayerProps {
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
         )}
-        {/* Cold-start optimization overlay — hidden as soon as the byte target is reached */}
+        {/* Cold-start optimization overlay — phase-aware messaging with dynamic progress */}
         {(showColdStartOverlay || isRemuxLoading) && !err && (
-          <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100' : 'opacity-0'}`}>
+          <div className={`absolute inset-x-0 top-0 bottom-16 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100' : 'opacity-0'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">
-              <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
+              {/* Spinner */}
+              <div className="relative w-16 h-16">
+                <div className="absolute inset-0 border-4 border-nobuf-primary/20 rounded-full" />
+                <div className="absolute inset-0 border-4 border-transparent border-t-nobuf-primary rounded-full animate-spin" />
+                {/* Format badge */}
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span className="text-nobuf-primary text-xs font-bold uppercase tracking-wider">
+                    {detectedFormat === 'ts' ? 'TS' : detectedFormat === 'mp4' ? 'MP4' : detectedFormat === 'mkv' ? 'MKV' : ''}
+                  </span>
+                </div>
+              </div>
+              {/* Phase-aware title + subtitle */}
               <div className="text-center">
-                <div className="text-white text-lg font-semibold mb-1">Optimizing video for No Buffer playback</div>
-                {coldStartProgress.targetBytes > 0 && (
+                <div className="text-white text-lg font-semibold mb-1">
+                  {coldStartPhase === 'fetching_metadata' ? 'Reading video metadata' :
+                   coldStartPhase === 'buffering' ? 'Optimizing for smooth playback' :
+                   coldStartPhase === 'initializing_player' ? 'Preparing video stream' :
+                   'Preparing video'}
+                </div>
+                <div className="text-white/50 text-sm">
+                  {coldStartPhase === 'fetching_metadata' ? 'Locating video structure for instant start' :
+                   coldStartPhase === 'buffering' ? 'Pre-loading data to prevent buffering' :
+                   coldStartPhase === 'initializing_player' ? 'Converting format for seamless playback' :
+                   'Ensuring buffer-free experience'}
+                </div>
+              </div>
+              {/* Progress bar — only for buffering phase with known target */}
+              {coldStartProgress.targetBytes > 0 && coldStartPhase === 'buffering' && (
+                <>
                   <div className="text-white/60 text-sm font-mono">
                     {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
                   </div>
-                )}
-              </div>
-              {coldStartProgress.targetBytes > 0 && (
-                <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-nobuf-primary rounded-full transition-all duration-300"
-                    style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
-                  />
+                  <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-nobuf-primary to-nobuf-primary/70 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
+                    />
+                  </div>
+                </>
+              )}
+              {/* Indeterminate bar for metadata or initializing phase */}
+              {(coldStartPhase === 'fetching_metadata' || coldStartPhase === 'initializing_player') && (
+                <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-nobuf-primary to-transparent rounded-full animate-[shimmer_1.5s_ease-in-out_infinite]" />
                 </div>
               )}
             </div>
