@@ -1314,7 +1314,7 @@ interface FastStreamPlayerProps {
         )}
         {/* Cold-start optimization overlay — phase-aware messaging with dynamic progress */}
         {(showColdStartOverlay || isRemuxLoading) && !err && (
-          <div className={`absolute inset-x-0 top-0 bottom-16 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100' : 'opacity-0'}`}>
+          <div className={`absolute inset-x-0 top-0 bottom-16 flex items-center justify-center z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">
               {/* Spinner */}
               <div className="relative w-16 h-16">

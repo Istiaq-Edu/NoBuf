@@ -300,6 +300,10 @@ pub(crate) struct StreamQuery {
     /// thumbnail pipeline to limit downloads to ~5MB instead of fetching
     /// to EOF (hundreds of MB) — only needs enough data to find one keyframe.
     pub(crate) max_bytes: Option<u64>,
+    /// Seek start time in seconds (for remux endpoint). When set, ffmpeg
+    /// uses `-ss` to start remuxing from this position instead of the
+    /// beginning, enabling byte-range-like seeking through the remux pipe.
+    pub(crate) ss: Option<f64>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -1823,7 +1827,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2206,6 +2210,13 @@ async fn remux_ts_to_mp4(
             message_id, video_stream_idx, audio_stream_idx, probed_duration);
 
         let mut cmd = TokioCommand::new("ffmpeg");
+        // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking
+        let ss_secs = query.ss.unwrap_or(0.0);
+        if ss_secs > 0.0 {
+            let ss_str = format!("{:.3}", ss_secs);
+            log::info!("[REMUX] msg {}: seeking to {}s before remux", message_id, ss_str);
+            cmd.args(["-ss", &ss_str]);
+        }
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
@@ -2213,6 +2224,12 @@ async fn remux_ts_to_mp4(
             "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
+        ]);
+        // Preserve original timestamps so MSE timeline matches video.currentTime
+        if ss_secs > 0.0 {
+            cmd.args(["-copyts", "-start_at_zero"]);
+        }
+        cmd.args([
             "-f", "mpegts",
             "-mpegts_flags", "resend_headers",
             "-",
@@ -2931,7 +2948,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
