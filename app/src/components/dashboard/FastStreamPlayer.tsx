@@ -741,7 +741,10 @@ interface FastStreamPlayerProps {
       // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
       // is cached. Starting here would play under the overlay with thin buffer.
       if (!coldStartBufferingRef.current) {
-        v.play().catch((e) => console.warn('[Player] play() failed:', e));
+        v.play().catch((e: any) => {
+          // AbortError is expected during VBR correction (old player destroyed mid-play)
+          if (e?.name !== 'AbortError') console.warn('[Player] play() failed:', e);
+        });
       }
     };
     const onCanPlay = () => {

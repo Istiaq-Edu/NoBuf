@@ -3880,7 +3880,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  Concurrency: uses a generation counter — if a newer recreation starts while
    *  this one is awaiting, we bail early instead of operating on stale state.
    */
-  const _mpegtsRecreatePlayerForSeek = async (byteOffset: number, timeSeconds: number, videoOnly?: boolean) => {
+  const _mpegtsRecreatePlayerForSeek = async (byteOffset: number, timeSeconds: number, videoOnly?: boolean, vbrDepth?: number) => {
     const video = videoRef.current;
     if (!video) return;
 
@@ -4066,12 +4066,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         video.currentTime = timeSeconds;
         diagLog(`[MPEGTS] Recreated player — seeked to byte ${byteOffset}`);
 
-        // For video-only seek: set up a lightweight align poll that jumps
-        // currentTime to the first video buffer start (since keyframes can
-        // be up to 10s after the requested position).
+        // For video-only seek: set up an align poll that jumps currentTime
+        // to the first video buffer start AND performs VBR correction if the
+        // landing position is >10s from the target (linear estimate is wrong
+        // for VBR content).
         if (videoOnly) {
           const alignGen = gen; // capture for closure
           let alignTicks = 0;
+          const vbrAttempts = vbrDepth ?? 0;
+          const MAX_VBR_ATTEMPTS = 2;
           const alignIv = setInterval(() => {
             alignTicks++;
             // Bail if superseded or unmounted
@@ -4081,11 +4084,51 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             const v = videoRef.current;
             if (v.buffered.length > 0) {
               const bufStart = v.buffered.start(0);
-              if (bufStart > v.currentTime + 0.05) {
-                diagLog(`[MPEGTS] Align (recreated): jumping from ${v.currentTime.toFixed(1)}s to buffer start ${bufStart.toFixed(1)}s`);
+              const gap = bufStart - timeSeconds;
+
+              // VBR correction: buffer landed >15s from target (10s would
+              // false-trigger on legitimate GOP keyframe distance in large-GOP files)
+              if (Math.abs(gap) > 15 && vbrAttempts < MAX_VBR_ATTEMPTS && dur > 0 && fs > 0) {
+                // Use LOCAL bitrate from actual data: byteOffset → bufStart gives
+                // the real byte-per-second ratio at this file position. This is far
+                // more accurate than average bitrate for VBR content.
+                const localBytesPerSec = byteOffset / bufStart;
+                const correctedByte = Math.max(0, Math.min(fs - 1,
+                  Math.floor((timeSeconds * localBytesPerSec) / 188) * 188
+                ));
+                // Skip if correction is too small to justify a full recreation
+                if (Math.abs(correctedByte - byteOffset) < 1024 * 1024) {
+                  if (Math.abs(bufStart - v.currentTime) > 0.05) v.currentTime = bufStart;
+                  clearInterval(alignIv);
+                  (window as any).__nobuf_seekTargetTime = 0;
+                  return;
+                }
+                diagLog(`[MPEGTS] Recreate VBR correction #${vbrAttempts + 1}: target ${timeSeconds.toFixed(1)}s, buffer at ${bufStart.toFixed(1)}s (gap ${gap.toFixed(1)}s) → re-seek byte ${(correctedByte/1024/1024).toFixed(1)}MB`);
+                clearInterval(alignIv);
+                // Update seekTarget for UI
+                (window as any).__nobuf_seekTargetTime = timeSeconds;
+                _mpegtsRecreatePlayerForSeek(correctedByte, timeSeconds, true, vbrAttempts + 1);
+                return;
+              }
+
+              // Normal alignment: jump to buffer start
+              if (Math.abs(bufStart - v.currentTime) > 0.05) {
+                diagLog(`[MPEGTS] Align (recreated): target ${timeSeconds.toFixed(1)}s → buffer start ${bufStart.toFixed(1)}s (delta ${(bufStart - timeSeconds).toFixed(1)}s)`);
                 v.currentTime = bufStart;
               }
+              // Cache VBR-corrected position for future seeks
+              if (vbrAttempts > 0) {
+                const existing = tsKeyframeIndexRef.current;
+                const newEntry = { timestamp: bufStart, byteOffset: byteOffset };
+                const filtered = existing.filter(k => Math.abs(k.timestamp - bufStart) > 5);
+                filtered.push(newEntry);
+                filtered.sort((a, b) => a.timestamp - b.timestamp);
+                tsKeyframeIndexRef.current = filtered;
+                diagLog(`[MPEGTS] Recreate VBR keyframe cached: ${bufStart.toFixed(1)}s -> byte ${byteOffset}`);
+              }
               clearInterval(alignIv);
+              // Clear seek-in-progress so timeupdate uses real currentTime
+              (window as any).__nobuf_seekTargetTime = 0;
             }
           }, 500);
         }
