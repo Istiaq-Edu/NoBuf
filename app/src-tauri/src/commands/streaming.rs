@@ -156,12 +156,21 @@ pub async fn cmd_get_cache_status(
 #[tauri::command]
 pub async fn cmd_delete_cache(
     message_id: i32,
+    reason: Option<String>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
+    let reason_str = reason.unwrap_or_else(|| "unknown".to_string());
+    let has_active_dl = cache_state.has_active_download(message_id).await;
+    let is_streaming = cache_state.is_streaming(message_id);
+    log::info!(
+        "[CACHE] cmd_delete_cache called for msg {} reason={} active_dl={} streaming={}",
+        message_id, reason_str, has_active_dl, is_streaming
+    );
+
     // Check for active downloads BEFORE attempting deletion.
     // The download coordinator uses async mutex, so we check here
     // (in the async Tauri command) rather than in the sync delete_cache method.
-    if cache_state.has_active_download(message_id).await {
+    if has_active_dl {
         return Err("Cache has active download — retry later".to_string());
     }
 
@@ -171,6 +180,7 @@ pub async fn cmd_delete_cache(
     if !deleted {
         return Err("Cache is still streaming — retry later".to_string());
     }
+    log::info!("[CACHE] cmd_delete_cache succeeded for msg {} reason={}", message_id, reason_str);
     Ok(true)
 }
 
@@ -749,7 +759,7 @@ async fn proactive_prebuffer_download(
         // position after a backward seek — the user sees "old prebuffers still growing."
         if latest_current_byte > start_byte {
             start_byte = latest_current_byte;
-        } else if latest_current_byte + 10 * 1024 * 1024 < start_byte {
+        } else if latest_current_byte + 50 * 1024 * 1024 < start_byte {
             // Backward seek detected — target moved >10MB backward.
             // This is typically a VBR correction that moved the target.
             // Set jumped=true so the 2s sleep runs, giving /stream time to
@@ -944,7 +954,7 @@ async fn proactive_prebuffer_download(
                             );
                             jumped = true;
                             break;
-                        } else if target_byte + 10 * 1024 * 1024 < offset
+                        } else if target_byte + 50 * 1024 * 1024 < offset
                                    && target_changed {
                             // Backward seek — but ONLY if the target changed (new seek).
                             // If target hasn't changed, PROACTIVE is just ahead of the
@@ -959,13 +969,28 @@ async fn proactive_prebuffer_download(
                     }
                 }
 
-                // Use blocking acquire — the 250ms global rate limiter ensures
-                // no FLOOD_PREMIUM_WAIT. After a playhead jump (seek), yield to
-                // /stream for 5 seconds so the seek download gets exclusive
-                // access to the rate limiter. Without this, the proactive and
-                // /stream alternate rate-limited calls, making seeks 2x slower.
+                // Yield to /stream: use try_acquire instead of blocking acquire.
+                // When /stream is actively downloading (holding a permit or
+                // player_actively_downloading is true), the prebuffer yields
+                // instead of competing for the rate limiter budget. This gives
+                // /stream 100% of the API call budget during seeks and active
+                // playback, while the prebuffer fills disk only during idle time.
                 let chunk_result = {
-                    let _permit = state.download_semaphore.acquire().await.unwrap();
+                    // Secondary throttle: check if the player's IOController is
+                    // actively downloading. This flag is set by the frontend via
+                    // cmd_report_playback_position(is_player_downloading=true).
+                    if state.player_actively_downloading.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    let _permit = match state.download_semaphore.try_acquire() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // /stream is holding all permits — yield
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    };
                     throttle_api_calls(&state.rate_limiter).await;
                     iter.next().await
                 };
