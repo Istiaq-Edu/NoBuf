@@ -57,6 +57,7 @@ interface FastStreamPlayerProps {
 
   // Settings panel state
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [controlsPinned, setControlsPinned] = useState(false);
   const [loop, setLoop] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [brightness, setBrightness] = useState(1);
@@ -159,14 +160,14 @@ interface FastStreamPlayerProps {
     useNative: playerUseNative,
     remuxUrl: playerRemuxUrl,
     unsupportedCodec: playerUnsupportedCodec,
-    prefetchedBytes,
+    prefetchedBytes: _prefetchedBytes,
     totalBytes,
-    isPrefetching,
-    isPaused: prefetchPaused,
+    isPrefetching: _isPrefetching,
+    isPaused: _prefetchPaused,
     isComplete: prefetchComplete,
     speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
-    pausePrefetch,
-    resumePrefetch,
+    pausePrefetch: _pausePrefetch,
+    resumePrefetch: _resumePrefetch,
     seekTo,
     suppressLoadingSpinnerRef,
     setVideoRef,
@@ -1010,8 +1011,8 @@ interface FastStreamPlayerProps {
   const lastMousePos = useRef({ x: 0, y: 0 });
   const hideDelayMs = settings.playerAutoHideDelay === 0 ? 0 : settings.playerAutoHideDelay * 1000;
   useEffect(() => {
-    // Always show controls when paused or settings panel is open
-    if (!playing || settingsOpen) {
+    // Always show controls when paused, settings panel is open, or pinned
+    if (!playing || settingsOpen || controlsPinned) {
       setVis(true);
       return;
     }
@@ -1027,7 +1028,7 @@ interface FastStreamPlayerProps {
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
         // CSS :hover works with stationary mouse — unlike JS event tracking
-        if (playing && !settingsOpen && !controlsRef.current?.matches(':hover')) {
+        if (playing && !settingsOpen && !controlsPinned && !controlsRef.current?.matches(':hover')) {
           setVis(false);
         }
       }, hideDelayMs);
@@ -1051,7 +1052,7 @@ interface FastStreamPlayerProps {
     const onMouseLeave = () => {
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
-        if (playing && !settingsOpen) setVis(false);
+        if (playing && !settingsOpen && !controlsPinned) setVis(false);
       }, 1500);
     };
 
@@ -1062,7 +1063,7 @@ interface FastStreamPlayerProps {
       document.removeEventListener('mouseleave', onMouseLeave);
       clearTimeout(hideTimer);
     };
-  }, [playing, settingsOpen, hideDelayMs]);
+  }, [playing, settingsOpen, controlsPinned, hideDelayMs]);
 
   // Mini progress bar — appears after controls have fully hidden (300ms delay)
   useEffect(() => {
@@ -1388,10 +1389,17 @@ interface FastStreamPlayerProps {
         )}
       </div>
 
-      {/* Persistent mini progress bar — visible when controls are hidden */}
+      {/* Persistent mini progress bar + speed — visible when controls are hidden */}
       {miniBarVisible && !err && dur > 0 && (
-        <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-white/20 z-40 pointer-events-none transition-opacity duration-300">
-          <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+        <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none transition-opacity duration-300">
+          <div className="flex items-center justify-end px-2 pb-0.5">
+            <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
+              {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+            </span>
+          </div>
+          <div className="h-[2px] bg-white/20">
+            <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+          </div>
         </div>
       )}
 
@@ -1408,7 +1416,7 @@ interface FastStreamPlayerProps {
         {/* Progress bar — unified with buffer, position, and preview indicators */}
         <div
           ref={barRef}
-          className="relative cursor-pointer group mb-3 mx-1 py-3"
+          className="relative cursor-pointer group mb-1 mx-1 py-3"
           onClick={onBarClick}
           onMouseMove={onBarMove}
           onMouseLeave={() => {
@@ -1505,8 +1513,7 @@ interface FastStreamPlayerProps {
                 );
               });
             })()}
-            {/* Knob */}
-            <div className="absolute w-4 h-4 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-40" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
+
           </div>
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {
@@ -1577,7 +1584,6 @@ interface FastStreamPlayerProps {
             {(() => {
               const vid = vidRef.current;
               const curTime = vid?.currentTime ?? 0;
-              // Calculate SourceBuffer ahead
               let sbAhead = 0;
               if (vid?.buffered && vid.buffered.length > 0) {
                 for (let i = 0; i < vid.buffered.length; i++) {
@@ -1586,7 +1592,6 @@ interface FastStreamPlayerProps {
                   }
                 }
               }
-              // Calculate disk cache ahead (green bar data beyond SourceBuffer)
               let cacheAhead = 0;
               if (cachedTimeRanges.length > 0 && dur > 0) {
                 for (const [s, e] of cachedTimeRanges) {
@@ -1598,52 +1603,24 @@ interface FastStreamPlayerProps {
               cacheAhead = Math.max(0, cacheAhead - sbAhead);
               const totalAhead = sbAhead + cacheAhead;
 
-              // Buffer health color
               const healthColor = totalAhead > 300 ? 'text-green-400'
                 : totalAhead > 60 ? 'text-yellow-400'
                 : totalAhead > 10 ? 'text-orange-400'
                 : 'text-red-400';
 
-              // Progress toward full file (disk cache)
-              const cacheProgress = totalBytes > 0 ? Math.min(1, prefetchedBytes / totalBytes) : 0;
-              const showController = isPrefetching || prefetchPaused || prefetchComplete || prefetchedBytes > 0 || sbAhead > 0;
-
-              if (!showController) return null;
-
               return (
                 <div className="flex items-center gap-2 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
-                  {/* Play/Pause buffering icon */}
-                  <button
-                    onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
-                    className="hover:bg-white/10 rounded p-0.5"
-                    title={prefetchPaused ? 'Resume buffering' : prefetchComplete ? 'Buffering complete' : 'Pause buffering'}
-                  >
-                    {prefetchPaused ? (
-                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                    ) : prefetchComplete ? (
-                      <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
-                    ) : (
-                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
-                    )}
-                  </button>
-
+                  {/* Download speed */}
+                  <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
+                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+                  </span>
                   {/* Buffer ahead */}
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
                     {totalAhead >= 60 ? `${(totalAhead / 60).toFixed(1)}m` : `${totalAhead.toFixed(0)}s`}
                   </span>
-
-                  {/* Mini progress bar: cache fill */}
-                  <div className="w-10 h-1.5 bg-white/10 rounded-full overflow-hidden" title={`${formatBytes(prefetchedBytes)} / ${formatBytes(totalBytes)} cached`}>
-                    <div
-                      className={`h-full rounded-full transition-all duration-300 ${prefetchComplete ? 'bg-green-400' : 'bg-nobuf-primary'}`}
-                      style={{ width: `${cacheProgress * 100}%` }}
-                    />
-                  </div>
-
-                  {/* Download speed from Telegram (green bar / proactive prebuffer) */}
-                  <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
-                  </span>
+                  {prefetchComplete && (
+                    <svg className="w-3 h-3 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
+                  )}
                 </div>
               );
             })()}
@@ -1696,6 +1673,12 @@ interface FastStreamPlayerProps {
                   {cacheComplete ? <span className="text-green-400">✓</span> : `${cachePercent}%`}
                 </span>
               )}
+            </button>
+            {/* Pin controls */}
+            <button onClick={() => setControlsPinned(p => !p)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${controlsPinned ? 'text-nobuf-primary' : 'text-white/50'}`} title={controlsPinned ? 'Unpin controls (auto-hide)' : 'Pin controls (always show)'}>
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" style={{ transform: controlsPinned ? 'rotate(0deg)' : 'rotate(45deg)', transition: 'transform 200ms' }}>
+                <path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z" />
+              </svg>
             </button>
             {/* Close */}
             <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close (Esc)">
