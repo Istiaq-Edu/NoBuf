@@ -20,7 +20,7 @@ interface ProgressPayload {
 // cancellation flag and close its handle) then retry up to 3 times.
 function deleteCacheAfterCancel(messageId: number) {
     const tryDelete = (attempt: number) => {
-        invoke('cmd_delete_cache', { messageId }).catch(() => {
+        invoke('cmd_delete_cache', { messageId, reason: 'download-cancel-cleanup' }).catch(() => {
             if (attempt < 5) {
                 setTimeout(() => tryDelete(attempt + 1), 2000);
             }

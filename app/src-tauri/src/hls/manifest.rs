@@ -1595,51 +1595,177 @@ pub fn crc32_mpeg2(data: &[u8]) -> u32 {
 /// `pkt_end` is the end boundary (exclusive) for validation (typically pkt_offset + 188).
 ///
 /// Returns the number of stream entries rewritten.
-pub fn rewrite_pmt_stream_types(buf: &mut [u8], section_start: usize, pkt_end: usize) -> u32 {
-    if section_start + 12 >= pkt_end { return 0; }
+pub fn rewrite_pmt_stream_types(buf: &mut [u8], section_start: usize, pkt_end: usize) -> (u32, Vec<u16>) {
+    if section_start + 12 >= pkt_end { return (0, vec![]); }
 
     let table_id = buf[section_start];
-    if table_id != 0x02 { return 0; } // Not a PMT section
+    if table_id != 0x02 { return (0, vec![]); } // Not a PMT section
 
     let section_length = (((buf[section_start + 1] & 0x0F) as u16) << 8) | buf[section_start + 2] as u16;
     let program_info_length = (((buf[section_start + 10] & 0x0F) as u16) << 8) | buf[section_start + 11] as u16;
     let section_end_with_crc = section_start + 3 + section_length as usize;
     let crc_end = section_end_with_crc - 4;
 
-    if crc_end <= section_start || section_end_with_crc > pkt_end { return 0; }
+    if crc_end <= section_start || section_end_with_crc > pkt_end { return (0, vec![]); }
 
-    // Parse stream entries starting after program_info descriptors
+    // ─────────────────────────────────────────────────────────────────────────
+    // Two-pass approach:
+    //   Pass 1: classify every stream entry, detecting genuine ID3/timed-metadata
+    //           streams via:
+    //             (a) metadata_descriptor (tag 0x26) in the ES_info loop, OR
+    //             (b) "ID3 " (0x49 0x44 0x33 0x20) byte signature in ES_info, OR
+    //             (c) presence of a sibling audio stream (0x0F/0x03/0x04/0x11/0x81)
+    //                 — if the file already carries real audio, the 0x15 stream
+    //                 is metadata, not LATM-AAC.
+    //   Pass 2: rewrite only the 0x15 entries that did NOT match any of the
+    //           above signals (i.e. files that genuinely encode LATM-AAC at
+    //           stream_type=0x15, the case the original rewrite was added for).
+    //
+    // Why: the original blanket rewrite (0x15→0x11) corrupts files like
+    // LuluStream.ts where 0x15 is a real ID3 metadata track sitting next to
+    // real ADTS AAC at 0x0F. mpegts.js then treats the metadata stream as a
+    // second LOAS-AAC track, slotting phantom frames into the shared audio
+    // PTS counter (+1024/44100 = +23.22ms drift per overlap) until
+    // MEDIA_ERR_DECODE fires after ~100s.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    struct Entry { offset: usize, stream_type: u8, pid: u16, es_info_start: usize, es_info_len: usize }
+    let mut entries: Vec<Entry> = Vec::new();
     let mut pos = section_start + 12 + program_info_length as usize;
-    let mut rewritten = 0;
-
     while pos + 5 <= crc_end && pos + 5 <= pkt_end {
         let stream_type = buf[pos];
+        let pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
         let es_info_length = (((buf[pos + 3] & 0x0F) as u16) << 8) | buf[pos + 4] as u16;
+        let es_info_start = pos + 5;
+        let es_info_end = es_info_start + es_info_length as usize;
+        if es_info_end > crc_end || es_info_end > pkt_end { break; }
+        entries.push(Entry { offset: pos, stream_type, pid, es_info_start, es_info_len: es_info_length as usize });
+        pos = es_info_end;
+    }
 
-        for &(from, to) in REWRITE_STREAM_TYPES {
-            if stream_type == from {
-                let pid = ((buf[pos + 1] as u16 & 0x1F) << 8) | buf[pos + 2] as u16;
-                buf[pos] = to;
-                rewritten += 1;
-                log::debug!("[HLS-STREAM-TYPE] Rewrote stream_type 0x{:02X} → 0x{:02X} for PID 0x{:04X} in PMT",
-                    from, to, pid);
+    const REAL_AUDIO_TYPES: &[u8] = &[0x0F, 0x03, 0x04, 0x11, 0x81];
+    let has_real_audio = entries.iter().any(|e| REAL_AUDIO_TYPES.contains(&e.stream_type));
+
+    // Precompute ID3-metadata flag for each entry. We do this BEFORE the
+    // mutation loop because the check borrows `buf` immutably (reads
+    // es_info bytes), and the loop mutates `buf[entry.offset]`.
+    fn entry_is_id3_metadata(buf: &[u8], e: &Entry) -> bool {
+        if e.es_info_start + e.es_info_len > buf.len() { return false; }
+        let info = &buf[e.es_info_start..e.es_info_start + e.es_info_len];
+        let mut d = 0usize;
+        while d + 2 <= info.len() {
+            let tag = info[d];
+            let len = info[d + 1] as usize;
+            if d + 2 + len > info.len() { break; }
+            // 0x26 = metadata_descriptor, 0x25 = metadata_pointer_descriptor.
+            if tag == 0x26 || tag == 0x25 { return true; }
+            d += 2 + len;
+        }
+        // Fallback: scan the raw ES_info bytes for the literal "ID3 "
+        // identifier (some muxers don't use standard descriptor tags).
+        info.windows(4).any(|w| w == b"ID3 ")
+    }
+    let id3_flags: Vec<bool> = entries.iter().map(|e| entry_is_id3_metadata(buf, e)).collect();
+
+    let mut rewritten = 0u32;
+    let mut stripped_pids: Vec<u16> = Vec::new();
+
+    // Classify entries: keep or strip
+    let mut strip_flags: Vec<bool> = Vec::new();
+    let mut total_strip_bytes = 0usize;
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut should_strip = false;
+        for &(from, _to) in REWRITE_STREAM_TYPES {
+            if entry.stream_type != from { continue; }
+            let id3 = id3_flags[idx];
+            if has_real_audio || id3 {
+                should_strip = true;
+                let entry_len = 5 + entry.es_info_len;
+                total_strip_bytes += entry_len;
+                stripped_pids.push(entry.pid);
+                log::debug!(
+                    "[HLS-STREAM-TYPE] STRIP timed_id3 entry for PID 0x{:04X} from PMT ({} bytes): has_real_audio={} id3_metadata={}",
+                    entry.pid, entry_len, has_real_audio, id3
+                );
             }
         }
-
-        pos += 5 + es_info_length as usize;
+        strip_flags.push(should_strip);
     }
 
-    // Recalculate CRC-32 if any stream_types were changed
-    if rewritten > 0 {
-        let new_crc = crc32_mpeg2(&buf[section_start..crc_end]);
-        buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
-        buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
-        buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
-        buf[crc_end + 3] = (new_crc & 0xFF) as u8;
-        log::debug!("[HLS-STREAM-TYPE] PMT CRC recalculated after stream_type rewrite: 0x{:08X}", new_crc);
+    if total_strip_bytes > 0 {
+        // Rebuild stream entries section: copy only non-stripped entries
+        let entries_start = section_start + 12 + program_info_length as usize;
+        let mut write_pos = entries_start;
+        for (idx, entry) in entries.iter().enumerate() {
+            let entry_len = 5 + entry.es_info_len;
+            if strip_flags[idx] {
+                rewritten += 1;
+                continue; // skip stripped entry
+            }
+            // Apply LATM-AAC rewrite if needed (non-id3, non-real-audio 0x15)
+            let mut st = entry.stream_type;
+            for &(from, to) in REWRITE_STREAM_TYPES {
+                if st == from && !id3_flags[idx] && !has_real_audio {
+                    st = to;
+                    rewritten += 1;
+                }
+            }
+            if write_pos != entry.offset {
+                // Need to move this entry
+                for i in 0..entry_len {
+                    buf[write_pos + i] = buf[entry.offset + i];
+                }
+            }
+            buf[write_pos] = st; // write (possibly rewritten) stream_type
+            write_pos += entry_len;
+        }
+
+        // Adjust section_length
+        let new_section_length = section_length as usize - total_strip_bytes;
+        buf[section_start + 1] = (buf[section_start + 1] & 0xF0) | ((new_section_length >> 8) & 0x0F) as u8;
+        buf[section_start + 2] = (new_section_length & 0xFF) as u8;
+
+        // Write CRC at new position
+        let new_crc_end = section_start + 3 + new_section_length - 4;
+        let new_crc = crc32_mpeg2(&buf[section_start..new_crc_end]);
+        buf[new_crc_end] = ((new_crc >> 24) & 0xFF) as u8;
+        buf[new_crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
+        buf[new_crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
+        buf[new_crc_end + 3] = (new_crc & 0xFF) as u8;
+
+        // Fill freed tail with 0xFF stuffing
+        let stuff_start = new_crc_end + 4;
+        let stuff_end = section_end_with_crc.min(pkt_end);
+        for i in stuff_start..stuff_end {
+            buf[i] = 0xFF;
+        }
+        log::debug!("[HLS-STREAM-TYPE] PMT stripped {} bytes ({} entries), new section_length={}, CRC=0x{:08X}",
+            total_strip_bytes, strip_flags.iter().filter(|&&s| s).count(), new_section_length, new_crc);
+    } else {
+        // No stripping — apply in-place rewrites only
+        for (_idx, entry) in entries.iter().enumerate() {
+            for &(from, to) in REWRITE_STREAM_TYPES {
+                if entry.stream_type != from { continue; }
+                buf[entry.offset] = to;
+                rewritten += 1;
+                log::debug!(
+                    "[HLS-STREAM-TYPE] Rewrote stream_type 0x{:02X} → 0x{:02X} for PID 0x{:04X} in PMT (no ID3 descriptor, no sibling audio — assuming LATM-AAC)",
+                    from, to, entry.pid
+                );
+            }
+        }
+        if rewritten > 0 {
+            let new_crc = crc32_mpeg2(&buf[section_start..crc_end]);
+            buf[crc_end] = ((new_crc >> 24) & 0xFF) as u8;
+            buf[crc_end + 1] = ((new_crc >> 16) & 0xFF) as u8;
+            buf[crc_end + 2] = ((new_crc >> 8) & 0xFF) as u8;
+            buf[crc_end + 3] = (new_crc & 0xFF) as u8;
+            log::debug!("[HLS-STREAM-TYPE] PMT CRC recalculated after stream_type rewrite: 0x{:08X}", new_crc);
+        }
     }
 
-    rewritten
+    (rewritten, stripped_pids)
 }
 
 /// Extract media PIDs (video/audio) from the PMT section in a TS buffer.
@@ -2014,9 +2140,12 @@ pub fn ensure_init_prefix_no_rewrite(
                     let pointer_field = init_prefix_rewritten[payload_offset] as usize;
                     let section_start = payload_offset + 1 + pointer_field;
                     let pkt_end = pkt_offset + ps;
-                    let rewritten = rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_end);
+                    let (rewritten, stripped) = rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_end);
                     if rewritten > 0 {
-                        log::info!("[HLS-INIT] Rewrote {} stream_type(s) 0x15→0x11 in init-prefix PMT for msg {}", message_id, rewritten);
+                        log::info!("[HLS-INIT] Rewrote/stripped {} stream entry(s) in init-prefix PMT for msg {} (stripped PIDs: {:?})", message_id, rewritten, stripped);
+                    }
+                    if !stripped.is_empty() {
+                        cache_mgr.cache_stripped_pids(message_id, stripped);
                     }
                 }
                 cache_mgr.cache_init_prefix(message_id, init_prefix_rewritten.clone());
@@ -2057,7 +2186,7 @@ pub fn ensure_init_prefix_no_rewrite(
                     if payload_offset >= pkt_offset + ps { continue; }
                     let pointer_field = init_prefix_rewritten[payload_offset] as usize;
                     let section_start = payload_offset + 1 + pointer_field;
-                    rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_offset + ps);
+                    let _ = rewrite_pmt_stream_types(&mut init_prefix_rewritten, section_start, pkt_offset + ps);
                 }
                 cache_mgr.cache_init_prefix(message_id, init_prefix_rewritten.clone());
                 log::info!("[HLS-INIT] Cached init prefix (stream_type rewritten, raw fallback) for msg {}: {} bytes",

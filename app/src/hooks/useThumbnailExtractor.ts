@@ -28,6 +28,48 @@ const THUMBNAIL_WIDTH = 114;
 const THUMBNAIL_HEIGHT = 64;
 const BUCKET_SIZE = 2;
 const MAX_BUFFER_SIZE = 5000;
+
+// ─── Seek-in-progress suppression ─────────────────────────────────────
+// Prevents thumbnail capture from firing during seeks, which causes
+// concurrent fMP4 segment downloads that trigger FLOOD_PREMIUM_WAIT and
+// 503 errors. The __nobuf_userSeekInProgress flag is set true by
+// useMSEPlayer at seek start and cleared on seek completion. If the seek
+// completion callback never fires (component unmount, error), the flag
+// stays stuck — the 30s safety timeout below treats it as not-in-progress
+// so thumbnails resume. We do NOT mutate the global flag (other components
+// read it for cache polling suppression).
+let _seekFlagFirstSeen: number | null = null;
+
+function isSeekInProgress(): boolean {
+  // Check if a seek is actively executing (__nobuf_userSeekInProgress)
+  // OR if a seek was recently requested (__nobuf_seekRequestedAt covers
+  // the 400ms debounce window before _mpegtsUnbufferedSeek runs).
+  const executing = (window as any).__nobuf_userSeekInProgress === true;
+  const requestedAt = (window as any).__nobuf_seekRequestedAt || 0;
+  const requestedRecently = Date.now() - requestedAt < 30000; // covers debounce + execution + align poll (typically 5-15s)
+
+  if (!executing && !requestedRecently) {
+    _seekFlagFirstSeen = null;
+    return false;
+  }
+
+  // Stuck-flag safety only applies to __nobuf_userSeekInProgress
+  // (the debounce timestamp is transient and always cleared within 400ms).
+  if (executing) {
+    if (_seekFlagFirstSeen === null) {
+      _seekFlagFirstSeen = Date.now();
+    }
+    if (Date.now() - _seekFlagFirstSeen > 30000) {
+      _seekFlagFirstSeen = null;
+      return false;
+    }
+    return true;
+  }
+
+  // requestedRecently but not executing — suppress thumbnails
+  return true;
+}
+
 const CAPTURE_DELAY_MS = 2000;
 const MIN_HOVER_FETCH_SIZE = 256 * 1024; // 256KB minimum per hover position
 const MAX_HOVER_FETCH_SIZE = 5 * 1024 * 1024; // 5MB maximum — covers large keyframe gaps
@@ -1939,6 +1981,15 @@ export function useThumbnailExtractor(
           // segments from the server by timestamp, no byte-offset seeking needed.
           if (transmuxerPipeline && getters && getters.getFormat() === 'ts' && !getters.isFmp4Stream() && !getters.keyframeIndexReady) {
             await new Promise(r => setTimeout(r, 200));
+            continue;
+          }
+
+          // Suppress thumbnail capture during seeks — prevents concurrent
+          // fMP4 segment downloads that trigger FLOOD_PREMIUM_WAIT and 503
+          // errors. The 30s stuck-flag safety in isSeekInProgress() ensures
+          // thumbnails resume even if the seek completion callback never fires.
+          if (isSeekInProgress()) {
+            await new Promise(r => setTimeout(r, 500));
             continue;
           }
 

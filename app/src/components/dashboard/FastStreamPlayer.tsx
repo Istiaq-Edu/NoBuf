@@ -138,6 +138,8 @@ interface FastStreamPlayerProps {
     keyframeIndexReady: msePlayer.keyframeIndexReady,
     coldStartProgress: msePlayer.coldStartProgress,
     isColdStartBuffering: msePlayer.isColdStartBuffering,
+    coldStartPhase: msePlayer.coldStartPhase,
+    detectedFormat: msePlayer.detectedFormat,
     getMoovBuffer: msePlayer.getMoovBuffer,
     getFirstChunk: msePlayer.getFirstChunk,
     getInitSegments: msePlayer.getInitSegments,
@@ -178,12 +180,23 @@ interface FastStreamPlayerProps {
     keyframeIndexReady: _keyframeIndexReady,
     isColdStartBuffering,
     coldStartProgress,
+    coldStartPhase,
+    detectedFormat,
   } = player;
 
   // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
   // snap off the moment the buffer gate completes. Playback starts immediately
   // underneath the overlay; the overlay is purely informational progress.
   const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
+  // Dedicated overlay for the remux fallback path (TS files with timed_id3).
+  // Covers the full startup pipeline: metadata fetch + ffprobe + ffmpeg spawn +
+  // first fMP4 fragments. The cold-start overlay only covers the mpegts.js 5MB
+  // prebuffer — it hides at ~2s, but remux video isn't ready for 5-10s. This
+  // state stays true until onPlay fires (video actually playing) or a 15s
+  // safety timeout prevents a stuck overlay if playback never starts.
+  const [isRemuxLoading, setIsRemuxLoading] = useState(false);
+  const isRemuxLoadingRef = useRef(false);
+  isRemuxLoadingRef.current = isRemuxLoading;
   // Ref mirror so event handlers (onMeta/onCanPlay) inside the useEffect
   // closure can check the current cold-start state without re-registering.
   // Without this, the handlers capture a stale `isColdStartBuffering=false`
@@ -265,7 +278,7 @@ interface FastStreamPlayerProps {
       if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
         onClose();
         const tryDelete = (attempt: number) => {
-          invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+          invoke('cmd_delete_cache', { messageId: file.id, reason: 'player-close-zero-cache' }).catch(() => {
             if (attempt < 5) {
               setTimeout(() => tryDelete(attempt + 1), 2000);
             }
@@ -290,7 +303,7 @@ interface FastStreamPlayerProps {
     // to drop its StreamingGuard and file handle. cmd_delete_cache now returns
     // an error when streaming is still active, so retries properly handle this.
     const tryDelete = (attempt: number) => {
-      invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+      invoke('cmd_delete_cache', { messageId: file.id, reason: 'cache-dialog-discard' }).catch(() => {
         if (attempt < 5) {
           setTimeout(() => tryDelete(attempt + 1), 2000);
         }
@@ -603,10 +616,12 @@ interface FastStreamPlayerProps {
         if (knownDuration <= 0 && (window as any).__nobuf_ptsDuration > 0) {
           knownDuration = (window as any).__nobuf_ptsDuration;
         }
-        // Priority 3: Bitrate estimation from file size (unreliable for TS)
-        if (knownDuration <= 0 && file.size > 0) {
-          knownDuration = (file.size / 4_000_000) * 8; // bits / bitrate = seconds
-        }
+        // NO Priority 3 (4Mbps estimate) for the remux path — it poisons durRef
+        // with ~38min before the fetch resolves, causing the "live-stream" growing
+        // duration. If no authoritative duration is available yet, leave durRef
+        // at 0 and let onDurChange set it once __nobuf_ptsDuration arrives.
+        // The onDurChange suppression guard (isRemux && realDuration <= 0 → return)
+        // keeps the displayed duration at 0:00 until the real value is known.
         if (knownDuration > 0) {
           console.log('[Player] Remux: overriding duration to', knownDuration.toFixed(1), 's');
           setDur(knownDuration);
@@ -617,6 +632,21 @@ interface FastStreamPlayerProps {
       v.src = nativeUrl;
       setLastVideoSrc(nativeUrl);
       v.autoplay = true;
+      // Show the remux loading overlay — covers download + ffprobe + ffmpeg startup +
+      // first fragments. Hidden by onPlay (video actually playing) or timeout.
+      // For large uncached files the backend must: download → ffprobe → ffmpeg start →
+      // produce first fMP4 fragment → browser decode → fire play. 45s covers 1GB+ files.
+      if (nativeUrl === playerRemuxUrl) {
+        setIsRemuxLoading(true);
+        const remuxTimeoutId = setTimeout(() => {
+          if (isRemuxLoadingRef.current) {
+            console.warn('[Player] Remux loading timeout (45s) — hiding overlay');
+            setIsRemuxLoading(false);
+          }
+        }, 45000);
+        // Store timeout id on the video element so onPlay/onErr can clear it
+        (v as any).__nobuf_remuxTimeoutId = remuxTimeoutId;
+      }
     } else {
       // MSE mode (ALL formats): use Blob URL
       // For mpegts.js (TS files), mseUrl is null because mpegts.js creates
@@ -682,11 +712,17 @@ interface FastStreamPlayerProps {
         // overwrite it. For cached mode, video.duration is correct from faststart moov.
         // For mpegts.js, if the only duration we have is the 4 Mbps estimate, keep
         // the UI at 0:00 until the real PTS duration arrives.
-        const isRemux = lastVideoSrc === playerRemuxUrl;
+        const isRemux = lastVideoSrc === playerRemuxUrl || v.src?.includes('/remux/');
         const realDuration = (file?.duration && file.duration > 0 && isFinite(file.duration))
           ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
         const isEstimate = (window as any).__nobuf_durationIsEstimate === true && realDuration <= 0;
-        if (!isRemux || v.duration > durRef.current) {
+
+        // On remux: if authoritative duration is known, use it immediately — don't
+        // let the bogus empty_moov duration (5s, 10s, etc.) flash in the UI.
+        if (isRemux && realDuration > 0) {
+          setDur(realDuration);
+          durRef.current = realDuration;
+        } else if (!isRemux || v.duration > durRef.current) {
           if (isEstimate) {
             (window as any).__nobuf_estimateDuration = v.duration;
           } else {
@@ -705,7 +741,12 @@ interface FastStreamPlayerProps {
       // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
       // is cached. Starting here would play under the overlay with thin buffer.
       if (!coldStartBufferingRef.current) {
-        v.play().catch((e) => console.warn('[Player] play() failed:', e));
+        // Don't auto-play during deferred VBR check — the align poll will play()
+        // after confirming the position is correct (or after VBR correction)
+        if ((window as any).__nobuf_seekTargetTime > 0) return;
+        v.play().catch((e: any) => {
+          if (e?.name !== 'AbortError') console.warn('[Player] play() failed:', e);
+        });
       }
     };
     const onCanPlay = () => {
@@ -723,18 +764,41 @@ interface FastStreamPlayerProps {
       if (videoEndedRef.current) return;
       // Same cold-start gate as onMeta — don't play before the buffer gate.
       if (coldStartBufferingRef.current) return;
+      // Don't auto-play during deferred VBR check
+      if ((window as any).__nobuf_seekTargetTime > 0) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
       const err = v.error;
       console.error('[Player] video error:', err?.code, err?.message, 'src:', v.src);
+      // Clear remux loading overlay on error — don't keep it stuck
+      if (isRemuxLoadingRef.current) {
+        setIsRemuxLoading(false);
+      }
+      if ((v as any).__nobuf_remuxTimeoutId) {
+        clearTimeout((v as any).__nobuf_remuxTimeoutId);
+        (v as any).__nobuf_remuxTimeoutId = null;
+      }
       setErr(playerError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
     const onTime = () => {
       const ct = v.currentTime;
       if (!isFinite(ct)) return; // guard against NaN after eviction/resume
-      setTime(ct);
+      // During player recreation, hold the bar at the seek target.
+      // Hold when ct is BELOW target (forward seek / recreation ct=0)
+      // OR when ct is far ABOVE target (backward seek — stale old buffer ct).
+      // Don't clear during active recreation — wait for align poll.
+      const seekTarget = (window as any).__nobuf_seekTargetTime;
+      const seekInProgress = (window as any).__nobuf_userSeekInProgress === true;
+      if (seekTarget > 0 && (seekInProgress || ct < seekTarget - 2 || ct > seekTarget + 20)) {
+        setTime(seekTarget);
+      } else {
+        if (seekTarget > 0) {
+          (window as any).__nobuf_seekTargetTime = 0; // seek complete — clear
+        }
+        setTime(ct);
+      }
       // Get the furthest buffered position
       if (v.buffered.length > 0) {
         let maxBuf = 0;
@@ -751,6 +815,14 @@ interface FastStreamPlayerProps {
       setBufferedRanges(ranges);
     };
     const onPlay = () => {
+      // Clear remux loading overlay — video is actually playing now
+      if (isRemuxLoadingRef.current) {
+        setIsRemuxLoading(false);
+      }
+      if ((v as any).__nobuf_remuxTimeoutId) {
+        clearTimeout((v as any).__nobuf_remuxTimeoutId);
+        (v as any).__nobuf_remuxTimeoutId = null;
+      }
       setPlaying(true);
       // Only clear videoEnded if the video is NOT at the end.
       // When the MSE guard dispatches a synthetic 'ended' event, it also
@@ -811,7 +883,16 @@ interface FastStreamPlayerProps {
         ? file.duration
         : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
 
-      const isRemux = lastVideoSrc === playerRemuxUrl;
+      const isRemux = lastVideoSrc === playerRemuxUrl || v.src?.includes('/remux/');
+
+      // On remux fallback: suppress fragment-growing duration (5→10→20→49s) and
+      // the 4Mbps estimate until the backend PTS duration arrives. The cold-start
+      // overlay hides the video during the fetch; this guard prevents durRef from
+      // being polluted underneath. Once __nobuf_ptsDuration is set, realDuration > 0
+      // and the floor guard below clamps correctly from the first real event.
+      if (isRemux && realDuration <= 0 && isFinite(v.duration) && v.duration > 0) {
+        return;
+      }
 
       if (isFinite(v.duration) && v.duration > 0) {
         // Overflow guard: mpegts.js can report ~2^32/1000 ≈ 4294967s after aborts.
@@ -822,6 +903,13 @@ interface FastStreamPlayerProps {
         // duration from the current buffer only (e.g., 153s instead of 2073s),
         // restore the authoritative value.
         const safeDur = (realDuration > 0 && clampedDur < realDuration) ? realDuration : clampedDur;
+
+        // Early exit: if we already have this duration set, nothing to do.
+        // fMP4 empty_moov streams fire durationchange on every fragment arrival —
+        // without this guard we'd log thousands of no-op corrections.
+        if (durRef.current > 0 && Math.abs(safeDur - durRef.current) < 0.01) {
+          return;
+        }
 
         if (!isRemux || safeDur > durRef.current) {
           const isEstimate = (window as any).__nobuf_durationIsEstimate === true;
@@ -1123,6 +1211,7 @@ interface FastStreamPlayerProps {
       setPlaying(false);
       setLoad(false);
     } else {
+      setTime(targetTime); // Instant UI update before debounce/recreation
       seekTo(targetTime);
     }
   }, [dur, playerUseNative, seekTo]);
@@ -1244,23 +1333,56 @@ interface FastStreamPlayerProps {
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
         )}
-        {/* Cold-start optimization overlay — hidden as soon as the byte target is reached */}
-        {showColdStartOverlay && !err && (
-          <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${isColdStartBuffering ? 'opacity-100' : 'opacity-0'}`}>
+        {/* Cold-start optimization overlay — phase-aware messaging with dynamic progress */}
+        {(showColdStartOverlay || isRemuxLoading) && !err && (
+          <div className={`absolute inset-x-0 top-0 bottom-16 flex items-center justify-center z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">
-              <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
-              <div className="text-center">
-                <div className="text-white text-lg font-semibold mb-1">Optimizing video for No Buffer playback</div>
-                <div className="text-white/60 text-sm font-mono">
-                  {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+              {/* Spinner */}
+              <div className="relative w-16 h-16">
+                <div className="absolute inset-0 border-4 border-nobuf-primary/20 rounded-full" />
+                <div className="absolute inset-0 border-4 border-transparent border-t-nobuf-primary rounded-full animate-spin" />
+                {/* Format badge */}
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span className="text-nobuf-primary text-xs font-bold uppercase tracking-wider">
+                    {detectedFormat === 'ts' ? 'TS' : detectedFormat === 'mp4' ? 'MP4' : detectedFormat === 'mkv' ? 'MKV' : ''}
+                  </span>
                 </div>
               </div>
-              <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-nobuf-primary rounded-full transition-all duration-300"
-                  style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
-                />
+              {/* Phase-aware title + subtitle */}
+              <div className="text-center">
+                <div className="text-white text-lg font-semibold mb-1">
+                  {coldStartPhase === 'fetching_metadata' ? 'Reading video metadata' :
+                   coldStartPhase === 'buffering' ? 'Optimizing for smooth playback' :
+                   coldStartPhase === 'initializing_player' ? 'Preparing video stream' :
+                   'Preparing video'}
+                </div>
+                <div className="text-white/50 text-sm">
+                  {coldStartPhase === 'fetching_metadata' ? 'Locating video structure for instant start' :
+                   coldStartPhase === 'buffering' ? 'Pre-loading data to prevent buffering' :
+                   coldStartPhase === 'initializing_player' ? 'Converting format for seamless playback' :
+                   'Ensuring buffer-free experience'}
+                </div>
               </div>
+              {/* Progress bar — only for buffering phase with known target */}
+              {coldStartProgress.targetBytes > 0 && coldStartPhase === 'buffering' && (
+                <>
+                  <div className="text-white/60 text-sm font-mono">
+                    {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+                  </div>
+                  <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-nobuf-primary to-nobuf-primary/70 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
+                    />
+                  </div>
+                </>
+              )}
+              {/* Indeterminate bar for metadata or initializing phase */}
+              {(coldStartPhase === 'fetching_metadata' || coldStartPhase === 'initializing_player') && (
+                <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-nobuf-primary to-transparent rounded-full animate-[shimmer_1.5s_ease-in-out_infinite]" />
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -14,6 +14,7 @@ declare global {
     __nobuf_ptsDuration?: number;
     __nobuf_durationIsEstimate?: boolean;
     __nobuf_estimateDuration?: number;
+    __nobuf_seekRequestedAt?: number;
   }
 }
 
