@@ -4131,8 +4131,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 diagLog(`[MPEGTS] Recreate VBR keyframe cached: ${bufStart.toFixed(1)}s -> byte ${byteOffset}`);
               }
               clearInterval(alignIv);
-              // Clear seek-in-progress so timeupdate uses real currentTime
-              (window as any).__nobuf_seekTargetTime = 0;
+              // DON'T clear seekTargetTime here — let onTime handler clear it
+              // when currentTime catches up within 2s. Clearing it here would
+              // cause a visible bar jump if bufStart differs from the target.
               // If play was deferred (depth=0 first attempt), start playback now
               if (v && v.paused) v.play().catch(() => {});
             }
