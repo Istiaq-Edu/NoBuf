@@ -778,7 +778,21 @@ interface FastStreamPlayerProps {
     const onTime = () => {
       const ct = v.currentTime;
       if (!isFinite(ct)) return; // guard against NaN after eviction/resume
-      setTime(ct);
+      // During player recreation for seek, v.currentTime may report 0 or a
+      // stale value before the new MSE buffer arrives. Use the stored seek
+      // target to keep the progress bar at the correct position.
+      // This covers: (1) the 400ms debounce wait, (2) recreation window
+      // before buffer data arrives, and (3) backward seeks where ct is
+      // ahead of the target from the old buffer.
+      const seekTarget = (window as any).__nobuf_seekTargetTime;
+      if (seekTarget > 0 && Math.abs(ct - seekTarget) > 5) {
+        setTime(seekTarget);
+      } else {
+        if (seekTarget > 0 && Math.abs(ct - seekTarget) <= 5) {
+          (window as any).__nobuf_seekTargetTime = 0; // buffer caught up — clear
+        }
+        setTime(ct);
+      }
       // Get the furthest buffered position
       if (v.buffered.length > 0) {
         let maxBuf = 0;
@@ -1191,6 +1205,7 @@ interface FastStreamPlayerProps {
       setPlaying(false);
       setLoad(false);
     } else {
+      setTime(targetTime); // Instant UI update before debounce/recreation
       seekTo(targetTime);
     }
   }, [dur, playerUseNative, seekTo]);

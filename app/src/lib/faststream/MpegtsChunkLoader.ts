@@ -58,6 +58,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
     private _postSeekFirstChunkSize: number;
     private _shadowCache: StreamShadowCache | null;
     private _isSeekStart = false;
+    private _pumpGen = 0;
 
     static isSupported() {
       return typeof self !== 'undefined' && typeof self.fetch === 'function' && typeof self.ReadableStream === 'function' && typeof self.AbortController === 'function';
@@ -91,12 +92,14 @@ export function createChunkedFetchLoader(mpegts: any): any {
       this._currentByte = range.from || 0;
       this._isFirstChunk = this._currentByte === 0;
       this._isSeekStart = !this._isFirstChunk;
+      // Bump generation so any previous _pumpChunks loop bails on next iteration
+      const gen = ++this._pumpGen;
 
       if (this._fileLength > 0) {
         this._onContentLengthKnown(this._fileLength);
       }
 
-      this._pumpChunks();
+      this._pumpChunks(gen);
     }
 
     abort() {
@@ -114,11 +117,11 @@ export function createChunkedFetchLoader(mpegts: any): any {
       return this._chunkSize;
     }
 
-    private async _pumpChunks(): Promise<void> {
-      if (this._requestAbort) return;
+    private async _pumpChunks(gen: number): Promise<void> {
+      if (this._requestAbort || gen !== this._pumpGen) return;
 
       while (true) {
-        if (this._requestAbort) return;
+        if (this._requestAbort || gen !== this._pumpGen) return;
 
         const from = this._currentByte;
         if (this._fileLength > 0 && from >= this._fileLength) {
@@ -138,8 +141,9 @@ export function createChunkedFetchLoader(mpegts: any): any {
             try {
               this._onDataArrival(cached, from, cached.byteLength);
             } catch (err: any) {
+              if (gen !== this._pumpGen) return; // stale pump — player already replaced
               this._status = mpegts.LoaderStatus.kError;
-              this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message });
+              try { this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message }); } catch (_) {}
               return;
             }
             this._currentByte = to + 1;
@@ -150,8 +154,8 @@ export function createChunkedFetchLoader(mpegts: any): any {
             // transmuxer pipeline (TSDemuxer → MP4Remuxer → SourceBuffer.appendBuffer),
             // blocking the main thread and freezing the UI.
             await new Promise<void>(resolve => setTimeout(resolve, 0));
-            // Hard-stop: if a fatal decode error occurred, stop serving cache chunks too
-            if ((window as any).__nobuf_mpegtsFatalAbort) return;
+            // Hard-stop: if a fatal decode error occurred, stop feeding data to transmuxer
+            if ((window as any).__nobuf_mpegtsFatalAbort || gen !== this._pumpGen) return;
             continue;
           }
         }
@@ -159,9 +163,9 @@ export function createChunkedFetchLoader(mpegts: any): any {
         try {
           await this._fetchRange(from, to);
         } catch (err: any) {
-          if (this._requestAbort || err.name === 'AbortError') return;
+          if (this._requestAbort || err.name === 'AbortError' || gen !== this._pumpGen) return;
           this._status = mpegts.LoaderStatus.kError;
-          this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message });
+          try { this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message }); } catch (_) {}
           return;
         }
       }
@@ -218,7 +222,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
           this._onDataArrival(chunk, offset, chunk.byteLength);
         } catch (err: any) {
           this._status = mpegts.LoaderStatus.kError;
-          this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message });
+          try { this._onError(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: err.message }); } catch (_) {}
           await reader.cancel().catch(() => {});
           return;
         }
