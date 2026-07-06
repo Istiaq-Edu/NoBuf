@@ -741,8 +741,10 @@ interface FastStreamPlayerProps {
       // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
       // is cached. Starting here would play under the overlay with thin buffer.
       if (!coldStartBufferingRef.current) {
+        // Don't auto-play during deferred VBR check — the align poll will play()
+        // after confirming the position is correct (or after VBR correction)
+        if ((window as any).__nobuf_seekTargetTime > 0) return;
         v.play().catch((e: any) => {
-          // AbortError is expected during VBR correction (old player destroyed mid-play)
           if (e?.name !== 'AbortError') console.warn('[Player] play() failed:', e);
         });
       }
@@ -762,6 +764,8 @@ interface FastStreamPlayerProps {
       if (videoEndedRef.current) return;
       // Same cold-start gate as onMeta — don't play before the buffer gate.
       if (coldStartBufferingRef.current) return;
+      // Don't auto-play during deferred VBR check
+      if ((window as any).__nobuf_seekTargetTime > 0) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
@@ -781,18 +785,17 @@ interface FastStreamPlayerProps {
     const onTime = () => {
       const ct = v.currentTime;
       if (!isFinite(ct)) return; // guard against NaN after eviction/resume
-      // During player recreation for seek, v.currentTime may report 0 or a
-      // stale value before the new MSE buffer arrives. Use the stored seek
-      // target to keep the progress bar at the correct position.
-      // This covers: (1) the 400ms debounce wait, (2) recreation window
-      // before buffer data arrives, and (3) backward seeks where ct is
-      // ahead of the target from the old buffer.
+      // During player recreation, hold the bar at the seek target.
+      // Hold when ct is BELOW target (forward seek / recreation ct=0)
+      // OR when ct is far ABOVE target (backward seek — stale old buffer ct).
+      // Don't clear during active recreation — wait for align poll.
       const seekTarget = (window as any).__nobuf_seekTargetTime;
-      if (seekTarget > 0 && Math.abs(ct - seekTarget) > 5) {
+      const seekInProgress = (window as any).__nobuf_userSeekInProgress === true;
+      if (seekTarget > 0 && (seekInProgress || ct < seekTarget - 2 || ct > seekTarget + 20)) {
         setTime(seekTarget);
       } else {
-        if (seekTarget > 0 && Math.abs(ct - seekTarget) <= 5) {
-          (window as any).__nobuf_seekTargetTime = 0; // buffer caught up — clear
+        if (seekTarget > 0) {
+          (window as any).__nobuf_seekTargetTime = 0; // seek complete — clear
         }
         setTime(ct);
       }
