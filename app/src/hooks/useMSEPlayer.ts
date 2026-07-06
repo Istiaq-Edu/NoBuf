@@ -3893,6 +3893,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const oldPlayer = mpegtsPlayerRef.current;
     if (oldPlayer) {
       try {
+        // Pause video before detach — cancels mpegts.js SeekingHandler's
+        // _pollAndApplyUnbufferedSeek setTimeout, which would otherwise fire
+        // after detachMediaElement nulls _mediaElement → TypeError on .currentTime
+        if (video && !video.paused) video.pause();
         oldPlayer.detachMediaElement();
         oldPlayer.unload();
         oldPlayer.destroy();
@@ -4074,7 +4078,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const alignGen = gen; // capture for closure
           let alignTicks = 0;
           const vbrAttempts = vbrDepth ?? 0;
-          const MAX_VBR_ATTEMPTS = 2;
+          const MAX_VBR_ATTEMPTS = 1;
           const alignIv = setInterval(() => {
             alignTicks++;
             // Bail if superseded or unmounted
@@ -4086,9 +4090,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               const bufStart = v.buffered.start(0);
               const gap = bufStart - timeSeconds;
 
-              // VBR correction: buffer landed >15s from target (10s would
+              // VBR correction: buffer landed >20s from target (15s would
               // false-trigger on legitimate GOP keyframe distance in large-GOP files)
-              if (Math.abs(gap) > 15 && vbrAttempts < MAX_VBR_ATTEMPTS && dur > 0 && fs > 0) {
+              if (Math.abs(gap) > 20 && vbrAttempts < MAX_VBR_ATTEMPTS && dur > 0 && fs > 0) {
                 // Use LOCAL bitrate from actual data: byteOffset → bufStart gives
                 // the real byte-per-second ratio at this file position. This is far
                 // more accurate than average bitrate for VBR content.
@@ -4129,6 +4133,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               clearInterval(alignIv);
               // Clear seek-in-progress so timeupdate uses real currentTime
               (window as any).__nobuf_seekTargetTime = 0;
+              // If play was deferred (depth=0 first attempt), start playback now
+              if (v && v.paused) v.play().catch(() => {});
             }
           }, 500);
         }
@@ -4146,18 +4152,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         mpegtsDurationRef.current = dur;
       }
 
-      // Fire-and-forget play — do NOT await. Awaiting play() blocks until the
-      // browser buffers enough data, which takes 5-15s on Telegram downloads.
-      // During that time, new seeks queue up and then crash because they find
-      // a stale player mid-await. The play promise rejection (AbortError when
-      // a newer seek destroys this player) is harmless.
-      const playResult = newPlayer.play();
-      if (playResult && typeof playResult.catch === 'function') {
-        playResult.catch((_: any) => {
-          // AbortError from a superseding seek — expected and harmless
-        });
+      // Fire-and-forget play — but DEFER on first attempt to avoid VBR flicker.
+      // On depth=0 (first try, VBR error unknown), we pause and let the align poll
+      // decide: if VBR correction fires, the user never sees wrong content. If no
+      // correction needed, the align poll calls play() after aligning.
+      // On depth>=1 (VBR-corrected), play immediately — the position is already close.
+      const deferPlay = (vbrDepth ?? 0) === 0;
+      if (!deferPlay) {
+        const playResult = newPlayer.play();
+        if (playResult && typeof playResult.catch === 'function') {
+          playResult.catch((_: any) => {});
+        }
+        diagLog(`[MPEGTS] Recreated player — play() fired for ${timeSeconds.toFixed(1)}s`);
+      } else {
+        // Pause to prevent showing wrong content; align poll will play() after check
+        if (video && !video.paused) video.pause();
+        diagLog(`[MPEGTS] Recreated player — deferred play for VBR check at ${timeSeconds.toFixed(1)}s`);
       }
-      diagLog(`[MPEGTS] Recreated player — play() fired for ${timeSeconds.toFixed(1)}s`);
 
     } catch (e: any) {
       diagLog(`[MPEGTS] Player recreation failed: ${e.message}`);
