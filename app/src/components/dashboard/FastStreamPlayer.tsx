@@ -163,11 +163,11 @@ interface FastStreamPlayerProps {
     prefetchedBytes: _prefetchedBytes,
     totalBytes,
     isPrefetching: _isPrefetching,
-    isPaused: _prefetchPaused,
+    isPaused: prefetchPaused,
     isComplete: prefetchComplete,
     speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
-    pausePrefetch: _pausePrefetch,
-    resumePrefetch: _resumePrefetch,
+    pausePrefetch,
+    resumePrefetch,
     seekTo,
     suppressLoadingSpinnerRef,
     setVideoRef,
@@ -1392,7 +1392,20 @@ interface FastStreamPlayerProps {
       {/* Persistent mini progress bar + speed — visible when controls are hidden */}
       {miniBarVisible && !err && dur > 0 && (
         <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none transition-opacity duration-300">
-          <div className="flex items-center justify-end px-2 pb-0.5">
+          <div className="flex items-center justify-end gap-1 px-2 pb-0.5">
+            {!prefetchComplete && (
+              <button
+                onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
+                className="pointer-events-auto hover:bg-white/10 rounded p-0.5"
+                title={prefetchPaused ? 'Resume buffering' : 'Pause buffering'}
+              >
+                {prefetchPaused ? (
+                  <svg className="w-3 h-3 text-white/60" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                ) : (
+                  <svg className="w-3 h-3 text-white/60" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                )}
+              </button>
+            )}
             <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
               {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
             </span>
@@ -1609,7 +1622,22 @@ interface FastStreamPlayerProps {
                 : 'text-red-400';
 
               return (
-                <div className="flex items-center gap-2 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
+                  {/* Play/Pause prebuffer */}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
+                    className={`hover:bg-white/10 rounded p-0.5 ${prefetchComplete ? 'cursor-default' : ''}`}
+                    disabled={prefetchComplete}
+                    title={prefetchComplete ? 'Buffering complete' : prefetchPaused ? 'Resume buffering' : 'Pause buffering'}
+                  >
+                    {prefetchComplete ? (
+                      <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
+                    ) : prefetchPaused ? (
+                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                    ) : (
+                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                    )}
+                  </button>
                   {/* Download speed */}
                   <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
                     {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
@@ -1618,9 +1646,6 @@ interface FastStreamPlayerProps {
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
                     {totalAhead >= 60 ? `${(totalAhead / 60).toFixed(1)}m` : `${totalAhead.toFixed(0)}s`}
                   </span>
-                  {prefetchComplete && (
-                    <svg className="w-3 h-3 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
-                  )}
                 </div>
               );
             })()}
