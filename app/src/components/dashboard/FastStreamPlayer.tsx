@@ -1531,7 +1531,7 @@ interface FastStreamPlayerProps {
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {
             const barWidth = barRef.current?.getBoundingClientRect().width ?? 0;
-            const tooltipHalf = 60;
+            const tooltipHalf = 120;
             const clampedX = Math.max(tooltipHalf, Math.min(tip.x, barWidth - tooltipHalf));
             return (
               <div className="absolute pointer-events-none flex flex-col items-center" style={{ left: clampedX, bottom: '100%', marginBottom: '8px', transform: 'translateX(-50%)' }}>
@@ -1539,11 +1539,11 @@ interface FastStreamPlayerProps {
                   <img
                     src={thumbUrl}
                     className="rounded overflow-hidden border border-white/20 mb-1 shadow-lg"
-                    style={{ width: 114, height: 64, objectFit: 'cover' }}
+                    style={{ width: 228, height: 128, objectFit: 'cover' }}
                     alt=""
                   />
                 ) : thumbLoading ? (
-                  <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
+                  <div className="w-[228px] h-[128px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
                   </div>
                 ) : null}

@@ -24,8 +24,8 @@ import { createOffsetTauriStreamSource, type TSKeyframeEntry } from '../lib/fast
  * - FIFO eviction at 5000 entries (~166 min at 2s intervals)
  */
 
-const THUMBNAIL_WIDTH = 114;
-const THUMBNAIL_HEIGHT = 64;
+const THUMBNAIL_WIDTH = 228;
+const THUMBNAIL_HEIGHT = 128;
 const BUCKET_SIZE = 2;
 const MAX_BUFFER_SIZE = 5000;
 
