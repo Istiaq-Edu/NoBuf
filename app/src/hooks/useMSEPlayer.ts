@@ -3067,6 +3067,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  after the target time.
    */
   const _mpegtsUnbufferedSeek = async (timeSeconds: number, duration: number, correctedByteOffset?: number, vbrDepth?: number) => {
+    // Any unbuffered seek implies downloading must resume — clear pause state
+    // so the UI icon updates correctly (e.g. seek while prebuffer paused).
+    if (isPausedRef.current) {
+      isPausedRef.current = false;
+      setIsPaused(false);
+      setIsPrefetching(true);
+    }
     // Set the seek-in-progress flag IMMEDIATELY — before any await — so that
     // concurrent seekTo() calls see it as true and skip. Without this, the
     // SourceBuffer await below creates a window where the flag is still false,
@@ -3904,7 +3911,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       mpegtsPlayerRef.current = null;
     }
 
-    // 2. Create new player with a URL that includes the start offset
+    // Yield to let GC reclaim old player's ArrayBuffers/SourceBuffers
+    // before allocating new ones — prevents OOM on rapid recreations
+    await new Promise<void>(r => setTimeout(r, 0));
+    if (gen !== mpegtsRecreationGenRef.current) return;
+
+    // 2. Create new player
     //    We use mpegts.js's built-in Range seek: after load(), we immediately
     //    call IOController.open(byteOffset) to start from the target offset.
     try {
@@ -3991,8 +4003,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         } catch (_) {}
       }
 
+      let oomRecoveryScheduled = false;
       newPlayer.on(MpegtsPlayer.Events.ERROR, (_type: string, detail: string) => {
         diagLog(`[MPEGTS] Recreated player error: ${detail}`);
+        // OOM recovery: when ArrayBuffer allocation fails (memory pressure from
+        // rapid player recreations), wait for GC then retry seek to same position
+        if (!oomRecoveryScheduled && detail && detail.indexOf('Array buffer allocation failed') !== -1) {
+          oomRecoveryScheduled = true;
+          const v = videoRef.current;
+          const ct = v ? v.currentTime : timeSeconds;
+          const d = mpegtsDurationRef.current || state.current.duration || 0;
+          diagLog(`[MPEGTS] OOM detected — scheduling recovery seek to ${ct.toFixed(1)}s`);
+          setTimeout(() => {
+            if (mpegtsPlayerRef.current) {
+              _mpegtsUnbufferedSeek(ct, d);
+            }
+          }, 500);
+        }
       });
 
       if (shadowCacheRef.current) {
@@ -5976,16 +6003,82 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       clearTimeout(seekDebounceTimerRef.current);
       seekDebounceTimerRef.current = null;
     }
+    // TS files: pause the mpegts.js IOController to stop downloading.
+    // This aborts the HTTP connection to /remux/ (killing the ffmpeg pipe).
+    // On resume, we use _mpegtsUnbufferedSeek(currentTime) to restart from
+    // the correct position via /remux/?ss=X — we CANNOT use ioctl.resume()
+    // because it calls _internalSeek which opens a new /remux/ request
+    // without ?ss, restarting ffmpeg from byte 0 → DTS mismatch.
+    const player = mpegtsPlayerRef.current as any;
+    if (player) {
+      const ioctl = player._player_engine?._transmuxer?._controller?._ioctl;
+      if (ioctl && !ioctl._paused) {
+        try { ioctl.pause(); } catch (_) {}
+      }
+    }
+    // Stop proactive prebuffer (Rust backend)
+    const ppMsgId = proactivePrebufferMsgIdRef.current;
+    if (ppMsgId) {
+      invoke('cmd_stop_proactive_prebuffer', { messageId: ppMsgId }).catch(() => {});
+    }
+    if (proactiveIntervalRef.current) {
+      clearInterval(proactiveIntervalRef.current);
+      proactiveIntervalRef.current = null;
+    }
     setIsPaused(true);
     setIsPrefetching(false);
     setSpeed(0);
   };
 
   const resumePrefetch = () => {
+    isPausedRef.current = false;
+    setIsPaused(false);
+    setIsPrefetching(true);
+
+    // TS files: resume by seeking to the current playback position.
+    // ioctl.resume() is broken for /remux/ URLs (restarts ffmpeg from byte 0).
+    // Instead, we use _mpegtsUnbufferedSeek which destroys/recreates the player
+    // and starts a fresh /remux/?ss=X from the correct time offset.
+    const player = mpegtsPlayerRef.current as any;
+    if (player) {
+      const video = videoRef.current;
+      const dur = mpegtsDurationRef.current || state.current.duration || 0;
+
+      if (video && dur > 0) {
+        _mpegtsUnbufferedSeek(video.currentTime, dur);
+      }
+      // Restart proactive prebuffer reporting interval
+      const _fileId = file?.id;
+      const _folderId = activeFolderId;
+      const _fileSize = state.current.fileLength;
+      if (_fileId && _folderId && _fileSize && !proactiveIntervalRef.current) {
+        proactivePrebufferMsgIdRef.current = _fileId;
+        const proactiveInterval = setInterval(async () => {
+          const v = videoRef.current;
+          if (!v || v.paused || v.ended) return;
+          const eng = (mpegtsPlayerRef.current as any)?._player_engine;
+          const ic = eng?._ioctl;
+          const isDownloading = ic ? !ic._paused : false;
+          try {
+            await invoke('cmd_report_playback_position', {
+              messageId: _fileId,
+              folderId: _folderId,
+              currentTimeS: v.currentTime,
+              durationS: mpegtsDurationRef.current || v.duration || 0,
+              fileSize: _fileSize,
+              isPlayerDownloading: isDownloading,
+              playbackRate: v.playbackRate || 1.0,
+              byteOffset: null,
+            });
+          } catch { /* ignore */ }
+        }, 10000);
+        proactiveIntervalRef.current = proactiveInterval;
+      }
+      return; // TS path handled — don't run downloadLoop
+    }
+
+    // MP4/MKV/WebM: restart download loop
     if (!state.current.downloading && streamUrl && downloadLoopRef.current) {
-      isPausedRef.current = false;
-      setIsPaused(false);
-      setIsPrefetching(true);
       downloadLoopRef.current(streamUrl);
     }
   };
