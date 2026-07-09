@@ -5421,18 +5421,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return false;
       })();
 
-      // Disk-cached range check: forward 180s from seek target must be cached.
-      // Uses the VBR byte/time index for accurate byte offsets instead of a
-      // linear estimate, so the seek lands precisely and the interceptor can
-      // burst the entire 180s window instantly.
-      const isSeekToCachedRange = (targetTime: number) => {
+      // Disk-cached range check: is `forwardSec` seconds from the seek target
+      // cached on disk? Uses the VBR byte/time index for accurate byte offsets.
+      // The required forward window differs by context (see call site below).
+      const isSeekToCachedRange = (targetTime: number, forwardSec: number) => {
         const fileLen = state.current.fileLength || 0;
         const duration = mpegtsDurationRef.current || state.current.duration || 0;
         if (!shadowCacheRef.current || fileLen === 0 || duration === 0) return false;
         const startByte = byteOffsetAtOrBeforeTime(tsKeyframeIndexRef.current, targetTime, duration, fileLen);
         const endByte = byteOffsetAtOrBeforeTime(
           tsKeyframeIndexRef.current,
-          Math.min(targetTime + 180, duration),
+          Math.min(targetTime + forwardSec, duration),
           duration,
           fileLen
         );
@@ -5442,7 +5441,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return run !== null && run.end >= endByteClamped;
       };
 
-      const isCacheHit = !isBuffered && isSeekToCachedRange(clamped);
+      // Forward-window requirement differs by pause state:
+      //  - Running (180s): the interceptor can burst a full lookahead window
+      //    instantly, so require it cached for smooth uninterrupted playback.
+      //  - Paused (8s): "paused = no Telegram", so we can't fetch a 180s window
+      //    anyway. We only need enough cached data AT the target to start
+      //    playing; the recreate align-poll's boundary-stall detector then pauses
+      //    the loader exactly at the cache edge. Without this relaxation, a paused
+      //    seek into a partially-cached region (e.g. 50s cached, 180s required)
+      //    is wrongly classified blocked-paused and the video never plays — the
+      //    reported bug.
+      const CACHE_FORWARD_BURST_SEC = 180;
+      const CACHE_FORWARD_PAUSED_MIN_SEC = 8;
+      const isCacheHit = !isBuffered && isSeekToCachedRange(
+        clamped,
+        isPausedRef.current ? CACHE_FORWARD_PAUSED_MIN_SEC : CACHE_FORWARD_BURST_SEC
+      );
 
       // Single source of truth for the pause/seek policy (unit-tested via
       // decideTsSeekAction). buffered→memory, cache→disk, network→Telegram,
