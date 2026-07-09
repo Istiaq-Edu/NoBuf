@@ -4181,29 +4181,50 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // when currentTime catches up within 2s. Clearing it here would
               // cause a visible bar jump if bufStart differs from the target.
 
-              // PREFETCH-PAUSE re-pause: a cache-hit seek is allowed while
-              // paused (it reads from disk cache, not Telegram) and recreates
-              // the player with a FRESH IOController that starts unpaused. Once
-              // the disk-cached 180s window is consumed, lazyLoad would call
-              // ioctl.resume() → Telegram fetch. To honor "paused means paused",
-              // re-pause the new IOController now that initial buffer has arrived
-              // for display. Also stop the proactive prebuffer that pipeline
-              // init may have restarted. (See video-streaming skill rev6-FINAL,
-              // "Seek while paused".)
+              // PREFETCH-PAUSE handling: a disk-cache-hit seek is allowed while
+              // paused because it reads LOCAL cached data, not Telegram. Stop the
+              // proactive prebuffer immediately (a separate Telegram downloader) —
+              // but do NOT pause the loader on this first align tick. The cached
+              // window (up to 180s) has only partially drained into the
+              // SourceBuffer here; pausing now truncates delivery mid-segment and
+              // the video never plays (the reported bug). Instead let the loader
+              // finish delivering the on-disk cached data, then pause it at the
+              // cache boundary — detected as buffered.end no longer advancing
+              // (loader stalled waiting on uncached bytes → about to hit the
+              // backend's 5s STREAM-CACHE-WAIT → Telegram fallback). Pausing at a
+              // 750ms stall (<< 5s) aborts that boundary request before Telegram
+              // starts, honoring "paused = no Telegram" while still playing all
+              // cached data. (See video-streaming skill rev6-FINAL.)
               if (isPausedRef.current) {
-                const newIoctl = (mpegtsPlayerRef.current as any)?._player_engine
-                  ?._transmuxer?._controller?._ioctl;
-                if (newIoctl && !newIoctl._paused) {
-                  try { newIoctl.pause(); } catch (_) {}
-                }
                 const ppMsgId = proactivePrebufferMsgIdRef.current;
-                if (ppMsgId) {
-                  invoke('cmd_stop_proactive_prebuffer', { messageId: ppMsgId }).catch(() => {});
-                }
+                if (ppMsgId) invoke('cmd_stop_proactive_prebuffer', { messageId: ppMsgId }).catch(() => {});
                 if (proactiveIntervalRef.current) {
                   clearInterval(proactiveIntervalRef.current);
                   proactiveIntervalRef.current = null;
                 }
+                let lastBufEnd = -1, stalledTicks = 0, bpTicks = 0;
+                const boundaryIv = setInterval(() => {
+                  bpTicks++;
+                  const io = (mpegtsPlayerRef.current as any)?._player_engine?._transmuxer?._controller?._ioctl;
+                  // Bail if superseded, resumed, timed out (30s), or loader gone.
+                  if (alignGen !== mpegtsRecreationGenRef.current || !isPausedRef.current || bpTicks > 120 || !io) {
+                    clearInterval(boundaryIv); return;
+                  }
+                  if (io._paused) { clearInterval(boundaryIv); return; } // lazyLoad already paused it at 180s
+                  const vNow = videoRef.current;
+                  const bufEnd = vNow && vNow.buffered.length > 0 ? vNow.buffered.end(vNow.buffered.length - 1) : 0;
+                  if (bufEnd <= lastBufEnd + 0.01) {
+                    // No new data this tick — loader stalled at the cache boundary.
+                    if (++stalledTicks >= 3) { // 3 × 250ms = 750ms
+                      try { io.pause(); } catch (_) {}
+                      clearInterval(boundaryIv);
+                      diagLog('[MPEGTS] Paused loader at cache boundary (prefetch paused) — cached data played, no Telegram fetch');
+                    }
+                  } else {
+                    stalledTicks = 0;
+                    lastBufEnd = bufEnd;
+                  }
+                }, 250);
               }
 
               // If play was deferred (depth=0 first attempt), start playback now
@@ -5469,7 +5490,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // intended "no internet" behavior.
           try { v.currentTime = clamped; } catch (_) {}
         }
-        (window as any).__nobuf_seekTargetTime = clamped;
+        // Do NOT set __nobuf_seekTargetTime here. That flag is the deferred-play
+        // suppressor for an IN-FLIGHT unbuffered load — it holds the progress bar
+        // and gates onCanPlay/onMeta auto-play until the align poll clears it.
+        // A blocked-paused seek has NO in-flight load (nothing is fetching), so
+        // the flag would never clear: it would pin the bar at a position we're
+        // not at and block auto-play on the next buffered seek / resume. The
+        // currentTime set above moves the bar honestly via the native seeked event.
         // Cancel any queued unbuffered seek so a stale one can't fire post-resume.
         if (mpegtsSeekDebounceRef.current !== null) {
           clearTimeout(mpegtsSeekDebounceRef.current);
