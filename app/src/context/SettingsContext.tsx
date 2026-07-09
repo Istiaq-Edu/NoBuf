@@ -60,6 +60,7 @@ export interface Settings {
     playerSkipBackward: SkipDuration;
     playerVideoFit: VideoFit;
     playerAutoHideDelay: AutoHideDelay;
+    playerShowPinButton: boolean;   // show pin button on control bar; when off, controls never auto-hide
     prebufferSpeedLimit: SpeedLimitValue;  // KB/s, 0 = unlimited
     downloadSpeedLimit: SpeedLimitValue;   // KB/s, 0 = unlimited
 }
@@ -78,6 +79,7 @@ const defaultSettings: Settings = {
     playerSkipBackward: 5,
     playerVideoFit: 'contain',
     playerAutoHideDelay: 3,
+    playerShowPinButton: false,
     prebufferSpeedLimit: 0,
     downloadSpeedLimit: 0,
 };
