@@ -7,7 +7,7 @@ import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, AutoHideDelay, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 
@@ -57,7 +57,7 @@ interface FastStreamPlayerProps {
 
   // Settings panel state
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [controlsPinned, setControlsPinned] = useState(false);
+  const [controlsPinned, setControlsPinned] = useState(true); // default pinned; only matters when playerShowPinButton is on
   const [loop, setLoop] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [brightness, setBrightness] = useState(1);
@@ -1007,17 +1007,22 @@ interface FastStreamPlayerProps {
 
   // Buffer state is already updated by timeupdate and progress events above
 
-  // Auto-hide controls — show on mouse activity, hide after idle during playback
+  // Auto-hide controls — show on mouse activity, hide after idle during playback.
+  // Behavior is gated by the "show pin button" setting:
+  //   • OFF (default): control bar is ALWAYS visible — never auto-hides.
+  //   • ON: user gets a pin toggle on the bar. Pinned → always visible;
+  //         unpinned → auto-hide after a fixed idle delay while playing.
   const lastMousePos = useRef({ x: 0, y: 0 });
-  const hideDelayMs = settings.playerAutoHideDelay === 0 ? 0 : settings.playerAutoHideDelay * 1000;
+  const PIN_AUTO_HIDE_MS = 3000; // fixed idle delay when pin feature is on + unpinned
+  const showPinButton = settings.playerShowPinButton;
   useEffect(() => {
-    // Always show controls when paused, settings panel is open, or pinned
-    if (!playing || settingsOpen || controlsPinned) {
+    // Pin feature off → controls never auto-hide.
+    if (!showPinButton) {
       setVis(true);
       return;
     }
-    // Never auto-hide if delay is 0
-    if (hideDelayMs === 0) {
+    // Always show controls when paused, settings panel is open, or pinned
+    if (!playing || settingsOpen || controlsPinned) {
       setVis(true);
       return;
     }
@@ -1031,7 +1036,7 @@ interface FastStreamPlayerProps {
         if (playing && !settingsOpen && !controlsPinned && !controlsRef.current?.matches(':hover')) {
           setVis(false);
         }
-      }, hideDelayMs);
+      }, PIN_AUTO_HIDE_MS);
     };
 
     // Schedule initial hide — handles case where mouse is already outside window
@@ -1063,7 +1068,7 @@ interface FastStreamPlayerProps {
       document.removeEventListener('mouseleave', onMouseLeave);
       clearTimeout(hideTimer);
     };
-  }, [playing, settingsOpen, controlsPinned, hideDelayMs]);
+  }, [showPinButton, playing, settingsOpen, controlsPinned]);
 
   // Mini progress bar — appears after controls have fully hidden (300ms delay)
   useEffect(() => {
@@ -1699,12 +1704,14 @@ interface FastStreamPlayerProps {
                 </span>
               )}
             </button>
-            {/* Pin controls */}
+            {/* Pin controls — only shown when enabled in Settings; default pinned */}
+            {showPinButton && (
             <button onClick={() => setControlsPinned(p => !p)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${controlsPinned ? 'text-nobuf-primary' : 'text-white/50'}`} title={controlsPinned ? 'Unpin controls (auto-hide)' : 'Pin controls (always show)'}>
               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" style={{ transform: controlsPinned ? 'rotate(0deg)' : 'rotate(45deg)', transition: 'transform 200ms' }}>
                 <path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z" />
               </svg>
             </button>
+            )}
             {/* Close */}
             <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close (Esc)">
               <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
@@ -1861,25 +1868,19 @@ interface FastStreamPlayerProps {
           {/* Behavior */}
           <div className="px-4 py-3 border-b border-white/10">
             <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Behavior</h3>
-            {/* Auto-hide delay */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block">Auto-hide controls</label>
-              <div className="flex gap-1">
-                {([
-                  [3, '3s'],
-                  [5, '5s'],
-                  [10, '10s'],
-                  [0, 'Never'],
-                ] as [AutoHideDelay, string][]).map(([val, label]) => (
-                  <button
-                    key={val}
-                    onClick={() => updateSetting('playerAutoHideDelay', val)}
-                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
+            {/* Show pin button on controls */}
+            <div className="mb-1 flex items-center justify-between">
+              <div className="pr-3">
+                <label className="text-white/70 text-xs block">Show pin button</label>
+                <span className="text-white/40 text-[10px]">Adds a pin toggle to the control bar. When off, controls stay visible.</span>
               </div>
+              <button
+                onClick={() => updateSetting('playerShowPinButton', !settings.playerShowPinButton)}
+                className={`relative w-9 h-5 rounded-full transition-colors shrink-0 ${settings.playerShowPinButton ? 'bg-nobuf-primary' : 'bg-white/20'}`}
+                title={settings.playerShowPinButton ? 'Hide pin button' : 'Show pin button'}
+              >
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${settings.playerShowPinButton ? 'left-5' : 'left-0.5'}`} />
+              </button>
             </div>
             </div>
 
