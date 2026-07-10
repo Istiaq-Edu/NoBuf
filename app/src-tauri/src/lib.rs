@@ -310,6 +310,17 @@ pub fn run() {
                 }
             }
 
+            // Clean up orphaned upload-staging temp files (dropped files + zipped folders)
+            // from previous sessions. These are never cleaned otherwise if the app crashed
+            // mid-upload. Best-effort — ignore errors (files may be locked/in-use).
+            for stale in ["nobuf_dropped", "nobuf_zip"] {
+                let dir = std::env::temp_dir().join(stale);
+                if dir.exists() {
+                    log::info!("[STARTUP-CLEANUP] Removing orphaned upload staging dir at {:?}...", dir);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+
             // Clean up thumbnail cache (unbounded — can grow to hundreds of MBs)
             let thumb_dir = app.path().app_data_dir()
                 .map_err(|e| format!("app_data_dir: {}", e))
@@ -396,6 +407,9 @@ pub fn run() {
             commands::cmd_auth_check_password,
             commands::cmd_get_files,
             commands::cmd_upload_file,
+            commands::cmd_upload_limit,
+            commands::cmd_file_size,
+            commands::cmd_stage_dropped_file,
             commands::cmd_upload_from_url,
             commands::cmd_connect,
             commands::cmd_log,
@@ -564,3 +578,5 @@ pub fn run() {
         }
     });
 }
+
+

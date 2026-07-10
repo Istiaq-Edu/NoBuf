@@ -1,5 +1,6 @@
 use grammers_client::Client;
 use grammers_client::types::Peer;
+use grammers_tl_types as tl;
 use tauri::{State, Manager};
 use serde::{Deserialize, Serialize};
 use crate::bandwidth::BandwidthManager;
@@ -60,6 +61,25 @@ pub async fn resolve_peer(
 /// Clear the peer cache (called on logout)
 pub async fn clear_peer_cache(peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>) {
     peer_cache.write().await.clear();
+}
+
+// --- Upload size limit (Premium-aware) ---
+// grammers exposes no premium() accessor; read the raw TL flag.
+// VERIFIED: `pub premium: bool` at generated_types.rs:57654 (grammers rev d07f96f);
+// `me.raw` is a public field (peer/user.rs:66) of type `tl::enums::User` with
+// variants `User(u)` | `Empty(_)` — premium only on the `User` variant.
+// Telegram enforces the true limit server-side; this is client-side pre-validation only.
+pub async fn is_premium(client: &Client) -> Result<bool, String> {
+    let me = client.get_me().await.map_err(|e| e.to_string())?;
+    Ok(match &me.raw {
+        tl::enums::User::User(u) => u.premium,
+        tl::enums::User::Empty(_) => false,
+    })
+}
+
+/// Per-file upload limit in bytes: 4 GB Premium, 2 GB free (documentation-based decimal GB).
+pub async fn upload_limit_bytes(client: &Client) -> Result<u64, String> {
+    Ok(if is_premium(client).await? { 4_000_000_000 } else { 2_000_000_000 })
 }
 
 #[tauri::command]
@@ -298,3 +318,5 @@ pub fn cmd_get_network_settings(
         Err(_) => Ok(NetworkSettings::default()),
     }
 }
+
+

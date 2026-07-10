@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-file-size"
+description = "Enables the cmd_file_size command without any pre-configured scope."
+commands.allow = ["cmd_file_size"]
+
+[[permission]]
+identifier = "deny-cmd-file-size"
+description = "Denies the cmd_file_size command without any pre-configured scope."
+commands.deny = ["cmd_file_size"]

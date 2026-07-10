@@ -283,8 +283,6 @@ pub async fn cmd_zip_folder(
     folder_path: String,
     state: tauri::State<'_, crate::commands::TelegramState>,
 ) -> Result<String, String> {
-    let _ = state; // Not used but required for tauri command macro
-
     let source = std::path::Path::new(&folder_path);
     if !source.exists() {
         return Err(format!("Source folder does not exist: {}", folder_path));
@@ -334,11 +332,18 @@ pub async fn cmd_zip_folder(
 
     zip_writer.finish().map_err(|e| format!("ZIP finish error: {}", e))?;
 
-    // Check 2GB Telegram limit
+    // Check upload size limit (Premium-aware — 4 GB Premium, 2 GB free)
     let zip_size = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
-    if zip_size > 2 * 1024 * 1024 * 1024 {
+    let limit = {
+        let client_opt = { state.client.lock().await.clone() };
+        match client_opt {
+            Some(client) => crate::commands::utils::upload_limit_bytes(&client).await.unwrap_or(2_000_000_000),
+            None => 2_000_000_000,
+        }
+    };
+    if zip_size > limit {
         let _ = std::fs::remove_file(&zip_path);
-        return Err(format!("Compressed folder exceeds Telegram's 2GB limit ({} bytes)", zip_size));
+        return Err(format!("Compressed folder exceeds the {} GB upload limit ({} bytes)", limit / 1_000_000_000, zip_size));
     }
 
     log::info!("Folder zipped: {} → {} ({} bytes)", folder_path, zip_path.display(), zip_size);
@@ -378,3 +383,5 @@ mod tests {
         assert_eq!(sanitise_entry_name("file.txt"), "file.txt");
     }
 }
+
+
