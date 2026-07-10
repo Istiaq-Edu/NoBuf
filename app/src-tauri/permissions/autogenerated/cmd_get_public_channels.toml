@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-public-channels"
+description = "Enables the cmd_get_public_channels command without any pre-configured scope."
+commands.allow = ["cmd_get_public_channels"]
+
+[[permission]]
+identifier = "deny-cmd-get-public-channels"
+description = "Denies the cmd_get_public_channels command without any pre-configured scope."
+commands.deny = ["cmd_get_public_channels"]

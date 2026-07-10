@@ -183,10 +183,34 @@ fn rewrite_ts_stream_in_buf(
             let section_start = payload_offset + 1 + pointer_field;
             let pkt_end = pkt_offset + ps;
 
-            let rewritten = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
+            let (rewritten, stripped_inline) = hls::manifest::rewrite_pmt_stream_types(buf, section_start, pkt_end);
             if rewritten > 0 {
-                log::info!("[STREAM-TS] Rewrote {} stream_type(s) 0x15→0x11 (kLOASAAC) in PMT at buf_offset={} (file_offset={})",
-                    rewritten, pkt_offset, buf_start + pkt_offset as u64);
+                log::info!("[STREAM-TS] Rewrote/stripped {} stream entry(s) in PMT at buf_offset={} (file_offset={}, stripped_pids={:?})",
+                    rewritten, pkt_offset, buf_start + pkt_offset as u64, stripped_inline);
+                did_rewrite = true;
+            }
+        }
+    }
+
+    // Step 4: Null out TS packets from stripped PIDs (timed_id3 metadata streams).
+    // Even after stripping the entry from the PMT, the raw TS stream still
+    // contains PES packets for the stripped PID. mpegts.js will skip them
+    // (PID not in PMT) but only if it parsed the STRIPPED PMT first. If any
+    // code path serves raw data before the PMT rewrite takes effect, or if
+    // mpegts.js re-parses an inline unrewritten PMT, the metadata PES packets
+    // cause AAC PTS drift. Belt-and-suspenders: null the PID at transport level.
+    let stripped_pids = cache_mgr.get_stripped_pids(message_id);
+    if !stripped_pids.is_empty() {
+        let ps: usize = 188;
+        let align_offset = (buf_start % ps as u64) as usize;
+        for pkt_offset in (align_offset..buf.len()).step_by(ps) {
+            if pkt_offset + ps > buf.len() { break; }
+            if buf[pkt_offset] != 0x47 { continue; }
+            let pid = ((buf[pkt_offset + 1] as u16 & 0x1F) << 8) | buf[pkt_offset + 2] as u16;
+            if stripped_pids.contains(&pid) {
+                // Overwrite PID to 0x1FFF (null packet) — mpegts.js skips null PIDs
+                buf[pkt_offset + 1] = (buf[pkt_offset + 1] & 0xE0) | 0x1F;
+                buf[pkt_offset + 2] = 0xFF;
                 did_rewrite = true;
             }
         }
@@ -276,6 +300,10 @@ pub(crate) struct StreamQuery {
     /// thumbnail pipeline to limit downloads to ~5MB instead of fetching
     /// to EOF (hundreds of MB) — only needs enough data to find one keyframe.
     pub(crate) max_bytes: Option<u64>,
+    /// Seek start time in seconds (for remux endpoint). When set, ffmpeg
+    /// uses `-ss` to start remuxing from this position instead of the
+    /// beginning, enabling byte-range-like seeking through the remux pipe.
+    pub(crate) ss: Option<f64>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -284,12 +312,13 @@ pub(crate) struct StreamQuery {
 const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 
 /// Minimum interval between upload.GetFile API calls on the main client.
-/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. With
-/// Semaphore(1), the actual API call rate is 1/(interval + network_latency).
-/// At 150ms interval + ~150ms network = 300ms per call = 3.3 req/s — safely
-/// under the threshold. Throughput: 512KB / 300ms = 1.71 MB/s.
-/// Previous 250ms gave 1.28 MB/s — too slow for practical playback.
-const MIN_API_CALL_INTERVAL_MS: u64 = 150;
+/// Telegram's FLOOD_PREMIUM_WAIT triggers at ~5-6 req/s sustained. The rate
+/// limiter serializes ALL API calls (regardless of Semaphore count), so the
+/// effective rate is 1/interval = 1/300ms = 3.33 req/s — safely under the
+/// 5-6 req/s FLOOD threshold. Throughput: 512KB / 450ms = 1.14 MB/s.
+/// 250ms gave 4 req/s — still triggered FLOOD_PREMIUM_WAIT (25 occurrences
+/// in 4 min). 300ms gives more headroom at the cost of ~10% throughput.
+const MIN_API_CALL_INTERVAL_MS: u64 = 300;
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -1400,6 +1429,8 @@ struct Fmp4MetadataResponse {
     video_codec_string: String,
     audio_codec_string: String,
     total_size: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_timed_id3: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1447,8 +1478,11 @@ async fn download_and_cache_range(
     let client = client.ok_or("Telegram client not available")?;
 
     // Per-chunk try_acquire + rate limiter. The keyframe search is a BACKGROUND
-    // task — try_acquire ensures it doesn't block /stream. The rate limiter
-    // ensures ≥250ms between ALL API calls globally, preventing FLOOD_WAIT.
+    // task — try_acquire ensures it doesn't block /stream. When /stream is
+    // actively downloading (holding a permit), the keyframe search yields
+    // instead of competing for the rate limiter budget. This gives /stream
+    // priority and prevents FLOOD_PREMIUM_WAIT from the keyframe search
+    // stealing bandwidth from playback.
     let chunk_size: i32 = 512 * 1024;
     let skip_chunks = (start / chunk_size as u64) as i32;
     let bytes_to_discard = start % chunk_size as u64;
@@ -1462,10 +1496,27 @@ async fn download_and_cache_range(
     let mut downloaded = Vec::new();
     let mut first_chunk = true;
     let mut dac_retries = 0u32;
+    let mut yield_count = 0u32;
 
     loop {
         let chunk_result = {
-            let _permit = data.download_semaphore.acquire().await.unwrap();
+            // try_acquire: if /stream is using all permits, yield instead of
+            // blocking. This gives /stream priority for the rate limiter budget.
+            let _permit = match data.download_semaphore.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    yield_count += 1;
+                    // After 100 yields (~50s at 500ms each), give up and block
+                    // to ensure the keyframe search eventually completes.
+                    if yield_count > 100 {
+                        log::info!("[DAC] Keyframe search yielded {} times, now blocking for permit", yield_count);
+                        data.download_semaphore.acquire().await.unwrap()
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
+            };
             throttle_api_calls(&data.rate_limiter).await;
             iter.next().await
         };
@@ -1602,7 +1653,7 @@ async fn find_keyframe_at_or_before_time(
     let mut window_size: u64 = 4 * 1024 * 1024; // 4MB initial
     let max_window: u64 = 256 * 1024 * 1024; // 256MB max (for extreme VBR offsets up to ~128MB forward)
     let search_start = std::time::Instant::now();
-    let search_deadline = std::time::Duration::from_secs(30);
+    let search_deadline = std::time::Duration::from_secs(15);
 
     while window_size <= max_window {
         // Symmetric search: 50% backward, 50% forward.
@@ -1701,13 +1752,13 @@ async fn find_keyframe_at_or_before_time(
 
         window_size *= 2;
 
-        // Search deadline: if the search has been running for >30s (due to
+        // Search deadline: if the search has been running for >15s (due to
         // FLOOD_PREMIUM_WAIT on each download), stop expanding and return None.
         // The caller returns a linear byte estimate fallback. The frontend's
         // 5s AbortController has already fired by this point, but the backend
         // keeps running and caches the result for future seeks.
         if search_start.elapsed() >= search_deadline {
-            log::warn!("[FMP4-KF-AT] Search deadline (30s) exceeded for msg {} at {}s, returning fallback",
+            log::warn!("[FMP4-KF-AT] Search deadline (15s) exceeded for msg {} at {}s, returning fallback",
                 message_id, target_time_s);
             return None;
         }
@@ -1776,7 +1827,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2066,19 +2117,12 @@ async fn remux_ts_to_mp4(
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
-            "-ignore_unknown",
-            "-probesize", "50000000",
-            "-analyzeduration", "50000000",
             "-i", &input_source,
-        ]);
-        cmd.args(["-map", &format!("0:{}", video_stream_idx)]);
-        cmd.args(["-map", &format!("0:{}", audio_stream_idx)]);
-        cmd.args([
+            "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
-            "-c:a", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-f", "mp4",
-            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "192k",
+            "-f", "mpegts",
+            "-mpegts_flags", "resend_headers",
         ]);
         cmd.arg(&remux_tmp);
         cmd.stdout(std::process::Stdio::null());
@@ -2166,22 +2210,38 @@ async fn remux_ts_to_mp4(
             message_id, video_stream_idx, audio_stream_idx, probed_duration);
 
         let mut cmd = TokioCommand::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "warning"]);
+        // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking
+        let ss_secs = query.ss.unwrap_or(0.0);
+        if ss_secs > 0.0 {
+            let ss_str = format!("{:.3}", ss_secs);
+            log::info!("[REMUX] msg {}: seeking to {}s before remux", message_id, ss_str);
+            cmd.args(["-ss", &ss_str]);
+        }
+        // +genpts: regenerate PTS from DTS (fixes non-monotonic audio timestamps)
+        // +discardcorrupt: drop damaged packets before they reach the filter chain
         cmd.args([
-            "-hide_banner",
-            "-loglevel", "warning",
-            "-ignore_unknown",
-            "-probesize", "50000000",
-            "-analyzeduration", "50000000",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", &input_source,
-        ]);
-        cmd.args(["-map", &format!("0:{}", video_stream_idx)]);
-        cmd.args(["-map", &format!("0:{}", audio_stream_idx)]);
-        cmd.args([
+            "-map", "0:v:0", "-map", "0:a:0",
             "-c:v", "copy",
-            "-c:a", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            "-f", "mp4",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-c:a", "aac", "-b:a", "192k",
+            // asetpts=N/SR/TB: force monotonically increasing audio PTS by construction.
+            // The source TS has AAC frames with overlapping PTS that crash the mpegts
+            // output muxer. This filter rewrites PTS from sample count, guaranteeing
+            // forward progression regardless of source corruption.
+            "-af", "asetpts=N/SR/TB",
+        ]);
+        // Preserve original timestamps so MSE timeline matches video.currentTime
+        if ss_secs > 0.0 {
+            cmd.args(["-copyts", "-start_at_zero"]);
+        }
+        cmd.args([
+            // Disable interleave check: prevent muxer from rejecting audio packets
+            // that arrive slightly out-of-order relative to video DTS
+            "-max_interleave_delta", "0",
+            "-f", "mpegts",
+            "-mpegts_flags", "resend_headers",
             "-",
         ]);
         cmd.stdout(std::process::Stdio::piped());
@@ -2269,12 +2329,14 @@ async fn remux_ts_to_mp4(
                         bg_cmd.args([
                             "-hide_banner", "-loglevel", "warning",
                             "-ignore_unknown",
+                            "-fflags", "+genpts+discardcorrupt",
                             "-probesize", "50000000", "-analyzeduration", "50000000",
                             "-i", &bg_input,
                         ]);
                         bg_cmd.args(["-map", &format!("0:{}", bg_vid_idx)]);
                         bg_cmd.args(["-map", &format!("0:{}", bg_aud_idx)]);
                         bg_cmd.args([
+                            "-sn",
                             "-c:v", "copy", "-c:a", "copy",
                             "-bsf:a", "aac_adtstoasc",
                             "-f", "mp4",
@@ -2827,44 +2889,77 @@ async fn fmp4_segment(
 
     if !is_range_cached(&meta.cached_ranges, read_start, read_end) {
         let dl_info = cache_mgr.find_best_covering_download(message_id, read_start, read_end).await;
-        if let Some(dl) = dl_info {
-            let current_progress = *dl.progress_rx.borrow();
-            if current_progress >= read_start {
-                let mut progress_rx = dl.progress_rx.clone();
-                let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-                loop {
-                    let progress = *progress_rx.borrow();
-                    if is_range_cached(
-                        &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
-                        read_start, read_end
-                    ) {
-                        break;
-                    }
-                    if progress >= read_end {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= timeout {
-                        log::warn!("[FMP4-SEG] Timeout waiting for download for msg {}", message_id);
+        let mut need_own_download = false;
+
+        if let Some(dl) = &dl_info {
+            let mut progress_rx = dl.progress_rx.clone();
+            let cancel_flag = dl.cancel_flag.clone();
+            let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+
+            loop {
+                let progress = *progress_rx.borrow();
+
+                // Check if the range is now fully cached
+                if is_range_cached(
+                    &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
+                    read_start, read_end
+                ) {
+                    break;
+                }
+
+                // Download has progressed past our range end — data should be cached
+                if progress >= read_end {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    break;
+                }
+
+                // Timeout — if download hasn't reached read_start yet, fall through
+                // to own-download. If it has reached read_start but range isn't cached,
+                // return 503 (same as original behavior).
+                if tokio::time::Instant::now() >= timeout {
+                    if progress < read_start {
+                        log::warn!("[FMP4-SEG] Timeout waiting for download to reach read_start {} (progress={}) for msg {}", read_start, progress, message_id);
+                        need_own_download = true;
+                    } else {
+                        log::warn!("[FMP4-SEG] Timeout waiting for cache fill for msg {}", message_id);
                         return HttpResponse::ServiceUnavailable()
                             .insert_header(("Retry-After", "2"))
                             .body("Waiting for download");
                     }
-                    match progress_rx.changed().await {
-                        Ok(()) => {},
-                        Err(_) => break,
+                    break;
+                }
+
+                // Download was cancelled — fall through to own-download
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("[FMP4-SEG] Active download cancelled for msg {}, falling through to own-download", message_id);
+                    need_own_download = true;
+                    break;
+                }
+
+                // Wait for progress update
+                match progress_rx.changed().await {
+                    Ok(()) => {},
+                    Err(_) => {
+                        // Download ended (sender dropped). Check if range is cached
+                        // before falling through.
+                        if is_range_cached(
+                            &cache_mgr.load_meta(message_id).map(|m| m.cached_ranges).unwrap_or_default(),
+                            read_start, read_end
+                        ) {
+                            break;
+                        }
+                        log::info!("[FMP4-SEG] Active download ended for msg {}, falling through to own-download", message_id);
+                        need_own_download = true;
+                        break;
                     }
                 }
-            } else {
-                log::info!("[FMP4-SEG] Active download progress {} < read_start {} for msg {}", current_progress, read_start, message_id);
-                return HttpResponse::ServiceUnavailable()
-                    .insert_header(("Retry-After", "3"))
-                    .body("Download not yet at requested offset");
             }
-        } else {
+        }
+
+        if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -2883,8 +2978,8 @@ async fn fmp4_segment(
                     }
                 };
 
-                // Blocking acquire — with Semaphore(1), all download paths
-                // serialize. The 250ms rate limiter spaces API calls.
+                // Blocking acquire — with Semaphore(2), /stream and fMP4 segment
+                // downloads can run concurrently. The 250ms rate limiter spaces API calls.
                 // Thumbnail downloads briefly pause /stream (400ms per chunk),
                 // but the 180s buffer ahead absorbs this.
                 let mut iter = download_iter;
@@ -3841,6 +3936,8 @@ async fn fmp4_metadata(
         0.0
     };
 
+    let has_timed_id3 = !cache_mgr.get_stripped_pids(message_id).is_empty();
+
     let response = Fmp4MetadataResponse {
         duration_s,
         video_codec: video_codec_str.to_string(),
@@ -3850,6 +3947,7 @@ async fn fmp4_metadata(
         video_codec_string,
         audio_codec_string,
         total_size,
+        has_timed_id3,
     };
 
     let body = match serde_json::to_vec(&response) {
@@ -3955,32 +4053,59 @@ async fn fmp4_keyframes(
     };
 
     let data_path = cache_mgr.data_path(message_id);
-    let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
-        Some(result) => result,
-        None => {
-            // The data file may not exist yet (cold start) or be too small for
-            // packet-size detection. Return an empty partial index so the
-            // frontend can fall back to linear byte mapping and retry later.
-            log::info!("[FMP4-KF] Data file not ready for msg {} — returning empty partial index", message_id);
-            let response = Fmp4KeyframeResponse {
-                keyframes: vec![],
-                total_size: 0,
-                partial: true,
-            };
-            return match serde_json::to_vec(&response) {
-                Ok(body) => HttpResponse::Ok()
-                    .content_type("application/json")
-                    .insert_header(("X-Cache", "MISS"))
-                    .insert_header(("X-Partial", "true"))
-                    .insert_header(("X-Reason", "data-not-ready"))
-                    .body(body),
-                Err(e) => {
-                    log::error!("[FMP4-KF] Failed to serialize empty partial response for msg {}: {}", message_id, e);
-                    HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+        let (_ts_packet_size, is_m2ts) = match detect_ts_packet_size(&data_path) {
+            Some(result) => result,
+            None => {
+                // detect_ts_packet_size returns None when:
+                // 1. File doesn't exist yet (cold start) → partial: true, retry later
+                // 2. File exists but isn't TS (MP4/MKV/etc) → partial: false, stop retrying
+                if data_path.exists() {
+                    let file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+                    if file_size >= 193 {
+                        // File exists and has enough data — it's simply not a TS file.
+                        // Return partial: false so the frontend stops polling and uses
+                        // linear byte mapping for seeking.
+                        log::info!("[FMP4-KF] msg {} is not a TS stream ({} bytes) — returning empty final index", message_id, file_size);
+                        let response = Fmp4KeyframeResponse {
+                            keyframes: vec![],
+                            total_size: file_size,
+                            partial: false,
+                        };
+                        return match serde_json::to_vec(&response) {
+                            Ok(body) => HttpResponse::Ok()
+                                .content_type("application/json")
+                                .insert_header(("X-Cache", "HIT"))
+                                .insert_header(("X-Partial", "false"))
+                                .insert_header(("X-Reason", "not-ts-format"))
+                                .body(body),
+                            Err(e) => {
+                                log::error!("[FMP4-KF] Failed to serialize empty final response for msg {}: {}", message_id, e);
+                                HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+                            }
+                        };
+                    }
                 }
-            };
-        }
-    };
+                // File doesn't exist or is too small — genuinely not ready
+                log::info!("[FMP4-KF] Data file not ready for msg {} — returning empty partial index", message_id);
+                let response = Fmp4KeyframeResponse {
+                    keyframes: vec![],
+                    total_size: 0,
+                    partial: true,
+                };
+                return match serde_json::to_vec(&response) {
+                    Ok(body) => HttpResponse::Ok()
+                        .content_type("application/json")
+                        .insert_header(("X-Cache", "MISS"))
+                        .insert_header(("X-Partial", "true"))
+                        .insert_header(("X-Reason", "data-not-ready"))
+                        .body(body),
+                    Err(e) => {
+                        log::error!("[FMP4-KF] Failed to serialize empty partial response for msg {}: {}", message_id, e);
+                        HttpResponse::InternalServerError().body("Failed to serialize keyframes")
+                    }
+                };
+            }
+        };
 
     // Load meta to know what's cached
     let _lock = cache_mgr.lock_meta(message_id).await;
@@ -4419,3 +4544,12 @@ mod tests {
 // Continuation tests removed — ContinuationGuard and continuation_should_run
 // have been removed. The proactive prebuffer is now the ONLY path that
 // downloads from Telegram; /stream reads exclusively from disk cache.
+
+
+
+
+
+
+
+
+

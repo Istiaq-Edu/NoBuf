@@ -60,6 +60,9 @@ export interface Settings {
     playerSkipBackward: SkipDuration;
     playerVideoFit: VideoFit;
     playerAutoHideDelay: AutoHideDelay;
+    playerShowPinButton: boolean;   // show pin button on control bar; when off, controls never auto-hide
+    playerSettingsWidth: number;    // px width of the video settings side panel (resizable + persisted)
+    playerBarLayout: { left: string[]; right: string[]; tray: string[] }; // customizable control-bar chip placement (incl. '__tray__' token for the ⋯ trigger)
     prebufferSpeedLimit: SpeedLimitValue;  // KB/s, 0 = unlimited
     downloadSpeedLimit: SpeedLimitValue;   // KB/s, 0 = unlimited
 }
@@ -78,6 +81,9 @@ const defaultSettings: Settings = {
     playerSkipBackward: 5,
     playerVideoFit: 'contain',
     playerAutoHideDelay: 3,
+    playerShowPinButton: false,
+    playerSettingsWidth: 336,
+    playerBarLayout: { left: ['skipBack', 'skipFwd'], right: ['speed', 'download', 'settings', 'pin', 'fullscreen', '__tray__'], tray: ['loop', 'pip'] },
     prebufferSpeedLimit: 0,
     downloadSpeedLimit: 0,
 };
