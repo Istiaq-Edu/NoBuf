@@ -378,14 +378,30 @@ body,
   animation: subtlePulse 2s ease-in-out infinite;
 }
 
-/* Skip feedback — pop-in bounce then smooth fade-out */
-@keyframes skipPop {
-  0% { opacity: 0; transform: scale(0.6); }
-  12% { opacity: 1; transform: scale(1.08); }
-  24% { transform: scale(0.96); }
-  36% { transform: scale(1); }
-  72% { opacity: 1; transform: scale(1); }
-  100% { opacity: 0; transform: scale(0.92); }
+/* Blink for the download icon while an active download is in progress */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.animate-blink {
+  animation: blink 1s steps(1, end) infinite;
+}
+
+/* Skip feedback — side-positioned delta + from→to. Entrance only; it must END
+   visible (opacity 1) because mid-burst updates reuse the same element without
+   remounting, so a self-fading animation would freeze it invisible. Removal is
+   handled in JS (setSkipFeedback(null)) after the burst goes idle. */
+@keyframes skipIn {
+  0% { opacity: 0; transform: scale(0.85); }
+  60% { transform: scale(1.04); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* Drag insertion bar — pulses so the drop slot is unmistakable */
+@keyframes barPulse {
+  0%, 100% { opacity: 0.55; transform: scaleY(0.85); }
+  50% { opacity: 1; transform: scaleY(1); }
 }
 
 /* Light mode specific overrides for common patterns */
