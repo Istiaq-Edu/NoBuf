@@ -196,6 +196,32 @@ export interface ByteTimeSample {
   byte: number;
 }
 
+/**
+ * Decide how a TS seek should be handled while prefetch may be paused.
+ *
+ * Single source of truth for the pause/seek policy (mirrors the branches in
+ * seekTo): a seek only needs the network when its target is neither in the
+ * in-memory SourceBuffer nor on local disk. "Paused means paused" — while
+ * paused we allow buffered/cache-hit seeks (they read memory/disk, never
+ * Telegram) but block unbuffered seeks (which would fetch from Telegram).
+ *
+ * @param isPaused    Whether prefetch is currently paused by the user.
+ * @param isBuffered  Target time is inside the in-memory SourceBuffer.
+ * @param isCacheHit  Target's forward window is fully on local disk cache.
+ * @returns 'buffered' | 'cache' | 'network' | 'blocked-paused'
+ */
+export type TsSeekAction = 'buffered' | 'cache' | 'network' | 'blocked-paused';
+export function decideTsSeekAction(
+  isPaused: boolean,
+  isBuffered: boolean,
+  isCacheHit: boolean
+): TsSeekAction {
+  if (isBuffered) return 'buffered';   // memory — always allowed, no network
+  if (isCacheHit) return 'cache';      // local disk — always allowed, no network
+  if (isPaused) return 'blocked-paused'; // would hit Telegram → honor pause
+  return 'network';                    // not paused → fetch from Telegram
+}
+
 
 /**
  * Find the byte position for a target media time using observed byte-to-time samples.
@@ -3000,7 +3026,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const _fileIdForProactive = file?.id;
       const _folderIdForProactive = activeFolderId;
       const _fileSizeForProactive = state.current.fileLength;
-      if (_fileIdForProactive && _folderIdForProactive && _fileSizeForProactive) {
+      if (_fileIdForProactive && _folderIdForProactive && _fileSizeForProactive && !isPausedRef.current) {
         proactivePrebufferMsgIdRef.current = _fileIdForProactive;
         const proactiveInterval = setInterval(async () => {
           const v = videoRef.current;
@@ -3904,7 +3930,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       mpegtsPlayerRef.current = null;
     }
 
-    // 2. Create new player with a URL that includes the start offset
+    // Yield to let GC reclaim old player's ArrayBuffers/SourceBuffers
+    // before allocating new ones — prevents OOM on rapid recreations
+    await new Promise<void>(r => setTimeout(r, 0));
+    if (gen !== mpegtsRecreationGenRef.current) return;
+
+    // 2. Create new player
     //    We use mpegts.js's built-in Range seek: after load(), we immediately
     //    call IOController.open(byteOffset) to start from the target offset.
     try {
@@ -3991,8 +4022,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         } catch (_) {}
       }
 
+      let oomRecoveryScheduled = false;
       newPlayer.on(MpegtsPlayer.Events.ERROR, (_type: string, detail: string) => {
         diagLog(`[MPEGTS] Recreated player error: ${detail}`);
+        // OOM recovery: when ArrayBuffer allocation fails (memory pressure from
+        // rapid player recreations), wait for GC then retry seek to same position
+        if (!oomRecoveryScheduled && detail && detail.indexOf('Array buffer allocation failed') !== -1) {
+          oomRecoveryScheduled = true;
+          const v = videoRef.current;
+          const ct = v ? v.currentTime : timeSeconds;
+          const d = mpegtsDurationRef.current || state.current.duration || 0;
+          diagLog(`[MPEGTS] OOM detected — scheduling recovery seek to ${ct.toFixed(1)}s`);
+          setTimeout(() => {
+            if (mpegtsPlayerRef.current) {
+              _mpegtsUnbufferedSeek(ct, d);
+            }
+          }, 500);
+        }
       });
 
       if (shadowCacheRef.current) {
@@ -4134,6 +4180,53 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // DON'T clear seekTargetTime here — let onTime handler clear it
               // when currentTime catches up within 2s. Clearing it here would
               // cause a visible bar jump if bufStart differs from the target.
+
+              // PREFETCH-PAUSE handling: a disk-cache-hit seek is allowed while
+              // paused because it reads LOCAL cached data, not Telegram. Stop the
+              // proactive prebuffer immediately (a separate Telegram downloader) —
+              // but do NOT pause the loader on this first align tick. The cached
+              // window (up to 180s) has only partially drained into the
+              // SourceBuffer here; pausing now truncates delivery mid-segment and
+              // the video never plays (the reported bug). Instead let the loader
+              // finish delivering the on-disk cached data, then pause it at the
+              // cache boundary — detected as buffered.end no longer advancing
+              // (loader stalled waiting on uncached bytes → about to hit the
+              // backend's 5s STREAM-CACHE-WAIT → Telegram fallback). Pausing at a
+              // 750ms stall (<< 5s) aborts that boundary request before Telegram
+              // starts, honoring "paused = no Telegram" while still playing all
+              // cached data. (See video-streaming skill rev6-FINAL.)
+              if (isPausedRef.current) {
+                const ppMsgId = proactivePrebufferMsgIdRef.current;
+                if (ppMsgId) invoke('cmd_stop_proactive_prebuffer', { messageId: ppMsgId }).catch(() => {});
+                if (proactiveIntervalRef.current) {
+                  clearInterval(proactiveIntervalRef.current);
+                  proactiveIntervalRef.current = null;
+                }
+                let lastBufEnd = -1, stalledTicks = 0, bpTicks = 0;
+                const boundaryIv = setInterval(() => {
+                  bpTicks++;
+                  const io = (mpegtsPlayerRef.current as any)?._player_engine?._transmuxer?._controller?._ioctl;
+                  // Bail if superseded, resumed, timed out (30s), or loader gone.
+                  if (alignGen !== mpegtsRecreationGenRef.current || !isPausedRef.current || bpTicks > 120 || !io) {
+                    clearInterval(boundaryIv); return;
+                  }
+                  if (io._paused) { clearInterval(boundaryIv); return; } // lazyLoad already paused it at 180s
+                  const vNow = videoRef.current;
+                  const bufEnd = vNow && vNow.buffered.length > 0 ? vNow.buffered.end(vNow.buffered.length - 1) : 0;
+                  if (bufEnd <= lastBufEnd + 0.01) {
+                    // No new data this tick — loader stalled at the cache boundary.
+                    if (++stalledTicks >= 3) { // 3 × 250ms = 750ms
+                      try { io.pause(); } catch (_) {}
+                      clearInterval(boundaryIv);
+                      diagLog('[MPEGTS] Paused loader at cache boundary (prefetch paused) — cached data played, no Telegram fetch');
+                    }
+                  } else {
+                    stalledTicks = 0;
+                    lastBufEnd = bufEnd;
+                  }
+                }, 250);
+              }
+
               // If play was deferred (depth=0 first attempt), start playback now
               if (v && v.paused) v.play().catch(() => {});
             }
@@ -5328,18 +5421,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return false;
       })();
 
-      // Disk-cached range check: forward 180s from seek target must be cached.
-      // Uses the VBR byte/time index for accurate byte offsets instead of a
-      // linear estimate, so the seek lands precisely and the interceptor can
-      // burst the entire 180s window instantly.
-      const isSeekToCachedRange = (targetTime: number) => {
+      // Disk-cached range check: is `forwardSec` seconds from the seek target
+      // cached on disk? Uses the VBR byte/time index for accurate byte offsets.
+      // The required forward window differs by context (see call site below).
+      const isSeekToCachedRange = (targetTime: number, forwardSec: number) => {
         const fileLen = state.current.fileLength || 0;
         const duration = mpegtsDurationRef.current || state.current.duration || 0;
         if (!shadowCacheRef.current || fileLen === 0 || duration === 0) return false;
         const startByte = byteOffsetAtOrBeforeTime(tsKeyframeIndexRef.current, targetTime, duration, fileLen);
         const endByte = byteOffsetAtOrBeforeTime(
           tsKeyframeIndexRef.current,
-          Math.min(targetTime + 180, duration),
+          Math.min(targetTime + forwardSec, duration),
           duration,
           fileLen
         );
@@ -5349,13 +5441,34 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return run !== null && run.end >= endByteClamped;
       };
 
-      const isCacheHit = !isBuffered && isSeekToCachedRange(clamped);
+      // Forward-window requirement differs by pause state:
+      //  - Running (180s): the interceptor can burst a full lookahead window
+      //    instantly, so require it cached for smooth uninterrupted playback.
+      //  - Paused (8s): "paused = no Telegram", so we can't fetch a 180s window
+      //    anyway. We only need enough cached data AT the target to start
+      //    playing; the recreate align-poll's boundary-stall detector then pauses
+      //    the loader exactly at the cache edge. Without this relaxation, a paused
+      //    seek into a partially-cached region (e.g. 50s cached, 180s required)
+      //    is wrongly classified blocked-paused and the video never plays — the
+      //    reported bug.
+      const CACHE_FORWARD_BURST_SEC = 180;
+      const CACHE_FORWARD_PAUSED_MIN_SEC = 8;
+      const isCacheHit = !isBuffered && isSeekToCachedRange(
+        clamped,
+        isPausedRef.current ? CACHE_FORWARD_PAUSED_MIN_SEC : CACHE_FORWARD_BURST_SEC
+      );
 
-      if (isBuffered) {
-        // Buffered seek — just set currentTime (mpegts.js handles it)
+      // Single source of truth for the pause/seek policy (unit-tested via
+      // decideTsSeekAction). buffered→memory, cache→disk, network→Telegram,
+      // blocked-paused→honor pause (no Telegram).
+      const seekAction = decideTsSeekAction(isPausedRef.current, isBuffered, isCacheHit);
+
+      if (seekAction === 'buffered') {
+        // Buffered seek — just set currentTime (mpegts.js handles it).
+        // Reads from the in-memory SourceBuffer; allowed even while paused.
         diagLog(`[MPEGTS] Buffered seek to ${clamped.toFixed(1)}s`);
         video.currentTime = clamped;
-      } else if (isCacheHit) {
+      } else if (seekAction === 'cache') {
         // Cached seek — data is on disk, server will serve instantly.
         // Still need unbuffered seek (mpegts must re-transmux), but the
         // loading latency will be minimal (~0.5-1s for transmux).
@@ -5373,12 +5486,44 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
         // Auto-clear suppress after 3s (safety net)
         setTimeout(() => { suppressLoadingSpinnerRef.current = false; }, 3000);
+      } else if (seekAction === 'blocked-paused') {
+        // PREFETCH-PAUSE GUARD: target is unbuffered (would fetch from Telegram)
+        // AND prefetch is paused. "Paused means paused" — the only thing that
+        // resumes downloading is the explicit resume button. Instead of
+        // recreating the player (which opens a fresh IOController and pulls from
+        // Telegram), record the desired position and update the UI. On resume,
+        // resumePrefetch() calls _mpegtsUnbufferedSeek(video.currentTime), which
+        // fetches from exactly this position.
+        diagLog(`[MPEGTS] Unbuffered seek to ${clamped.toFixed(1)}s while PAUSED — staying paused, no Telegram fetch (resume will fetch from here)`);
+        const v = videoRef.current;
+        if (v) {
+          // Reposition the playhead for UI/resume without triggering mpegts.js's
+          // SeekingHandler → IOController resume. The IOController is already
+          // paused (ioctl.pause() in pausePrefetch); setting currentTime to an
+          // unbuffered region leaves the frame frozen until resume, which is the
+          // intended "no internet" behavior.
+          try { v.currentTime = clamped; } catch (_) {}
+        }
+        // Do NOT set __nobuf_seekTargetTime here. That flag is the deferred-play
+        // suppressor for an IN-FLIGHT unbuffered load — it holds the progress bar
+        // and gates onCanPlay/onMeta auto-play until the align poll clears it.
+        // A blocked-paused seek has NO in-flight load (nothing is fetching), so
+        // the flag would never clear: it would pin the bar at a position we're
+        // not at and block auto-play on the next buffered seek / resume. The
+        // currentTime set above moves the bar honestly via the native seeked event.
+        // Cancel any queued unbuffered seek so a stale one can't fire post-resume.
+        if (mpegtsSeekDebounceRef.current !== null) {
+          clearTimeout(mpegtsSeekDebounceRef.current);
+          mpegtsSeekDebounceRef.current = null;
+        }
+        pendingSeekTargetRef.current = null;
+        return;
       } else {
-        // Unbuffered seek — data must be fetched from Telegram.
-        // Use a 400ms debounce so rapid scrubbing only triggers one seek
-        // (the LAST one wins). If a seek is already in progress when the
-        // debounce fires, store the target as pending and execute it after
-        // the in-progress seek completes.
+        // seekAction === 'network' — not paused and target is unbuffered, so
+        // fetch from Telegram. Use a 400ms debounce so rapid scrubbing only
+        // triggers one seek (the LAST one wins). If a seek is already in
+        // progress when the debounce fires, store the target as pending and
+        // execute it after the in-progress seek completes.
         const TS_SEEK_DEBOUNCE_MS = 400;
 
         // Cancel any previous debounce timer — only the last seek in a
@@ -5928,15 +6073,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Abort the in-flight fetch so the download loop processes the pending seek
       abortRef.current?.abort();
 
-      // Restart download loop — seeking to an unbuffered position means the
-      // user wants to watch from there, so downloads must resume regardless
-      // of pause state. Clear isPaused so resumePrefetch() doesn't get stuck
-      // (it checks !state.current.downloading which would be true if loop is
-      // already running from this restart).
-      if (!state.current.downloading && downloadLoopRef.current) {
+      // Restart download loop if it was stopped at completion (not user-paused).
+      // If prebuffer is paused, respect that — the seek just repositions the
+      // offset so resumePrefetch() picks up from the right place later.
+      if (!state.current.downloading && downloadLoopRef.current && !isPausedRef.current) {
         console.log('[MSE] Restarting download loop after seek (offset was at completion)');
-        isPausedRef.current = false;
-        setIsPaused(false);
         state.current.downloading = true;
         setIsPrefetching(true);
         downloadLoopRef.current(streamUrl);
@@ -5976,16 +6117,92 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       clearTimeout(seekDebounceTimerRef.current);
       seekDebounceTimerRef.current = null;
     }
+    // TS files: "pause" = stop ALL Telegram downloads. This means BOTH:
+    //   (1) mpegts.js's own ChunkedFetchLoader (via IOController), AND
+    //   (2) the Rust proactive prebuffer.
+    // Stopping only the proactive prebuffer is USELESS: mpegts.js has its own
+    // fetch pipeline (ChunkedFetchLoader → IOController → /stream/), and /stream/
+    // falls back to Telegram on cache miss. So the loader keeps pulling from
+    // Telegram independently of the Rust prebuffer. Must kill the IOController.
+    // NEVER call ioctl.resume() on resume — it triggers _internalSeek → a new
+    // /remux/ request from byte 0 → DTS catastrophe. Resume recreates the player
+    // via _mpegtsUnbufferedSeek instead. (See video-streaming skill rev6-FINAL.)
+    const player = mpegtsPlayerRef.current as any;
+    if (player) {
+      const ioctl = player._player_engine?._transmuxer?._controller?._ioctl;
+      if (ioctl && !ioctl._paused) {
+        try { ioctl.pause(); } catch (_) {}
+      }
+    }
+    // Stop proactive prebuffer (Rust backend)
+    const ppMsgId = proactivePrebufferMsgIdRef.current;
+    if (ppMsgId) {
+      invoke('cmd_stop_proactive_prebuffer', { messageId: ppMsgId }).catch(() => {});
+    }
+    if (proactiveIntervalRef.current) {
+      clearInterval(proactiveIntervalRef.current);
+      proactiveIntervalRef.current = null;
+    }
     setIsPaused(true);
     setIsPrefetching(false);
     setSpeed(0);
   };
 
   const resumePrefetch = () => {
+    isPausedRef.current = false;
+    setIsPaused(false);
+    setIsPrefetching(true);
+
+    // TS files: pause killed the IOController (loader + HTTP connection) via
+    // ioctl.pause(). To resume downloading we must RECREATE the player at the
+    // current playhead using _mpegtsUnbufferedSeek — NEVER ioctl.resume(), which
+    // triggers _internalSeek → a new /remux/ request from byte 0 → DTS overflow.
+    // _mpegtsUnbufferedSeek destroys the paused player and creates a fresh one
+    // starting from the correct byte offset. Playback of already-buffered data
+    // (the in-memory SourceBuffer) is preserved — recreation seeks to
+    // video.currentTime, so the user resumes exactly where they paused.
+    const player = mpegtsPlayerRef.current as any;
+    if (player) {
+      const video = videoRef.current;
+      const dur = mpegtsDurationRef.current || state.current.duration || 0;
+      if (video && dur > 0) {
+        // Recreate the player at the current position to restart the loader.
+        // isPausedRef is already false (set above), so the align poll will NOT
+        // re-pause the new IOController — downloading resumes normally.
+        _mpegtsUnbufferedSeek(video.currentTime, dur);
+      }
+      // Restart proactive prebuffer reporting interval
+      const _fileId = file?.id;
+      const _folderId = activeFolderId;
+      const _fileSize = state.current.fileLength;
+      if (_fileId && _folderId && _fileSize && !proactiveIntervalRef.current) {
+        proactivePrebufferMsgIdRef.current = _fileId;
+        const proactiveInterval = setInterval(async () => {
+          const v = videoRef.current;
+          if (!v || v.paused || v.ended) return;
+          const eng = (mpegtsPlayerRef.current as any)?._player_engine;
+          const ic = eng?._ioctl;
+          const isDownloading = ic ? !ic._paused : false;
+          try {
+            await invoke('cmd_report_playback_position', {
+              messageId: _fileId,
+              folderId: _folderId,
+              currentTimeS: v.currentTime,
+              durationS: mpegtsDurationRef.current || v.duration || 0,
+              fileSize: _fileSize,
+              isPlayerDownloading: isDownloading,
+              playbackRate: v.playbackRate || 1.0,
+              byteOffset: null,
+            });
+          } catch { /* ignore */ }
+        }, 10000);
+        proactiveIntervalRef.current = proactiveInterval;
+      }
+      return; // TS path handled — don't run downloadLoop
+    }
+
+    // MP4/MKV/WebM: restart download loop
     if (!state.current.downloading && streamUrl && downloadLoopRef.current) {
-      isPausedRef.current = false;
-      setIsPaused(false);
-      setIsPrefetching(true);
       downloadLoopRef.current(streamUrl);
     }
   };
