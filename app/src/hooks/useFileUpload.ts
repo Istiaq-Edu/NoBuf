@@ -21,6 +21,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
     const [processing, setProcessing] = useState(false);
     const [initialized, setInitialized] = useState(false);
+    const [limitBytes, setLimitBytes] = useState(2_000_000_000);
+    useEffect(() => { invoke<number>('cmd_upload_limit').then(setLimitBytes).catch(() => {}); }, []);
     const cancelledRef = useRef<Set<string>>(new Set());
 
     // Listen for progress events from Rust
@@ -123,14 +125,29 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             const selected = await open({ multiple: true, directory: false });
             if (selected) {
                 const paths = Array.isArray(selected) ? selected : [selected];
-                const newItems: QueueItem[] = paths.map((path: string) => ({
+                // Pre-validate against the Premium-aware size limit (consistent with drop path).
+                const kept: string[] = [];
+                const oversized: string[] = [];
+                for (const p of paths) {
+                    try {
+                        const size = await invoke<number>('cmd_file_size', { path: p });
+                        if (size > limitBytes) { oversized.push(p.split(/[/\\]/).pop() || p); continue; }
+                    } catch { /* if size probe fails, let the upload flow surface the error */ }
+                    kept.push(p);
+                }
+                if (oversized.length > 0) {
+                    const gb = Math.round(limitBytes / 1_000_000_000);
+                    toast.error(`${oversized.length} file(s) exceed the ${gb} GB limit.`);
+                }
+                if (kept.length === 0) return;
+                const newItems: QueueItem[] = kept.map((path: string) => ({
                     id: Math.random().toString(36).substr(2, 9),
                     path,
                     folderId: activeFolderId,
                     status: 'pending'
                 }));
                 setUploadQueue(prev => [...prev, ...newItems]);
-                toast.info(`Queued ${paths.length} files for upload`);
+                toast.info(`Queued ${kept.length} files for upload`);
             }
         } catch {
             toast.error("Failed to open file dialog");
@@ -219,12 +236,22 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const { isDragging } = useFileDrop();
 
+    const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean) => {
+        const { stageDroppedFiles } = await import('./useDroppedFileUpload');
+        const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder);
+        if (items.length > 0) {
+            setUploadQueue(prev => [...prev, ...items]);
+            toast.info(`Queued ${items.length} file(s) for upload`);
+        }
+    };
+
     return {
         uploadQueue,
         setUploadQueue,
         handleManualUpload,
         handleFolderUpload,
         handleRemoteUpload,
+        stageAndQueue,
         cancelAll,
         cancelItem,
         retryItem,

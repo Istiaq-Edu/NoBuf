@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-stage-dropped-file"
+description = "Enables the cmd_stage_dropped_file command without any pre-configured scope."
+commands.allow = ["cmd_stage_dropped_file"]
+
+[[permission]]
+identifier = "deny-cmd-stage-dropped-file"
+description = "Denies the cmd_stage_dropped_file command without any pre-configured scope."
+commands.deny = ["cmd_stage_dropped_file"]

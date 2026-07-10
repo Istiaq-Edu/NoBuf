@@ -290,6 +290,67 @@ pub async fn cmd_cancel_transfer(
     Ok(true)
 }
 
+/// Returns the current account's per-file upload limit in bytes (Premium-aware).
+/// Frontend caches this to pre-validate drops/picks instantly without a round-trip per file.
+#[tauri::command]
+pub async fn cmd_upload_limit(state: State<'_, TelegramState>) -> Result<u64, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    match client_opt {
+        Some(client) => crate::commands::utils::upload_limit_bytes(&client).await,
+        None => Ok(2_000_000_000), // not connected → conservative free-tier default
+    }
+}
+
+/// Returns a local file's size in bytes. Used for client-side pre-validation of picker uploads.
+#[tauri::command]
+pub async fn cmd_file_size(path: String) -> Result<u64, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    Ok(meta.len())
+}
+
+/// Stage bytes of a dropped browser File into a temp file, chunk by chunk.
+/// upload_id: collision-safe id from the frontend (the QueueItem id).
+/// file_name: original name (sanitized here); chunk_index 0 truncates, others append.
+/// Returns the temp file's absolute path on the final chunk, else "".
+/// NOTE: `std::io::Write` is already imported at the top of this file (write_all in scope).
+#[tauri::command]
+pub async fn cmd_stage_dropped_file(
+    upload_id: String,
+    file_name: String,
+    chunk_index: u64,
+    is_last: bool,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    // Sanitize: strip any path components — keep the bare filename only.
+    let safe_name = std::path::Path::new(&file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dropped".to_string());
+    let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if safe_id.is_empty() {
+        return Err("Invalid upload id".to_string());
+    }
+
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}-{}", safe_id, safe_name));
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(chunk_index != 0)  // first chunk: overwrite; later: append
+        .truncate(chunk_index == 0)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(&bytes).map_err(|e| e.to_string())?;
+
+    if is_last {
+        Ok(path.to_string_lossy().to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_upload_file(
     path: String,
@@ -1501,3 +1562,5 @@ pub async fn cmd_scan_folders(
 
     Ok(ScanResult { added, updated, removed, current })
 }
+
+
