@@ -19,9 +19,10 @@ interface MediaPlayerProps {
     activeFolderId: number | null;
     onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
     isAlreadyDownloading?: boolean;
+    isPublicChannel?: boolean;
 }
 
-export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: MediaPlayerProps) {
+export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: MediaPlayerProps) {
     const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null);
 
     useEffect(() => {
@@ -47,6 +48,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
             activeFolderId={activeFolderId}
             onContinueToDownload={onContinueToDownload}
             isAlreadyDownloading={isAlreadyDownloading}
+            isPublicChannel={isPublicChannel}
         />
     );
 }

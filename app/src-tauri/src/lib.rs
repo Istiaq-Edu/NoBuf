@@ -452,8 +452,17 @@ pub fn run() {
             commands::cmd_update_group_order,
             commands::cmd_get_enriched_folders,
             commands::cmd_open_url,
-            commands::cmd_open_telegram_auth,
-         ])
+            commands::cmd_resolve_channel_link,
+            commands::cmd_join_channel_by_link,
+            commands::cmd_list_joined_channels,
+            commands::cmd_add_joined_channel,
+            commands::cmd_get_public_channels,
+            commands::cmd_get_public_channel_files,
+            commands::cmd_remove_public_channel,
+            commands::cmd_forward_to_folder,
+            commands::cmd_update_nb_pub_sync,
+            commands::cmd_sync_public_channels,
+        ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));
         })

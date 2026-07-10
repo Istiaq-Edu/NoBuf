@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-update-nb-pub-sync"
+description = "Enables the cmd_update_nb_pub_sync command without any pre-configured scope."
+commands.allow = ["cmd_update_nb_pub_sync"]
+
+[[permission]]
+identifier = "deny-cmd-update-nb-pub-sync"
+description = "Denies the cmd_update_nb_pub_sync command without any pre-configured scope."
+commands.deny = ["cmd_update_nb_pub_sync"]

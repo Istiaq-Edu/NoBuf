@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-add-joined-channel"
+description = "Enables the cmd_add_joined_channel command without any pre-configured scope."
+commands.allow = ["cmd_add_joined_channel"]
+
+[[permission]]
+identifier = "deny-cmd-add-joined-channel"
+description = "Denies the cmd_add_joined_channel command without any pre-configured scope."
+commands.deny = ["cmd_add_joined_channel"]

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -7,7 +7,7 @@ import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
 import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, AutoHideDelay, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 
@@ -20,11 +20,83 @@ interface FastStreamPlayerProps {
   activeFolderId: number | null;
   onContinueToDownload?: (messageId: number, filename: string, folderId: number | null, savePath: string, fromCachePercent: number) => void;
   isAlreadyDownloading?: boolean;
-}
+    isPublicChannel?: boolean;
+  }
 
-const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 8, 16];
+  const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 
-export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading }: FastStreamPlayerProps) {
+  // ─── Settings-panel primitives (presentational, DRY) ──────────────────────
+  type ChipTone = 'secondary' | 'primary' | 'green';
+
+  function SettingsSection({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
+    return (
+      <div className="px-4 py-3.5 border-b border-white/[0.06]">
+        <h3 className="text-white/40 text-[10px] font-semibold uppercase tracking-[0.14em] mb-3 flex items-center gap-1.5">
+          <span className="text-nobuf-primary/70">{icon}</span>{title}
+        </h3>
+        <div className="space-y-3.5">{children}</div>
+      </div>
+    );
+  }
+
+  function SettingRow({ label, hint, stack, children }: { label: string; hint?: string; stack?: boolean; children: ReactNode }) {
+    const head = (
+      <div className="min-w-0">
+        <div className="text-white/75 text-xs">{label}</div>
+        {hint && <div className="text-white/35 text-[10px] leading-snug mt-0.5">{hint}</div>}
+      </div>
+    );
+    if (stack) return <div>{head && <div className="mb-2">{head}</div>}{children}</div>;
+    return (
+      <div className="flex items-center justify-between gap-3">
+        {head}
+        <div className="shrink-0">{children}</div>
+      </div>
+    );
+  }
+
+  function Switch({ on, onClick, title }: { on: boolean; onClick: () => void; title?: string }) {
+    return (
+      <button onClick={onClick} title={title} role="switch" aria-checked={on}
+        className={`relative w-10 h-[22px] rounded-full transition-colors duration-200 ${on ? 'bg-nobuf-primary' : 'bg-white/15'}`}>
+        <span className={`absolute top-[3px] w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200 ${on ? 'left-[21px]' : 'left-[3px]'}`} />
+      </button>
+    );
+  }
+
+  function Chip({ active, onClick, tone = 'secondary', children }: { active: boolean; onClick: () => void; tone?: ChipTone; children: ReactNode }) {
+    const activeCls =
+      tone === 'green' ? 'bg-green-500/25 text-green-300 ring-1 ring-green-400/40'
+      : tone === 'primary' ? 'bg-nobuf-primary/20 text-nobuf-primary ring-1 ring-nobuf-primary/40'
+      : 'bg-nobuf-secondary text-white';
+    return (
+      <button onClick={onClick}
+        className={`px-2.5 py-1 rounded-md text-xs transition-all duration-150 ${active ? activeCls : 'bg-white/[0.07] text-white/55 hover:bg-white/15 hover:text-white/85'}`}>
+        {children}
+      </button>
+    );
+  }
+
+  function UnitToggle({ unit, onChange, tone }: { unit: 'kb' | 'mb'; onChange: (u: 'kb' | 'mb') => void; tone: 'green' | 'primary' }) {
+    const activeCls = tone === 'green' ? 'bg-green-500/25 text-green-300' : 'bg-nobuf-primary/20 text-nobuf-primary';
+    return (
+      <div className="flex rounded-md overflow-hidden border border-white/10 shrink-0">
+        {(['kb', 'mb'] as const).map(u => (
+          <button key={u} onClick={() => onChange(u)}
+            className={`px-2 py-1 text-[10px] font-mono transition-colors ${unit === u ? activeCls : 'bg-white/[0.04] text-white/40 hover:text-white/70'}`}>
+            {u === 'kb' ? 'KB/s' : 'MB/s'}
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  const NumInput = ({ value, onChange, focusCls = 'focus:border-nobuf-secondary', title, w = 'w-14' }: { value: number | string; onChange: (v: string) => void; focusCls?: string; title?: string; w?: string }) => (
+    <input type="number" value={value} title={title} onChange={e => onChange(e.target.value)}
+      className={`${w} px-1.5 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 ${focusCls} focus:outline-none text-center`} />
+  );
+
+  export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -56,6 +128,27 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // Settings panel state
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Control-bar customization (drag & drop chips). Declared here — above the
+  // auto-hide + tray effects that read them.
+  const [dragChip, setDragChip] = useState<string | null>(null);
+  const [dropSide, setDropSide] = useState<'left' | 'right' | 'tray' | null>(null);
+  const [dragKind, setDragKind] = useState<'chip' | null>(null); // non-null while a bar chip (incl. the ⋯ tray) is being dragged
+  // True only WHILE a chip/tray drag is physically in progress (dragstart→dragend).
+  const dragActiveRef = useRef(false);
+  // Timestamp of the last dragend. The WebView fires a synthetic Escape keydown a
+  // few ms after a *cancelled* native drag; we swallow any Escape landing within
+  // this window. A timestamp (not a held boolean) can NEVER get stuck "armed", so
+  // the X button and a genuine Escape are never disabled by a drag that failed to
+  // fire a clean dragend — which is what was killing the close button.
+  const lastDragEndRef = useRef(0);
+  const markDragStart = useCallback(() => { dragActiveRef.current = true; }, []);
+  const markDragEnd = useCallback(() => { dragActiveRef.current = false; lastDragEndRef.current = Date.now(); }, []);
+  const [dropIndex, setDropIndex] = useState<number | null>(null); // live insertion slot within the active side
+  const [trayOpen, setTrayOpen] = useState(false);
+  // Live width while dragging the resize handle (null = use persisted settings width).
+  const [panelDragWidth, setPanelDragWidth] = useState<number | null>(null);
+  const panelResizing = useRef(false);
+  const [controlsPinned, setControlsPinned] = useState(true); // default pinned; only matters when playerShowPinButton is on
   const [loop, setLoop] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [brightness, setBrightness] = useState(1);
@@ -69,9 +162,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // Video cache dialog state — replaces old bgCache auto-dialog
   const [showCacheDialog, setShowCacheDialog] = useState(false);
   const [pendingCachePercent, setPendingCachePercent] = useState(0);
-  const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; amount: number } | null>(null);
+  const [skipFeedback, setSkipFeedback] = useState<{ direction: 'forward' | 'backward'; totalDelta: number; from: number; to: number } | null>(null);
   const skipFeedbackTimer = useRef<number>(0);
   const skipFeedbackKey = useRef(0);
+  // Anchor time where the current burst started — lets us show the true cumulative
+  // jump (from → to) across rapid key presses instead of a single-step estimate.
+  const skipBurstFrom = useRef<number | null>(null);
   const [videoEnded, setVideoEnded] = useState(false);
   // Ref synced alongside videoEnded state — prevents stale closure in
   // onPlay handler (which is inside a useEffect and doesn't have videoEnded
@@ -104,7 +200,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // keyframe seeking instead of hls.js. This eliminates MISS-FAR targeted
   // downloads at seek positions — same "seek poison" approach as .mp4 files.
 
-  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId);
+  const msePlayer = useMSEPlayer(streamUrl, file, activeFolderId, isPublicChannel);
 
   // MSE player handles ALL formats (MP4, TS, MKV, WebM).
   // TS files use MediabunnyTransmuxer instead of hls.js.
@@ -137,6 +233,8 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     keyframeIndexReady: msePlayer.keyframeIndexReady,
     coldStartProgress: msePlayer.coldStartProgress,
     isColdStartBuffering: msePlayer.isColdStartBuffering,
+    coldStartPhase: msePlayer.coldStartPhase,
+    detectedFormat: msePlayer.detectedFormat,
     getMoovBuffer: msePlayer.getMoovBuffer,
     getFirstChunk: msePlayer.getFirstChunk,
     getInitSegments: msePlayer.getInitSegments,
@@ -156,9 +254,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     useNative: playerUseNative,
     remuxUrl: playerRemuxUrl,
     unsupportedCodec: playerUnsupportedCodec,
-    prefetchedBytes,
+    prefetchedBytes: _prefetchedBytes,
     totalBytes,
-    isPrefetching,
+    isPrefetching: _isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
     speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
@@ -177,12 +275,23 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     keyframeIndexReady: _keyframeIndexReady,
     isColdStartBuffering,
     coldStartProgress,
+    coldStartPhase,
+    detectedFormat,
   } = player;
 
   // Cold-start overlay visibility with a 300ms fade-out so the overlay doesn't
   // snap off the moment the buffer gate completes. Playback starts immediately
   // underneath the overlay; the overlay is purely informational progress.
   const [showColdStartOverlay, setShowColdStartOverlay] = useState(false);
+  // Dedicated overlay for the remux fallback path (TS files with timed_id3).
+  // Covers the full startup pipeline: metadata fetch + ffprobe + ffmpeg spawn +
+  // first fMP4 fragments. The cold-start overlay only covers the mpegts.js 5MB
+  // prebuffer — it hides at ~2s, but remux video isn't ready for 5-10s. This
+  // state stays true until onPlay fires (video actually playing) or a 15s
+  // safety timeout prevents a stuck overlay if playback never starts.
+  const [isRemuxLoading, setIsRemuxLoading] = useState(false);
+  const isRemuxLoadingRef = useRef(false);
+  isRemuxLoadingRef.current = isRemuxLoading;
   // Ref mirror so event handlers (onMeta/onCanPlay) inside the useEffect
   // closure can check the current cold-start state without re-registering.
   // Without this, the handlers capture a stale `isColdStartBuffering=false`
@@ -241,6 +350,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   // Close handler — background cache controls behavior
   // Close handler — show VideoCacheDialog for video files with cache > 0%
   const handleClose = useCallback(async () => {
+    // Swallow the phantom click WebView2 synthesizes on the element under the
+    // cursor when a native chip-drag is released — dropping on the bar's right
+    // end lands that click on this X button. A real X click never lands within
+    // 350ms of a chip dragend, so a recency window blocks the phantom without
+    // ever disabling a genuine close.
+    if (Date.now() - lastDragEndRef.current < 350) return;
     // Only show dialog for video files with cached data
     if (!isVideoFile(file.name)) {
       // console.log(`[CACHE-DIALOG] Not a video file — closing directly for "${file.name}"`);
@@ -264,7 +379,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (cacheStatus && cacheStatus.percentage === 0 && cacheStatus.cached_bytes > 0) {
         onClose();
         const tryDelete = (attempt: number) => {
-          invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+          invoke('cmd_delete_cache', { messageId: file.id, reason: 'player-close-zero-cache' }).catch(() => {
             if (attempt < 5) {
               setTimeout(() => tryDelete(attempt + 1), 2000);
             }
@@ -289,7 +404,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     // to drop its StreamingGuard and file handle. cmd_delete_cache now returns
     // an error when streaming is still active, so retries properly handle this.
     const tryDelete = (attempt: number) => {
-      invoke('cmd_delete_cache', { messageId: file.id }).catch(() => {
+      invoke('cmd_delete_cache', { messageId: file.id, reason: 'cache-dialog-discard' }).catch(() => {
         if (attempt < 5) {
           setTimeout(() => tryDelete(attempt + 1), 2000);
         }
@@ -602,10 +717,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         if (knownDuration <= 0 && (window as any).__nobuf_ptsDuration > 0) {
           knownDuration = (window as any).__nobuf_ptsDuration;
         }
-        // Priority 3: Bitrate estimation from file size (unreliable for TS)
-        if (knownDuration <= 0 && file.size > 0) {
-          knownDuration = (file.size / 4_000_000) * 8; // bits / bitrate = seconds
-        }
+        // NO Priority 3 (4Mbps estimate) for the remux path — it poisons durRef
+        // with ~38min before the fetch resolves, causing the "live-stream" growing
+        // duration. If no authoritative duration is available yet, leave durRef
+        // at 0 and let onDurChange set it once __nobuf_ptsDuration arrives.
+        // The onDurChange suppression guard (isRemux && realDuration <= 0 → return)
+        // keeps the displayed duration at 0:00 until the real value is known.
         if (knownDuration > 0) {
           console.log('[Player] Remux: overriding duration to', knownDuration.toFixed(1), 's');
           setDur(knownDuration);
@@ -616,6 +733,21 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       v.src = nativeUrl;
       setLastVideoSrc(nativeUrl);
       v.autoplay = true;
+      // Show the remux loading overlay — covers download + ffprobe + ffmpeg startup +
+      // first fragments. Hidden by onPlay (video actually playing) or timeout.
+      // For large uncached files the backend must: download → ffprobe → ffmpeg start →
+      // produce first fMP4 fragment → browser decode → fire play. 45s covers 1GB+ files.
+      if (nativeUrl === playerRemuxUrl) {
+        setIsRemuxLoading(true);
+        const remuxTimeoutId = setTimeout(() => {
+          if (isRemuxLoadingRef.current) {
+            console.warn('[Player] Remux loading timeout (45s) — hiding overlay');
+            setIsRemuxLoading(false);
+          }
+        }, 45000);
+        // Store timeout id on the video element so onPlay/onErr can clear it
+        (v as any).__nobuf_remuxTimeoutId = remuxTimeoutId;
+      }
     } else {
       // MSE mode (ALL formats): use Blob URL
       // For mpegts.js (TS files), mseUrl is null because mpegts.js creates
@@ -681,11 +813,17 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // overwrite it. For cached mode, video.duration is correct from faststart moov.
         // For mpegts.js, if the only duration we have is the 4 Mbps estimate, keep
         // the UI at 0:00 until the real PTS duration arrives.
-        const isRemux = lastVideoSrc === playerRemuxUrl;
+        const isRemux = lastVideoSrc === playerRemuxUrl || v.src?.includes('/remux/');
         const realDuration = (file?.duration && file.duration > 0 && isFinite(file.duration))
           ? file.duration : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
         const isEstimate = (window as any).__nobuf_durationIsEstimate === true && realDuration <= 0;
-        if (!isRemux || v.duration > durRef.current) {
+
+        // On remux: if authoritative duration is known, use it immediately — don't
+        // let the bogus empty_moov duration (5s, 10s, etc.) flash in the UI.
+        if (isRemux && realDuration > 0) {
+          setDur(realDuration);
+          durRef.current = realDuration;
+        } else if (!isRemux || v.duration > durRef.current) {
           if (isEstimate) {
             (window as any).__nobuf_estimateDuration = v.duration;
           } else {
@@ -704,7 +842,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       // useMSEPlayer._initMpegtsPlayer will call player.play() after 5 MB
       // is cached. Starting here would play under the overlay with thin buffer.
       if (!coldStartBufferingRef.current) {
-        v.play().catch((e) => console.warn('[Player] play() failed:', e));
+        // Don't auto-play during deferred VBR check — the align poll will play()
+        // after confirming the position is correct (or after VBR correction)
+        if ((window as any).__nobuf_seekTargetTime > 0) return;
+        v.play().catch((e: any) => {
+          if (e?.name !== 'AbortError') console.warn('[Player] play() failed:', e);
+        });
       }
     };
     const onCanPlay = () => {
@@ -722,18 +865,41 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       if (videoEndedRef.current) return;
       // Same cold-start gate as onMeta — don't play before the buffer gate.
       if (coldStartBufferingRef.current) return;
+      // Don't auto-play during deferred VBR check
+      if ((window as any).__nobuf_seekTargetTime > 0) return;
       v.play().catch(() => {});
     };
     const onErr = () => {
       const err = v.error;
       console.error('[Player] video error:', err?.code, err?.message, 'src:', v.src);
+      // Clear remux loading overlay on error — don't keep it stuck
+      if (isRemuxLoadingRef.current) {
+        setIsRemuxLoading(false);
+      }
+      if ((v as any).__nobuf_remuxTimeoutId) {
+        clearTimeout((v as any).__nobuf_remuxTimeoutId);
+        (v as any).__nobuf_remuxTimeoutId = null;
+      }
       setErr(playerError || `Video error: ${err?.message || 'unknown'}`);
       setLoad(false);
     };
     const onTime = () => {
       const ct = v.currentTime;
       if (!isFinite(ct)) return; // guard against NaN after eviction/resume
-      setTime(ct);
+      // During player recreation, hold the bar at the seek target.
+      // Hold when ct is BELOW target (forward seek / recreation ct=0)
+      // OR when ct is far ABOVE target (backward seek — stale old buffer ct).
+      // Don't clear during active recreation — wait for align poll.
+      const seekTarget = (window as any).__nobuf_seekTargetTime;
+      const seekInProgress = (window as any).__nobuf_userSeekInProgress === true;
+      if (seekTarget > 0 && (seekInProgress || ct < seekTarget - 2 || ct > seekTarget + 20)) {
+        setTime(seekTarget);
+      } else {
+        if (seekTarget > 0) {
+          (window as any).__nobuf_seekTargetTime = 0; // seek complete — clear
+        }
+        setTime(ct);
+      }
       // Get the furthest buffered position
       if (v.buffered.length > 0) {
         let maxBuf = 0;
@@ -750,6 +916,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setBufferedRanges(ranges);
     };
     const onPlay = () => {
+      // Clear remux loading overlay — video is actually playing now
+      if (isRemuxLoadingRef.current) {
+        setIsRemuxLoading(false);
+      }
+      if ((v as any).__nobuf_remuxTimeoutId) {
+        clearTimeout((v as any).__nobuf_remuxTimeoutId);
+        (v as any).__nobuf_remuxTimeoutId = null;
+      }
       setPlaying(true);
       // Only clear videoEnded if the video is NOT at the end.
       // When the MSE guard dispatches a synthetic 'ended' event, it also
@@ -810,7 +984,16 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         ? file.duration
         : ((window as any).__nobuf_ptsDuration > 0 ? (window as any).__nobuf_ptsDuration : 0);
 
-      const isRemux = lastVideoSrc === playerRemuxUrl;
+      const isRemux = lastVideoSrc === playerRemuxUrl || v.src?.includes('/remux/');
+
+      // On remux fallback: suppress fragment-growing duration (5→10→20→49s) and
+      // the 4Mbps estimate until the backend PTS duration arrives. The cold-start
+      // overlay hides the video during the fetch; this guard prevents durRef from
+      // being polluted underneath. Once __nobuf_ptsDuration is set, realDuration > 0
+      // and the floor guard below clamps correctly from the first real event.
+      if (isRemux && realDuration <= 0 && isFinite(v.duration) && v.duration > 0) {
+        return;
+      }
 
       if (isFinite(v.duration) && v.duration > 0) {
         // Overflow guard: mpegts.js can report ~2^32/1000 ≈ 4294967s after aborts.
@@ -821,6 +1004,13 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         // duration from the current buffer only (e.g., 153s instead of 2073s),
         // restore the authoritative value.
         const safeDur = (realDuration > 0 && clampedDur < realDuration) ? realDuration : clampedDur;
+
+        // Early exit: if we already have this duration set, nothing to do.
+        // fMP4 empty_moov streams fire durationchange on every fragment arrival —
+        // without this guard we'd log thousands of no-op corrections.
+        if (durRef.current > 0 && Math.abs(safeDur - durRef.current) < 0.01) {
+          return;
+        }
 
         if (!isRemux || safeDur > durRef.current) {
           const isEstimate = (window as any).__nobuf_durationIsEstimate === true;
@@ -917,17 +1107,23 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   // Buffer state is already updated by timeupdate and progress events above
 
-  // Auto-hide controls — show on mouse activity, hide after idle during playback
+  // Auto-hide controls — show on mouse activity, hide after idle during playback.
+  // Behavior is gated by the "show pin button" setting:
+  //   • OFF (default): control bar is ALWAYS visible — never auto-hides.
+  //   • ON: user gets a pin toggle on the bar. Pinned → always visible;
+  //         unpinned → auto-hide after a fixed idle delay while playing.
   const lastMousePos = useRef({ x: 0, y: 0 });
-  const hideDelayMs = settings.playerAutoHideDelay === 0 ? 0 : settings.playerAutoHideDelay * 1000;
+  const PIN_AUTO_HIDE_MS = 3000; // fixed idle delay when pin feature is on + unpinned
+  const showPinButton = settings.playerShowPinButton;
   useEffect(() => {
-    // Always show controls when paused or settings panel is open
-    if (!playing || settingsOpen) {
+    // Pin feature off → controls never auto-hide.
+    if (!showPinButton) {
       setVis(true);
       return;
     }
-    // Never auto-hide if delay is 0
-    if (hideDelayMs === 0) {
+    // Always show controls when paused, settings panel is open, pinned, or
+    // while a chip/tray is being dragged (auto-hide mid-drag would abort the drop).
+    if (!playing || settingsOpen || controlsPinned || dragKind) {
       setVis(true);
       return;
     }
@@ -938,10 +1134,10 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
         // CSS :hover works with stationary mouse — unlike JS event tracking
-        if (playing && !settingsOpen && !controlsRef.current?.matches(':hover')) {
+        if (playing && !settingsOpen && !controlsPinned && !controlsRef.current?.matches(':hover')) {
           setVis(false);
         }
-      }, hideDelayMs);
+      }, PIN_AUTO_HIDE_MS);
     };
 
     // Schedule initial hide — handles case where mouse is already outside window
@@ -962,7 +1158,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     const onMouseLeave = () => {
       clearTimeout(hideTimer);
       hideTimer = window.setTimeout(() => {
-        if (playing && !settingsOpen) setVis(false);
+        if (playing && !settingsOpen && !controlsPinned) setVis(false);
       }, 1500);
     };
 
@@ -973,7 +1169,52 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       document.removeEventListener('mouseleave', onMouseLeave);
       clearTimeout(hideTimer);
     };
-  }, [playing, settingsOpen, hideDelayMs]);
+  }, [showPinButton, playing, settingsOpen, controlsPinned, dragKind]);
+
+  // Close the customization tray on outside-click or Escape.
+  useEffect(() => {
+    if (!trayOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (!t.closest('[data-tray-root]')) setTrayOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setTrayOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
+  }, [trayOpen]);
+
+  // While any chip/tray drag is active, force a 'grabbing' cursor everywhere and
+  // block text selection — so the cursor reflects drag state across the whole UI.
+  useEffect(() => {
+    if (!dragKind) return;
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'grabbing';
+    document.body.style.userSelect = 'none';
+    return () => { document.body.style.cursor = prevCursor; document.body.style.userSelect = prevSelect; };
+  }, [dragKind]);
+
+  // Native drag-and-drop hard guard. While the player is mounted, cancel EVERY
+  // dragover/drop at the document in the capture phase. Without this, releasing a
+  // chip anywhere outside the bar lets the WebView treat the drop as "navigate to
+  // this payload" — which reloads the <video> src and throws it to the error
+  // screen. Capture-phase on document beats React's synthetic root listeners, so
+  // the native default never runs. The bar's own onDrop still gets the event.
+  useEffect(() => {
+    const prevent = (e: DragEvent) => {
+      const onBar = !!(e.target as HTMLElement)?.closest?.('[data-controls-root]');
+      // Only hard-cancel drops that land OUTSIDE the control bar. Inside the bar,
+      // let React's own onDrop/onDragOver handle it (they preventDefault too).
+      if (!onBar) e.preventDefault();
+    };
+    document.addEventListener('dragover', prevent, true);
+    document.addEventListener('drop', prevent, true);
+    return () => {
+      document.removeEventListener('dragover', prevent, true);
+      document.removeEventListener('drop', prevent, true);
+    };
+  }, []);
 
   // Mini progress bar — appears after controls have fully hidden (300ms delay)
   useEffect(() => {
@@ -1025,6 +1266,24 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     }
   }, [pip]);
 
+  // Keep the `pip` flag (and thus the chip's active color) in sync with the
+  // ACTUAL PiP window state. Closing PiP via the window's own X fires
+  // 'leavepictureinpicture' without touching our state — without this the chip
+  // stays highlighted. Setting state to the value it already holds is a no-op,
+  // so this can't ping-pong with the effect above.
+  useEffect(() => {
+    const v = vidRef.current;
+    if (!v) return;
+    const onEnter = () => setPip(true);
+    const onLeave = () => setPip(false);
+    v.addEventListener('enterpictureinpicture', onEnter);
+    v.addEventListener('leavepictureinpicture', onLeave);
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnter);
+      v.removeEventListener('leavepictureinpicture', onLeave);
+    };
+  }, []);
+
   // Track controls overlay height for download overlay positioning
   useEffect(() => {
     const el = controlsRef.current;
@@ -1041,8 +1300,9 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
   const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; if (videoEndedRef.current) { replay(); } else { v.paused ? v.play().catch(() => {}) : v.pause(); } }, [replay]);
   const seek = useCallback((s: number) => {
     const v = vidRef.current;
-    if (!v) return;
-    const target = Math.max(0, Math.min(v.currentTime + s, dur));
+    if (!v) return null;
+    const from = v.currentTime;
+    const target = Math.max(0, Math.min(from + s, dur));
     if (playerUseNative) {
       v.currentTime = target;
     } else if (target >= dur) {
@@ -1060,18 +1320,31 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     } else {
       seekTo(target);
     }
+    return { from, to: target };
   }, [dur, playerUseNative, seekTo]);
+  // Show/refresh the skip feedback overlay. Reads the REAL from/to returned by
+  // seek() (live video time, not lagging React state) and accumulates the total
+  // jump across a rapid burst of presses so the numbers always match reality.
+  const showSkipFeedback = useCallback((dir: 'forward' | 'backward', res: { from: number; to: number } | null) => {
+    if (!res) return;
+    setVis(true);
+    const bursting = skipBurstFrom.current != null;
+    const anchor = bursting ? (skipBurstFrom.current as number) : res.from;
+    skipBurstFrom.current = anchor;
+    // Only bump the key (→ remount → play the entrance animation) when a NEW
+    // burst starts. Mid-burst presses keep the same key so the overlay just
+    // updates its numbers in place — no jarring re-animation.
+    if (!bursting) skipFeedbackKey.current += 1;
+    clearTimeout(skipFeedbackTimer.current);
+    setSkipFeedback({ direction: dir, from: anchor, to: res.to, totalDelta: res.to - anchor });
+    skipFeedbackTimer.current = window.setTimeout(() => { setSkipFeedback(null); skipBurstFrom.current = null; }, 1000);
+  }, []);
   const seekFwd = useCallback(() => {
     // When replay overlay is showing, ignore forward seeks — the video
     // has already ended. Pressing space/k calls replay() via toggle().
     if (videoEndedRef.current) return;
-    seek(settings.playerSkipForward);
-    setVis(true);
-    clearTimeout(skipFeedbackTimer.current);
-    skipFeedbackKey.current += 1;
-    setSkipFeedback({ direction: 'forward', amount: settings.playerSkipForward });
-    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
-  }, [seek, settings.playerSkipForward]);
+    showSkipFeedback('forward', seek(settings.playerSkipForward));
+  }, [seek, showSkipFeedback, settings.playerSkipForward]);
   const seekBwd = useCallback(() => {
     // When replay overlay is showing, allow backward seeks — the user
     // wants to re-watch content near the end. Clear videoEnded so the
@@ -1082,7 +1355,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setVideoEnded(false);
       videoEndedRef.current = false;
     }
-    seek(-settings.playerSkipBackward);
+    const res = seek(-settings.playerSkipBackward);
     // Resume playback AFTER the backward seek — must not call play() before
     // seek() because currentTime might be at duration (from MSE guard), and
     // play() at duration fires 'ended' immediately, re-setting videoEnded=true
@@ -1091,16 +1364,118 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
     if (wasVideoEnded) {
       vidRef.current?.play().catch(() => {});
     }
-    setVis(true);
-    clearTimeout(skipFeedbackTimer.current);
-    skipFeedbackKey.current += 1;
-    setSkipFeedback({ direction: 'backward', amount: settings.playerSkipBackward });
-    skipFeedbackTimer.current = window.setTimeout(() => setSkipFeedback(null), 1500);
-  }, [seek, settings.playerSkipBackward]);
+    showSkipFeedback('backward', res);
+  }, [seek, showSkipFeedback, settings.playerSkipBackward]);
+  // Fixed 30s jump chips (replace prev/next). Reuse seek() + the side overlay.
+  const skip30Fwd = useCallback(() => { if (videoEndedRef.current) return; showSkipFeedback('forward', seek(30)); }, [seek, showSkipFeedback]);
+  const skip30Bwd = useCallback(() => { showSkipFeedback('backward', seek(-30)); }, [seek, showSkipFeedback]);
   const setVol2 = useCallback((n: number) => { const v = vidRef.current; if (!v) return; v.volume = Math.max(0, Math.min(1, n)); setVol(v.volume); if (n > 0) { v.muted = false; setMuted(false); } }, []);
   const mute = useCallback(() => { const v = vidRef.current; if (!v) return; v.muted = !v.muted; setMuted(v.muted); }, []);
   const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
   const rate2 = useCallback((r: number) => { const v = vidRef.current; if (v) { v.playbackRate = r; setRate(r); } setMenu(false); }, []);
+
+  // Settings panel resize: drag the left edge. Width is clamped to the player box
+  // and persisted so it's remembered across sessions. Panel grows leftward, so a
+  // drag to the LEFT (smaller clientX) = wider panel.
+  const PANEL_MIN = 260, PANEL_MAX_FRAC = 0.7;
+  const startPanelResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault(); e.stopPropagation();
+    panelResizing.current = true;
+    const rect = boxRef.current?.getBoundingClientRect();
+    const boxW = rect?.width ?? window.innerWidth;
+    const rightEdge = rect?.right ?? window.innerWidth;
+    const maxW = Math.max(PANEL_MIN, Math.round(boxW * PANEL_MAX_FRAC));
+    const move = (ev: MouseEvent) => {
+      if (!panelResizing.current) return;
+      const w = Math.max(PANEL_MIN, Math.min(maxW, Math.round(rightEdge - ev.clientX)));
+      setPanelDragWidth(w);
+    };
+    const up = () => {
+      panelResizing.current = false;
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.style.userSelect = '';
+      setPanelDragWidth(w => { if (w != null) updateSetting('playerSettingsWidth', w); return null; });
+    };
+    document.body.style.userSelect = 'none';
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  }, [updateSetting]);
+
+  // ─── Customizable control-bar layout (drag & drop chips between zones) ──────
+  // Chips are keyed ids. A sanitized layout guarantees fixed anchors are never
+  // in the movable pool and any newly-added chip id shows up (in the tray) so a
+  // stale persisted layout can't hide a control. '__tray__' is the ⋯ trigger —
+  // positionable on the bar like any chip, but it can never live inside the tray
+  // popover (it IS the popover) and must always be present somewhere on the bar.
+  const TRAY = '__tray__';
+  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
+  const barLayout = useMemo(() => {
+    const raw = settings.playerBarLayout ?? { left: [], right: [], tray: [] };
+    const seen = new Set<string>();
+    const clean = (arr: string[]) => (arr ?? []).filter(id => ALL_CHIPS.includes(id) && !seen.has(id) && (seen.add(id), true));
+    const left = clean(raw.left), right = clean(raw.right);
+    // The ⋯ trigger can't be parked inside its own popover — pull it out if stale
+    // layout put it there, and guarantee it lands on the bar (default: right end).
+    const tray = clean(raw.tray).filter(id => id !== TRAY);
+    if (!seen.has(TRAY)) { right.push(TRAY); seen.add(TRAY); }
+    const missing = ALL_CHIPS.filter(id => id !== TRAY && !seen.has(id)); // any unplaced chip → tray
+    return { left, right, tray: [...tray, ...missing] };
+  }, [settings.playerBarLayout, ALL_CHIPS]);
+
+  const moveChip = useCallback((chip: string, zone: 'left' | 'right' | 'tray', index?: number) => {
+    const next = { left: [...barLayout.left], right: [...barLayout.right], tray: [...barLayout.tray] };
+    const from = (['left', 'right', 'tray'] as const).find(z => next[z].includes(chip));
+    const fromIdx = from ? next[from].indexOf(chip) : -1;
+    next.left = next.left.filter(c => c !== chip);
+    next.right = next.right.filter(c => c !== chip);
+    next.tray = next.tray.filter(c => c !== chip);
+    // index is a FULL-array slot (counted with the dragged chip still present).
+    // When moving within the same zone from an earlier slot, removal shifts the
+    // target left by one — adjust so the chip lands exactly where the bar showed.
+    let target = index;
+    if (target != null && from === zone && fromIdx !== -1 && fromIdx < target) target -= 1;
+    if (target == null || target < 0 || target > next[zone].length) next[zone].push(chip);
+    else next[zone].splice(target, 0, chip);
+    updateSetting('playerBarLayout', next);
+  }, [barLayout, updateSetting]);
+  // Which side of the row a free-area drop lands on (X vs horizontal midpoint).
+  const sideFromX = useCallback((clientX: number): 'left' | 'right' => {
+    const rect = controlsRef.current?.getBoundingClientRect();
+    return rect && clientX > rect.left + rect.width / 2 ? 'right' : 'left';
+  }, []);
+  // FULL-array insertion index within a side (counts ALL chips, including the
+  // dragged one) so the visual insertion bar and the final landing slot agree.
+  const indexFromX = useCallback((side: 'left' | 'right', clientX: number): number => {
+    const nodes = Array.from(document.querySelectorAll<HTMLElement>(`[data-chip-zone="${side}"] [data-chip-id]`));
+    let idx = 0;
+    for (const n of nodes) {
+      const r = n.getBoundingClientRect();
+      if (clientX > r.left + r.width / 2) idx++; else break;
+    }
+    return idx;
+  }, []);
+  // Unified free-area drop on the buttons row. The ⋯ tray is now just another
+  // chip (id=TRAY), so a single path handles every draggable — insert at the
+  // aimed slot on whichever side the cursor is over.
+  const onRowDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation(); // don't let the container's stray-drop swallow handler also fire
+    lastDragEndRef.current = Date.now(); // stamp recency here too: a reordered tray node's onDragEnd may not fire
+    const side = sideFromX(e.clientX);
+    if (dragChip) moveChip(dragChip, side, indexFromX(side, e.clientX));
+    setDragChip(null);
+    setDragKind(null);
+    setDropSide(null);
+    setDropIndex(null);
+  }, [moveChip, sideFromX, indexFromX, dragChip]);
+  const onTrayDrop = useCallback(() => {
+    lastDragEndRef.current = Date.now(); // stamp recency: guards the phantom post-drop click on the X button
+    if (dragChip) moveChip(dragChip, 'tray');
+    setDragChip(null);
+    setDropSide(null);
+    setDragKind(null);
+  }, [moveChip, dragChip]);
 
   const onBarClick = useCallback((e: React.MouseEvent) => {
     if (!barRef.current || !vidRef.current || !isFinite(dur) || dur <= 0) return;
@@ -1122,6 +1497,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       setPlaying(false);
       setLoad(false);
     } else {
+      setTime(targetTime); // Instant UI update before debounce/recreation
       seekTo(targetTime);
     }
   }, [dur, playerUseNative, seekTo]);
@@ -1192,13 +1568,21 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         case 'arrowdown': e.preventDefault(); setVol2(vol - 0.1); break;
         case 'm': e.preventDefault(); mute(); break;
         case 'f': e.preventDefault(); fs2(); break;
-        case 'escape': e.preventDefault(); document.fullscreenElement ? document.exitFullscreen() : handleClose(); break;
+        case 'escape':
+          e.preventDefault();
+          // Swallow the synthetic Escape the WebView fires when a native chip drag
+          // is cancelled (arrives within a few ms of dragend). A deliberate user
+          // Escape always lands well after any drag, so this only eats the
+          // drag-cancel artifact — never a real close request.
+          if (dragActiveRef.current || Date.now() - lastDragEndRef.current < 350) break;
+          document.fullscreenElement ? document.exitFullscreen() : handleClose();
+          break;
         case 'j': e.preventDefault(); seekBwd(); break;
         case 'l': e.preventDefault(); seekFwd(); break;
         case ',': e.preventDefault(); rate2(Math.max(0.25, rate - 0.25)); break;
-        case '.': e.preventDefault(); rate2(Math.min(16, rate + 0.25)); break;
+        case '.': e.preventDefault(); rate2(Math.min(4, rate + 0.25)); break;
         case '<': e.preventDefault(); rate2(Math.max(0.25, rate / 2)); break;
-        case '>': e.preventDefault(); rate2(Math.min(16, rate * 2)); break;
+        case '>': e.preventDefault(); rate2(Math.min(4, rate * 2)); break;
       }
     };
     document.addEventListener('keydown', h);
@@ -1207,8 +1591,178 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
 
+  // Chip registry: id → button JSX. Each movable control lives here once and is
+  // placed by the persisted layout into left/right/tray zones.
+  const chipButton = (id: string): { el: React.ReactNode; label: string } => {
+    switch (id) {
+      case 'skipBack': return { label: 'Back 30s', el:
+        <button onClick={skip30Bwd} className="p-1.5 hover:bg-white/10 rounded text-white" title="Back 30s">
+          <svg className="w-5 h-5 block" fill="currentColor" viewBox="0 0 24 24"><path d="M12.5 3C7.81 3 4 6.81 4 11.5S7.81 20 12.5 20s8.5-3.81 8.5-8.5c0-.53-.05-1.05-.14-1.55l-1.63.55c.05.33.07.66.07 1 0 3.58-2.92 6.5-6.5 6.5S6 15.08 6 11.5 8.92 5 12.5 5V8l4-4-4-4v3z" transform="scale(-1,1) translate(-24,0)"/><text x="12" y="15" fontSize="8" fontFamily="monospace" fill="currentColor" textAnchor="middle" fontWeight="bold">30</text></svg>
+        </button> };
+      case 'skipFwd': return { label: 'Forward 30s', el:
+        <button onClick={skip30Fwd} className="p-1.5 hover:bg-white/10 rounded text-white" title="Forward 30s">
+          <svg className="w-5 h-5 block" fill="currentColor" viewBox="0 0 24 24"><path d="M12.5 3C7.81 3 4 6.81 4 11.5S7.81 20 12.5 20s8.5-3.81 8.5-8.5c0-.53-.05-1.05-.14-1.55l-1.63.55c.05.33.07.66.07 1 0 3.58-2.92 6.5-6.5 6.5S6 15.08 6 11.5 8.92 5 12.5 5V8l4-4-4-4v3z"/><text x="12" y="15" fontSize="8" fontFamily="monospace" fill="currentColor" textAnchor="middle" fontWeight="bold">30</text></svg>
+        </button> };
+      case 'loop': return { label: 'Loop', el:
+        <button onClick={() => setLoop(l => !l)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${loop ? 'text-nobuf-primary' : 'text-white'}`} title={loop ? 'Loop on' : 'Loop off'}>
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+        </button> };
+      case 'pip': return { label: 'Picture-in-Picture', el:
+        <button onClick={() => setPip(p => !p)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${pip ? 'text-nobuf-primary' : 'text-white'}`} title="Picture-in-Picture">
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16.01H3V4.98h18v14.03z"/></svg>
+        </button> };
+      case 'speed': return { label: 'Speed', el:
+        <div className="relative">
+          <button onClick={() => setMenu(!menu)} className={`px-1.5 py-1 hover:bg-white/10 rounded text-xs font-mono font-semibold flex items-center gap-1 ${rate !== 1 ? 'text-nobuf-primary' : 'text-white'}`} title="Playback speed">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+            {rate}x
+          </button>
+          {menu && (
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[64px] max-h-64 overflow-y-auto z-50 shadow-2xl">
+              {RATES.map(r => (<button key={r} onClick={() => rate2(r)} className={`block w-full text-left px-3 py-1.5 text-sm font-mono hover:bg-white/10 ${rate === r ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>{r}x</button>))}
+            </div>
+          )}
+        </div> };
+      case 'download': return { label: 'Download', el:
+        <button onClick={handleDownload} className="p-1.5 hover:bg-white/10 rounded flex items-center gap-1" title="Download">
+          <svg className={`w-5 h-5 ${dlOverlay?.active && !dlOverlay?.completed ? 'text-nobuf-primary animate-blink' : 'text-white'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
+          {dlOverlay?.active && !dlOverlay?.completed && (<span className="text-xs font-mono text-nobuf-primary">{Math.round(dlOverlay.percent)}%</span>)}
+        </button> };
+      case 'settings': return { label: 'Settings', el:
+        <button onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }} className="p-1.5 hover:bg-white/10 rounded text-white" title="Settings">
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z" /></svg>
+        </button> };
+      case 'pin': return showPinButton ? { label: 'Pin', el:
+        <button onClick={() => setControlsPinned(p => !p)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${controlsPinned ? 'text-nobuf-primary' : 'text-white/50'}`} title={controlsPinned ? 'Unpin controls (auto-hide)' : 'Pin controls (always show)'}>
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" style={{ transform: controlsPinned ? 'rotate(0deg)' : 'rotate(45deg)', transition: 'transform 200ms' }}><path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z" /></svg>
+        </button> } : { label: 'Pin', el: null };
+      case 'fullscreen': return { label: 'Fullscreen', el:
+        <button onClick={fs2} className="p-1.5 hover:bg-white/10 rounded text-white" title="Fullscreen (F)">
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">{fs ? <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" /> : <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" />}</svg>
+        </button> };
+      default: return { label: id, el: null };
+    }
+  };
+  // Render a draggable chip. IMPORTANT: this is a plain function, NOT a nested
+  // component — a nested component gets a new identity on every setDragChip and
+  // React remounts the node mid-drag, which cancels the native drag. A function
+  // returns stable element types so the drag survives.
+  const renderChip = (id: string) => {
+    if (id === TRAY) return renderTray();
+    const { el, label } = chipButton(id);
+    if (!el) return null;
+    return (
+      <div
+        key={id}
+        draggable
+        onDragStart={(e) => {
+          markDragStart();
+          setDragChip(id);
+          setDragKind('chip');
+          // If this chip lives in the tray, collapse the popover so its empty
+          // space doesn't linger. Deferred a tick: collapsing synchronously here
+          // unmounts the chip mid-dragstart and the native drag aborts. Drag-over
+          // the ⋯ reopens it.
+          if (barLayout.tray.includes(id)) setTimeout(() => setTrayOpen(false), 0);
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', id); // required or the webview aborts the drag
+        }}
+        onDragEnd={() => { markDragEnd(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }}
+        title={`${label} — drag to move`}
+        data-chip-id={id}
+        className={`transition-all duration-150 cursor-grab active:cursor-grabbing ${dragChip === id ? 'opacity-30 scale-90' : 'opacity-100 hover:-translate-y-0.5'}`}
+      >
+        {el}
+      </div>
+    );
+  };
+
+  // Render a side's chips with a vertical insertion bar at the live drop slot.
+  const insertBar = (key: string) => (
+    <div key={key} className="w-0.5 h-6 rounded-full bg-nobuf-primary shadow-[0_0_8px_rgba(29,252,159,0.8)] animate-[barPulse_0.8s_ease-in-out_infinite]" />
+  );
+  const renderZone = (side: 'left' | 'right') => {
+    const ids = barLayout[side];
+    // Show the insertion bar only when dropping here would ACTUALLY move the chip.
+    // A drop is a no-op when the chip is already in this side and the target slot
+    // is its current index or the slot immediately after it — suppress the bar then.
+    let showBar = dragKind === 'chip' && dropSide === side && dropIndex != null;
+    if (showBar && dragChip) {
+      const cur = ids.indexOf(dragChip);
+      if (cur !== -1 && (dropIndex === cur || dropIndex === cur + 1)) showBar = false;
+    }
+    // NOTE: never filter out the dragged chip — unmounting the drag source cancels
+    // the native drag. Keep every chip mounted; the dragged one just dims.
+    const out: React.ReactNode[] = [];
+    ids.forEach((id, i) => {
+      if (showBar && dropIndex === i) out.push(insertBar(`bar-${side}`));
+      out.push(renderChip(id));
+    });
+    if (showBar && dropIndex! >= ids.length) out.push(insertBar(`bar-${side}-end`));
+    return <span data-chip-zone={side} className="flex items-center gap-1">{out}</span>;
+  };
+
+  // The ⋯ trigger renders as a positional chip (data-chip-id=TRAY) so it flows
+  // through the SAME unified drag/insertion logic as every other button. It's also
+  // a drop target: drop a chip on it to park that chip in the popover.
+  const traySide: 'left' | 'right' = barLayout.left.includes(TRAY) ? 'left' : 'right';
+  const renderTray = () => (
+    <div
+      key={TRAY}
+      data-chip-id={TRAY}
+      data-tray-root
+      className={`relative transition-all duration-150 ${dragChip === TRAY ? 'opacity-30 scale-90' : 'opacity-100'}`}
+    >
+      <button
+        draggable
+        onDragStart={(e) => {
+          markDragStart();
+          setDragChip(TRAY);
+          setDragKind('chip');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', TRAY);
+          setTrayOpen(false); // collapse while dragging the trigger itself
+        }}
+        onDragEnd={() => { markDragEnd(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }}
+        onClick={() => setTrayOpen(o => !o)}
+        onDragOver={(e) => { if (dragKind === 'chip' && dragChip !== TRAY) { e.preventDefault(); e.stopPropagation(); setDropSide('tray'); setTrayOpen(true); } }}
+        onDrop={(e) => { if (dragKind === 'chip' && dragChip !== TRAY) { e.preventDefault(); e.stopPropagation(); onTrayDrop(); } }}
+        title="Customize controls — drag icons out to the bar, or drag me to reposition"
+        className={`p-1.5 rounded transition-all duration-150 cursor-grab active:cursor-grabbing ${trayOpen || dropSide === 'tray' ? 'bg-white/15 text-nobuf-primary' : 'hover:bg-white/10 text-white hover:-translate-y-0.5'}`}
+      >
+        <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      </button>
+      {trayOpen && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          onDragOver={(e) => { if (dragKind === 'chip' && dragChip !== TRAY && !barLayout.tray.includes(dragChip!)) { e.preventDefault(); e.stopPropagation(); setDropSide('tray'); } }}
+          onDrop={(e) => { if (dragKind === 'chip' && dragChip !== TRAY && !barLayout.tray.includes(dragChip!)) { e.preventDefault(); e.stopPropagation(); onTrayDrop(); } }}
+          className={`absolute bottom-full ${traySide === 'right' ? 'right-0' : 'left-0'} mb-0.5 p-2 rounded-xl bg-black/95 border backdrop-blur-xl shadow-2xl z-50 transition-colors ${dropSide === 'tray' ? 'border-nobuf-primary/60 ring-1 ring-nobuf-primary/40' : 'border-white/10'}`}
+        >
+          <div className="text-[10px] uppercase tracking-wider text-white/40 px-1 pb-1.5 whitespace-nowrap">Drag to the bar · drop here to park</div>
+          <div className="flex flex-wrap gap-1 max-w-[220px] min-w-[120px]">
+            {barLayout.tray.map(id => renderChip(id))}
+            {barLayout.tray.length === 0 && (
+              <span className="text-white/30 text-xs px-1 py-2">Empty — drag icons here to park them.</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div ref={boxRef} className="fixed inset-0 z-50 bg-black flex flex-col select-none">
+    <div
+      ref={boxRef}
+      className="fixed inset-0 z-50 bg-black flex flex-col select-none"
+      onDragOver={(e) => { if (dragKind) e.preventDefault(); }}
+      onDrop={(e) => {
+        // Stray chip drop outside the bar (e.g. over the video). Swallow it so the
+        // webview never tries to navigate to the drag payload — that was crashing
+        // the player to the "Video error: unknown" screen. Just cancel the drag.
+        if (dragKind) { e.preventDefault(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }
+      }}
+    >
       {/* Video - FastStream's DirectVideoPlayer approach */}
       <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
         {err ? (
@@ -1243,38 +1797,92 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
         )}
-        {/* Cold-start optimization overlay — hidden as soon as the byte target is reached */}
-        {showColdStartOverlay && !err && (
-          <div className={`absolute inset-0 flex items-center justify-center pointer-events-none z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${isColdStartBuffering ? 'opacity-100' : 'opacity-0'}`}>
+        {/* Cold-start optimization overlay — phase-aware messaging with dynamic progress */}
+        {(showColdStartOverlay || isRemuxLoading) && !err && (
+          <div className={`absolute inset-x-0 top-0 bottom-16 flex items-center justify-center z-30 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ${(isColdStartBuffering || isRemuxLoading) ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
             <div className="flex flex-col items-center gap-4 max-w-md px-6">
-              <div className="w-14 h-14 border-4 border-nobuf-primary/30 border-t-nobuf-primary rounded-full animate-spin" />
-              <div className="text-center">
-                <div className="text-white text-lg font-semibold mb-1">Optimizing video for No Buffer playback</div>
-                <div className="text-white/60 text-sm font-mono">
-                  {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+              {/* Spinner */}
+              <div className="relative w-16 h-16">
+                <div className="absolute inset-0 border-4 border-nobuf-primary/20 rounded-full" />
+                <div className="absolute inset-0 border-4 border-transparent border-t-nobuf-primary rounded-full animate-spin" />
+                {/* Format badge */}
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span className="text-nobuf-primary text-xs font-bold uppercase tracking-wider">
+                    {detectedFormat === 'ts' ? 'TS' : detectedFormat === 'mp4' ? 'MP4' : detectedFormat === 'mkv' ? 'MKV' : ''}
+                  </span>
                 </div>
               </div>
-              <div className="w-64 h-2 bg-white/10 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-nobuf-primary rounded-full transition-all duration-300"
-                  style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
-                />
+              {/* Phase-aware title + subtitle */}
+              <div className="text-center">
+                <div className="text-white text-lg font-semibold mb-1">
+                  {coldStartPhase === 'fetching_metadata' ? 'Reading video metadata' :
+                   coldStartPhase === 'buffering' ? 'Optimizing for smooth playback' :
+                   coldStartPhase === 'initializing_player' ? 'Preparing video stream' :
+                   'Preparing video'}
+                </div>
+                <div className="text-white/50 text-sm">
+                  {coldStartPhase === 'fetching_metadata' ? 'Locating video structure for instant start' :
+                   coldStartPhase === 'buffering' ? 'Pre-loading data to prevent buffering' :
+                   coldStartPhase === 'initializing_player' ? 'Converting format for seamless playback' :
+                   'Ensuring buffer-free experience'}
+                </div>
               </div>
+              {/* Progress bar — only for buffering phase with known target */}
+              {coldStartProgress.targetBytes > 0 && coldStartPhase === 'buffering' && (
+                <>
+                  <div className="text-white/60 text-sm font-mono">
+                    {formatBytes(coldStartProgress.bytes)} / {formatBytes(coldStartProgress.targetBytes)}
+                  </div>
+                  <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-nobuf-primary to-nobuf-primary/70 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${Math.min(100, (coldStartProgress.bytes / coldStartProgress.targetBytes) * 100)}%` }}
+                    />
+                  </div>
+                </>
+              )}
+              {/* Indeterminate bar for metadata or initializing phase */}
+              {(coldStartPhase === 'fetching_metadata' || coldStartPhase === 'initializing_player') && (
+                <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-nobuf-primary to-transparent rounded-full animate-[shimmer_1.5s_ease-in-out_infinite]" />
+                </div>
+              )}
             </div>
           </div>
         )}
       </div>
 
-      {/* Persistent mini progress bar — visible when controls are hidden */}
+      {/* Persistent mini progress bar + speed — visible when controls are hidden */}
       {miniBarVisible && !err && dur > 0 && (
-        <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-white/20 z-40 pointer-events-none transition-opacity duration-300">
-          <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+        <div className="absolute bottom-[2px] left-0 right-0 z-40 pointer-events-none transition-opacity duration-300">
+          <div className="flex items-center justify-end gap-1 px-2 pb-0.5">
+            {!prefetchComplete && (
+              <button
+                onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
+                className="pointer-events-auto hover:bg-white/10 rounded p-0.5"
+                title={prefetchPaused ? 'Resume buffering' : 'Pause buffering'}
+              >
+                {prefetchPaused ? (
+                  <svg className="w-3 h-3 text-white/60" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                ) : (
+                  <svg className="w-3 h-3 text-white/60" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                )}
+              </button>
+            )}
+            <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
+              {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+            </span>
+          </div>
+          <div className="relative h-[2px] bg-white/20">
+            <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full" style={{ width: `${pct}%` }} />
+          </div>
         </div>
       )}
 
       {/* Controls - FastStream-style */}
       <div
         ref={controlsRef}
+        data-controls-root
         className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
         style={{
           opacity: vis ? 1 : 0,
@@ -1285,7 +1893,7 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
         {/* Progress bar — unified with buffer, position, and preview indicators */}
         <div
           ref={barRef}
-          className="relative cursor-pointer group mb-3 mx-1 py-3"
+          className="relative cursor-pointer group mb-1 mx-1 py-3"
           onClick={onBarClick}
           onMouseMove={onBarMove}
           onMouseLeave={() => {
@@ -1382,13 +1990,12 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 );
               });
             })()}
-            {/* Knob */}
-            <div className="absolute w-4 h-4 bg-red-500 rounded-full top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity z-40" style={{ left: `${pct}%`, transform: 'translate(-50%, -50%)' }} />
+
           </div>
           {/* Tooltip with WebCodecs thumbnail */}
           {tip.show && (() => {
             const barWidth = barRef.current?.getBoundingClientRect().width ?? 0;
-            const tooltipHalf = 60;
+            const tooltipHalf = 120;
             const clampedX = Math.max(tooltipHalf, Math.min(tip.x, barWidth - tooltipHalf));
             return (
               <div className="absolute pointer-events-none flex flex-col items-center" style={{ left: clampedX, bottom: '100%', marginBottom: '8px', transform: 'translateX(-50%)' }}>
@@ -1396,11 +2003,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   <img
                     src={thumbUrl}
                     className="rounded overflow-hidden border border-white/20 mb-1 shadow-lg"
-                    style={{ width: 114, height: 64, objectFit: 'cover' }}
+                    style={{ width: 228, height: 128, objectFit: 'cover' }}
                     alt=""
                   />
                 ) : thumbLoading ? (
-                  <div className="w-[114px] h-[64px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
+                  <div className="w-[228px] h-[128px] rounded border border-white/20 mb-1 bg-white/5 flex items-center justify-center">
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
                   </div>
                 ) : null}
@@ -1412,29 +2019,25 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           })()}
         </div>
 
-        {/* Buttons row */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1">
-            {/* Play/Pause */}
-            <button onClick={toggle} className="p-1.5 hover:bg-white/10 rounded text-white" title="Play/Pause (Space)">
-              <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                {playing ? <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /> : <path d="M8 5v14l11-7z" />}
+        {/* Buttons row — also the free-area drop surface for customizable chips.
+            Drop side is decided by X position (left half vs right half). */}
+        <div
+          className="flex items-center justify-between relative"
+          onDragOver={(e) => { if (dragKind) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; const s = sideFromX(e.clientX); setDropSide(s); setDropIndex(dragKind === 'chip' ? indexFromX(s, e.clientX) : null); } }}
+          onDrop={onRowDrop}
+        >
+          <div className="flex items-center gap-1 relative z-10">
+            {/* Play/Pause — fixed anchor, larger for visual weight + centering */}
+            <button onClick={toggle} className="p-1 hover:bg-white/10 rounded text-white transition-transform active:scale-90 flex items-center justify-center" title="Play/Pause (Space)">
+              <svg className="w-7 h-7 block" fill="currentColor" viewBox="0 0 24 24">
+                {playing ? <path d="M8 5a1.5 1.5 0 013 0v14a1.5 1.5 0 01-3 0V5zm5 0a1.5 1.5 0 013 0v14a1.5 1.5 0 01-3 0V5z" /> : <path d="M7 5.27v13.46c0 .79.87 1.27 1.54.84l10.58-6.73a1 1 0 000-1.68L8.54 4.43C7.87 4 7 4.48 7 5.27z" />}
               </svg>
             </button>
-            {/* Prev */}
-            {onPrev && (
-              <button onClick={onPrev} className="p-1.5 hover:bg-white/10 rounded text-white" title="Previous">
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" /></svg>
-              </button>
-            )}
-            {/* Next */}
-            {onNext && (
-              <button onClick={onNext} className="p-1.5 hover:bg-white/10 rounded text-white" title="Next">
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" /></svg>
-              </button>
-            )}
-            {/* Volume */}
+            {/* Left chips — free area with insertion bar */}
+            {renderZone('left')}
+            {/* Volume — fixed anchor. % sits LEFT of the icon. */}
             <div className="flex items-center group">
+              <span className="text-white/70 text-xs font-mono tabular-nums leading-none w-8 text-right mr-0.5">{muted ? 0 : Math.round(vol * 100)}%</span>
               <button onClick={mute} className="p-1.5 hover:bg-white/10 rounded text-white" title="Mute (M)">
                 <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                   {muted || vol === 0
@@ -1446,15 +2049,14 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               </button>
               <input type="range" min="0" max="1" step="0.01" value={muted ? 0 : vol} onChange={e => setVol2(parseFloat(e.target.value))} className="w-0 group-hover:w-20 transition-all opacity-0 group-hover:opacity-100 accent-white" />
             </div>
-            {/* Time */}
-            <span className="text-white text-xs font-mono ml-1">{fmt(time)} / {fmt(dur)}</span>
+
+            <span className="text-white text-xs font-mono leading-none ml-1">{fmt(time)} / {fmt(dur)}</span>
           </div>
-          <div className="flex items-center gap-1">
-            {/* Prebuffer controller — download speed from Telegram */}
+          <div className="flex items-center gap-1 relative z-10">
+
             {(() => {
               const vid = vidRef.current;
               const curTime = vid?.currentTime ?? 0;
-              // Calculate SourceBuffer ahead
               let sbAhead = 0;
               if (vid?.buffered && vid.buffered.length > 0) {
                 for (let i = 0; i < vid.buffered.length; i++) {
@@ -1463,7 +2065,6 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                   }
                 }
               }
-              // Calculate disk cache ahead (green bar data beyond SourceBuffer)
               let cacheAhead = 0;
               if (cachedTimeRanges.length > 0 && dur > 0) {
                 for (const [s, e] of cachedTimeRanges) {
@@ -1475,51 +2076,35 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
               cacheAhead = Math.max(0, cacheAhead - sbAhead);
               const totalAhead = sbAhead + cacheAhead;
 
-              // Buffer health color
               const healthColor = totalAhead > 300 ? 'text-green-400'
                 : totalAhead > 60 ? 'text-yellow-400'
                 : totalAhead > 10 ? 'text-orange-400'
                 : 'text-red-400';
 
-              // Progress toward full file (disk cache)
-              const cacheProgress = totalBytes > 0 ? Math.min(1, prefetchedBytes / totalBytes) : 0;
-              const showController = isPrefetching || prefetchPaused || prefetchComplete || prefetchedBytes > 0 || sbAhead > 0;
-
-              if (!showController) return null;
-
               return (
-                <div className="flex items-center gap-2 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
-                  {/* Play/Pause buffering icon */}
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
+                  {/* Play/Pause prebuffer */}
                   <button
                     onClick={(e) => { e.stopPropagation(); prefetchPaused ? resumePrefetch() : pausePrefetch(); }}
-                    className="hover:bg-white/10 rounded p-0.5"
-                    title={prefetchPaused ? 'Resume buffering' : prefetchComplete ? 'Buffering complete' : 'Pause buffering'}
+                    className={`hover:bg-white/10 rounded p-0.5 ${prefetchComplete ? 'cursor-default' : ''}`}
+                    disabled={prefetchComplete}
+                    title={prefetchComplete ? 'Buffering complete' : prefetchPaused ? 'Resume buffering' : 'Pause buffering'}
                   >
-                    {prefetchPaused ? (
-                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
-                    ) : prefetchComplete ? (
+                    {prefetchComplete ? (
                       <svg className="w-3.5 h-3.5 text-green-400" fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" /></svg>
+                    ) : prefetchPaused ? (
+                      <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                     ) : (
                       <svg className="w-3.5 h-3.5 text-white/70" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
                     )}
                   </button>
-
+                  {/* Download speed */}
+                  <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
+                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+                  </span>
                   {/* Buffer ahead */}
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
                     {totalAhead >= 60 ? `${(totalAhead / 60).toFixed(1)}m` : `${totalAhead.toFixed(0)}s`}
-                  </span>
-
-                  {/* Mini progress bar: cache fill */}
-                  <div className="w-10 h-1.5 bg-white/10 rounded-full overflow-hidden" title={`${formatBytes(prefetchedBytes)} / ${formatBytes(totalBytes)} cached`}>
-                    <div
-                      className={`h-full rounded-full transition-all duration-300 ${prefetchComplete ? 'bg-green-400' : 'bg-nobuf-primary'}`}
-                      style={{ width: `${cacheProgress * 100}%` }}
-                    />
-                  </div>
-
-                  {/* Download speed from Telegram (green bar / proactive prebuffer) */}
-                  <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
                   </span>
                 </div>
               );
@@ -1546,45 +2131,11 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
                 <span className="text-xs font-mono text-nobuf-primary">{formatSpeedLimitCompact(settings.downloadSpeedLimit)}</span>
               </button>
             )}
-            {/* Speed */}
-            <div className="relative">
-              <button onClick={() => setMenu(!menu)} className="px-2 py-1 hover:bg-white/10 rounded text-white text-xs font-mono" title="Playback speed">
-                {rate}x
-              </button>
-              {menu && (
-                <div className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-lg overflow-hidden min-w-[60px] z-50">
-                  {RATES.map(r => (
-                    <button key={r} onClick={() => rate2(r)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${rate === r ? 'text-red-400 bg-white/5' : 'text-white'}`}>
-                      {r}x
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-            {/* Settings */}
-            <button onClick={(e) => { e.stopPropagation(); setSettingsOpen(prev => !prev); }} className="p-1.5 hover:bg-white/10 rounded text-white" title="Settings">
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z" /></svg>
-            </button>
-            {/* Download */}
-            <button onClick={handleDownload} className="p-1.5 hover:bg-white/10 rounded text-white flex items-center gap-1" title="Download">
-              <svg className={`w-5 h-5 ${dlOverlayVisible && !dlOverlay?.completed ? 'animate-subtle-pulse' : ''}`} fill="currentColor" viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" /></svg>
-              {cachePercent > 0 && (
-                <span className="text-xs font-mono">
-                  {cacheComplete ? <span className="text-green-400">✓</span> : `${cachePercent}%`}
-                </span>
-              )}
-            </button>
-            {/* Close */}
-            <button onClick={handleClose} className="p-1.5 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close (Esc)">
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
-            </button>
-            {/* Fullscreen */}
-            <button onClick={fs2} className="p-1.5 hover:bg-white/10 rounded text-white" title="Fullscreen (F)">
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                {fs
-                  ? <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" />
-                  : <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" />}
-              </svg>
+            {/* Right chips — free area with insertion bar (incl. the ⋯ tray chip) */}
+            {renderZone('right')}
+            {/* Close — fixed anchor, always far right, matches play/pause size */}
+            <button onClick={handleClose} className="p-1 rounded text-red-500 hover:text-red-400 hover:bg-red-500/15 transition-transform active:scale-90 flex items-center justify-center" title="Close (Esc)">
+              <svg className="w-7 h-7 block" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
             </button>
           </div>
         </div>
@@ -1595,317 +2146,187 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
       {/* Settings overlay panel */}
       {settingsOpen && (
         <div
-          className="absolute right-0 top-0 bottom-0 w-[40%] max-w-[320px] z-30 bg-black/70 backdrop-blur-xl border-l border-white/10 overflow-y-auto"
+          className="absolute right-0 top-0 bottom-0 z-30 bg-gradient-to-b from-black/80 to-black/70 backdrop-blur-2xl border-l border-white/10 overflow-y-auto shadow-2xl shadow-black/50 animate-[settingsIn_180ms_ease-out]"
           onClick={(e) => e.stopPropagation()}
+          style={{ width: panelDragWidth ?? settings.playerSettingsWidth, maxWidth: '70%', scrollbarWidth: 'thin', transition: panelDragWidth == null ? 'width 120ms ease' : 'none' }}
         >
+          <style>{`@keyframes settingsIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}`}</style>
+          {/* Resize handle — drag the left edge; double-click resets to default width */}
+          <div
+            onMouseDown={startPanelResize}
+            onDoubleClick={() => updateSetting('playerSettingsWidth', 336)}
+            className="absolute left-0 top-0 bottom-0 w-1.5 cursor-ew-resize group z-20 hover:bg-nobuf-primary/20 active:bg-nobuf-primary/30 transition-colors"
+            title="Drag to resize · double-click to reset"
+          >
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-10 rounded-full bg-white/20 group-hover:bg-nobuf-primary/70 transition-colors" />
+          </div>
           {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
-            <span className="text-white text-sm font-semibold">Settings</span>
-            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close settings">
+          <div className="sticky top-0 z-10 flex items-center justify-between px-4 py-3 border-b border-white/10 bg-black/40 backdrop-blur-xl">
+            <span className="text-white text-sm font-semibold tracking-wide flex items-center gap-2">
+              <svg className="w-4 h-4 text-nobuf-primary" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+              Settings
+            </span>
+            <button onClick={() => setSettingsOpen(false)} className="p-1 hover:bg-white/10 rounded-md text-nobuf-subtext hover:text-nobuf-primary transition-colors" title="Close settings">
               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" /></svg>
             </button>
           </div>
 
           {/* Playback */}
-          <div className="px-4 py-3 border-b border-white/10">
-            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Playback</h3>
-            {/* Loop */}
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-white/70 text-xs">Loop</span>
-              <button
-                onClick={() => setLoop(!loop)}
-                className={`w-10 h-5 rounded-full transition-colors relative ${loop ? 'bg-nobuf-secondary' : 'bg-white/20'}`}
-              >
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${loop ? 'left-5' : 'left-0.5'}`} />
-              </button>
-            </div>
-            {/* Skip forward */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block">Skip forward</label>
+          <SettingsSection title="Playback" icon={<svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>}>
+            <SettingRow label="Skip forward" stack>
               <div className="flex gap-1 items-center">
                 {[5, 10, 15, 30].map(s => (
-                  <button
-                    key={s}
-                    onClick={() => updateSetting('playerSkipForward', s as SkipDuration)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipForward === s ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {s}s
-                  </button>
+                  <Chip key={s} active={settings.playerSkipForward === s} onClick={() => updateSetting('playerSkipForward', s as SkipDuration)}>
+                    <span className="font-mono">{s}s</span>
+                  </Chip>
                 ))}
-                <input
-                  type="number" min="1" max="60"
-                  value={settings.playerSkipForward}
-                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipForward', v as SkipDuration); }}
-                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-secondary focus:outline-none text-center"
-                  title="Custom seconds (1-60)"
-                />
+                <NumInput value={settings.playerSkipForward} title="Custom seconds (1-60)"
+                  onChange={v => updateSetting('playerSkipForward', Math.max(1, Math.min(60, parseInt(v) || 1)) as SkipDuration)} />
               </div>
-            </div>
-            {/* Skip backward */}
-            <div className="mb-0">
-              <label className="text-white/70 text-xs mb-1.5 block">Skip backward</label>
+            </SettingRow>
+            <SettingRow label="Skip backward" stack>
               <div className="flex gap-1 items-center">
                 {[5, 10, 15, 30].map(s => (
-                  <button
-                    key={s}
-                    onClick={() => updateSetting('playerSkipBackward', s as SkipDuration)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${settings.playerSkipBackward === s ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {s}s
-                  </button>
+                  <Chip key={s} active={settings.playerSkipBackward === s} onClick={() => updateSetting('playerSkipBackward', s as SkipDuration)}>
+                    <span className="font-mono">{s}s</span>
+                  </Chip>
                 ))}
-                <input
-                  type="number" min="1" max="60"
-                  value={settings.playerSkipBackward}
-                  onChange={e => { const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1)); updateSetting('playerSkipBackward', v as SkipDuration); }}
-                  className="w-14 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-secondary focus:outline-none text-center"
-                  title="Custom seconds (1-60)"
-                />
+                <NumInput value={settings.playerSkipBackward} title="Custom seconds (1-60)"
+                  onChange={v => updateSetting('playerSkipBackward', Math.max(1, Math.min(60, parseInt(v) || 1)) as SkipDuration)} />
               </div>
-            </div>
-          </div>
+            </SettingRow>
+          </SettingsSection>
 
           {/* Display */}
-          <div className="px-4 py-3 border-b border-white/10">
-            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Display</h3>
-            {/* Video fit */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block">Video fit</label>
+          <SettingsSection title="Display" icon={<svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/></svg>}>
+            <SettingRow label="Video fit" stack>
               <div className="flex gap-1">
-                {([
-                  ['original', 'Original'],
-                  ['contain', 'Fit'],
-                  ['fill', 'Fill'],
-                ] as [VideoFit, string][]).map(([val, label]) => (
-                  <button
-                    key={val}
-                    onClick={() => updateSetting('playerVideoFit', val)}
-                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerVideoFit === val ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {label}
-                  </button>
+                {([['original', 'Original'], ['contain', 'Fit'], ['fill', 'Fill']] as [VideoFit, string][]).map(([val, label]) => (
+                  <Chip key={val} active={settings.playerVideoFit === val} onClick={() => updateSetting('playerVideoFit', val)}>{label}</Chip>
                 ))}
               </div>
-            </div>
-            {/* Rotation */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block">Rotation</label>
+            </SettingRow>
+            <SettingRow label="Rotation" stack>
               <div className="flex gap-1">
                 {[0, 90, 180, 270].map(r => (
-                  <button
-                    key={r}
-                    onClick={() => setRotation(r)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors ${rotation === r ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {r}°
-                  </button>
+                  <Chip key={r} active={rotation === r} onClick={() => setRotation(r)}><span className="font-mono">{r}°</span></Chip>
                 ))}
               </div>
-            </div>
-            {/* Brightness */}
-            <div className="mb-3">
-              <div className="flex items-center justify-between mb-1.5">
-                <label className="text-white/70 text-xs">Brightness</label>
-                <span className="text-white/50 text-xs font-mono">{brightness.toFixed(1)}</span>
+            </SettingRow>
+            <SettingRow label="Brightness" stack>
+              <div className="flex items-center gap-2.5">
+                <input type="range" min="0.5" max="2" step="0.1" value={brightness}
+                  onChange={e => setBrightness(parseFloat(e.target.value))}
+                  className="flex-1 accent-nobuf-primary h-1" />
+                <span className="text-white/60 text-xs font-mono w-7 text-right tabular-nums">{brightness.toFixed(1)}</span>
               </div>
-              <input
-                type="range" min="0.5" max="2" step="0.1"
-                value={brightness}
-                onChange={e => setBrightness(parseFloat(e.target.value))}
-                className="w-full accent-nobuf-secondary h-1"
-              />
-            </div>
-            {/* PiP */}
-            <div className="flex items-center justify-between">
-              <span className="text-white/70 text-xs">Picture-in-Picture</span>
-              <button
-                onClick={() => setPip(!pip)}
-                className={`w-10 h-5 rounded-full transition-colors relative ${pip ? 'bg-nobuf-secondary' : 'bg-white/20'}`}
-              >
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${pip ? 'left-5' : 'left-0.5'}`} />
-              </button>
-            </div>
-          </div>
+            </SettingRow>
+          </SettingsSection>
 
           {/* Behavior */}
-          <div className="px-4 py-3 border-b border-white/10">
-            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Behavior</h3>
-            {/* Auto-hide delay */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block">Auto-hide controls</label>
-              <div className="flex gap-1">
-                {([
-                  [3, '3s'],
-                  [5, '5s'],
-                  [10, '10s'],
-                  [0, 'Never'],
-                ] as [AutoHideDelay, string][]).map(([val, label]) => (
-                  <button
-                    key={val}
-                    onClick={() => updateSetting('playerAutoHideDelay', val)}
-                    className={`px-2.5 py-1 rounded text-xs transition-colors ${settings.playerAutoHideDelay === val ? 'bg-nobuf-secondary text-white' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            </div>
+          <SettingsSection title="Behavior" icon={<svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>}>
+            <SettingRow label="Show pin button" hint="Adds a pin toggle to the control bar. When off, controls stay visible.">
+              <Switch on={settings.playerShowPinButton} onClick={() => updateSetting('playerShowPinButton', !settings.playerShowPinButton)}
+                title={settings.playerShowPinButton ? 'Hide pin button' : 'Show pin button'} />
+            </SettingRow>
+          </SettingsSection>
 
           {/* Bandwidth */}
-          <div className="px-4 py-3 border-b border-white/10">
-            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2 flex items-center gap-1.5">
-              <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
-              <span className="inline-block w-2 h-2 rounded-full bg-nobuf-primary" />
-              Bandwidth
-            </h3>
+          <SettingsSection title="Bandwidth" icon={
+            <span className="flex items-center gap-0.5"><span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400" /><span className="inline-block w-1.5 h-1.5 rounded-full bg-nobuf-primary" /></span>
+          }>
             {/* Prebuffer speed limit */}
-            <div className="mb-3">
-              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-400" />
-                Prebuffer speed
-              </label>
+            <SettingRow stack label="Prebuffer speed">
               <div className="flex flex-wrap gap-1 items-center">
                 {SPEED_LIMIT_PRESETS.map(p => (
-                  <button
-                    key={p.value}
-                    onClick={() => { updateSetting('prebufferSpeedLimit', p.value as SpeedLimitValue); setCustomPrebufferValue(''); }}
-                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.prebufferSpeedLimit === p.value ? 'bg-green-500/30 text-green-400 ring-1 ring-green-400' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
+                  <Chip key={p.value} tone="green" active={settings.prebufferSpeedLimit === p.value}
+                    onClick={() => { updateSetting('prebufferSpeedLimit', p.value as SpeedLimitValue); setCustomPrebufferValue(''); }}>
                     {p.label}
-                  </button>
+                  </Chip>
                 ))}
-                {/* Custom input */}
                 <div className="flex items-center gap-1">
-                  <input
-                    type="number" min="1" max="102400"
-                    placeholder="Custom"
-                    value={customPrebufferValue}
+                  <input type="number" min="1" max="102400" placeholder="Custom" value={customPrebufferValue}
                     onChange={e => {
-                      const raw = e.target.value;
-                      setCustomPrebufferValue(raw);
-                      if (raw && Number(raw) > 0) {
-                        const kb = customPrebufferUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
-                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
-                      }
+                      const raw = e.target.value; setCustomPrebufferValue(raw);
+                      if (raw && Number(raw) > 0) { const kb = customPrebufferUnit === 'mb' ? Number(raw) * 1024 : Number(raw); updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400)); }
                     }}
-                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-green-400 focus:outline-none text-center"
-                  />
-                  <select
-                    value={customPrebufferUnit}
-                    onChange={e => {
-                      const unit = e.target.value as 'kb' | 'mb';
-                      setCustomPrebufferUnit(unit);
-                      if (customPrebufferValue && Number(customPrebufferValue) > 0) {
-                        const kb = unit === 'mb' ? Number(customPrebufferValue) * 1024 : Number(customPrebufferValue);
-                        updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400));
-                      }
-                    }}
-                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-green-400 focus:outline-none"
-                  >
-                    <option value="kb">KB/s</option>
-                    <option value="mb">MB/s</option>
-                  </select>
+                    className="w-16 px-1.5 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 focus:border-green-400 focus:outline-none text-center" />
+                  <UnitToggle unit={customPrebufferUnit} tone="green" onChange={unit => {
+                    setCustomPrebufferUnit(unit);
+                    if (customPrebufferValue && Number(customPrebufferValue) > 0) { const kb = unit === 'mb' ? Number(customPrebufferValue) * 1024 : Number(customPrebufferValue); updateSetting('prebufferSpeedLimit', Math.min(Math.max(kb, 1), 102400)); }
+                  }} />
                 </div>
               </div>
               {settings.prebufferSpeedLimit > 0 && (
-                <div className="mt-1.5 text-[10px] text-green-400/70">
-                  Active: {formatSpeedLimit(settings.prebufferSpeedLimit)}
+                <div className="mt-2 inline-flex items-center gap-1 text-[10px] text-green-300/80 bg-green-500/10 px-2 py-0.5 rounded">
+                  <span className="inline-block w-1 h-1 rounded-full bg-green-400" />Active: {formatSpeedLimit(settings.prebufferSpeedLimit)}
                 </div>
               )}
-            </div>
+            </SettingRow>
             {/* Download speed limit */}
-            <div className="mb-2">
-              <label className="text-white/70 text-xs mb-1.5 block flex items-center gap-1">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-nobuf-primary" />
-                Download speed
-              </label>
+            <SettingRow stack label="Download speed">
               <div className="flex flex-wrap gap-1 items-center">
                 {SPEED_LIMIT_PRESETS.map(p => (
-                  <button
-                    key={p.value}
-                    onClick={() => { updateSetting('downloadSpeedLimit', p.value as SpeedLimitValue); setCustomDownloadValue(''); }}
-                    className={`px-2 py-1 rounded text-xs transition-colors ${settings.downloadSpeedLimit === p.value ? 'bg-nobuf-primary/30 text-nobuf-primary ring-1 ring-nobuf-primary' : 'bg-white/10 text-white/60 hover:bg-white/20'}`}
-                  >
+                  <Chip key={p.value} tone="primary" active={settings.downloadSpeedLimit === p.value}
+                    onClick={() => { updateSetting('downloadSpeedLimit', p.value as SpeedLimitValue); setCustomDownloadValue(''); }}>
                     {p.label}
-                  </button>
+                  </Chip>
                 ))}
-                {/* Custom input */}
                 <div className="flex items-center gap-1">
-                  <input
-                    type="number" min="1" max="102400"
-                    placeholder="Custom"
-                    value={customDownloadValue}
+                  <input type="number" min="1" max="102400" placeholder="Custom" value={customDownloadValue}
                     onChange={e => {
-                      const raw = e.target.value;
-                      setCustomDownloadValue(raw);
-                      if (raw && Number(raw) > 0) {
-                        const kb = customDownloadUnit === 'mb' ? Number(raw) * 1024 : Number(raw);
-                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
-                      }
+                      const raw = e.target.value; setCustomDownloadValue(raw);
+                      if (raw && Number(raw) > 0) { const kb = customDownloadUnit === 'mb' ? Number(raw) * 1024 : Number(raw); updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400)); }
                     }}
-                    className="w-16 px-1.5 py-1 rounded text-xs font-mono bg-white/10 text-white/80 border border-white/10 focus:border-nobuf-primary focus:outline-none text-center"
-                  />
-                  <select
-                    value={customDownloadUnit}
-                    onChange={e => {
-                      const unit = e.target.value as 'kb' | 'mb';
-                      setCustomDownloadUnit(unit);
-                      if (customDownloadValue && Number(customDownloadValue) > 0) {
-                        const kb = unit === 'mb' ? Number(customDownloadValue) * 1024 : Number(customDownloadValue);
-                        updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400));
-                      }
-                    }}
-                    className="px-1 py-1 rounded text-xs bg-white/10 text-white/60 border border-white/10 focus:border-nobuf-primary focus:outline-none"
-                  >
-                    <option value="kb">KB/s</option>
-                    <option value="mb">MB/s</option>
-                  </select>
+                    className="w-16 px-1.5 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 focus:border-nobuf-primary focus:outline-none text-center" />
+                  <UnitToggle unit={customDownloadUnit} tone="primary" onChange={unit => {
+                    setCustomDownloadUnit(unit);
+                    if (customDownloadValue && Number(customDownloadValue) > 0) { const kb = unit === 'mb' ? Number(customDownloadValue) * 1024 : Number(customDownloadValue); updateSetting('downloadSpeedLimit', Math.min(Math.max(kb, 1), 102400)); }
+                  }} />
                 </div>
               </div>
               {settings.downloadSpeedLimit > 0 && (
-                <div className="mt-1.5 text-[10px] text-nobuf-primary/70">
-                  Active: {formatSpeedLimit(settings.downloadSpeedLimit)}
+                <div className="mt-2 inline-flex items-center gap-1 text-[10px] text-nobuf-primary/80 bg-nobuf-primary/10 px-2 py-0.5 rounded">
+                  <span className="inline-block w-1 h-1 rounded-full bg-nobuf-primary" />Active: {formatSpeedLimit(settings.downloadSpeedLimit)}
                 </div>
               )}
-            </div>
+            </SettingRow>
             {/* Conflict warning */}
             {settings.prebufferSpeedLimit > 0 && settings.downloadSpeedLimit > 0 && (
-              <div className="flex items-start gap-1.5 px-2 py-1.5 rounded bg-yellow-500/10 text-yellow-400/80 text-[10px]">
+              <div className="flex items-start gap-1.5 px-2.5 py-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-300/90 text-[10px] leading-snug">
                 <svg className="w-3 h-3 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
                 <span>Both limits share 1 Telegram connection — speeds may not reach their full ceiling simultaneously.</span>
               </div>
             )}
-          </div>
+          </SettingsSection>
 
           {/* Info */}
-          <div className="px-4 py-3">
-            <h3 className="text-white/50 text-[10px] uppercase tracking-wider mb-2">Video info</h3>
-            <div className="space-y-1">
+          <SettingsSection title="Video info" icon={<svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path strokeLinecap="round" d="M12 11v5M12 8h.01"/></svg>}>
+            <div className="space-y-2 -mt-1">
               {videoResolution && (
-                <div className="flex justify-between text-xs">
-                  <span className="text-white/50">Resolution</span>
-                  <span className="text-white/80 font-mono">{videoResolution.w}×{videoResolution.h}</span>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-white/45">Resolution</span>
+                  <span className="text-white/85 font-mono">{videoResolution.w}×{videoResolution.h}</span>
                 </div>
               )}
               {dur > 0 && (
-                <div className="flex justify-between text-xs">
-                  <span className="text-white/50">Duration</span>
-                  <span className="text-white/80 font-mono">{fmt(dur)}</span>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-white/45">Duration</span>
+                  <span className="text-white/85 font-mono">{fmt(dur)}</span>
                 </div>
               )}
               {totalBytes > 0 && (
-                <div className="flex justify-between text-xs">
-                  <span className="text-white/50">File size</span>
-                  <span className="text-white/80 font-mono">{formatBytes(totalBytes)}</span>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-white/45">File size</span>
+                  <span className="text-white/85 font-mono">{formatBytes(totalBytes)}</span>
                 </div>
               )}
-              <div className="flex justify-between text-xs">
-                <span className="text-white/50">Cache</span>
-                <span className="text-white/80 font-mono">{cacheComplete ? 'Complete ✓' : cachePercent > 0 ? `${cachePercent}%` : 'None'}</span>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-white/45">Cache</span>
+                <span className={`font-mono ${cacheComplete ? 'text-green-300' : 'text-white/85'}`}>{cacheComplete ? 'Complete ✓' : cachePercent > 0 ? `${cachePercent}%` : 'None'}</span>
               </div>
             </div>
-          </div>
+          </SettingsSection>
         </div>
       )}
 
@@ -1947,41 +2368,27 @@ export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, act
           </div>
         )}
       </div>
-
-      {/* Skip feedback overlay */}
+      {/* Skip feedback — sits on the side you're seeking toward (left for
+          rewind, right for forward). Shows only: how much, and from→to.
+          Numbers come from seek() (real video time). Mid-burst presses reuse
+          the same key so it updates in place instead of re-animating. */}
       {skipFeedback && (() => {
-        const fromTime = time;
-        const toTime = skipFeedback.direction === 'forward'
-          ? Math.min(fromTime + skipFeedback.amount, dur)
-          : Math.max(fromTime - skipFeedback.amount, 0);
         const isForward = skipFeedback.direction === 'forward';
+        const fromTime = Math.max(0, Math.min(skipFeedback.from, dur || skipFeedback.from));
+        const toTime = Math.max(0, Math.min(skipFeedback.to, dur || skipFeedback.to));
+        const deltaSec = Math.round(Math.abs(skipFeedback.totalDelta));
+        const accent = isForward ? 'text-nobuf-primary' : 'text-white';
+        const glow = isForward ? 'rgba(29,252,159,0.35)' : 'rgba(255,255,255,0.25)';
         return (
-          <div
-            key={skipFeedbackKey.current}
-            className="absolute inset-0 flex items-center justify-center pointer-events-none z-20 animate-[skipPop_1.5s_ease-out_forwards]"
-          >
-            <div className="flex flex-col items-center gap-2 bg-black/30 backdrop-blur-xl rounded-2xl px-10 py-6">
-              {/* Icon + delta */}
-              <div className="flex items-center gap-2">
-                {isForward ? (
-                  <svg className="w-7 h-7 text-nobuf-primary" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M5.59 7.41L10.18 12l-4.59 4.59L7 18l6-6-6-6zM16 18l6-6-6-6-1.41 1.41L20.18 12l-5.59 4.59L16 18z" />
-                  </svg>
-                ) : (
-                  <svg className="w-7 h-7 text-white" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M18.41 16.59L13.82 12l4.59-4.59L17 6l-6 6 6 6zM8 6l-6 6 6 6 1.41-1.41L3.82 12l5.59-4.59L8 6z" />
-                  </svg>
-                )}
-                <span className={`text-xl font-bold font-mono ${isForward ? 'text-nobuf-primary' : 'text-white'}`}>
-                  {isForward ? '+' : '-'}{skipFeedback.amount}s
-                </span>
-              </div>
-              {/* FROM → TO — big, bold, dominant */}
-              <div className="flex items-center gap-4">
-                <span className="text-2xl font-bold text-white font-mono">{fmt(fromTime)}</span>
-                <svg className={`w-6 h-6 ${isForward ? 'text-nobuf-primary' : 'text-white/60'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" /></svg>
-                <span className={`text-2xl font-bold font-mono ${isForward ? 'text-nobuf-primary' : 'text-white'}`}>{fmt(toTime)}</span>
-              </div>
+          <div className={`absolute inset-y-0 ${isForward ? 'right-0' : 'left-0'} w-1/2 flex items-center ${isForward ? 'justify-end pr-[8%]' : 'justify-start pl-[8%]'} pointer-events-none z-20`}>
+            <div key={skipFeedbackKey.current}
+              className={`flex flex-col ${isForward ? 'items-end' : 'items-start'} gap-1 animate-[skipIn_0.25s_ease-out]`}>
+              <span className={`text-4xl font-black font-mono tabular-nums ${accent}`} style={{ textShadow: `0 0 16px ${glow}` }}>
+                {isForward ? '+' : '−'}{deltaSec}s
+              </span>
+              <span className="text-white/70 text-lg font-mono tabular-nums" style={{ textShadow: '0 2px 8px rgba(0,0,0,0.6)' }}>
+                {fmt(fromTime)} <span className={accent}>→</span> {fmt(toTime)}
+              </span>
             </div>
           </div>
         );
