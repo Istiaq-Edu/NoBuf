@@ -17,7 +17,6 @@ import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
-import { ExternalDropBlocker } from './dashboard/ExternalDropBlocker';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
@@ -125,6 +124,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         isPublicView ? activeView.channelId : null
     );
 
+    // --- External file drag-drop (upload) ---
+    // WebView2 routes native OS file drops through the DOCUMENT (capture phase), not
+    // React's synthetic onDrop — so we register document-level listeners in an effect
+    // below. dropCtxRef mirrors the latest values so that once-registered listener never
+    // reads stale closures.
+    const FILE_ID_MIME = 'application/x-telegram-file-id';
+    const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
+    const [externalDragActive, setExternalDragActive] = useState(false);
+    const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
+    useEffect(() => {
+        invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
+    }, []);
+    // Public channels are read-only; only saved/folder views accept uploads.
+    const canUploadHere = !isReadOnly;
+    const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; stage: ((f: File[], l: number, hasFolder: boolean) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, stage: null });
+
+
     const { data: nbFiles = [], isLoading: nbFilesLoading, error } = useQuery({
         queryKey: ['files', activeFolderId],
         queryFn: () => invoke<any[]>('cmd_get_files', { folderId: activeFolderId }).then(res => res.map(f => ({
@@ -169,7 +185,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
@@ -501,21 +517,65 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             : folders.find(f => f.id === activeFolderId)?.name || "Folder";
 
 
-    const handleRootDragOver = (e: React.DragEvent) => {
-        if (internalDragRef.current) {
-            e.preventDefault();
-            e.stopPropagation();
-            e.dataTransfer.dropEffect = 'move';
-        }
-    };
+    // Keep dropCtxRef current so the document-level listeners (registered once) never
+    // read stale state.
+    dropCtxRef.current = { canUploadHere, limit: uploadLimitBytes, stage: stageAndQueue };
 
-    const handleRootDragEnter = (e: React.DragEvent) => {
-        if (internalDragRef.current) {
+    // Register native document-level drag/drop listeners in the CAPTURE phase. WebView2
+    // delivers external OS file drops here — React's synthetic onDrop on a div does not
+    // fire for them. Internal drags (file→folder, folder reorder) carry custom MIME types
+    // and are ignored here so their own React handlers keep working untouched.
+    useEffect(() => {
+        const isExternal = (dt: DataTransfer | null) => {
+            if (!dt) return false;
+            const t = Array.from(dt.types);
+            return t.includes('Files') && !t.includes(FILE_ID_MIME) && !t.includes(FOLDER_REORDER_MIME);
+        };
+        const onDragOver = (e: DragEvent) => {
+            if (!isExternal(e.dataTransfer)) return;
+            e.preventDefault();  // required so 'drop' fires
+            if (e.dataTransfer) e.dataTransfer.dropEffect = dropCtxRef.current.canUploadHere ? 'copy' : 'none';
+            setExternalDragActive(true);
+        };
+        const onDragLeave = (e: DragEvent) => {
+            if (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
+                setExternalDragActive(false);
+            }
+        };
+        const onDrop = async (e: DragEvent) => {
+            if (!isExternal(e.dataTransfer)) return;  // internal drops handled by their own targets
             e.preventDefault();
             e.stopPropagation();
-            e.dataTransfer.dropEffect = 'move';
-        }
-    };
+            setExternalDragActive(false);
+            const { canUploadHere: canUp, limit, stage } = dropCtxRef.current;
+            // Detect folders SYNCHRONOUSLY before any await — the items list is neutralized
+            // after the handler yields. A dropped folder appears in .files as a zero-byte
+            // File, so webkitGetAsEntry().isDirectory is the only reliable discriminator.
+            let hasFolder = false;
+            const items = e.dataTransfer?.items;
+            if (items) {
+                for (let i = 0; i < items.length; i++) {
+                    const entry = items[i].webkitGetAsEntry?.();
+                    if (entry?.isDirectory) { hasFolder = true; break; }
+                }
+            }
+            const files = e.dataTransfer ? Array.from(e.dataTransfer.files) : [];
+            if (!canUp) {
+                toast.error("Can't upload to a public channel — switch to Saved Messages or a folder.");
+                return;
+            }
+            if (files.length === 0 || !stage) return;
+            await stage(files, limit, hasFolder);
+        };
+        document.addEventListener('dragover', onDragOver, true);
+        document.addEventListener('dragleave', onDragLeave, true);
+        document.addEventListener('drop', onDrop, true);
+        return () => {
+            document.removeEventListener('dragover', onDragOver, true);
+            document.removeEventListener('dragleave', onDragLeave, true);
+            document.removeEventListener('drop', onDrop, true);
+        };
+    }, []);
 
     const previewNeighbors = previewNeighborFiles();
 
@@ -529,11 +589,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         <div
             className="flex h-screen w-full overflow-hidden bg-nobuf-bg relative"
             onClick={() => setSelectedIds([])}
-            onDragOver={handleRootDragOver}
-            onDragEnter={handleRootDragEnter}
+            onDragOver={(e) => { if (internalDragRef.current) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; } }}
+            onDragEnter={(e) => { if (internalDragRef.current) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; } }}
         >
-
-            <ExternalDropBlocker onUploadClick={handleManualUpload} />
 
             <AnimatePresence>
                 {showMoveModal && (
@@ -585,6 +643,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     />
                 )}
                 {isDragging && internalDragFileId === null && <DragDropOverlay key="drag-drop-overlay" />}
+                {externalDragActive && (
+                    <DragDropOverlay
+                        key="external-drop-overlay"
+                        variant={canUploadHere ? 'accept' : 'reject'}
+                        folderName={canUploadHere ? currentFolderName : undefined}
+                    />
+                )}
             </AnimatePresence>
 
             {isMobile && mobileSidebarOpen && (

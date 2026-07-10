@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-upload-limit"
+description = "Enables the cmd_upload_limit command without any pre-configured scope."
+commands.allow = ["cmd_upload_limit"]
+
+[[permission]]
+identifier = "deny-cmd-upload-limit"
+description = "Denies the cmd_upload_limit command without any pre-configured scope."
+commands.deny = ["cmd_upload_limit"]
