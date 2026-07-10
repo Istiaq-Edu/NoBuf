@@ -1854,7 +1854,7 @@ interface FastStreamPlayerProps {
 
       {/* Persistent mini progress bar + speed — visible when controls are hidden */}
       {miniBarVisible && !err && dur > 0 && (
-        <div className="absolute bottom-0 left-0 right-0 z-40 pointer-events-none transition-opacity duration-300">
+        <div className="absolute bottom-[2px] left-0 right-0 z-40 pointer-events-none transition-opacity duration-300">
           <div className="flex items-center justify-end gap-1 px-2 pb-0.5">
             {!prefetchComplete && (
               <button
