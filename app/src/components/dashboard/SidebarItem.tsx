@@ -51,6 +51,7 @@ export function SidebarItem({
     const [availableGroups, setAvailableGroups] = useState<FolderGroup[]>([]);
     const inputRef = useRef<HTMLInputElement>(null);
     const contextMenuRef = useRef<HTMLDivElement>(null);
+    const buttonRef = useRef<HTMLButtonElement>(null);
 
     const isFolder = folderId !== null;
 
@@ -60,6 +61,34 @@ export function SidebarItem({
             inputRef.current.select();
         }
     }, [isRenaming]);
+
+    // Safety net for a stuck drop-target highlight. Two WebView2 gaps this covers:
+    //  1) Moving the dragged file OFF this folder without dropping — the element's own
+    //     `onDragLeave` rect check can miss (stale coords / child targets), leaving isOver
+    //     stuck. `dragover` fires continuously on whatever is under the cursor, so if a
+    //     document-level dragover lands outside this button, we clear.
+    //  2) Drag termination — `onDragEnd` never fires on the drop TARGET (it fires on the
+    //     dragged FileCard source), so we also clear on document dragend/drop.
+    useEffect(() => {
+        if (!isOver) return;
+        const clearIfOutside = (e: DragEvent) => {
+            const el = buttonRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+                setIsOver(false);
+            }
+        };
+        const clear = () => setIsOver(false);
+        document.addEventListener('dragover', clearIfOutside, true);
+        document.addEventListener('dragend', clear, true);
+        document.addEventListener('drop', clear, true);
+        return () => {
+            document.removeEventListener('dragover', clearIfOutside, true);
+            document.removeEventListener('dragend', clear, true);
+            document.removeEventListener('drop', clear, true);
+        };
+    }, [isOver]);
 
     useEffect(() => {
         if (!showContextMenu) return;
@@ -104,6 +133,7 @@ export function SidebarItem({
             )}
 
             <button
+                ref={buttonRef}
                 // CRITICAL: <button> elements are NOT draggable by default in HTML.
                 // Without draggable="true", onDragStart never fires.
                 draggable={isFolder && !isRenaming && !collapsed ? true : false}
