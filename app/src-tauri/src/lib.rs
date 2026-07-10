@@ -260,6 +260,11 @@ pub fn run() {
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                qr_token: Arc::new(tokio::sync::Mutex::new(None)),
+                stored_api_hash: Arc::new(tokio::sync::Mutex::new(None)),
+                stored_api_id: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                qr_finalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             });
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
@@ -418,6 +423,7 @@ pub fn run() {
             commands::cmd_cancel_transfer,
             commands::cmd_auth_qr_login,
             commands::cmd_auth_qr_poll,
+            commands::cmd_open_telegram_auth,
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
