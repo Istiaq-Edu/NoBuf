@@ -348,6 +348,13 @@ pub async fn throttle_api_calls(rate_limiter: &tokio::sync::Mutex<u64>) {
 /// Parse a Range header value (e.g., "bytes=0-1023") into (start, end) where end is inclusive.
 /// Returns None if the header is missing or malformed.
 pub(crate) fn parse_range_header(range: &str, total_size: u64) -> Option<(u64, u64)> {
+    // Fix #9: guard zero-size media (photos / undetermined size). Every branch
+    // below computes `total_size - 1`, which underflows (u64) when size is 0 —
+    // panicking in debug and wrapping to u64::MAX in release. No range is
+    // satisfiable against an empty representation, so bail early.
+    if total_size == 0 {
+        return None;
+    }
     let range = range.trim().strip_prefix("bytes=")?;
     let parts: Vec<&str> = range.split('-').collect();
     if parts.len() != 2 {
@@ -392,15 +399,11 @@ pub(crate) async fn resolve_media_from_path(
         }
     }
 
-    // Fast path: check media cache — eliminates unthrottled get_messages_by_id
-    // calls that contribute to FLOOD_PREMIUM_WAIT.
-    {
-        let cache = data.media_cache.read().await;
-        if let Some((media, total_size)) = cache.get(&message_id) {
-            return Ok((media.clone(), *total_size));
-        }
-    }
-
+    // Fix #2: resolve folder BEFORE the media cache lookup and key the cache by
+    // (folder_id, message_id). Telegram message_id is unique only within a peer,
+    // so keying by message_id alone made channel A's msg 18 poison channel B's
+    // msg 18 (wrong file/size served). folder_key uses i64::MIN as the sentinel
+    // for the None/me/home/null folder so the key is total.
     let folder_id = if folder_id_str == "me" || folder_id_str == "home" || folder_id_str == "null" {
         None
     } else {
@@ -409,6 +412,16 @@ pub(crate) async fn resolve_media_from_path(
             Err(_) => return Err(HttpResponse::BadRequest().body("Invalid folder ID")),
         }
     };
+    let folder_key = folder_id.unwrap_or(i64::MIN);
+
+    // Fast path: check media cache — eliminates unthrottled get_messages_by_id
+    // calls that contribute to FLOOD_PREMIUM_WAIT.
+    {
+        let cache = data.media_cache.read().await;
+        if let Some((media, total_size)) = cache.get(&(folder_key, message_id)) {
+            return Ok((media.clone(), *total_size));
+        }
+    }
 
     let client_guard = { data.client.lock().await.clone() };
     let client = match client_guard {
@@ -469,7 +482,7 @@ pub(crate) async fn resolve_media_from_path(
     // calls on subsequent /stream requests for the same message.
     {
         let mut cache = data.media_cache.write().await;
-        cache.insert(message_id, (media.clone(), size));
+        cache.insert((folder_key, message_id), (media.clone(), size));
     }
 
     Ok((media, size))
@@ -642,7 +655,7 @@ async fn stream_media(
                     }
                 }
             } else {
-                log::info!("[PREBUFFER] MISS: msg {} range {}-{} not cached",
+                log::debug!("[PREBUFFER] MISS: msg {} range {}-{} not cached",
                     message_id, start_byte, end_byte);
             }
         } else {
@@ -780,11 +793,15 @@ async fn stream_media(
                                     }
 
                                     if bytes_remaining > 0 {
-                                        log::warn!("[PREBUFFER] COORDINATOR: Active download ended before covering full range for msg {} (need {}-{}, progress reached {}, delivered up to {})",
-                                            subscriber_msg, read_offset, subscriber_end, current_progress, read_offset - 1);
+                                        // Fix #6c: this fires on NORMAL chunk-boundary handoff, not a real
+                                        // error — downgrade from warn to debug. Fix #6b: read_offset can be 0
+                                        // (download died before writing byte 0), so read_offset - 1 underflows;
+                                        // use saturating_sub.
+                                        log::debug!("[PREBUFFER] COORDINATOR: chunk boundary reached before full range for msg {} (need {}-{}, progress reached {}, delivered up to {}); subscriber will continue",
+                                            subscriber_msg, read_offset, subscriber_end, current_progress, read_offset.saturating_sub(1));
                                     }
                                 } else {
-                                    log::warn!("[PREBUFFER] COORDINATOR: Active download ended before covering full range for msg {} (need {}-{}, progress reached {})",
+                                    log::debug!("[PREBUFFER] COORDINATOR: chunk boundary reached before full range for msg {} (need {}-{}, progress reached {}); subscriber will continue",
                                         subscriber_msg, read_offset, subscriber_end, current_progress);
                                 }
                                 break;
@@ -892,7 +909,7 @@ async fn stream_media(
     // download as a safety net (prevents player from hanging forever
     // if the proactive prebuffer fails or isn't running).
 
-    log::info!("[PREBUFFER] CACHE-POLL: msg {} range {}-{} ({} bytes) polling disk cache",
+    log::debug!("[PREBUFFER] CACHE-POLL: msg {} range {}-{} ({} bytes) polling disk cache",
         message_id, start_byte, end_byte, content_length);
 
     // Clone cache_mgr for use inside the async_stream block.
@@ -1038,7 +1055,7 @@ async fn stream_media(
         };
 
         if skip_poll {
-            log::info!("[STREAM-CACHE-POLL] msg {}: no disk cache exists — using Telegram download directly (bootstrap)", message_id);
+            log::debug!("[STREAM-CACHE-POLL] msg {}: no disk cache exists — using Telegram download directly (bootstrap)", message_id);
         }
 
         while !skip_poll && bytes_sent < content_length {
@@ -1127,7 +1144,7 @@ async fn stream_media(
         if bytes_sent < content_length {
             let fallback_start = read_offset;
             let fallback_remaining = content_length - bytes_sent;
-            log::info!("[STREAM-FALLBACK] msg {} falling back to Telegram download from offset {}, {} bytes remaining",
+            log::debug!("[STREAM-FALLBACK] msg {} falling back to Telegram download from offset {}, {} bytes remaining",
                 message_id, fallback_start, fallback_remaining);
 
             let chunks_to_skip = (fallback_start / TELEGRAM_CHUNK_SIZE as u64) as i32;
@@ -1190,7 +1207,7 @@ async fn stream_media(
                 // message with a different range has arrived. Break immediately
                 // to stop this zombie download from competing for the rate limiter.
                 if stream_cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    log::info!("[STREAM-FALLBACK] Cancelled zombie download for msg {} at offset {}", message_id, current_offset);
+                    log::debug!("[STREAM-FALLBACK] Cancelled zombie download for msg {} at offset {}", message_id, current_offset);
                     break;
                 }
                 match chunk {

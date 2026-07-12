@@ -74,6 +74,11 @@ const CAPTURE_DELAY_MS = 2000;
 const MIN_HOVER_FETCH_SIZE = 256 * 1024; // 256KB minimum per hover position
 const MAX_HOVER_FETCH_SIZE = 5 * 1024 * 1024; // 5MB maximum — covers large keyframe gaps
 const THUMBNAIL_NB_SAMPLES = 1; // 1 sample per segment — ensures every sample immediately flushes via onSegment
+// Max gap (s) between a hover time and the nearest keyframe in the sparse
+// playback-built index before we distrust it and use native getKeyPacket(time)
+// instead. The playback index only holds keyframes seen so far (often 2-3 near
+// the start), so a far hover must NOT snap to a stale near-start keyframe.
+const THUMB_INDEX_MAX_GAP = 12; // one conservative GOP
 
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
@@ -602,6 +607,7 @@ class TransmuxerThumbnailPipeline {
       url: streamUrl,
       fileSize: fileLength,
       prefetchProfile: 'none', // No prefetch — prevents background reads into uncached territory
+      sourceId: 'thumbnail',   // isolates thumbnail reads from the player in the backend coordinator (source_ids_match) so they don't cross-cancel
     };
     this.keyframeTimestamps = keyframeTimestamps ?? [];
   }
@@ -752,15 +758,18 @@ class TransmuxerThumbnailPipeline {
             hi = mid - 1;
           }
         }
-        if (ts[lo] <= time) {
+        if (ts[lo] <= time && time - ts[lo] <= THUMB_INDEX_MAX_GAP) {
           keyframeTimestampFromIndex = ts[lo];
           // Use the known timestamp with verifyKeyPackets: false — our index
           // already confirmed this is a keyframe during the metadataOnly scan.
           keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
         } else {
-          // All keyframes are after time — use the first one
-          keyframeTimestampFromIndex = ts[0];
-          keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
+          // The sparse playback-built index doesn't cover the hover time (it only
+          // holds keyframes seen during playback, e.g. 2 entries near the start).
+          // Binary-searching it for a far hover returns a keyframe hundreds of
+          // seconds away → wrong thumbnail frame. Fall back to native getKeyPacket,
+          // which uses mediabunny's full Cues to find the real keyframe at `time`.
+          keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
         }
       } else {
         // No keyframe index — fall back to standard getKeyPacket with verification
@@ -1742,7 +1751,11 @@ export function useThumbnailExtractor(
       transmuxerPipelineRef.current.updateKeyframeData(byteOffsets, headerData, sourceConfig);
       console.log(`[ThumbnailExtractor] Updated keyframe data: ${timestamps.length} timestamps, ${byteOffsets.length} byte-offsets`);
     } else {
-      console.log(`[ThumbnailExtractor] Updated keyframe timestamps: ${timestamps.length} available (no byte-offsets yet)`);
+      // Byte-offsets are only consumed by the TS OffsetCustomSource capture path.
+      // MKV/MP4 capture via mediabunny getKeyPacket + the timestamp binary search
+      // (cluster-based, already fast), so empty byte-offsets here is expected, not
+      // a missing index. Log timestamps only to avoid implying something's absent.
+      console.log(`[ThumbnailExtractor] Updated keyframe timestamps: ${timestamps.length} available (timestamp-based capture; byte-offsets N/A for non-TS)`);
     }
   }, [mseGetters?.keyframeIndexReady]);
 

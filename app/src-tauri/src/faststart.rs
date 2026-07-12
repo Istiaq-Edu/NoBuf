@@ -213,7 +213,23 @@ fn patch_stco_table(data: &mut [u8], data_start: usize, adjustment: u64) {
     for i in 0..entry_count {
         let pos = entries_start + i * 4;
         let old_offset = read_u32(data, pos);
-        let new_offset = old_offset.wrapping_add(adjustment_u32);
+        // Fix #10: promote-or-skip instead of silently wrapping. A 32-bit stco
+        // whose offsets, once shifted forward by the relocated moov, cross
+        // u32::MAX would wrap with wrapping_add → the decoder seeks to a garbage
+        // offset and the file tail is corrupt. A correct fix rewrites the box as
+        // 64-bit co64, which is a larger change; until then, detect the overflow,
+        // log it, and leave the offset unchanged (un-faststarted for that chunk)
+        // — a stall is recoverable, wrapped offsets are silent corruption.
+        let new_offset = match old_offset.checked_add(adjustment_u32) {
+            Some(v) => v,
+            None => {
+                log::error!(
+                    "[FASTSTART] stco offset {} + {} overflows u32 — needs co64; leaving chunk offset unpatched to avoid corruption",
+                    old_offset, adjustment_u32
+                );
+                continue;
+            }
+        };
         data[pos..pos + 4].copy_from_slice(&new_offset.to_be_bytes());
     }
 }
