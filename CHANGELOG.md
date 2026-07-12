@@ -2,7 +2,93 @@
 
 All notable changes to NoBuf will be documented in this file.
 
+## [0.9.0] - 2026-07-12
+
+### Bug Fixes
+
+- Fix QR login and add automated Telegram auth
+- P0 — Tauri permissions for 10 new commands, parameterized SQL, upload_file error mapping
+- P1+P2 — Rename hide for public channels, get_setting logging, sync retry with backoff, error toasts on sync failure, unused imports cleanup, loading spinner
+- Already_joined always false for ResolveUsername — JoinChannel is idempotent
+- Link parsing for trailing slashes/permalinks, Search+FilterDocument for file listing, type field in frontend
+- Revert to GetHistory (proven pattern), handle ChannelMessages variant, add diagnostic logging, fix has_more logic
+- Sync activeFolderId when viewing public channels — enables download/preview/stream
+- Return partial:false for non-TS files (MP4) so frontend stops polling and uses linear playback
+- 4 root causes from log analysis — MP4 keyframe polling, zombie download death spiral, GetHistory refetch spam, FLOOD_PREMIUM_WAIT cascade
+- StaleTime on publicChannels list query + NOT_A_MEMBER handling in loadMore
+- Memoize onLoadMore with useCallback to stop IntersectionObserver refetch loop, stop FMP4-KF polling when complete
+- Revert max-h transition to conditional rendering — restores scrollbar and clickability
+- HandleSelectFolder wrapper updates activeView + activeFolderId atomically — fixes private folders not opening from public channel view
+- Show channel icons when sidebar is collapsed — render regardless of section expand state
+- Align public channel icons in collapsed sidebar — centered 32px boxes, conditional avatar size, divider, px-2 nav padding
+- **streaming:** Suppress thumbnail seeks, wait for fMP4 downloads, reduce FLOOD_PREMIUM_WAIT
+- **seek:** Set seek flag before debounce; raise rate limiter to 250ms
+- **seek:** Use separate timestamp for thumbnail suppression to avoid debounce deadlock
+- **seek:** Cover align-poll phase in thumbnail suppression
+- Stale 15s log messages, raise prebuffer backward-jump threshold to 50MB
+- **ts-playback:** Timed_id3 TS files now play via ffmpeg mpegts remux + mpegts.js
+- **player:** Dynamic cold-start overlay + fix video.src race on reopen
+- Reduce audio drift and mute mpegts warnings
+- Ffmpeg remux fixes; ignore stale VBR gaps
+- Delay seek target clear during VBR alignment
+- Double thumbnail size and fix MPEGTS pause/resume logic
+- MKV MSE decode crash + streaming robustness (Fixes #1-#10)
+
+### Documentation
+
+- Add design spec + implementation plan for public channel browsing
+- Verification, validation & optimization plan for public channel feature
+
+### Features
+
+- Add PublicChannel, ChannelPreview, JoinedChannel, ActiveView types
+- Add public_channels module skeleton + models
+- Add usePublicChannels + usePublicChannelFiles hooks
+- Add cmd_resolve_channel_link for channel preview
+- Add cmd_join_channel_by_link for joining + DB insert
+- Add AddChannelModal with Paste Link + Browse Joined tabs
+- Add PublicChannelSidebarSection + PublicChannelItem
+- Add cmd_list_joined_channels, cmd_add_joined_channel, cmd_get_public_channels
+- Add cmd_get_public_channel_files, cmd_remove_public_channel, cmd_forward_to_folder
+- Wire up ActiveView state + public channel sidebar section
+- Add [NB-PUB] sync system + scan exclusion
+- Read-only banner + infinite scroll for public channel files
+- Not-a-member state + FLOOD_WAIT audit on all API calls
+- Forward-to-folder modal + context menu + remove flow with leave prompt
+- Larger streaming buffers for public channels — 20MB cold start, 120s prefetch, 80MB max buffer
+- Collapsible Private and Public Channels sections in sidebar with chevron toggles
+- Collapsible sidebar sections with smooth transitions, improved AddChannelModal UI/UX, avatar circles, count badges, icon buttons
+- **ts:** Re-enable proactive prebuffer with /stream priority
+- Add VBR correction for video seeking
+- Add controls pinning & improve buffer display
+- Add pause/resume prefetch controls and UI tweaks
+- Create PrefetchPause.test.ts
+- Player UX: control bar, settings & drag chips
+- External file drag-drop upload from Explorer
+
+### Miscellaneous Tasks
+
+- Remove log file from git, add to gitignore
+
+### Performance
+
+- **streaming:** Give /stream priority over keyframe search, raise rate limiter to 300ms
+- Improve TS remux seek & cold-start UX
+- Improve MPEG-TS seek/recreation and UI seek handling
+
+### Refactor
+
+- Replace auto-hide delay with pin button toggle
+
+### Security
+
+- Security audit: 44 fixes across critical/high/medium/low + TS playback fixes
+
 ## [0.7.0] - 2026-06-26
+
+### Documentation
+
+- Update CHANGELOG.md for v0.7.0
 
 ### Features
 
@@ -48,17 +134,6 @@ All notable changes to NoBuf will be documented in this file.
 
 - Update CHANGELOG.md for v0.4.7
 - Update CHANGELOG.md for v0.5.0
-
-### Enhancements
-
-- Update useMSEPlayer.ts
-- Update useMSEPlayer.ts
-- Update useMSEPlayer.ts
-- Update streaming.rs
-- Update FastStreamPlayer.tsx
-- Update useMSEPlayer.ts
-- Update server.rs
-- Update package.json
 
 ### Features
 
@@ -185,10 +260,6 @@ All notable changes to NoBuf will be documented in this file.
 
 - Update CHANGELOG.md for v0.3.2
 
-### Enhancements
-
-- Update default.json
-
 ### Features
 
 - Add localhost plugin and streaming robustness
@@ -275,10 +346,6 @@ All notable changes to NoBuf will be documented in this file.
 ### Enhancements
 
 - Update workflow: Remove macOS Intel, add ARM64 target with signing support
-- Update package.json
-- Update FastStreamPlayer.tsx
-- Update FastStreamPlayer.tsx
-- Update TopBar.tsx
 
 ### Features
 
@@ -356,5 +423,9 @@ All notable changes to NoBuf will be documented in this file.
 
 - Remove debug logging from player & MSE hook
 - Delete Reference-FastSyream-repo
+
+### Security
+
+- PDF viewer, remove file cap, code cleanup
 
 <!-- generated by git-cliff -->
