@@ -551,11 +551,18 @@ impl StreamCacheManager {
     ///
     /// Bug #13 fix: Searches through ALL active downloads for this message
     /// (Vec<ActiveDownload>), not just one.
-    pub async fn find_covering_download(&self, message_id: i32, start_byte: u64, _end_byte: u64) -> Option<ActiveDownloadInfo> {
+    pub async fn find_covering_download(&self, message_id: i32, start_byte: u64, end_byte: u64) -> Option<ActiveDownloadInfo> {
         let downloads = self.active_downloads.lock().await;
         let dls = downloads.get(&message_id)?;
         for dl in dls.iter() {
-            if dl.start_byte <= start_byte && dl.end_byte >= start_byte {
+            // Fix #6: require the download to cover our END too, not just our
+            // start. Subscribing to a download that ends before end_byte only
+            // delivers a partial range, then the subscriber loop hits the
+            // "ended before covering full range" path and the client must
+            // re-request the remainder — the observed coordinator churn. When
+            // no download fully covers [start,end], return None so the caller
+            // starts a fresh download for the whole range.
+            if dl.start_byte <= start_byte && dl.end_byte >= end_byte {
                 return Some(ActiveDownloadInfo {
                     start_byte: dl.start_byte,
                     end_byte: dl.end_byte,
@@ -579,7 +586,7 @@ impl StreamCacheManager {
     /// Uses last_progress (initialized to start_byte) for distance
     /// calculation, giving accurate estimates even before any chunks
     /// are downloaded.
-    pub async fn find_best_covering_download(&self, message_id: i32, start_byte: u64, _end_byte: u64) -> Option<ActiveDownloadInfo> {
+    pub async fn find_best_covering_download(&self, message_id: i32, start_byte: u64, end_byte: u64) -> Option<ActiveDownloadInfo> {
         let downloads = self.active_downloads.lock().await;
         let dls = downloads.get(&message_id)?;
 
@@ -587,9 +594,12 @@ impl StreamCacheManager {
         let mut best_distance: u64 = u64::MAX;
 
         for dl in dls.iter() {
-            // A download "covers" our start_byte if it starts before our
-            // offset and extends past it (it will eventually reach us).
-            if dl.start_byte <= start_byte && dl.end_byte >= start_byte {
+            // A download "covers" our request only if it starts at/before our
+            // start AND extends to at/beyond our END (Fix #6). Requiring the end
+            // too prevents subscribing to a download that can't deliver the full
+            // range — which otherwise forces a partial delivery + client
+            // re-request loop (the observed coordinator churn).
+            if dl.start_byte <= start_byte && dl.end_byte >= end_byte {
                 // Distance = how far the download's effective progress is
                 // from our start_byte. Use max(start_byte, last_progress)
                 // as effective progress — start_byte is the minimum since
@@ -698,7 +708,7 @@ impl StreamCacheManager {
                                 0 // overlap or adjacent — don't cancel
                             };
                             if distance > CANCEL_DISTANCE_BYTES {
-                                log::info!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?}, distance={}MB)",
+                                log::debug!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?}, distance={}MB)",
                                     message_id, dl.start_byte, dl.end_byte, start_byte, source_id, distance / (1024*1024));
                                 dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -726,7 +736,7 @@ impl StreamCacheManager {
             .or_insert_with(Vec::new)
             .push(dl);
         let new_count = downloads.get(&message_id).map(|v| v.len()).unwrap_or(0);
-        log::info!("[COORDINATOR] Registered download for msg {} range {}-{} initial_progress={} (total active: {})",
+        log::debug!("[COORDINATOR] Registered download for msg {} range {}-{} initial_progress={} (total active: {})",
             message_id, start_byte, end_byte, initial_value, new_count);
         Some(ActiveDownloadInfo {
             start_byte,
@@ -780,7 +790,7 @@ impl StreamCacheManager {
         if let Some(dls) = downloads.get_mut(&message_id) {
             if let Some(pos) = dls.iter().position(|dl| dl.start_byte == start_byte && dl.end_byte == end_byte) {
                 let dl = dls.remove(pos);
-                log::info!("[COORDINATOR] Unregistered download for msg {} (range {}-{}, remaining: {})",
+                log::debug!("[COORDINATOR] Unregistered download for msg {} (range {}-{}, remaining: {})",
                     message_id, dl.start_byte, dl.end_byte, dls.len());
                 // Dropping dl.progress_tx signals all subscribers watching this
                 // specific download that it has ended.

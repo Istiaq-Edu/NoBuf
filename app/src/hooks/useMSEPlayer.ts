@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../types';
 import { SourceBufferWrapper } from '../lib/faststream/players/SourceBufferWrapper';
 import { detectFormat, type DetectedFormat } from '../lib/faststream/utils/FormatDetector';
+import { Input, BufferSource, MATROSKA } from 'mediabunny';
 import { MediabunnyTransmuxer } from '../lib/faststream/players/MediabunnyTransmuxer';
 import { MuxJsTsTransmuxer } from '../lib/faststream/players/MuxJsTsTransmuxer';
 
@@ -482,10 +483,62 @@ const FRAGMENT_SIZES = [
 // within the seed for virtually all TS files (covers PAT/PMT, audio stream init, first video
 // IDR/SPS, plus ~30s of playback data). 5MB was insufficient — the first video IDR with SPS
 // data lay beyond 5MB on test files, forcing the demuxer into slow HTTP reads that hung init.
-const TS_INITIAL_PREFETCH = 20 * 1024 * 1024; // 20MB
+// MKV/WebM initial header prefetch. Sized to cover BOTH codec detection (EBML
+// header + Tracks, near byte 0) AND the first playback cluster/GOP — so the
+// blocking startup cost is a SINGLE sequential cold read instead of two (the
+// header prefetch, then a second cold fetch inside seekTo(0) for the cluster).
+// The transmuxer reads everything past this via the TauriStreamSource (cached
+// range requests); the Cues live at the file tail and are fetched separately.
+// Why 6MB: every byte from Telegram is gated by a single ~300ms rate limiter
+// (~1.14 MB/s, parallelism forbidden — FLOOD_PREMIUM_WAIT), so the goal is to
+// minimise the NUMBER of cold round-trips, not fetch "more". 2MB covered the
+// header but stopped before the first cluster (→ a separate ~7s seekTo fetch on
+// a cold 1080p file); 6MB brackets the first GOP so seekTo(0) serves from the
+// in-memory seed and playback starts as soon as this one fetch lands (~5s cold,
+// vs the old 20MB/~13s). If a log ever shows the first seekTo still doing a long
+// cold read, the first cluster exceeded 6MB — bump this (never back to 20MB).
+const MKV_INITIAL_PREFETCH = 6 * 1024 * 1024; // 6MB
+
+/**
+ * Detect the primary video codec of an MKV/WebM file from already-fetched header
+ * bytes, using mediabunny's Matroska demuxer (same lib already used for the TS
+ * seed path). Returns the mediabunny VideoCodec string ('avc' | 'hevc' | 'vp9' |
+ * 'av1' | 'vp8') or null if it can't be determined from the given bytes.
+ *
+ * Why: the /remux ffmpeg pipeline copies the video stream into MPEG-TS
+ * (`-c:v copy -f mpegts`), which mpegts.js then plays with full seek + progress
+ * bar. MPEG-TS can only carry H.264 (avc) and H.265 (hevc) via stream copy —
+ * VP8/VP9/AV1 cannot be muxed into TS and must fall back to native <video>
+ * (WebM/VP9 plays natively in WebView2 anyway). We therefore route MKV by codec:
+ * avc/hevc → /remux → mpegts.js; everything else → native.
+ *
+ * The backend's custom Rust fMP4 demuxer cannot parse Matroska, so this
+ * detection is done client-side from the prefetched header bytes.
+ */
+async function detectMkvVideoCodec(data: ArrayBuffer): Promise<string | null> {
+  try {
+    const input = new Input({ source: new BufferSource(data), formats: [MATROSKA] });
+    const videoTrack = await input.getPrimaryVideoTrack();
+    if (!videoTrack) return null;
+    const codec = await videoTrack.getCodec();
+    return codec ?? null;
+  } catch (e: any) {
+    diagLog(`[MSE] detectMkvVideoCodec failed: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+
 const MAX_BUFFER_BYTES = 20 * 1024 * 1024; // 20MB max buffer before eviction
 const BUFFER_KEEP_BEHIND = 30; // Keep 30s behind current playback position
-const MAX_BUFFER_AHEAD_SECONDS = 30; // Backpressure — stop downloading when >30s buffered ahead
+const MAX_BUFFER_AHEAD_SECONDS = 30; // Backpressure — stop downloading when >30s buffered ahead (data NOT yet on disk)
+// Dynamic backpressure: when the data just ahead of the buffer is ALREADY on
+// local disk, appending it is a near-free disk read (no Telegram round-trip),
+// so we let the playback buffer run much further ahead — the user asked for the
+// playback buffer to drain the prebuffer instead of stalling at a hardcoded cap.
+// The network cap above still applies whenever the next bytes must be fetched,
+// which is what prevents QuotaExceededError on huge uncached forward runs.
+const MAX_BUFFER_AHEAD_LOCAL_SECONDS = 120;
 
 // Cold-start overlay thresholds: show the overlay while the first chunk is being
 // pulled into the shadow cache, then fade it out once the player can start.
@@ -743,6 +796,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const [speed, setSpeed] = useState(0);
   // Downloaded byte-range → time-range for green buffer bar
   const [downloadedTimeRanges, setDownloadedTimeRanges] = useState<[number, number][]>([]);
+  // Ground-truth time ranges accumulated directly from transmuxer segment
+  // timestamps (VBR MKV seek path). Bypasses the byte→time round-trip that
+  // mislocates the green bar for VBR content — see trackTransmuxerTimeRange.
+  const downloadedTimeRangesRef = useRef<[number, number][]>([]);
 
   const downloadLoopRef = useRef<((url: string) => void) | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -863,6 +920,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Streaming chain generation — incremented when chain is stopped/started
   // so ongoing async refills can bail out if superseded by a new seek.
   const streamingChainGenRef = useRef(0);
+  // MKV disk-cache warmer (mirrors MP4's downloadLoop for the GREEN BAR only):
+  // a sequential 0→EOF Range walk over /stream that warms the SAME disk cache
+  // mediabunny reads from, so the prebuffer bar fills contiguously to EOF.
+  // Generation ref lets an in-flight warmer bail when a new file/teardown starts.
+  const mkvWarmerGenRef = useRef(0);
+  const mkvWarmerActiveRef = useRef(false);
   // Tracks the keyframe timestamp of the last refill seekTo. When a refill
   // finds the same keyframe as the previous refill (no new data progress),
   // it means we've reached EOF — the chain should stop and call endOfStream.
@@ -1008,6 +1071,31 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     return timeLo + (timeHi - timeLo) * (bytePos - byteLo) / (byteHi - byteLo);
   }, []);
 
+  /** Record a real (byteOffset, time) calibration anchor from a transmuxer seek
+   *  and keep byteToTimeTableRef sorted + deduped. This replaces the linear VBR
+   *  estimate with ground-truth anchors — same idea as the TS keyframe byte-index
+   *  (byteOffsetAtOrBeforeTime), but sourced from mediabunny's own seek reads so
+   *  the green prebuffer bar lands at the correct spot for VBR MKV. */
+  const recordByteTimeAnchor = useCallback((byteOffset: number, time: number) => {
+    if (!Number.isFinite(byteOffset) || byteOffset < 0 || !Number.isFinite(time) || time < 0) return;
+    const table = byteToTimeTableRef.current;
+    // Skip if an anchor at (nearly) this byte position already exists.
+    if (table.some(([b]) => Math.abs(b - byteOffset) < 65536)) return;
+    // MONOTONICITY GUARD: byteToTime interpolates assuming the table is strictly
+    // increasing in BOTH byte and time (larger byte ⇒ later time). A bad anchor
+    // (e.g. a stray Cues/tail read paired with a mid-file time) would violate
+    // this, producing wrong or zero/negative-width ranges → the green bar jumps
+    // far away or vanishes. Reject any anchor that breaks monotonicity with its
+    // would-be neighbours instead of corrupting the whole mapping.
+    let lo = 0, hi = table.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (table[m][0] < byteOffset) lo = m + 1; else hi = m; }
+    const prev = table[lo - 1]; // largest byte < byteOffset
+    const next = table[lo];     // smallest byte > byteOffset
+    if (prev && time <= prev[1]) return; // time must exceed earlier-byte anchor
+    if (next && time >= next[1]) return; // and precede later-byte anchor
+    table.splice(lo, 0, [byteOffset, time]);
+  }, []);
+
   // Debounced range reporter — accumulates fetched byte ranges and
   // reports them to the Rust backend every 2 seconds (or on completion)
   const reportRangesToBackend = useCallback((start: number, end: number) => {
@@ -1095,6 +1183,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Clear downloaded ranges (on seek / cleanup)
   const clearDownloadedRanges = useCallback(() => {
     downloadedRangesRef.current = [];
+    downloadedTimeRangesRef.current = [];
     // Don't clear the visual bar during seek — it causes a flash.
     // The bar updates with new data when the seek completes.
     // Only clear when NOT in a seek (e.g. player cleanup, file change).
@@ -1121,6 +1210,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     effectGenerationRef.current += 1;
     streamUrlRef.current = streamUrl;
     const currentGeneration = effectGenerationRef.current;
+
+    // Swallow the known-benign promise rejections that mediabunny's source
+    // worker (source.js _runWorker) surfaces as "Uncaught (in promise)" when a
+    // seek supersedes an in-flight read. Our TauriStreamSource intentionally
+    // throws on abort/dispose so mediabunny abandons the stale read — correct
+    // behaviour, but mediabunny doesn't catch it, so it hits window as an
+    // unhandled rejection. We filter ONLY these exact benign messages (and the
+    // native AbortError) so real errors still surface normally.
+    const onUnhandledRejection = (ev: PromiseRejectionEvent) => {
+      const r = ev.reason;
+      const msg = typeof r === 'string' ? r : r?.message ?? '';
+      if (
+        r?.name === 'AbortError' ||
+        msg.includes('[TauriStreamSource] read aborted') ||
+        msg.includes('[TauriStreamSource] disposed during')
+      ) {
+        ev.preventDefault(); // benign: seek superseded / source disposed
+      }
+    };
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
     setUseNative(false);
     // Clear stale PTS duration from a previous file so it doesn't clamp the
     // duration floor for the next file (e.g., switching from a 5471s file to
@@ -1240,6 +1349,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     return () => {
       cancelledRef.current = true;
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
       // Clear MSE init timeout
       if (initTimeoutRef.current !== null) {
         clearTimeout(initTimeoutRef.current);
@@ -1366,6 +1476,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         clearInterval(proactiveIntervalRef.current);
         proactiveIntervalRef.current = null;
       }
+      // Stop the MKV disk warmer (bump generation → in-flight loop bails).
+      mkvWarmerGenRef.current++;
+      mkvWarmerActiveRef.current = false;
       // Revoke blob URL on cleanup (always the currently active one)
       const currentBlobUrl = blobUrlRef.current;
       if (currentBlobUrl) {
@@ -1457,6 +1570,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       clearInterval(proactiveIntervalRef.current);
       proactiveIntervalRef.current = null;
     }
+    // Stop the MKV disk warmer (bump generation → in-flight loop bails).
+    mkvWarmerGenRef.current++;
+    mkvWarmerActiveRef.current = false;
   };
 
   /** Calculate how many seconds of video are buffered ahead of current playback.
@@ -1476,6 +1592,50 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     return totalAhead;
   };
 
+  /** True if `byterPos` falls inside a byte range we've already pulled to local
+   *  disk (warmer + refills + stream reads all feed downloadedRangesRef, which is
+   *  kept merged+sorted). Conservative: a byte that IS on disk but wasn't tracked
+   *  here reads as false → we simply keep the tighter network cap, never wrong in
+   *  the unsafe direction. Binary search over the merged ranges. */
+  const isByteLocal = (bytePos: number): boolean => {
+    const ranges = downloadedRangesRef.current;
+    if (!Number.isFinite(bytePos) || ranges.length === 0) return false;
+    let lo = 0, hi = ranges.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const [s, e] = ranges[mid];
+      if (bytePos < s) hi = mid - 1;
+      else if (bytePos > e) lo = mid + 1;
+      else return true;
+    }
+    return false;
+  };
+
+  /** Dynamic backpressure cap. When the data just past the current buffer end is
+   *  already on local disk (free append), allow the playback buffer to run far
+   *  ahead (drains the prebuffer, as the user asked). Otherwise keep the tight
+   *  network cap that prevents QuotaExceededError on huge uncached forward runs.
+   *  Falls back to the network cap whenever we can't resolve the byte (no cue
+   *  index, e.g. TS) — no assumption that unknown == local. */
+  const getBufferAheadCap = (): number => {
+    const video = videoRef.current;
+    const transmuxer = transmuxerRef.current;
+    if (!video || !transmuxer) return MAX_BUFFER_AHEAD_SECONDS;
+    const bufEndTime = video.currentTime + getBufferedAheadSeconds();
+    const byteAtEnd = (transmuxer as any).getByteOffsetForTime?.(bufEndTime) ?? -1;
+    if (byteAtEnd < 0) return MAX_BUFFER_AHEAD_SECONDS; // can't resolve → safe cap
+    if (!isByteLocal(byteAtEnd)) return MAX_BUFFER_AHEAD_SECONDS; // next data is remote
+    // Local (free append): allow a larger window, but bound it by a byte ceiling
+    // so a high-bitrate file can't push the SourceBuffer toward QuotaExceededError.
+    // 62 MB ceiling (matches ~120s at this file's ~0.5MB/s; fewer seconds for a
+    // higher-bitrate file). bitrate is bytes/sec; guard against 0/unknown.
+    const LOCAL_BUFFER_BYTE_CEILING = 64 * 1024 * 1024;
+    const bps = state.current.bitrate;
+    if (!bps || bps <= 0) return MAX_BUFFER_AHEAD_LOCAL_SECONDS;
+    const secondsForCeiling = LOCAL_BUFFER_BYTE_CEILING / bps;
+    return Math.max(MAX_BUFFER_AHEAD_SECONDS, Math.min(MAX_BUFFER_AHEAD_LOCAL_SECONDS, secondsForCeiling));
+  };
+
   /** Refill mechanism for transmuxer playback.
    *  After a limited seek, continuously stream data until buffer is sufficient.
    *  The streaming chain triggers the first refill immediately after the initial
@@ -1483,19 +1643,33 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  until buffer ahead >= REFILL_THRESHOLD_SECONDS. */
   // immediately after the initial seek (no timer delay), then chains
   // subsequent refills as needed until buffer ahead >= threshold.
-  const REFILL_THRESHOLD_SECONDS = 15;
-  // Smaller chunks (5s) produce faster refills: iteration covers less cold
-  // data, and overlap filter skips less cached data. With minimumFragmentDuration=0.5,
-  // each 5s chunk produces ~10 segments for smooth MSE streaming.
+  const REFILL_THRESHOLD_SECONDS = 20;
+  // 5s chunks: each refill produces ~17s of data (5+12 keyframe gap). Smaller
+  // chunks were reinstated because 15s chunks (27s per refill) triggered
+  // PIPELINE_ERROR_DECODE at ~51s — the larger iteration crossed something the
+  // decoder couldn't handle. The stutter fix comes from INITIAL_SEEK_DURATION=30
+  // (more runway), not from the chunk size. With 30s initial buffer, even 5s
+  // chunks don't stutter because the cold iteration (5-14s) leaves 16-25s.
   const REFILL_CHUNK_DURATION = 5;
   // Initial user seek produces enough data for smooth playback start.
-  // 10s provides sufficient runway for the first cold refill (which takes
-  // 5-7s downloading new clusters), preventing playback stalls. The extra
-  // iteration time (~2ms cached, ~1-2s cold) is negligible compared to
-  // getKeyPacket time (5-12s). Also enables reaching 15s threshold in
-  // just 1 refill cycle for cached scenarios (overlap filter skips fewer
-  // segments relative to the larger initial buffer).
-  const INITIAL_SEEK_DURATION = 15;
+  // 25s provides sufficient runway for the first cold refill iteration
+  // (which takes 10-14s downloading new clusters from Telegram at ~1.14MB/s).
+  // 25 - 14 = 11s remaining → no stutter. Must stay BELOW MAX_BUFFER_AHEAD_SECONDS
+  // (30): if initial buffer == cap, any playback advancement triggers an immediate
+  // refill whose keyframe is ~7s before the buffer end, creating a 7s overlap
+  // between initial prime and first refill → duplicate frames → PIPELINE_ERROR_DECODE
+  // at ~51s. With 25s initial, overlap is ~2s (same as original 15s) → no corruption.
+  const INITIAL_SEEK_DURATION = 25;
+  // Time-to-first-frame optimization for USER seeks to unbuffered positions.
+  // The initial seek fill above (25s) has to fully download from Telegram before
+  // playback starts — on a cold seek that's the ~10s "iteration" stall the user
+  // feels. Playback only needs the FIRST GOP to start; the refill chain (which
+  // fires immediately and abuts on keyframe boundaries — see Fix #1) extends to
+  // the full runway in the background. So seed just a small window (~2 GOPs) to
+  // start playing fast, then let refills catch up. Safe because abutting refills
+  // no longer overlap (the old PIPELINE_ERROR_DECODE risk that justified 25s is
+  // gone). Kept ≥ one refill chunk so the first refill has runway to iterate.
+  const SEEK_START_DURATION = 8;
   // Maximum maxDuration for refill seeks. Capped to prevent excessive
   // iteration when video plays far past seekOffsetRef.current. When
   // (video.currentTime - seekOffset) + ahead + REFILL_CHUNK_DURATION
@@ -1554,6 +1728,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         return;
       }
 
+      // Backpressure guard: if we already have >= the dynamic cap buffered
+      // ahead of the playhead, do NOT fetch more. The finally block reschedules
+      // a re-check. Without this guard, a frozen playhead (paused, or stalled on
+      // a cold seek) makes `ahead` grow unbounded every cycle (30s → 271s),
+      // eventually throwing QuotaExceededError and killing playback. The
+      // reschedule-side cap alone is decorative — it still calls this function,
+      // which fetched forward regardless. This is the real cap.
+      // Dynamic: cap is larger when the next data is already on local disk (free
+      // append drains the prebuffer) and tight when it must come from Telegram.
+      if (getBufferedAheadSeconds() >= getBufferAheadCap()) {
+        refillInProgressRef.current = false;
+        return;
+      }
+
       // Always seek from buffer end (discontinuity mode).
       // Previous approach (continuation from seekOffsetRef.current) re-iterated
       // the same data range, causing the overlap filter to skip more data each
@@ -1568,10 +1756,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const ahead = getBufferedAheadSeconds();
       const refillPosition = video.currentTime + ahead;
 
-      // maxDuration covers from keyframeTimestamp to (refillPosition + REFILL_CHUNK_DURATION).
-      // Since the keyframe can be up to ~12s before refillPosition (keyframe interval),
-      // we add 12 as a conservative estimate. Capped at REFILL_MAX_DURATION_CAP.
+      // maxDuration is the FALLBACK cutoff used only when no cue index exists
+      // (TS / pre-parse). For MKV we stop on a keyframe boundary instead (below).
       const maxDuration = Math.min(REFILL_CHUNK_DURATION + 12, REFILL_MAX_DURATION_CAP);
+
+      // Fix #1 (abutting refills — kills the ~51s PIPELINE_ERROR_DECODE):
+      // Stop this refill EXACTLY on the first cue keyframe past
+      // (refillPosition + REFILL_CHUNK_DURATION). Because the refill ends on a
+      // keyframe, the buffer end lands ON a keyframe, so the NEXT refill seeks
+      // to refillPosition == that keyframe and abuts with ZERO overlap (no
+      // coded-frame replacement → no stranded P-frame → no decode crash) and
+      // ZERO gap (the next GOP starts exactly where this one stopped). Returns
+      // Infinity when the cue index is unavailable → falls back to maxDuration,
+      // preserving the original behavior for TS/indexless streams.
+      const stopTime = transmuxer.nextKeyframeAtOrAfter(refillPosition + REFILL_CHUNK_DURATION) ?? Infinity;
 
       // Always skip init segment for refills — SourceBuffer already has it from
       // the initial seek. Producing a new init segment is wasteful and causes
@@ -1584,7 +1782,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // seekTo creates a fresh Input with the persistent TauriStreamSource,
       // guaranteeing a clean demuxer state that can iterate from any position.
-      const keyframeTimestamp = await transmuxer.seekTo(refillPosition, maxDuration, { skipInitSegment: skipInit });
+      const keyframeTimestamp = await transmuxer.seekTo(refillPosition, maxDuration, { skipInitSegment: skipInit, stopTime });
+
+      if (Number.isFinite(stopTime) && keyframeTimestamp !== null) {
+        console.log(`[MSE] Abutting refill: seekKf=${keyframeTimestamp.toFixed(3)}s bufEnd=${refillPosition.toFixed(3)}s stopKf=${stopTime.toFixed(3)}s overlap=${(refillPosition - keyframeTimestamp).toFixed(3)}s`);
+      }
 
       // Bail out if chain was stopped while we were waiting for seekTo.
       // CRITICAL: do NOT clear bufferingForSeekRef or seekBufferRef when the
@@ -1756,13 +1958,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const sb = state.current.videoSourceBuffer;
       if (video && transmuxer && sb && !video.ended && !sb.hasFatalError && !isCompleteRef.current) {
         const ahead = getBufferedAheadSeconds();
-        // Hard cap on buffer ahead: skip refills entirely when > 30s ahead.
+        // Hard cap on buffer ahead: skip refills entirely when > cap seconds ahead.
         // Prevents buffer from growing excessively (e.g., 62.9s ahead for TS)
         // which wastes bandwidth, risks QuotaExceededError, and slows seeks
-        // because more data needs to be evicted.
-        const MAX_BUFFER_AHEAD = 30;
-        if (ahead >= MAX_BUFFER_AHEAD) {
-          console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s exceeds hard cap ${MAX_BUFFER_AHEAD}s — sleeping 2000ms before re-check`);
+        // because more data needs to be evicted. Same dynamic cap enforced at the
+        // top of executeStreamingRefill (the entry guard is what actually caps;
+        // this just picks a longer re-check delay when already full).
+        const aheadCap = getBufferAheadCap();
+        if (ahead >= aheadCap) {
+          console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s exceeds cap ${aheadCap}s — sleeping 2000ms before re-check`);
           setTimeout(() => {
             if (streamingChainGenRef.current === chainGeneration) {
               executeStreamingRefill();
@@ -1918,11 +2122,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       if (format === 'mkv' || format === 'webm') {
-        if (data.byteLength < TS_INITIAL_PREFETCH && state.current.fileLength > TS_INITIAL_PREFETCH) {
-          diagLog(`[MSE] ${format}: fetching additional prefetch data (${data.byteLength} → ${TS_INITIAL_PREFETCH} bytes)`);
+        // Mark transmuxer init in-progress BEFORE the (potentially slow) cold
+        // prefetch below. On a cold network the 20MB prefetch can exceed the 20s
+        // MSE_INIT_TIMEOUT, and without this flag the timeout handler (checkInitTimeout)
+        // fires native fallback → closes the MediaSource → the transmuxer's later
+        // addSourceBuffer throws InvalidStateError ("readyState is not 'open'") and
+        // the whole MKV path collapses to the broken /remux fallback. Setting it
+        // here makes the timeout EXTEND (up to MSE_INIT_MAX_TIMEOUT) instead. It is
+        // reset to false on every failure/fallback path below.
+        transmuxerInitInProgressRef.current = true;
+        // MKV/WebM only need header+Tracks for codec detection (the transmuxer
+        // reads everything else via cached range requests); TS needs the full
+        // 20MB packet-scan seed. Using the smaller MKV target here is the bulk of
+        // the startup win — it removes ~18MB of blocking cold-network prefetch.
+        const prefetchTarget = MKV_INITIAL_PREFETCH;
+        if (data.byteLength < prefetchTarget && state.current.fileLength > prefetchTarget) {
+          diagLog(`[MSE] ${format}: fetching additional prefetch data (${data.byteLength} → ${prefetchTarget} bytes)`);
           try {
             const extraResponse = await fetch(url, {
-              headers: { Range: `bytes=${data.byteLength}-${TS_INITIAL_PREFETCH - 1}` },
+              headers: { Range: `bytes=${data.byteLength}-${prefetchTarget - 1}` },
             });
             if (extraResponse.ok || extraResponse.status === 206) {
               const extraData = await extraResponse.arrayBuffer();
@@ -2037,7 +2255,80 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       if (format === 'mkv' || format === 'webm') {
-        diagLog(`[MSE] ${format} — falling back to native playback`);
+        // WebM (VP8/VP9/Opus) plays natively in WebView2 — no remux needed.
+        // MKV routing depends on the video codec: mpegts.js (via the /remux
+        // ffmpeg pipeline) can play H.264/H.265 with full seek + progress bar,
+        // but VP8/VP9/AV1 cannot be `-c:v copy`'d into MPEG-TS and must use the
+        // native <video> element instead.
+        if (format === 'webm') {
+          diagLog('[MSE] webm — using native playback (WebView2 plays VP8/VP9/Opus natively)');
+          setUseNative(true);
+          return;
+        }
+
+        // MKV: detect the video codec from the prefetched header bytes.
+        const mkvCodec = await detectMkvVideoCodec(data);
+        diagLog(`[MSE] mkv video codec detected: ${mkvCodec ?? 'unknown'}`);
+        if (cancelledRef.current) return;
+
+        const parsed = parseStreamUrl(streamUrlRef.current ?? url);
+
+        // H.264 MKV → client-side MediabunnyTransmuxer (fMP4). This is the
+        // preferred path: it demuxes the MKV in-browser and seeks natively by
+        // keyframe, so the progress bar/seek work correctly (the /remux →
+        // mpegts.js path plays but its byte-seek can't parse raw Matroska).
+        // `data` is the 20MB header prefetch, reused as the transmuxer seed.
+        if (mkvCodec === 'avc') {
+          diagLog('[MSE] mkv (avc) — using client-side MediabunnyTransmuxer (fMP4, native seek)');
+          const ok = await _initMkvTransmuxerPlayer(url, mediaSource, blobUrl, data);
+          if (ok || cancelledRef.current) return;
+          // Transmuxer init failed — fall through to the /remux path below as a
+          // last resort (playback works there even if seek is limited).
+          diagLog('[MSE] mkv (avc) transmuxer init failed — falling back to /remux → mpegts.js');
+        }
+
+        // H.265 MKV (transmuxer marks hevc unsupported for MSE), or avc
+        // transmuxer fallback → ffmpeg /remux endpoint (outputs MPEG-TS) played
+        // with mpegts.js. Same pipeline as the timed_id3 TS path.
+        if ((mkvCodec === 'hevc' || mkvCodec === 'avc') && parsed) {
+          const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+          diagLog(`[MSE] mkv (${mkvCodec}) — routing to ffmpeg remux → mpegts.js: ${remuxUrl}`);
+          remuxUrlRef.current = remuxUrl;
+
+          if (!shadowCacheRef.current) {
+            shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
+          }
+          const mkvUrlKey = new URL(remuxUrl).pathname;
+          shadowCacheRef.current.reset(mkvUrlKey, 0);
+
+          // Mark transmuxer init in progress so the MSE init timeout extends
+          // instead of firing at 20s (remux needs: download + ffprobe + ffmpeg startup).
+          transmuxerInitInProgressRef.current = true;
+
+          // Clear mseUrl BEFORE mpegts.js init — mpegts.js creates its own
+          // MediaSource and sets video.src internally. Leaving mseUrl set to our
+          // empty blob URL would make FastStreamPlayer overwrite video.src on the
+          // next render, causing ERR_FILE_NOT_FOUND on the data-less blob.
+          setMseUrl(null);
+
+          // Show the cold-start overlay during remux startup (download + ffprobe +
+          // ffmpeg spawn + first fragments). The MEDIA_INFO handler resolves the
+          // deferred and dismisses the overlay once the player is ready.
+          let mkvColdStartResolve: () => void = () => {};
+          const mkvColdStartPromise = new Promise<void>((resolve) => { mkvColdStartResolve = resolve; });
+          coldStartDeferredRef.current = { resolve: mkvColdStartResolve, promise: mkvColdStartPromise };
+          setIsColdStartBuffering(true);
+          setColdStartPhase('initializing_player');
+          setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for remux
+
+          await _initMpegtsPlayer(remuxUrl, mediaSource, blobUrl, parsed);
+          return;
+        }
+
+        // VP8/VP9/AV1 in MKV, codec undetectable, or unparseable URL → native
+        // fallback. WebView2 can play VP9/AV1 MKV natively; H.264 MKV would fail
+        // natively, but if detection failed we have no better option.
+        diagLog(`[MSE] mkv (${mkvCodec ?? 'unknown'}) — not transmuxable/remuxable, using native playback`);
         setUseNative(true);
         return;
       }
@@ -2614,24 +2905,39 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // endpoints for thumbnail extraction — no second mpegts.js player,
       // no /stream rate limiter competition. The backend handles TS demuxing
       // and keyframe alignment server-side.
+      // Activate the thumbnail pipeline. Two mutually-exclusive routes:
+      //  - TS (native / timed_id3): backend fMP4 pipeline (/fmp4/init + /segment).
+      //    The backend demuxes TS server-side — no second mpegts.js, no /stream
+      //    rate-limiter competition.
+      //  - MKV-via-/remux: the backend fMP4 demuxer CANNOT parse Matroska
+      //    (/fmp4/init 500s), so instead use the client-side
+      //    TransmuxerThumbnailPipeline, which reads the raw /stream MKV directly
+      //    via mediabunny + WebCodecs (independent of the mpegts.js player).
+      //    It is triggered by isTransmuxerActive (see useThumbnailExtractor.ts).
       if (mediaInfo && mediaInfo.videoCodec) {
-        fmp4ConfigRef.current = {
-          baseUrl: `${parsed.baseUrl}/fmp4`,
-          folderId: parsed.folderId,
-          messageId: parsed.messageId,
-          queryParams: `token=${encodeURIComponent(parsed.token)}`,
-          mimeType: `video/mp4; codecs="${mediaInfo.videoCodec},${mediaInfo.audioCodec}"`,
-          duration: knownDuration || estimatedDurationS,
-          fileSize: knownFilesize || 0,
-        };
-        fmp4PipelineActiveRef.current = true;
-        diagLog('[MPEGTS] fMP4 thumbnail pipeline activated');
-        // Signal that thumbnail pipeline data is ready for TS files.
-        // For MP4, this is set in the mp4box.js onReady callback. For TS,
-        // the fMP4 backend pipeline doesn't need moov/firstChunk — it fetches
-        // init segments from the backend. Setting this here triggers the
-        // Fmp4ThumbnailPipeline effect in useThumbnailExtractor.ts.
-        setThumbnailDataReady(true);
+        if (formatRef.current === 'mkv') {
+          diagLog('[MPEGTS] MKV — activating client-side transmuxer thumbnail pipeline (mediabunny)');
+          setIsTransmuxerActive(true);
+          setThumbnailDataReady(true);
+        } else {
+          fmp4ConfigRef.current = {
+            baseUrl: `${parsed.baseUrl}/fmp4`,
+            folderId: parsed.folderId,
+            messageId: parsed.messageId,
+            queryParams: `token=${encodeURIComponent(parsed.token)}`,
+            mimeType: `video/mp4; codecs="${mediaInfo.videoCodec},${mediaInfo.audioCodec}"`,
+            duration: knownDuration || estimatedDurationS,
+            fileSize: knownFilesize || 0,
+          };
+          fmp4PipelineActiveRef.current = true;
+          diagLog('[MPEGTS] fMP4 thumbnail pipeline activated');
+          // Signal that thumbnail pipeline data is ready for TS files.
+          // For MP4, this is set in the mp4box.js onReady callback. For TS,
+          // the fMP4 backend pipeline doesn't need moov/firstChunk — it fetches
+          // init segments from the backend. Setting this here triggers the
+          // Fmp4ThumbnailPipeline effect in useThumbnailExtractor.ts.
+          setThumbnailDataReady(true);
+        }
       }
 
       // Start playback as soon as mpegts.js has identified the media streams AND
@@ -4270,6 +4576,408 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   };
 
   /**
+   * Initialize the client-side MediabunnyTransmuxer player for an H.264 MKV.
+   *
+   * WHY (not /remux → mpegts.js): the ffmpeg-remux path plays MKV but its
+   * seek engine byte-seeks the raw /stream (Matroska) bytes, which the TS
+   * demuxer can't parse (`sync_byte != 0x47`) — seek is structurally broken.
+   * mediabunny instead demuxes the MKV in-browser and transmuxes to fMP4,
+   * with native keyframe/cluster seeking (MediabunnyTransmuxer.seekTo). Same
+   * engine already proven for MKV hover-thumbnails on this exact content.
+   *
+   * This restores the previously-working transmuxer player wiring (git
+   * d6630a4), adapted to the current architecture and MKV-gated. Returns true
+   * on success; false → caller should fall back (native / remux).
+   *
+   * @param seedData in-memory header bytes (the 20MB MKV prefetch) — reads
+   *   within [0, seedData.byteLength] bypass HTTP, eliminating per-request
+   *   Tauri/WebView2 round-trips that otherwise make init take 30s+.
+   */
+  /**
+   * MKV disk-cache warmer — the green-bar counterpart to MP4's downloadLoop.
+   *
+   * WHY THIS EXISTS (and why it's separate from the transmuxer):
+   * MP4's green bar reaches EOF because its downloadLoop issues SEQUENTIAL Range
+   * requests 0→fileLength against /stream, and every /stream fetch is written to
+   * the backend disk cache (cached_ranges). The MKV path never does a sequential
+   * walk: mediabunny only PULLS scattered cluster bytes for decode, so the disk
+   * cache fills as sparse islands and the bar never marches to EOF.
+   * We CANNOT fix this by widening the transmuxer window — mediabunny's
+   * Conversion.execute() cannot be paused (confirmed: it exposes only
+   * init/execute/cancel + trim{start,end}), so running it far ahead races the
+   * playhead and the eviction backpressure punches permanent holes → stall
+   * (documented at the startStreamingChain prime comment).
+   *
+   * So we mirror MP4 at the layer that actually fills the bar: a sequential
+   * 0→EOF Range walk over /stream that warms the SAME disk cache mediabunny
+   * later reads from (cache hits — no double download). It is fully decoupled
+   * from the transmuxer/Conversion and from the 30s MSE playback buffer.
+   *
+   * COORDINATOR SAFETY: uses a distinct source_id ("warmer") so the backend's
+   * zombie-cancel logic never cross-cancels it against the player's scattered
+   * "playback" seek reads (TauriStreamSource uses source_id "playback"). The
+   * warmer yields (throttles) while the player is actively fetching so playback
+   * always wins the rate-limiter budget.
+   */
+  const startMkvDiskWarmer = (baseStreamUrl: string, startByte: number = 0) => {
+    const gen = ++mkvWarmerGenRef.current;  // supersedes any prior warmer (e.g. after a seek)
+    const fileLen = state.current.fileLength;
+    if (!fileLen || fileLen <= 0) return;
+    // Distinct source_id so the coordinator treats this as its own sequential
+    // download, isolated from the player's "playback" reads.
+    const sep = baseStreamUrl.includes('?') ? '&' : '?';
+    const warmerUrl = `${baseStreamUrl}${sep}source_id=warmer`;
+
+    mkvWarmerActiveRef.current = true;
+    const WARMER_CHUNK = 4 * 1024 * 1024; // 4 MiB sequential chunks
+    // Align start to a chunk boundary so warmed ranges stay chunk-aligned with
+    // the coordinator's download granularity. Arithmetic (not bitwise) — byte
+    // offsets exceed 2^31 (file is 1.76GB), so & would overflow 32-bit ints.
+    const clampedStart = Math.max(0, Math.min(startByte, fileLen - 1));
+    const alignedStart = clampedStart - (clampedStart % WARMER_CHUNK);
+
+    (async () => {
+      let offset = alignedStart;
+      try {
+        while (
+          !cancelledRef.current &&
+          gen === mkvWarmerGenRef.current &&
+          offset < fileLen
+        ) {
+          // Yield to playback: if the player is actively downloading (cold
+          // start / seek / refill fetching), sleep so /stream gets the full
+          // rate-limiter budget. The disk warm is best-effort background work.
+          if (state.current.downloading || bufferingForSeekRef.current) {
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+
+          const end = Math.min(offset + WARMER_CHUNK - 1, fileLen - 1);
+
+          // Skip ranges already on disk so we don't re-request cached bytes.
+          // trackDownloadedRange/reportRangesToBackend below still record the
+          // range for the bar; the backend serves cached hits instantly.
+          let resp: Response | null = null;
+          try {
+            resp = await fetch(warmerUrl, { headers: { Range: `bytes=${offset}-${end}` } });
+          } catch {
+            // Transient network/HTTP error — back off and retry same offset.
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          if (cancelledRef.current || gen !== mkvWarmerGenRef.current) break;
+
+          if (resp.status === 503) {
+            // Backend at max concurrent downloads — retry this offset later.
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          if (!resp.ok && resp.status !== 206) {
+            // Non-recoverable for this range — stop warming (don't spin).
+            break;
+          }
+
+          const buf = await resp.arrayBuffer();
+          if (cancelledRef.current || gen !== mkvWarmerGenRef.current) break;
+          const got = buf.byteLength;
+          if (got <= 0) {
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+
+          // Warm the disk cache accounting + green bar with the REAL fetched
+          // range (contiguous, unlike the transmuxer's estimated islands).
+          reportRangesToBackend(offset, offset + got - 1);
+          trackDownloadedRange(offset, offset + got - 1);
+
+          offset += got;
+        }
+        if (!cancelledRef.current && gen === mkvWarmerGenRef.current) {
+          flushRangeReport();
+          diagLog(`[MSE] MKV disk warmer finished at byte ${offset}/${fileLen}`);
+        }
+      } catch (e: any) {
+        if (!cancelledRef.current) diagLog(`[MSE] MKV disk warmer error: ${e?.message ?? String(e)}`);
+      } finally {
+        if (gen === mkvWarmerGenRef.current) mkvWarmerActiveRef.current = false;
+      }
+    })();
+  };
+
+  const _initMkvTransmuxerPlayer = async (
+    url: string,
+    mediaSource: MediaSource,
+    blobUrl: string,
+    seedData: ArrayBuffer,
+  ): Promise<boolean> => {
+    const transmuxer = new MediabunnyTransmuxer({
+      format: 'mkv',
+      sourceConfig: {
+        url,
+        fileSize: state.current.fileLength,
+        maxCacheSize: 32 * 1024 * 1024, // 32 MiB — avoids duplicate range requests during concurrent video+audio iteration (default 8 MiB too small)
+        prefetchProfile: 'network',     // 3 workers, aggressive random prefetch — fast random access for seek
+        seedData,                       // header bytes served from memory (zero-latency init)
+        sourceId: 'playback',           // isolates player reads from the thumbnail pipeline in the backend coordinator (source_ids_match)
+      },
+      onInitSegment: (segData: ArrayBuffer) => {
+        if (cancelledRef.current) return;
+        diagLog(`[MSE] MKV transmuxer init segment: ${segData.byteLength} bytes`);
+        // During seek: buffer until setTimestampOffset() runs (it clears the SB
+        // queue, so segments queued before the offset is set would be lost).
+        if (bufferingForSeekRef.current) {
+          seekBufferRef.current.push({ type: 'init', data: segData.slice(0) });
+          initSegmentsRef.current = [{ id: 1, buffer: segData.slice(0) }];
+          return;
+        }
+        state.current.videoSourceBuffer?.appendBuffer(segData);
+        initSegmentsRef.current = [{ id: 1, buffer: segData.slice(0) }];
+      },
+      onMediaSegment: (segData: ArrayBuffer, timestamp: number) => {
+        if (cancelledRef.current) return;
+        if (bufferingForSeekRef.current) {
+          seekBufferRef.current.push({ type: 'media', data: segData.slice(0), timestamp });
+          return;
+        }
+        // Non-buffering append (defensive — in the refill model segments normally
+        // flow through bufferingForSeekRef and are flushed by executeStreamingRefill).
+        // Evict only data BEHIND the playhead (evictOldBuffer). Do NOT evict
+        // ahead-of-playhead data here: the bounded refill chain already caps
+        // lookahead, and evicting ahead-data from a sequential producer that
+        // won't re-emit it punches a permanent hole that stalls playback.
+        evictOldBuffer();
+        state.current.videoSourceBuffer?.appendBuffer(segData);
+        // Progress: transmuxer timestamps are relative after a seek trim, so
+        // add seekOffsetRef to recover the absolute position.
+        const absoluteTimestamp = timestamp + seekOffsetRef.current;
+        if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.duration !== Infinity && state.current.fileLength > 0) {
+          const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+          setPrefetchedBytes(estimatedBytes);
+          trackDownloadedRange(estimatedBytes, estimatedBytes + segData.byteLength);
+        }
+      },
+      onDurationKnown: (duration: number) => {
+        if (cancelledRef.current) return;
+        diagLog(`[MSE] MKV transmuxer duration known: ${duration}s`);
+        state.current.duration = duration;
+        if (state.current.fileLength > 0 && duration > 0 && duration !== Infinity) {
+          state.current.bitrate = state.current.fileLength / duration;
+        }
+        // Seed byteToTimeTableRef with baseline anchors (0,0) and (fileLength,
+        // duration) — same as the TS/mpegts path — so byteToTime() has a valid
+        // monotonic mapping from the FIRST seek. Without this the MKV table is
+        // empty and the green prebuffer bar either renders far off or vanishes
+        // until real seek anchors populate it. Real anchors refine between these.
+        if (state.current.fileLength > 0 && duration > 0 && duration !== Infinity
+            && byteToTimeTableRef.current.length === 0) {
+          byteToTimeTableRef.current = [[0, 0], [state.current.fileLength, duration]];
+        }
+        try {
+          mediaSource.duration = duration;
+        } catch (_e) {
+          setTimeout(() => { try { mediaSource.duration = duration; } catch (_) {} }, 100);
+        }
+      },
+      onSpeedUpdate: (speed: number) => { if (!cancelledRef.current) setSpeed(speed); },
+      onProgressUpdate: (_t: number, estimatedBytes: number) => { if (!cancelledRef.current) setPrefetchedBytes(estimatedBytes); },
+      onCodecUnsupported: (codec: string) => {
+        if (cancelledRef.current) return;
+        diagLog(`[MSE] MKV transmuxer codec unsupported: ${codec}`);
+        setError(`Codec not supported for MSE playback: ${codec}`);
+        setUseNative(true);
+      },
+      onError: (error: Error) => {
+        if (cancelledRef.current) return;
+        diagLog(`[MSE] MKV transmuxer ERROR: ${error.message}`);
+        setError(error.message);
+        setUseNative(true);
+      },
+    });
+
+    // Mark init in progress so the fatal-video-error handler doesn't trip
+    // fallback during init (the empty blob URL fires error code 4 until data
+    // arrives — expected, not fatal).
+    transmuxerInitInProgressRef.current = true;
+
+    // Cold-start overlay (parity with MP4/TS): the transmuxer path was silent
+    // during its slow startup — metadata probe (~2s) + the initial-prime
+    // iteration that transmuxes the first window from Telegram (observed ~18s
+    // cold). Show the overlay so the user sees progress instead of a black
+    // frame. Phases are advanced inline; dismissed once the buffer is primed.
+    setIsColdStartBuffering(true);
+    setColdStartPhase('fetching_metadata');
+    setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate — probe/transmux, not a byte target
+
+    const result = await transmuxer.init();
+    if (!result || cancelledRef.current) {
+      transmuxerInitInProgressRef.current = false;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+      diagLog('[MSE] MKV transmuxer init FAILED or cancelled');
+      try { transmuxer.dispose(); } catch (_) {}
+      return false;
+    }
+    diagLog(`[MSE] MKV transmuxer init success: decision=${result.mseDecision}, mimeType=${result.mimeType}`);
+    // Init parsed (duration + cues + Conversion ready); next phase is the
+    // initial-prime transmux/download of the first playable window.
+    setColdStartPhase('initializing_player');
+
+    // Seed the byte↔time table with the REAL VBR cue anchors mediabunny parsed
+    // (time→exact cluster byte). This replaces the linear 2-point baseline so the
+    // green prebuffer bar is VBR-accurate from the FIRST frame of any seek —
+    // rather than rendering off and self-correcting only after a seek records its
+    // own single anchor. Endpoints (0,0)+(fileLength,duration) bracket the cues.
+    try {
+      const cueIndex = (transmuxer as any).getMkvCueIndex?.() as { time: number; byteOffset: number }[] | undefined;
+      const dur = state.current.duration;
+      if (cueIndex && cueIndex.length > 0 && state.current.fileLength > 0 && dur > 0 && dur !== Infinity) {
+        const table: [number, number][] = [[0, 0]];
+        for (const c of cueIndex) {
+          if (c.byteOffset > 0 && c.time > 0 && c.byteOffset < state.current.fileLength && c.time < dur) {
+            table.push([c.byteOffset, c.time]);
+          }
+        }
+        table.push([state.current.fileLength, dur]);
+        table.sort((a, b) => a[0] - b[0]);
+        // Dedupe by byte and drop any non-monotonic time (byteToTime needs both strictly increasing).
+        const seeded: [number, number][] = [];
+        for (const [b, t] of table) {
+          const last = seeded[seeded.length - 1];
+          if (last && (b - last[0] < 65536 || t <= last[1])) continue;
+          seeded.push([b, t]);
+        }
+        byteToTimeTableRef.current = seeded;
+        diagLog(`[MSE] MKV byte↔time table seeded with ${seeded.length} real VBR cue anchors`);
+      }
+    } catch (_e) { /* non-fatal — keep the linear baseline */ }
+
+    try {
+      const sb = mediaSource.addSourceBuffer(result.mimeType);
+      state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
+      state.current.videoSourceBuffer.setTimestampOffset(0);
+      diagLog(`[MSE] MKV: created combined SourceBuffer (${result.mimeType})`);
+    } catch (e: any) {
+      console.error(`[MSE] MKV: addSourceBuffer failed for "${result.mimeType}":`, e);
+      const fallbackMimes = ['video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4'];
+      for (const mime of fallbackMimes) {
+        try {
+          if (MediaSource.isTypeSupported(mime)) {
+            const sb = mediaSource.addSourceBuffer(mime);
+            state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
+            state.current.videoSourceBuffer.setTimestampOffset(0);
+            console.log(`[MSE] MKV: created SourceBuffer with fallback mime: ${mime}`);
+            break;
+          }
+        } catch (_) { continue; }
+      }
+      if (!state.current.videoSourceBuffer) {
+        transmuxerInitInProgressRef.current = false;
+        diagLog('[MSE] MKV: SourceBuffer creation failed — falling back');
+        try { transmuxer.dispose(); } catch (_) {}
+        return false;
+      }
+    }
+
+    transmuxerInitInProgressRef.current = false;
+    state.current.initialized = true;
+    if (initTimeoutRef.current !== null) {
+      clearTimeout(initTimeoutRef.current);
+      initTimeoutRef.current = null;
+    }
+    transmuxerRef.current = transmuxer;
+    setIsTransmuxerActive(true);
+    void blobUrl; // blob URL already set as video.src by the caller
+
+    setIsPrefetching(true);
+    setSpeed(0);
+
+    // Prime the initial buffer with a BOUNDED window, then hand off to the
+    // refill-loop streaming chain — the SAME on-demand mechanism the TS seek
+    // path uses. We must NOT call the unbounded transmuxer.startTransmuxing()
+    // (Conversion.execute() start→end): it races far ahead of the playhead as
+    // fast as it can download, and since mediabunny's Conversion can't be
+    // paused, the onMediaSegment backpressure evicts the far-ahead data — which
+    // the sequential Conversion never re-emits, leaving a permanent hole at the
+    // eviction boundary that stalls playback forever (observed: buffer frozen at
+    // [0-37s] while islands appended at 52s+). seekTo(0, INITIAL_SEEK_DURATION)
+    // produces a bounded window via Output trim; startStreamingChain() then tops
+    // the buffer up on demand, capping how far ahead the Conversion ever runs.
+    const sbVideo = state.current.videoSourceBuffer;
+    if (!sbVideo) return true;
+    bufferingForSeekRef.current = true;
+    seekBufferRef.current = [];
+    try {
+      // Fix #1: stop the initial prime on a keyframe boundary so the buffer end
+      // lands ON a keyframe; refill #1 then abuts it with zero overlap/gap.
+      const primeStop = transmuxer.nextKeyframeAtOrAfter(INITIAL_SEEK_DURATION) ?? Infinity;
+      const keyframeTimestamp = await transmuxer.seekTo(0, INITIAL_SEEK_DURATION, { stopTime: primeStop });
+      bufferingForSeekRef.current = false;
+      if (cancelledRef.current) return true;
+
+      const tsOffset = keyframeTimestamp ?? 0;
+      seekOffsetRef.current = tsOffset;
+      await sbVideo.setTimestampOffset(tsOffset);
+      const sbAudio = state.current.audioSourceBuffer;
+      if (sbAudio) await sbAudio.setTimestampOffset(tsOffset);
+
+      const buffered = seekBufferRef.current;
+      seekBufferRef.current = [];
+      for (const item of buffered) {
+        if (item.trackType === 'audio' && sbAudio) {
+          sbAudio.appendBuffer(item.data);
+        } else {
+          sbVideo.appendBuffer(item.data);
+        }
+        if (item.type === 'media') {
+          const absoluteTimestamp = (item.timestamp ?? 0) + seekOffsetRef.current;
+          if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.fileLength > 0) {
+            const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
+            setPrefetchedBytes(estimatedBytes);
+            trackDownloadedRange(estimatedBytes, estimatedBytes + item.data.byteLength);
+          }
+        }
+      }
+      await sbVideo.waitForQueueDrain();
+      if (sbAudio) await sbAudio.waitForQueueDrain();
+      diagLog(`[MSE] MKV initial buffer primed at keyframe ${tsOffset.toFixed(2)}s — starting refill chain`);
+
+      // First playable window is in the SourceBuffer — dismiss the cold-start
+      // overlay so playback becomes visible (parity with MP4/TS handoff).
+      coldStartDeferredRef.current?.resolve();
+      coldStartDeferredRef.current = null;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+
+      // On-demand refill loop keeps the buffer topped up (bounded lookahead).
+      startStreamingChain();
+
+      // Green-bar parity with MP4: warm the disk cache sequentially to EOF in
+      // the background (separate source_id, yields to playback). This is what
+      // makes the MKV prebuffer bar march to EOF like MP4's, without touching
+      // the bounded MSE playback buffer or the unpausable transmuxer Conversion.
+      if (url) startMkvDiskWarmer(url);
+    } catch (e: any) {
+      bufferingForSeekRef.current = false;
+      // Dismiss the overlay on prime failure too — otherwise it hangs until the
+      // 45s safety timeout.
+      coldStartDeferredRef.current?.resolve();
+      coldStartDeferredRef.current = null;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+      const isExpected = e?.message?.includes('has been canceled') ||
+        e?.name === 'ConversionCanceledError' ||
+        e?.message?.includes('Input has been disposed') ||
+        e?.name === 'InputDisposedError';
+      if (!isExpected && !cancelledRef.current) {
+        console.error('[MSE] MKV initial prime failed:', e);
+        setError(e?.message ?? String(e));
+      }
+    }
+
+    return true;
+  };
+
+  /**
    * Initialize the transmuxer player for TS content via mpegts.js.
    * Non-TS formats are routed to native playback in the main setup flow.
    */
@@ -5404,7 +6112,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // is also self-limiting: mpegts.js pauses the download after buffering
     // lazyLoadMaxDuration seconds (recoverDuration) before the buffer end.
     // entire file tail from seek point to EOF.
-    if (mpegtsPlayerRef.current && formatRef.current === 'ts') {
+    // mpegts.js seek path — engages whenever mpegts.js is the active player,
+    // regardless of container. This covers native TS, timed_id3 TS remux, AND
+    // MKV-via-/remux (all feed mpegts.js an MPEG-TS stream). Gating on the live
+    // `mpegtsPlayerRef` — not on formatRef — is what routes MKV seeks here
+    // instead of falling through to the MP4Box download loop ("moov not
+    // received"). MP4 has no mpegtsPlayerRef; the backend-fMP4 seek below is a
+    // separate `formatRef==='ts' && fmp4PipelineActiveRef` block, unaffected.
+    if (mpegtsPlayerRef.current) {
       const dur = mpegtsDurationRef.current || state.current.duration;
       if (!dur || dur <= 0 || !isFinite(dur)) return;
       const video = videoRef.current;
@@ -5845,6 +6560,37 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         transmuxerSeekInProgressRef.current = true; // Prevent concurrent seeks
         clearDownloadedRanges();
 
+        // Re-target the backend proactive download to the seek position. Without
+        // this, the Rust prebuffer keeps downloading SEQUENTIALLY from the OLD
+        // playhead while mediabunny's getKeyPacket blocks on cold seek-target
+        // cluster bytes → the 5-29s "prebuffers from wrong place / won't play"
+        // stall. cmd_report_playback_position with an explicit byteOffset makes
+        // the backend detect the playhead jump and re-prioritize (see
+        // [PROACTIVE] "playhead jumped forward … re-evaluating gaps"). We pass the
+        // linear byte estimate for the target time; the backend refines from its
+        // own reads. MKV-only — TS uses its periodic reporter + byte-offset index.
+        {
+          const _fid = file?.id, _folder = activeFolderId, _fsz = state.current.fileLength;
+          if (_fid && _folder !== null && _fsz > 0 && state.current.duration > 0) {
+            // Prefer the REAL VBR cluster byte from mediabunny's parsed Cues; fall
+            // back to the linear estimate only if the cue index is unavailable.
+            const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(clampedTime) ?? -1;
+            const targetByte = realByte >= 0
+              ? realByte
+              : Math.floor((clampedTime / state.current.duration) * _fsz);
+            invoke('cmd_report_playback_position', {
+              messageId: _fid,
+              folderId: _folder,
+              currentTimeS: clampedTime,
+              durationS: state.current.duration,
+              fileSize: _fsz,
+              isPlayerDownloading: true,
+              playbackRate: 1.0,
+              byteOffset: targetByte,
+            }).catch(() => {});
+          }
+        }
+
         // Stop streaming chain — new seek will start its own chain after completion
         stopStreamingChain();
         refillInProgressRef.current = false;
@@ -5866,7 +6612,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           if (sbAudio) resetPromises.push(sbAudio.resetForSeek());
 
           Promise.all(resetPromises).then(async () => {
-            const keyframeTimestamp = await transmuxerRef.current!.seekTo(clampedTime, INITIAL_SEEK_DURATION);
+            // Fix #1: stop the post-seek initial fill on a keyframe boundary so
+            // the buffer end lands ON a keyframe and refill #1 abuts it cleanly.
+            // Use the SMALL SEEK_START_DURATION window (not 25s) so playback
+            // starts after ~1-2s of download instead of waiting for the full
+            // runway; the refill chain extends it in the background.
+            const seekStop = transmuxerRef.current!.nextKeyframeAtOrAfter(clampedTime + SEEK_START_DURATION) ?? Infinity;
+            const keyframeTimestamp = await transmuxerRef.current!.seekTo(clampedTime, SEEK_START_DURATION, { stopTime: seekStop });
 
             bufferingForSeekRef.current = false;
 
@@ -5893,23 +6645,61 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   }
                   const absoluteTimestamp = item.timestamp! + seekOffsetRef.current;
                   if (absoluteTimestamp > 0 && state.current.duration > 0 && state.current.fileLength > 0) {
-                    const estimatedBytes = Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength);
-                    setPrefetchedBytes(estimatedBytes);
-                    trackDownloadedRange(estimatedBytes, estimatedBytes + item.data.byteLength);
+                    // prefetchedBytes drives the download %; a coarse linear
+                    // estimate is fine for a percentage. The GREEN BAR position is
+                    // set from the SourceBuffer's real .buffered ranges after the
+                    // queue drains (below) — ground-truth VBR times, not this
+                    // estimate that mislocated the bar for VBR MKV.
+                    setPrefetchedBytes(Math.floor((absoluteTimestamp / state.current.duration) * state.current.fileLength));
                   }
                 }
               }
 
               console.log(`[MSE] Transmuxer seek complete: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${buffer.length} buffered segments`);
 
+              // Record a REAL VBR calibration anchor: the cluster byte the seek's
+              // forward iteration reads from, paired with its resolved keyframe
+              // time. Ground-truth beats the linear time/duration estimate (way
+              // off for VBR MKV). The anchor is monotonicity-guarded (see
+              // recordByteTimeAnchor) so a stray byte can't distort the bar.
+              const seekAnchor = (transmuxerRef.current as any)?.getLastSeekAnchor?.() ?? null;
+              if (seekAnchor) recordByteTimeAnchor(seekAnchor.byteOffset, seekAnchor.time);
+
               await sbVideo.waitForQueueDrain();
               if (sbAudio) await sbAudio.waitForQueueDrain();
+
+              // Green bar (VBR-accurate): set it from the SourceBuffer's REAL
+              // .buffered ranges — the actual decoded time spans — instead of the
+              // linear byte→time estimate that mislocated the bar for VBR MKV.
+              try {
+                const b = sbVideo.buffered;
+                const realRanges: [number, number][] = [];
+                for (let i = 0; i < b.length; i++) realRanges.push([b.start(i), b.end(i)]);
+                if (realRanges.length > 0) {
+                  downloadedTimeRangesRef.current = realRanges;
+                  setDownloadedTimeRanges(realRanges);
+                }
+              } catch { /* buffered may throw if SB detached mid-seek — ignore */ }
 
               // Set video.currentTime to the actual keyframe position for accurate playback start
               video.currentTime = keyframeTimestamp;
 
               // Start streaming chain for continuous playback after limited seek
               startStreamingChain();
+
+              // Reposition the MKV disk warmer to the seek target so the green
+              // bar warms forward from HERE, not from the pre-seek position.
+              // Bumping the generation inside startMkvDiskWarmer supersedes the
+              // previous warmer (fixes "previous prebuffer not paused → multiple
+              // positioned prebuffers running at once"). Prefer the real VBR
+              // cluster byte for the resolved keyframe; fall back to linear.
+              if (streamUrl && state.current.fileLength > 0 && state.current.duration > 0) {
+                const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(keyframeTimestamp) ?? -1;
+                const warmFrom = realByte >= 0
+                  ? realByte
+                  : Math.floor((keyframeTimestamp / state.current.duration) * state.current.fileLength);
+                startMkvDiskWarmer(streamUrl, warmFrom);
+              }
               transmuxerSeekInProgressRef.current = false; // Seek complete — allow new seeks
 
               // Update keyframeIndexReady if the transmuxer's partial index became available
@@ -5943,6 +6733,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       };
 
       const timeSinceLastSeek = Date.now() - lastSeekTimeRef.current;
+      // Fire immediately when the debounce window has elapsed since the last
+      // seek — EVEN if a previous seek is still in flight. A deliberate, spaced
+      // seek should take effect now, not wait an extra debounce; it supersedes
+      // the running one (transmuxer.seekTo bumps seekGeneration + cancels the
+      // Conversion, so the stale seek bails and the NEW seek always wins). Only
+      // when events arrive WITHIN the debounce window (rapid drag) do we coalesce
+      // to the last target, avoiding overlapping cold getKeyPacket downloads.
       if (timeSinceLastSeek >= debounceMs || lastSeekTimeRef.current === 0) {
         if (seekDebounceTimerRef.current !== null) {
           clearTimeout(seekDebounceTimerRef.current);
@@ -5950,6 +6747,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
         executeTransmuxerSeek();
       } else {
+        // Within the debounce window — coalesce. Re-arming with each event means
+        // the LAST target wins when the timer finally fires.
         if (seekDebounceTimerRef.current !== null) {
           clearTimeout(seekDebounceTimerRef.current);
         }
@@ -6276,6 +7075,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (!streamUrl) return;
     tsKeyframeIndexRef.current = [];
     byteTimeSamplesRef.current = [];
+    // Skip the TS keyframe poll for MKV: mediabunny already parses the MKV Cues
+    // into a 419-point VBR byte↔time index (seeded into byteToTimeTableRef at
+    // transmuxer init), so this endpoint has nothing to offer — for MKV the
+    // backend only ever answers "not a TS stream" after 2-3 dead round-trips
+    // (`Data file not ready` → `not a TS stream`). Gate on the resolved format;
+    // 'unknown' (pre-detection) and TS/MP4 still poll as before.
+    if (detectedFormat === 'mkv') return;
     let timer: number;
     let cancelled = false;
     const tick = async () => {
@@ -6291,7 +7097,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         };
     tick();
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [streamUrl, refreshTsKeyframeIndex]);
+  }, [streamUrl, detectedFormat, refreshTsKeyframeIndex]);
 
   // Cold-start overlay progress poller: keep the overlay visible until the first
   // aligned chunk is fully in the shadow cache, or until a timeout fires.
