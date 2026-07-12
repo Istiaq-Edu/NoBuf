@@ -77,7 +77,7 @@ pub struct TelegramState {
     /// `get_messages_by_id` API calls (which are unthrottled and contribute
     /// to FLOOD_PREMIUM_WAIT). The media object doesn't change between requests
     /// for the same message, so caching is safe.
-    pub media_cache: Arc<tokio::sync::RwLock<HashMap<i32, (grammers_client::types::Media, u64)>>>,
+    pub media_cache: Arc<tokio::sync::RwLock<HashMap<(i64, i32), (grammers_client::types::Media, u64)>>>,
     /// QR login token bytes (from auth.exportLoginToken). Stored here so
     /// cmd_auth_qr_poll can call auth.importLoginToken with the same token
     /// to claim the authorization after the user scans the QR code.

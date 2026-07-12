@@ -112,7 +112,7 @@ You click play
 | **50MB buffer cap + 2min backpressure** | Stops downloading when ahead enough | Prevents memory bloat on long videos |
 
 > [!IMPORTANT]
-> **Format Support:** The MSE prebuffer pipeline currently supports **`.mp4`** files only. Support for **`.ts`** (MPEG-TS) and **`.mkv`** containers is planned for a future release. Non-MP4 video files fall back to direct download playback.
+> **Format Support:** The built-in MSE player handles **`.mp4`** (MP4Box.js), **`.ts`** (MPEG-TS, via mpegts.js), and **`.mkv`** with H.264/H.265 video (via the ffmpeg `/remux` → mpegts.js pipeline) — all with full seeking and progress-bar support. `.mkv` with VP8/VP9/AV1 video and `.webm` files use native `<video>` playback (WebView2 decodes them directly). Other/unrecognized formats fall back to direct download playback.
 
 ---
 
