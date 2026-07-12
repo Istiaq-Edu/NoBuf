@@ -118,6 +118,9 @@ export class MediabunnyTransmuxer {
   private ebmlHeaderData: Uint8Array | null = null;
   private lastProcessedTime: number = 0;
   private seekAbortFlag = false;
+  // Keyframe time of the last resolved seek — paired with the source's captured
+  // cluster byte to form a real VBR byte↔time calibration anchor.
+  private lastSeekKeyframeTime = -1;
   // Seek generation counter — incremented on each seek so stale callbacks are discarded
   private seekGeneration = 0;
   
@@ -146,8 +149,105 @@ export class MediabunnyTransmuxer {
   private tsHeaderData: Uint8Array | null = null;
   private initInputRef: Input | null = null;
 
+  // MKV Cues byte index — extracted from mediabunny's already-parsed cuePoints
+  // at init: sorted [{time (s), byteOffset (absolute cluster byte)}]. mediabunny
+  // parses these from the file's Cues element to seek, and clusterPosition is the
+  // EXACT VBR cluster byte — unlike the linear time/duration estimate. Used to
+  // tell the backend prefetch the real byte region for a seek target so the cold
+  // cluster fetch hits warm cache instead of a wrong-region miss. Empty when the
+  // MKV has no Cues or mediabunny's internal layout changed (guarded extraction).
+  private mkvCueIndex: { time: number; byteOffset: number }[] = [];
+
   constructor(config: TransmuxerConfig) {
     this.config = config;
+  }
+
+  /** Extract mediabunny's already-parsed MKV Cues into a sorted time→byte index.
+   *  Reaches internal demuxer fields (no public API exists) — fully guarded so a
+   *  mediabunny layout change degrades to an empty index (current behavior), never
+   *  a crash. cuePoint.time is in segment ticks (÷ timestampFactor = seconds);
+   *  clusterPosition is the absolute file byte of the cluster. Called once at init. */
+  private extractMkvCueIndex(videoTrack: unknown): void {
+    if (this.config.format !== 'mkv') return;
+    try {
+      const internal = (videoTrack as any)?._backing?.internalTrack;
+      const factor = internal?.segment?.timestampFactor;
+      const cues = internal?.cuePoints;
+      if (!Array.isArray(cues) || !factor || factor <= 0) return;
+      const index: { time: number; byteOffset: number }[] = [];
+      for (const c of cues) {
+        if (typeof c?.time !== 'number' || typeof c?.clusterPosition !== 'number') continue;
+        if (c.clusterPosition < 0) continue;
+        index.push({ time: c.time / factor, byteOffset: c.clusterPosition });
+      }
+      index.sort((a, b) => a.time - b.time);
+      this.mkvCueIndex = index;
+      diagLog(`[Transmuxer] MKV cue index: extracted ${index.length} cue points (real VBR byte offsets)`);
+    } catch (e: any) {
+      diagLog(`[Transmuxer] MKV cue index extraction failed (non-fatal): ${e?.message ?? e}`);
+      this.mkvCueIndex = [];
+    }
+  }
+
+  /** Real cluster byte at/just before `time` from the MKV cue index, or -1 if the
+   *  index is empty/unavailable. Used to point the backend prefetch at the exact
+   *  VBR region a seek will read, instead of a linear time/duration estimate. */
+  getByteOffsetForTime(time: number): number {
+    const idx = this.mkvCueIndex;
+    if (idx.length === 0 || !Number.isFinite(time)) return -1;
+    let lo = 0, hi = idx.length - 1;
+    if (time <= idx[0].time) return idx[0].byteOffset;
+    while (lo < hi) {
+      const mid = lo + ((hi - lo + 1) >> 1);
+      if (idx[mid].time <= time) lo = mid; else hi = mid - 1;
+    }
+    return idx[lo].byteOffset;
+  }
+
+  /** The full extracted MKV cue index (sorted time→byte). Used to seed the
+   *  player's byte↔time calibration table so the green prebuffer bar is
+   *  VBR-accurate from the first frame of any seek, not after it self-corrects. */
+  getMkvCueIndex(): { time: number; byteOffset: number }[] {
+    return this.mkvCueIndex;
+  }
+
+  /** Fix #1: first cue keyframe time STRICTLY greater than `time`, or null if
+   *  none/empty. Refills use this as their stop boundary so a refill ends
+   *  exactly on a GOP boundary; the NEXT refill then seeks to that same
+   *  boundary and abuts with zero overlap (no coded-frame replacement → no
+   *  PIPELINE_ERROR_DECODE) and zero gap (boundary is a real keyframe, so the
+   *  next GOP starts precisely where this one stopped). Returns null when the
+   *  cue index is unavailable (TS / pre-parse), so callers fall back to the
+   *  original maxDuration behavior unchanged. */
+  nextKeyframeAtOrAfter(time: number): number | null {
+    const idx = this.mkvCueIndex;
+    if (idx.length === 0 || !Number.isFinite(time)) return null;
+    let lo = 0, hi = idx.length; // find first idx[i].time > time
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (idx[mid].time > time) hi = mid; else lo = mid + 1;
+    }
+    return lo < idx.length ? idx[lo].time : null;
+  }
+
+  /** Nearest MKV cue keyframe time AT OR BEFORE `time`, or null if none/empty.
+   *  Unlike findNearestKeyframe (which reads the sparse, incrementally-built
+   *  keyframeTimestamps), this consults the FULL 419-entry parsed cue index, so
+   *  it has complete coverage for ANY seek target. Wiring this into seekTo turns
+   *  a far uncached MKV seek from an ~8s blind network cluster scan
+   *  (getKeyPacket(seekTime) with verifyKeyPackets:true) into a ~100ms indexed
+   *  jump (getKeyPacket(knownKeyframeTs) with verifyKeyPackets:false). */
+  nearestCueKeyframeAtOrBefore(time: number): number | null {
+    const idx = this.mkvCueIndex;
+    if (idx.length === 0 || !Number.isFinite(time)) return null;
+    // Binary search: rightmost idx[i].time <= time
+    let lo = 0, hi = idx.length - 1;
+    while (lo < hi) {
+      const mid = lo + ((hi - lo + 1) >> 1);
+      if (idx[mid].time <= time) lo = mid; else hi = mid - 1;
+    }
+    if (idx[lo].time <= time) return idx[lo].time;
+    return idx[0].time < 1.0 && time < 1.0 ? idx[0].time : null;
   }
 
   async init(): Promise<TransmuxerInitResult | null> {
@@ -284,6 +384,9 @@ export class MediabunnyTransmuxer {
       diagLog(`[Transmuxer] init: calling getPrimaryVideoTrack()`);
       const videoTrack = await this.input.getPrimaryVideoTrack();
       diagLog(`[Transmuxer] init: getPrimaryVideoTrack()=${videoTrack ? 'found' : 'null'} took ${((performance.now() - t2)/1000).toFixed(1)}s`);
+
+      // Build the real VBR time→byte cue index from mediabunny's parsed Cues.
+      if (videoTrack) this.extractMkvCueIndex(videoTrack);
 
       const t3 = performance.now();
       diagLog(`[Transmuxer] init: calling getPrimaryAudioTrack()`);
@@ -651,11 +754,16 @@ export class MediabunnyTransmuxer {
     // lo is the index of the rightmost keyframe <= seekTime
     if (ts[lo] <= seekTime) {
       // For full indexes, always return the nearest keyframe regardless of distance.
-      // For partial indexes (built incrementally from seeks), allow up to 60s gap.
-      // The previous 5s limit was too conservative for sparse incremental indexes
-      // (e.g., 8 keyframes across 2073s file meant >5s gaps were everywhere).
-      if (!this.keyframeIndexBuilt && seekTime - ts[lo] > 60) {
-        return null; // Very sparse coverage — don't use partial index for distant seeks
+      // For partial indexes (built incrementally from seeks), the nearest INDEXED
+      // keyframe may be far before seekTime with un-indexed keyframes in between —
+      // returning it would make the caller seek to that stale position instead of
+      // seekTime (observed: a sparse [0.09s] index collapsed every refill seek
+      // (15s, 17s, …) back to 0.09s → same-keyframe → false EOF at 17s). Only
+      // trust a partial-index hit within ONE GOP (~12s); beyond that, return null
+      // so the caller falls back to native getKeyPacket(seekTime), which finds the
+      // true keyframe at the requested position (fast for MKV — cluster-based).
+      if (!this.keyframeIndexBuilt && seekTime - ts[lo] > 12) {
+        return null; // Sparse coverage — don't seek to a distant stale keyframe
       }
       return ts[lo];
     }
@@ -697,6 +805,14 @@ export class MediabunnyTransmuxer {
   /** Returns true if the keyframe index has any timestamps (partial or full). */
   isKeyframeIndexReady(): boolean {
     return this.keyframeIndexBuilt || this.keyframeIndexPartial;
+  }
+
+  /** Real cluster byte + keyframe time of the last resolved seek — used to add
+   *  a VBR byte↔time calibration anchor. Returns null until a seek captures it. */
+  getLastSeekAnchor(): { byteOffset: number; time: number } | null {
+    const byteOffset = (this.streamSource as any)?.getClusterByteOfLastSeek?.() ?? -1;
+    if (byteOffset < 0 || this.lastSeekKeyframeTime < 0) return null;
+    return { byteOffset, time: this.lastSeekKeyframeTime };
   }
 
   /** Returns the keyframe timestamps array (for thumbnail pipeline). */
@@ -1062,11 +1178,19 @@ export class MediabunnyTransmuxer {
    * Returns the keyframe timestamp so the caller can set the correct
    * SourceBuffer.timestampOffset.
    */
-  async seekTo(seekTime: number, maxDuration: number = Infinity, options?: { skipInitSegment?: boolean }): Promise<number | null> {
+  async seekTo(seekTime: number, maxDuration: number = Infinity, options?: { skipInitSegment?: boolean; stopTime?: number }): Promise<number | null> {
     if (this.disposed) return null;
 
     // Abort any ongoing seek transmux loop
     this.seekAbortFlag = true;
+
+    // Abort the shared stream source's in-flight fetch. A refill's getKeyPacket
+    // read (e.g. at ~45MB) may still be awaiting an HTTP range when the user
+    // seeks far away (e.g. ~660MB); without this, the stale read keeps its
+    // backend download registered and ping-pongs with the new seek's download
+    // in the coordinator's zombie-cancel logic (both source_id=None) so neither
+    // ever completes and the seek hangs. Aborting frees the slot immediately.
+    (this.streamSource as any)?.abortInFlight?.();
 
     // Increment generation to discard stale callback data
     this.seekGeneration++;
@@ -1080,7 +1204,16 @@ export class MediabunnyTransmuxer {
       }
       this.conversion = null;
     }
-    if (this.input) {
+    // Dispose input on every seek EXCEPT the MKV persistent-Input path. For MKV
+    // the Input wraps the persistent streamSource and mediabunny caches the parsed
+    // metadata (SeekHead + Cues) per-Input (readMetadataPromise). Recreating the
+    // Input every seek discards that cache and forces a full tail Cues re-parse
+    // over the network. Keeping it alive means metadata is parsed ONCE; each seek
+    // is then an in-memory cuePoints binary search + one cluster fetch. The
+    // Output/Conversion state is cleared separately below, so reusing the Input is
+    // safe (tracks bind to the Input; EncodedPacketSink is recreated per seek).
+    const reuseMkvInput = this.config.format === 'mkv' && this.input !== null;
+    if (this.input && !reuseMkvInput) {
       this.input.dispose();
       this.input = null;
     }
@@ -1097,6 +1230,9 @@ export class MediabunnyTransmuxer {
 
     const currentGeneration = this.seekGeneration;
     const skipInit = options?.skipInitSegment ?? false;
+    // Fix #1: optional keyframe-boundary stop for abutting refills (see
+    // iterateVideoPackets). Infinity when not requested → maxDuration behavior.
+    const stopTime = options?.stopTime ?? Infinity;
 
     try {
       const formats = this.config.format === 'ts' ? [MPEG_TS] :
@@ -1131,9 +1267,13 @@ export class MediabunnyTransmuxer {
 
         this.input = new Input({ source: offsetSource, formats, initInput: this.initInputRef ?? undefined });
         console.log(`[Transmuxer] seekTo: using OffsetCustomSource — byteOffset=${byteOffsetKeyframe.byteOffset}, keyframeTs=${byteOffsetKeyframe.timestamp.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s`);
+      } else if (reuseMkvInput && this.input) {
+        // MKV persistent-Input reuse: keep the existing Input (and its cached
+        // metadata/Cues) instead of recreating it. Metadata parsed once at init.
+        console.log(`[Transmuxer] seekTo: reusing persistent MKV Input (cues cached), seekTime=${seekTime.toFixed(2)}s`);
       } else {
-        // No byte-offset index (MKV, or TS before scanner completes) — use
-        // persistent streamSource with initInput for codec matching.
+        // No byte-offset index (MKV first seek, or TS before scanner completes) —
+        // use persistent streamSource with initInput for codec matching.
         this.input = new Input({ source: this.streamSource!, formats, initInput: this.initInputRef ?? undefined });
       }
 
@@ -1155,7 +1295,24 @@ export class MediabunnyTransmuxer {
       // Find the nearest keyframe at or before seekTime.
       const videoKeyStart = performance.now();
       const videoSink = new EncodedPacketSink(videoTrack);
-      const cachedKeyframeTs = this.findNearestKeyframe(seekTime);
+      let cachedKeyframeTs: number | null = null;
+      if (this.config.format === 'mkv') {
+        // Cue index FIRST for MKV: it is authoritative (full coverage, exact
+        // keyframe times) and — critically — is the SAME index used to compute
+        // refill stopTimes (nextKeyframeAtOrAfter). Resolving the seek from it
+        // guarantees a refill seeking to the previous refill's stop boundary
+        // resolves EXACTLY that keyframe → zero-overlap abut (no coded-frame
+        // replacement → no stranded P-frame → no PIPELINE_ERROR_DECODE).
+        // The sparse findNearestKeyframe would instead return an EARLIER
+        // keyframe within its 12s tolerance (the stop-boundary keyframe isn't in
+        // the sparse index — it was never a seek RESULT, only a stopTime), which
+        // re-emits an already-buffered GOP and strands a P-frame (observed:
+        // seek 114.07 → resolved 105.128, overlap 8.942s → decode crash at 118.9s).
+        cachedKeyframeTs = this.nearestCueKeyframeAtOrBefore(seekTime);
+      }
+      if (cachedKeyframeTs === null) {
+        cachedKeyframeTs = this.findNearestKeyframe(seekTime);
+      }
       const useCachedIndex = cachedKeyframeTs !== null;
 
       // verifyKeyPackets: false when we know the timestamp from our index
@@ -1205,6 +1362,13 @@ export class MediabunnyTransmuxer {
 
       const keyframeTimestamp = keyPacket.timestamp;
       console.log(`[Transmuxer] Seek to ${seekTime}s: keyframe at ${keyframeTimestamp}s`);
+
+      // Arm the source to capture the cluster byte of the upcoming forward fMP4
+      // iteration (the read that actually contains this keyframe's data), so the
+      // caller can add a REAL (clusterByte, keyframeTimestamp) VBR anchor — not
+      // the Cues/SeekHead tail byte getKeyPacket just read to locate it.
+      (this.streamSource as any)?.markSeekResolved?.();
+      this.lastSeekKeyframeTime = keyframeTimestamp;
 
       // Collect keyframe timestamp for incremental index building — each seek
       // adds its keyframe to the index, enabling faster nearby seeks with
@@ -1272,11 +1436,11 @@ export class MediabunnyTransmuxer {
       // Run video and audio iteration concurrently for proper interleaving
       // If audio was skipped, only iterate video (fast — no audio bottleneck)
       const videoPromise = this.iterateVideoPackets(
-        videoSink, keyPacket, videoSource, videoMeta, keyframeTimestamp, currentGeneration, maxDuration, verifyKeyPackets
+        videoSink, keyPacket, videoSource, videoMeta, keyframeTimestamp, currentGeneration, maxDuration, verifyKeyPackets, stopTime
       );
       const audioPromise = audioSink && audioSource && audioStartPacket
         ? this.iterateAudioPackets(
-            audioSink, audioStartPacket, audioSource, audioMeta, keyframeTimestamp, currentGeneration, maxDuration
+            audioSink, audioStartPacket, audioSource, audioMeta, keyframeTimestamp, currentGeneration, maxDuration, stopTime
           )
         : Promise.resolve();
 
@@ -1338,6 +1502,7 @@ export class MediabunnyTransmuxer {
     generation: number,
     maxDuration: number,
     verifyKeyPackets: boolean = true,
+    stopTime: number = Infinity,
   ): Promise<void> {
     let isFirst = true;
     for await (const packet of videoSink.packets(keyPacket, undefined, { verifyKeyPackets })) {
@@ -1351,9 +1516,16 @@ export class MediabunnyTransmuxer {
       // small negative values that IsobmffMuxer.validateTimestamp rejects.
       const adjustedTimestamp = Math.max(0, packet.timestamp - keyframeTimestamp);
 
-      // Stop after producing enough data (maxDuration) — prevents iterating
-      // the entire remaining file for large files, making seeks instant.
-      if (maxDuration !== Infinity && adjustedTimestamp > maxDuration) {
+      // Fix #1 (abutting refills): when stopTime is set (a real cue keyframe
+      // time), stop EXACTLY at that boundary — break before emitting the packet
+      // at/after it. stopTime is a keyframe time, so this refill ends on a clean
+      // GOP boundary; the next refill seeks forward to this same boundary and
+      // abuts with zero overlap (no coded-frame replacement → no decode crash)
+      // and zero gap. When stopTime is Infinity (no cue index, e.g. TS), fall
+      // back to the original maxDuration cutoff — behavior unchanged.
+      if (stopTime !== Infinity) {
+        if (packet.timestamp >= stopTime) break;
+      } else if (maxDuration !== Infinity && adjustedTimestamp > maxDuration) {
         break;
       }
 
@@ -1385,6 +1557,7 @@ export class MediabunnyTransmuxer {
     keyframeTimestamp: number,
     generation: number,
     maxDuration: number,
+    stopTime: number = Infinity,
   ): Promise<void> {
     let isFirst = true;
     for await (const packet of audioSink.packets(startPacket)) {
@@ -1398,9 +1571,14 @@ export class MediabunnyTransmuxer {
       // small negative values that IsobmffMuxer.validateTimestamp rejects.
       const adjustedTimestamp = Math.max(0, packet.timestamp - keyframeTimestamp);
 
-      // Stop after producing enough data (maxDuration) — prevents iterating
-      // the entire remaining file for large files, making seeks instant.
-      if (maxDuration !== Infinity && adjustedTimestamp > maxDuration) {
+      // Fix #7 (A/V aligned cut): stop audio at the SAME absolute boundary as
+      // video (stopTime), not at an independently-computed maxDuration. Cutting
+      // the two tracks at different absolute times per refill accumulated A/V
+      // desync across refills. When stopTime is Infinity, keep the original
+      // maxDuration cutoff — behavior unchanged.
+      if (stopTime !== Infinity) {
+        if (packet.timestamp >= stopTime) break;
+      } else if (maxDuration !== Infinity && adjustedTimestamp > maxDuration) {
         break;
       }
 

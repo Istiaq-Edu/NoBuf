@@ -7,6 +7,13 @@ export interface TauriStreamSourceConfig {
   maxCacheSize?: number;
   prefetchProfile?: 'none' | 'fileSystem' | 'network';
   seedData?: ArrayBuffer;
+  /** Stable id tagged onto every /stream request as `&source_id=`. The backend
+   *  coordinator only zombie-cancels concurrent downloads that share a source_id
+   *  (source_ids_match), so distinct ids (e.g. 'playback' vs 'thumbnail') stop
+   *  the thumbnail pipeline and the player from cancelling each other. Tail-zone
+   *  reads (MKV Cues at file end) are additionally suffixed '-tail' so the
+   *  one-time metadata read doesn't cross-cancel the forward playback walk. */
+  sourceId?: string;
 }
 
 const MAX_503_RETRIES = 8;
@@ -18,17 +25,60 @@ const PARTIAL_RETRY_DELAY_MS = 100;
 const READAHEAD_CHUNK_SIZE = 8 * 1024 * 1024;
 
 export function createTauriStreamSource(config: TauriStreamSourceConfig): CustomSource {
-  const { url, fileSize, headers = {}, maxCacheSize, prefetchProfile = 'network', seedData } = config;
+  const { url, fileSize, headers = {}, maxCacheSize, prefetchProfile = 'network', seedData, sourceId } = config;
   const seedBytes = seedData ? new Uint8Array(seedData) : null;
   const seedLength = seedBytes ? seedBytes.byteLength : 0;
   const allHeaders = { ...headers };
   let disposed = false;
+
+  // Build source_id-tagged URLs once. Body reads use `sourceId`; reads landing in
+  // the file-tail zone (MKV Cues/SeekHead) use `sourceId-tail` so the one-time
+  // metadata read isn't cross-cancelled by the forward playback walk in the
+  // backend coordinator (which only cancels downloads sharing a source_id).
+  const TAIL_ZONE_START = fileSize > 32 * 1024 * 1024 ? fileSize - 32 * 1024 * 1024 : fileSize;
+  const buildUrl = (sid: string | undefined): string => {
+    if (!sid) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}source_id=${encodeURIComponent(sid)}`;
+  };
+  const bodyUrl = buildUrl(sourceId);
+  const tailUrl = buildUrl(sourceId ? `${sourceId}-tail` : undefined);
+  const urlForPos = (pos: number): string =>
+    (sourceId && pos >= TAIL_ZONE_START) ? tailUrl : bodyUrl;
 
   let readaheadBuf: Uint8Array | null = null;
   let readaheadStart = 0;
   let readaheadEnd = 0;
   let prefetchPromise: Promise<{ data: Uint8Array; start: number } | null> | null = null;
   let prefetchOffset = 0;
+
+  // Tracks the end of the last SEQUENTIAL read so we can distinguish steady
+  // playback (which benefits from read-ahead prefetch) from scattered seek
+  // reads. mediabunny's getKeyPacket() binary-searches a large MKV — dozens of
+  // far-apart reads (tail Cues → mid clusters). Firing a sequential prefetch
+  // after each scattered jump registers a far-away download that the backend
+  // coordinator then cancels as a "zombie" when the next jump lands >8MB away,
+  // producing an endless cancel loop (588MB↔447MB↔79MB) where getKeyPacket
+  // never completes and the unbuffered seek hangs forever. Only prefetch when
+  // the read continues near where the last one ended (true sequential playback).
+  let lastSeqReadEnd = -1;
+  const SEQ_GAP_TOLERANCE = 4 * 1024 * 1024; // 4 MB — within one read-ahead window
+
+  // AbortController for the CURRENT in-flight fetch. abortInFlight() (called by
+  // MediabunnyTransmuxer.seekTo when a new seek supersedes a running refill)
+  // aborts it so the stale read stops IMMEDIATELY instead of running to
+  // completion and keeping its backend download registered — which otherwise
+  // ping-pongs with the new seek's download in the coordinator's zombie-cancel
+  // logic (both share source_id=None), and neither ever finishes → seek hangs.
+  let inFlightAbort: AbortController | null = null;
+  // Byte position of the cluster where the last seek's forward fMP4 iteration
+  // began — the REAL (byte, keyframeTime) pair for VBR byte↔time calibration.
+  // NOT the Cues/SeekHead tail read (~fileLength) that getKeyPacket does to
+  // LOCATE the keyframe: anchoring on that maps ~99%-of-file bytes to ~39%-of-
+  // duration time, wrecking the green prebuffer bar. markSeekResolved() arms a
+  // capture so the NEXT read's start (the cluster) is recorded instead.
+  let clusterByteOfLastSeek = -1;
+  let captureNextReadStart = false;
 
   async function fetchRange(start: number, end: number): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
@@ -48,9 +98,21 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
         if (disposed) throw new Error('[TauriStreamSource] disposed during fetch');
 
-        const response = await fetch(url, {
-          headers: { ...allHeaders, Range: `bytes=${pos}-${rangeEnd}` },
-        });
+        inFlightAbort = new AbortController();
+        let response: Response;
+        try {
+          response = await fetch(urlForPos(pos), {
+            headers: { ...allHeaders, Range: `bytes=${pos}-${rangeEnd}` },
+            signal: inFlightAbort.signal,
+          });
+        } catch (e: any) {
+          if (e?.name === 'AbortError') {
+            // Superseded by a newer seek — stop cleanly so the backend download
+            // slot is freed immediately for the new seek (no zombie ping-pong).
+            throw new Error('[TauriStreamSource] read aborted (superseded by seek)');
+          }
+          throw e;
+        }
 
         if (response.ok || response.status === 206) {
           chunk = new Uint8Array(await response.arrayBuffer());
@@ -117,7 +179,13 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       });
   }
 
-  async function ensureBufferCovers(neededStart: number): Promise<void> {
+  // Only prefetch-ahead for SEQUENTIAL reads. Scattered seek reads (getKeyPacket
+  // binary search) must NOT prefetch — see lastSeqReadEnd comment above.
+  function maybePrefetch(afterEnd: number, sequential: boolean) {
+    if (sequential) startPrefetch(afterEnd);
+  }
+
+  async function ensureBufferCovers(neededStart: number, sequential: boolean): Promise<void> {
     if (readaheadBuf && neededStart >= readaheadStart && neededStart < readaheadEnd) return;
 
     if (prefetchPromise && neededStart >= prefetchOffset && neededStart < prefetchOffset + READAHEAD_CHUNK_SIZE) {
@@ -127,7 +195,7 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
         readaheadBuf = result.data;
         readaheadStart = result.start;
         readaheadEnd = result.start + result.data.length;
-        startPrefetch(readaheadEnd);
+        maybePrefetch(readaheadEnd, sequential);
       }
       if (readaheadBuf && neededStart >= readaheadStart && neededStart < readaheadEnd) return;
     }
@@ -138,18 +206,33 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
     readaheadBuf = chunk;
     readaheadStart = fetchStart;
     readaheadEnd = fetchStart + chunk.length;
-    startPrefetch(readaheadEnd);
+    maybePrefetch(readaheadEnd, sequential);
   }
 
-  return new CustomSource({
+  const source = new CustomSource({
     getSize: async () => fileSize,
     read: async (start: number, end: number) => {
       const totalRequested = end - start;
       const result = new Uint8Array(totalRequested);
       let filled = 0;
 
+      // Sequential = this read continues at (or very near) where the last read
+      // ended. Playback reads march forward and are sequential; getKeyPacket
+      // seek-search reads jump far and are not. Only sequential reads trigger
+      // read-ahead prefetch (see lastSeqReadEnd comment). The very first read
+      // (lastSeqReadEnd < 0) counts as sequential to prime the initial buffer.
+      const sequential = lastSeqReadEnd < 0 || Math.abs(start - lastSeqReadEnd) <= SEQ_GAP_TOLERANCE;
+      lastSeqReadEnd = end;
+      // If a seek just resolved (markSeekResolved), the NEXT read starts the
+      // forward fMP4 iteration at the real cluster byte — capture it as the
+      // VBR calibration anchor's byte (paired with the seek's keyframe time).
+      if (captureNextReadStart) {
+        clusterByteOfLastSeek = start;
+        captureNextReadStart = false;
+      }
+
       if (seedLength > 0 && !prefetchPromise && !readaheadBuf) {
-        startPrefetch(seedLength);
+        maybePrefetch(seedLength, sequential);
       }
 
       if (seedBytes && start < seedLength) {
@@ -171,7 +254,12 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       }
 
       if (filled < totalRequested) {
-        await ensureBufferCovers(currentStart);
+        try {
+          await ensureBufferCovers(currentStart, sequential);
+        } catch (e) {
+          if (disposed) return result.subarray(0, filled); // teardown mid-read
+          throw e;
+        }
         if (readaheadBuf && currentStart >= readaheadStart && currentStart < readaheadEnd) {
           const bufOffset = currentStart - readaheadStart;
           const available = Math.min(readaheadEnd - currentStart, totalRequested - filled);
@@ -183,13 +271,29 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       }
 
       while (filled < totalRequested) {
-        if (disposed) throw new Error('[TauriStreamSource] disposed during read');
+        if (disposed) {
+          // Teardown mid-read: the player was disposed while this read awaited
+          // an HTTP range. Returning the partially-filled buffer (instead of
+          // throwing) avoids an uncaught promise rejection in mediabunny's
+          // worker (observed: "[TauriStreamSource] disposed during fetch" at
+          // source.js _runWorker). The result is discarded on dispose anyway.
+          return result.subarray(0, filled);
+        }
 
         const remaining = totalRequested - filled;
         const rangeEnd = Math.min(currentStart + remaining - 1, fileSize - 1);
         if (currentStart > rangeEnd) break;
 
-        const chunk = await fetchRange(currentStart, rangeEnd);
+        let chunk: Uint8Array;
+        try {
+          chunk = await fetchRange(currentStart, rangeEnd);
+        } catch (e) {
+          // fetchRange throws "[TauriStreamSource] disposed during fetch" if the
+          // player is torn down mid-await. Swallow ONLY that case (return what
+          // we have); re-throw genuine errors so real failures still surface.
+          if (disposed) return result.subarray(0, filled);
+          throw e;
+        }
         const copyLen = Math.min(chunk.length, remaining);
         result.set(chunk.subarray(0, copyLen), filled);
         filled += copyLen;
@@ -215,4 +319,21 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
     maxCacheSize,
     prefetchProfile,
   });
+
+  // Expose an in-flight abort so a superseding seek can free the backend
+  // download slot immediately (see inFlightAbort comment). Attached to the
+  // instance because CustomSource's options don't include a control channel.
+  (source as any).abortInFlight = () => {
+    if (inFlightAbort) {
+      inFlightAbort.abort();
+      inFlightAbort = null;
+    }
+  };
+  // Arm cluster-byte capture: call right after getKeyPacket resolves so the
+  // next read (the forward fMP4 iteration) records the real cluster byte.
+  (source as any).markSeekResolved = () => { captureNextReadStart = true; };
+  // Real cluster byte of the last resolved seek — pair with the seek's keyframe
+  // time to add a VBR byte↔time anchor. -1 if not captured yet.
+  (source as any).getClusterByteOfLastSeek = () => clusterByteOfLastSeek;
+  return source;
 }

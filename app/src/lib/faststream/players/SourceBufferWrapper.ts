@@ -119,13 +119,16 @@ export class SourceBufferWrapper {
    *  decoder encountered a fatal error (CHUNK_DEMUXER_ERROR_APPEND_FAILED)
    *  and no more data can be appended to the SourceBuffer. */
   private checkFatalError(): void {
-    try {
-      // appendBuffer throws InvalidStateError if HTMLMediaElement.error is not null.
-      // We can detect this by checking if a tiny append fails with the specific error.
-      // But a safer approach: just try the next queued operation and if it fails
-      // with InvalidStateError mentioning HTMLMediaElement.error, mark as fatal.
-      // This is done in processQueue's catch block.
-    } catch (_) {}
+    // Fix #8: the SourceBuffer 'error' event fires on append/decode failure.
+    // We can't read HTMLMediaElement.error from here, but we can stop trusting
+    // the buffer and surface the condition instead of silently swallowing it
+    // (the old body was empty). Clear the processing flag so the queue isn't
+    // wedged, and clear quotaExceeded (this is a real error, not backpressure).
+    // We deliberately do NOT hard-set fatalError here — a lone 'error' event can
+    // be transient; the next failed op in processQueue's catch confirms fatal.
+    this.processing = false;
+    this.quotaExceeded = false;
+    console.warn('[SourceBuffer] error event observed — buffer may be unhealthy; next failed op will confirm fatal');
   }
 
   private processQueue(): void {
@@ -197,10 +200,6 @@ export class SourceBufferWrapper {
 
   setTimestampOffset(offset: number): Promise<void> {
     return new Promise<void>((resolve) => {
-      // Clear pending operations
-      this.queue = [];
-      this.processing = false;
-
       const apply = () => {
         try {
           this.sourceBuffer.timestampOffset = offset;
@@ -217,17 +216,22 @@ export class SourceBufferWrapper {
         resolve();
       };
 
-      if (this.sourceBuffer.updating) {
-        // Wait for current operation to finish before setting offset
-        this.sourceBuffer.addEventListener('updateend', apply, { once: true });
-        try {
-          this.sourceBuffer.abort();
-        } catch (_) {
-          // abort may also trigger updateend, but we handle it with once: true
+      // Fix #4: DRAIN the queue, don't DISCARD it. The old code did
+      // `this.queue = []` here, which silently threw away any ops enqueued
+      // immediately before (notably evictOldBuffer()'s remove() ops on the
+      // refill path) → eviction never ran → unbounded buffer growth →
+      // QuotaExceededError. timestampOffset may only be set while !updating
+      // (per MSE spec), so wait until the queue has fully drained and the SB
+      // is idle, THEN apply the offset. Pending appends/removes run first.
+      const whenIdle = () => {
+        if (this.fatalError) { resolve(); return; }
+        if (this.queue.length === 0 && !this.processing && !this.sourceBuffer.updating) {
+          apply();
+        } else {
+          this.sourceBuffer.addEventListener('updateend', () => setTimeout(whenIdle, 0), { once: true });
         }
-      } else {
-        apply();
-      }
+      };
+      whenIdle();
     });
   }
 
@@ -287,8 +291,13 @@ export class SourceBufferWrapper {
   waitForQueueDrain(): Promise<void> {
     return new Promise<void>((resolve) => {
       const checkAndResolve = () => {
-        // Fatal error — no more operations will process, resolve immediately
-        if (this.fatalError) {
+        // Fatal error — no more operations will process, resolve immediately.
+        // Fix #5: also resolve on quotaExceeded. The quota branch in processQueue
+        // leaves the queue non-empty with processing=false and starts no append,
+        // so no future 'updateend' fires — without this, a caller awaiting the
+        // drain (e.g. before setting currentTime) would hang forever. Eviction on
+        // the next segment frees space and resumes the queue independently.
+        if (this.fatalError || this.quotaExceeded) {
           resolve();
           return;
         }

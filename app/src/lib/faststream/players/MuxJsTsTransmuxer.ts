@@ -824,6 +824,9 @@ export class MuxJsTsTransmuxer {
   getFileLength(): number { return this.fileLength; }
   isKeyframeIndexReady(): boolean { return this.keyframeIndexBuilt || this.keyframeTimestamps.length > 0; }
   getKeyframeTimestamps(): number[] { return this.keyframeTimestamps; }
+  /** TS has no MKV cue index, so abutting-refill keyframe stops don't apply —
+   *  always null so callers fall back to the maxDuration cutoff (Fix #1). */
+  nextKeyframeAtOrAfter(_time: number): number | null { return null; }
   getKeyframeByteOffsets(): TSKeyframeEntry[] { return this.keyframeByteOffsets; }
   getTsHeaderData(): Uint8Array | null { return this.tsHeaderData; }
   getSourceConfig(): any { return null; }

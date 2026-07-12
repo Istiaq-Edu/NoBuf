@@ -25,7 +25,30 @@ interface FastStreamPlayerProps {
 
   const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 
-  // ─── Settings-panel primitives (presentational, DRY) ──────────────────────
+  /** Sort + merge [start,end] time ranges, bridging gaps up to `toleranceS`.
+   *  The backend's cached_ranges are contiguous byte runs meeting at byte
+   *  boundaries, but byteToTime interpolates piecewise-linearly between sparse
+   *  (~8.5s-apart) VBR cue anchors, so two byte-adjacent runs straddling a cue
+   *  segment boundary map to time endpoints that differ by a sub-second sliver
+   *  — a hairline gap on the green bar. A GENUINE undownloaded gap is at least
+   *  one coordinator chunk (~4-8MB ≈ several seconds), so a 1.0s default bridges
+   *  rendering artifacts without hiding real gaps. Used by BOTH bar-update paths
+   *  so they stay consistent (the download-progress path previously set raw,
+   *  unsorted, unmerged ranges → visible gaps). */
+  function mergeTimeRanges(ranges: [number, number][], toleranceS = 1.0): [number, number][] {
+    if (ranges.length === 0) return [];
+    const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+    const merged: [number, number][] = [];
+    for (const r of sorted) {
+      if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + toleranceS) {
+        merged.push([r[0], r[1]]);
+      } else {
+        merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
+      }
+    }
+    return merged;
+  }
+
   type ChipTone = 'secondary' | 'primary' | 'green';
 
   function SettingsSection({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
@@ -524,24 +547,10 @@ interface FastStreamPlayerProps {
           // 3. Misleading (shows data that's NOT on disk as "prebuffer")
           // The green bar should ONLY show disk cache (cmd_get_cache_status)
           // — the ACTUAL prebuffered data on local disk.
-          // Merge overlapping ranges
+          // Merge overlapping/adjacent ranges (shared helper, 1.0s tolerance —
+          // see mergeTimeRanges for why byte-adjacent VBR runs need bridging).
           if (ranges.length > 0) {
-            const sorted = ranges.sort((a, b) => a[0] - b[0]);
-            const merged: [number, number][] = [];
-            for (const r of sorted) {
-              // Merge overlapping ranges with tight tolerance (0.01s).
-              // Do NOT bridge the gap between /stream and PROACTIVE ranges.
-              // The gap should be EMPTY — no fake fill. The user sees two
-              // separate green bars: one at the seek point (/stream) and one
-              // 40s ahead (PROACTIVE). As /stream progresses, the first bar
-              // grows until it meets the second bar, then they merge naturally.
-              if (merged.length === 0 || r[0] > merged[merged.length - 1][1] + 0.01) {
-                merged.push([r[0], r[1]]);
-              } else {
-                merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], r[1]);
-              }
-            }
-            setCachedTimeRanges(merged);
+            setCachedTimeRanges(mergeTimeRanges(ranges));
           }
           } // end if (!__nobuf_userSeekInProgress)
         } catch { /* ignore */ }
@@ -582,7 +591,10 @@ interface FastStreamPlayerProps {
           if (status?.cached_ranges && dur > 0 && status.total_bytes > 0) {
             const ranges: [number, number][] = status.cached_ranges
               .map(([s, e]: [number, number]) => [byteToTime(s), byteToTime(e + 1)]);
-            setCachedTimeRanges(ranges);
+            // Sort+merge (shared helper) — this path previously set raw,
+            // unsorted, unmerged ranges, which is the primary source of the
+            // hairline gaps the user saw on the green bar.
+            setCachedTimeRanges(mergeTimeRanges(ranges));
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
