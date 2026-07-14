@@ -705,11 +705,11 @@ interface FastStreamPlayerProps {
     //   includes CORS headers with Access-Control-Allow-Private-Network: true.
     //   TS files use MSE transmuxer (MediabunnyTransmuxer) instead of hls.js.
     if (playerUseNative) {
-      // Native fallback: use remux URL (ffmpeg TS→MP4) if available, otherwise raw streamUrl
-      // Two strategies in the /remux/ endpoint:
-      //   Strategy A (file cached): disk remux with faststart → moov has correct duration
-      //   Strategy B (not cached): piped fMP4 → empty_moov with duration=0
-      // For Strategy B, we must override the player UI duration from metadata.
+      // Native fallback: use remux URL (ffmpeg TS→MPEG-TS) if available, otherwise raw streamUrl
+      // NOTE: /remux outputs MPEG-TS (video/mp2t), which native <video> CANNOT play.
+      // The remux URL is intended for mpegts.js consumption. If native fallback
+      // is used with a remux URL, playback will fail — but this path is only
+      // hit when mpegts.js itself fails to initialize (rare edge case).
       const nativeUrl = playerRemuxUrl || streamUrl;
       console.log('[Player] Native fallback: setting video src to', nativeUrl === playerRemuxUrl ? 'remux URL' : 'streamUrl');
 
