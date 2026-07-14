@@ -1971,14 +1971,11 @@ fn strip_m2ts_prefix(data: &[u8], is_m2ts: bool) -> Vec<u8> {
     out
 }
 
-/// FFmpeg-based TS→MP4 remux endpoint.
+/// FFmpeg-based TS→MPEG-TS remux endpoint.
 ///
-/// Spawns `ffmpeg -i INPUT -c copy -f mp4 -movflags frag_keyframe+empty_moov pipe:1`
-/// and streams the output to the client. This replaces the broken custom Rust
-/// TS demuxer + fMP4 builder pipeline (14 rounds of failed patches).
-///
-/// The browser's native `<video>` element plays the resulting MP4 perfectly —
-/// same path as the working MP4 playback, no MSE/SourceBuffer needed.
+/// Spawns `ffmpeg -i INPUT -c:v copy -c:a aac -b:a 192k -f mpegts -mpegts_flags resend_headers pipe:1`
+/// and streams the MPEG-TS output to the client. The output is consumed by
+/// mpegts.js (client-side TS demuxer → MSE fMP4), NOT by native `<video>`.
 ///
 /// Supports Range header via ffmpeg `-ss` (seek) and `-t` (duration) flags.
 #[get("/remux/{folder_id}/{message_id}")]
@@ -2013,7 +2010,7 @@ async fn remux_ts_to_mp4(
             Err(_) => return HttpResponse::InternalServerError().body("Failed to read remux cache"),
         };
         log::info!("[REMUX] msg {}: serving cached remux ({:.1} MB)", message_id, file_size as f64 / 1e6);
-        return serve_local_file(&req, &remux_path, file_size, "video/mp4");
+        return serve_local_file(&req, &remux_path, file_size, "video/mp2t");
     }
 
     // ── Check stream cache availability ──
@@ -2198,7 +2195,7 @@ async fn remux_ts_to_mp4(
                 };
                 log::info!("[REMUX] msg {}: faststart remux complete in {:.1}s ({:.1} MB), serving with byte-range",
                     message_id, elapsed.as_secs_f64(), file_size as f64 / 1e6);
-                serve_local_file(&req, &remux_path, file_size, "video/mp4")
+                serve_local_file(&req, &remux_path, file_size, "video/mp2t")
             }
             Ok(status) => {
                 let _ = std::fs::remove_file(&remux_tmp);
@@ -2393,9 +2390,13 @@ async fn remux_ts_to_mp4(
             }
         };
 
-        // Build response — include duration header for frontend override
+        // Build response — include duration header for frontend override.
+        // Content-Type is video/mp2t (MPEG-TS) because ffmpeg outputs -f mpegts.
+        // mpegts.js parses raw bytes and ignores Content-Type, so this is
+        // technically cosmetic — but correct labeling prevents confusion and
+        // makes the native <video> fallback fail fast instead of silently.
         let mut response = HttpResponse::Ok();
-        response.insert_header(("Content-Type", "video/mp4"));
+        response.insert_header(("Content-Type", "video/mp2t"));
         response.insert_header(("Cache-Control", "no-cache"));
         response.insert_header(("X-Remuxed", "true"));
         if probed_duration > 0.0 {
