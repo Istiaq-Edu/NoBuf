@@ -9,6 +9,25 @@ use crate::stream_cache::{self, StreamCacheManager, CacheMeta, merge_ranges, fin
 use grammers_client::types::Media;
 use grammers_tl_types as tl;
 
+/// Minimum byte delta before a VBR-corrected proactive target is treated as a
+/// genuinely new target. The frontend re-derives the seek byte from its
+/// keyframe/VBR table on every position report, which routinely produces ±1-byte
+/// (and other sub-chunk) jitter around a stable target (observed in logs:
+/// `1353514972 -> 1353514971`, `703432598 -> 703432597`, etc). Acting on that
+/// jitter re-evaluates gaps and tears down the download iterator for no benefit,
+/// since the proactive downloader fetches in 512KB chunks anyway — a sub-chunk
+/// move lands in the same chunk. 64KB is well below one chunk yet far above the
+/// observed jitter, so real seeks always cross it and jitter never does.
+pub const PROACTIVE_TARGET_EPSILON_BYTES: u64 = 64 * 1024;
+
+/// True if a newly reported proactive target is far enough from the current
+/// target to be worth acting on (re-evaluating gaps / sliding the window).
+/// Pure + saturating so it can be unit-tested and never panics on unordered
+/// operands. A move of exactly the epsilon counts as significant.
+pub fn is_significant_target_change(current: u64, new_target: u64) -> bool {
+    new_target.abs_diff(current) >= PROACTIVE_TARGET_EPSILON_BYTES
+}
+
 /// Holds the per-session streaming config (token + port)
 pub struct StreamConfig {
     pub token: String,
@@ -66,6 +85,73 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- VBR proactive-target dead-band (issue #4) ---
+
+    #[test]
+    fn dead_band_ignores_plus_minus_one_byte_jitter() {
+        // The exact jitter observed in the logs must NOT count as a retarget.
+        assert!(!is_significant_target_change(1353514972, 1353514971));
+        assert!(!is_significant_target_change(703432598, 703432597));
+        assert!(!is_significant_target_change(472248289, 472248288));
+        // Symmetric: order of operands must not matter.
+        assert!(!is_significant_target_change(1353514971, 1353514972));
+    }
+
+    #[test]
+    fn dead_band_ignores_sub_epsilon_moves() {
+        // Anything below the 64KB epsilon is jitter.
+        assert!(!is_significant_target_change(1_000_000, 1_000_000 + (PROACTIVE_TARGET_EPSILON_BYTES - 1)));
+        assert!(!is_significant_target_change(1_000_000, 1_000_000 - (PROACTIVE_TARGET_EPSILON_BYTES - 1)));
+        // Zero move.
+        assert!(!is_significant_target_change(500, 500));
+    }
+
+    #[test]
+    fn dead_band_accepts_epsilon_and_real_seeks() {
+        // Exactly epsilon counts (>= boundary).
+        assert!(is_significant_target_change(1_000_000, 1_000_000 + PROACTIVE_TARGET_EPSILON_BYTES));
+        // Real seeks from the log (hundreds of MB) always cross.
+        assert!(is_significant_target_change(1353514972, 703432598));
+        assert!(is_significant_target_change(472248289, 260823323));
+        // From byte 0 (cold start) to a real target.
+        assert!(is_significant_target_change(0, 59278028));
+    }
+
+    #[test]
+    fn dead_band_saturating_never_panics_at_extremes() {
+        // abs_diff is saturating/safe at the numeric extremes.
+        assert!(is_significant_target_change(0, u64::MAX));
+        assert!(is_significant_target_change(u64::MAX, 0));
+        assert!(!is_significant_target_change(u64::MAX, u64::MAX));
+    }
+
+    // --- Actix streaming worker-count clamp (issue #d) ---
+
+    #[test]
+    fn worker_count_clamps_high_core_machines() {
+        use crate::server::{streaming_worker_count, MAX_STREAMING_WORKERS};
+        // 20-core machine (the observed case): clamped to the max.
+        assert_eq!(streaming_worker_count(20), MAX_STREAMING_WORKERS);
+        assert_eq!(streaming_worker_count(128), MAX_STREAMING_WORKERS);
+    }
+
+    #[test]
+    fn worker_count_floors_low_core_machines() {
+        use crate::server::{streaming_worker_count, MIN_STREAMING_WORKERS};
+        // Single-core / zero (unavailable) never drops below the floor.
+        assert_eq!(streaming_worker_count(1), MIN_STREAMING_WORKERS);
+        assert_eq!(streaming_worker_count(0), MIN_STREAMING_WORKERS);
+    }
+
+    #[test]
+    fn worker_count_passes_through_mid_range() {
+        use crate::server::{streaming_worker_count, MIN_STREAMING_WORKERS, MAX_STREAMING_WORKERS};
+        // Core counts inside the band are returned unchanged.
+        for cores in MIN_STREAMING_WORKERS..=MAX_STREAMING_WORKERS {
+            assert_eq!(streaming_worker_count(cores), cores);
+        }
+    }
 
     /// Verify base_url uses direct HTTP format (http://localhost:PORT).
     /// This is the URL used for native <video> src with PNA CORS headers.
@@ -878,7 +964,10 @@ async fn proactive_prebuffer_download(
                             let targets = state.proactive_targets.read().await;
                             targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
                         };
-                        if current_target != start_byte {
+                        // Dead-band: ignore sub-chunk VBR jitter (±1 byte etc).
+                        // Only a move of >= PROACTIVE_TARGET_EPSILON_BYTES is a
+                        // real retarget worth re-evaluating gaps for.
+                        if is_significant_target_change(start_byte, current_target) {
                             log::info!("[PROACTIVE] msg {}: target updated during yield: {} -> {} (VBR correction)", 
                                 message_id, start_byte, current_target);
                             start_byte = current_target;

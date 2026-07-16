@@ -16,6 +16,36 @@ use std::collections::HashMap;
 use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom, Read};
 
+/// Choose the Actix worker-thread count for the localhost streaming server.
+///
+/// Actix's `HttpServer` defaults to one worker per physical CPU core (verified
+/// against the actix-web docs). On a 20-core machine that spins up 20 worker
+/// threads, each with its own copy of every route handler — wasteful for a
+/// server that only ever serves a single local WebView client streaming one
+/// file at a time. A handful of workers is plenty to overlap the concurrent
+/// range requests the MSE pipeline issues (video loop + audio prefetch +
+/// keyframe/index fetches), while keeping thread and memory overhead low.
+///
+/// Policy: clamp to `[MIN_STREAMING_WORKERS, MAX_STREAMING_WORKERS]`, defaulting
+/// to the available core count when it falls inside that band. Pure function so
+/// it can be unit-tested without spinning up a server.
+pub const MIN_STREAMING_WORKERS: usize = 2;
+pub const MAX_STREAMING_WORKERS: usize = 4;
+
+pub fn streaming_worker_count(available_cores: usize) -> usize {
+    available_cores
+        .clamp(MIN_STREAMING_WORKERS, MAX_STREAMING_WORKERS)
+}
+
+/// Resolve the worker count from the live machine, falling back to MIN when the
+/// core count is unavailable (per `std::thread::available_parallelism` docs).
+pub fn resolve_streaming_worker_count() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(MIN_STREAMING_WORKERS);
+    streaming_worker_count(cores)
+}
+
 /// Detect TS packet size from cached file data.
 /// Standard TS = 188 bytes per packet, M2TS = 192 bytes per packet.
 /// Detection: check if byte at offset 192 is 0x47 (M2TS) or byte at offset 188 is 0x47 (standard TS).
@@ -4410,6 +4440,7 @@ pub async fn start_streaming_server(
                 );
             })
     })
+    .workers(resolve_streaming_worker_count())
     .bind(("127.0.0.1", port))?
     .run();
 

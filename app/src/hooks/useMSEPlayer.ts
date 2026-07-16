@@ -351,6 +351,90 @@ export function computeSlidingWindowSeconds(
   return { backward: Math.floor(backward), forward: Math.floor(forward) };
 }
 
+/** A simple {start,end} time range, decoupled from the browser TimeRanges API
+ *  so the buffered-ahead math is pure and unit-testable. */
+export interface SimpleTimeRange {
+  start: number;
+  end: number;
+}
+
+/** Max gap (seconds) between two buffered ranges that we still treat as
+ *  "contiguous" for playback. Mirrors hls.js `maxBufferHole` (0.1–0.5s): MP4
+ *  segment boundaries can leave sub-frame rounding gaps that are not real holes.
+ *  Kept small so genuine gaps (a forward region we still need to fetch) are NOT
+ *  bridged — the download loop must see those as "need more data". */
+export const MAX_BUFFER_HOLE_SECONDS = 0.5;
+
+/**
+ * Contiguous buffered seconds AHEAD of `pos`, tolerating holes smaller than
+ * `maxHoleDuration`. This is the correct measure for download backpressure:
+ * only the buffer that is actually reachable from the playhead by continuous
+ * playback counts. A far-away buffered island (e.g. leftover data from a
+ * previous seek near EOF, 5000s away from the current position) is UNPLAYABLE
+ * from `pos` and must NOT be counted — otherwise the download loop believes the
+ * buffer is full and stops fetching, deadlocking playback after a seek.
+ *
+ * Algorithm mirrors hls.js `BufferHelper.bufferedInfo`
+ * (src/utils/buffer-helper.ts): sort ranges, merge sub-`maxHoleDuration` holes
+ * and overlaps, then walk forward from the range containing `pos` and return
+ * `end - pos`. Stops at the first real gap.
+ *
+ * Edge cases handled explicitly (see tests):
+ *  - empty ranges → 0
+ *  - non-finite / negative pos → treated as 0
+ *  - unsorted or overlapping input ranges (browsers don't guarantee order)
+ *  - pos before all ranges (far island ahead) → 0
+ *  - pos at/after the last range end → 0
+ *  - pos just before a range within tolerance → bridges the tiny gap
+ *  - big forward gap → counts only up to the gap, not past it
+ */
+export function contiguousBufferedAhead(
+  ranges: SimpleTimeRange[],
+  pos: number,
+  maxHoleDuration: number = MAX_BUFFER_HOLE_SECONDS
+): number {
+  if (!ranges || ranges.length === 0) return 0;
+  if (!Number.isFinite(pos)) return 0;
+  pos = Math.max(0, pos);
+  const hole = Number.isFinite(maxHoleDuration) && maxHoleDuration > 0 ? maxHoleDuration : 0;
+
+  // Copy + sort by start (then wider range first) — browsers do not guarantee
+  // buffered ranges are sorted, and we must not mutate the caller's array.
+  const sorted = ranges
+    .filter((r) => Number.isFinite(r.start) && Number.isFinite(r.end) && r.end > r.start)
+    .slice()
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+  if (sorted.length === 0) return 0;
+
+  // Merge overlaps and holes smaller than maxHoleDuration into contiguous spans.
+  const merged: SimpleTimeRange[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    if (merged.length) {
+      const last = merged[merged.length - 1];
+      if (r.start - last.end < hole) {
+        if (r.end > last.end) last.end = r.end;
+        continue;
+      }
+    }
+    merged.push({ start: r.start, end: r.end });
+  }
+
+  // Walk forward from the merged span that contains (or nearly contains) pos.
+  let bufferEnd = pos;
+  for (let i = 0; i < merged.length; i++) {
+    const { start, end } = merged[i];
+    if (pos + hole >= start && pos < end) {
+      // pos is inside this span (within tolerance) — its end is our reachable edge
+      bufferEnd = end;
+    } else if (pos + hole < start) {
+      // next span starts beyond a real gap — unreachable from pos, stop
+      break;
+    }
+  }
+  return Math.max(0, bufferEnd - pos);
+}
+
 export function findTimeForByte(
   targetByte: number,
   samples: ByteTimeSample[],
@@ -1590,16 +1674,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const getBufferedAheadSeconds = (): number => {
     const video = videoRef.current;
     if (!video) return 0;
+    // CONTIGUOUS buffer ahead only. The previous implementation summed EVERY
+    // range with end > currentTime, so a stale far-away island (e.g. leftover
+    // data from a prior seek near EOF, thousands of seconds away) inflated the
+    // measure. That made the download-loop backpressure gate believe the buffer
+    // was full (>30s) and sleep forever, while the PROACTIVE reporter believed
+    // the player was idle — a deadlock that stranded backward seeks after a
+    // near-EOF seek (see SEEK-STRAND-CROSSVALIDATION.md). Only buffer reachable
+    // from the playhead by continuous playback should count toward backpressure.
     const buffered = video.buffered;
-    const currentTime = video.currentTime;
-    let totalAhead = 0;
+    const ranges: SimpleTimeRange[] = [];
     for (let i = 0; i < buffered.length; i++) {
-      if (buffered.end(i) > currentTime) {
-        const start = Math.max(buffered.start(i), currentTime);
-        totalAhead += buffered.end(i) - start;
-      }
+      ranges.push({ start: buffered.start(i), end: buffered.end(i) });
     }
-    return totalAhead;
+    return contiguousBufferedAhead(ranges, video.currentTime);
   };
 
   /** True if `byterPos` falls inside a byte range we've already pulled to local
@@ -2123,7 +2211,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         !!isPublicChannel,
       );
       setMinColdStartBytes(dynamicThreshold);
-      diagLog(`[MSE] Dynamic cold-start threshold: ${formatBytes(dynamicThreshold)} (file=${formatBytes(state.current.fileLength)}, duration=${file?.duration ?? 'unknown'}s, format=${format})`);
+      diagLog(`[MSE] Dynamic cold-start threshold: ${formatBytes(dynamicThreshold)} (file=${formatBytes(state.current.fileLength)}, duration=${file?.duration != null ? `${file.duration}s` : 'unknown'}, format=${format})`);
 
       if (format === 'unknown') {
         diagLog('[MSE] Unknown format — falling back to native playback');
@@ -5900,6 +5988,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // This prevents SourceBuffer from filling up past Chrome's quota
       // and triggering QuotaExceededError.
       while (!cancelledRef.current && state.current.downloading && gen === loopGeneration.current) {
+        // A queued seek must ALWAYS win over backpressure: the pendingSeek
+        // handler below clears the (now stale) buffer, so continuing to wait on
+        // a "full" buffer for a position we're about to discard would strand the
+        // seek. Break immediately so the handler runs this iteration.
+        if (state.current.pendingSeek >= 0) break;
         const ahead = getBufferedAheadSeconds();
         if (ahead <= maxBufferAhead) break;
         // Sleep 2s — let playback consume buffered data before downloading more
@@ -5907,7 +6000,29 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Proactively evict during the wait to free space
         evictOldBuffer();
       }
-      if (cancelledRef.current || !state.current.downloading || gen !== loopGeneration.current) break;
+      if (cancelledRef.current || !state.current.downloading || gen !== loopGeneration.current) {
+        // TRIPWIRE (permanent): if the loop bails here with a pendingSeek still
+        // queued, the seek target was stranded — executeSeek set it but the loop
+        // broke on the generation/cancel/downloading guard BEFORE reaching the
+        // pendingSeek handler below, so the target is never fetched ("seeked,
+        // frame+thumbnail showed the new position, but playback never resumed").
+        // Root cause of the historical case was a backpressure deadlock from a
+        // stale far buffer island inflating getBufferedAheadSeconds() — fixed via
+        // contiguousBufferedAhead() + the pendingSeek-first break above. This warn
+        // stays as a regression tripwire: it should never fire in normal use, only
+        // on a genuine teardown (cancelled=true) which is expected.
+        if (state.current.pendingSeek >= 0) {
+          const strandedByte = state.current.pendingSeek;
+          const strandedTime = (strandedByte / state.current.fileLength) * state.current.duration;
+          console.warn(
+            `[SEEK-DIAG] downloadLoop bailed with STRANDED pendingSeek=${strandedByte} (${strandedTime.toFixed(1)}s) — ` +
+            `reason: cancelled=${cancelledRef.current} downloading=${state.current.downloading} ` +
+            `genStale=${gen !== loopGeneration.current} (gen=${gen}, loopGen=${loopGeneration.current}) ` +
+            `currentOffset=${state.current.currentOffset}`
+          );
+        }
+        break;
+      }
 
       // Check for pending seek (set by seekTo when user clicks progress bar
       // on an unbuffered position)
@@ -6092,7 +6207,37 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
     // Only set isComplete if we reached the end (not interrupted by seek)
     const reachedEnd = state.current.currentOffset >= state.current.fileLength;
-    console.log(`[MSE] Download loop exited: offset=${state.current.currentOffset}, fileLength=${state.current.fileLength}, reachedEnd=${reachedEnd}`);
+    console.log(`[MSE] Download loop exited: offset=${state.current.currentOffset}, fileLength=${state.current.fileLength}, reachedEnd=${reachedEnd}, pendingSeek=${state.current.pendingSeek}`);
+    // TRIPWIRE + SELF-HEAL: a pendingSeek still set at loop exit means the seek
+    // target was never fetched/appended — stranded regardless of which exit route
+    // (mid-body guard or top-level while condition) the loop took.
+    if (state.current.pendingSeek >= 0) {
+      const strandedByte = state.current.pendingSeek;
+      const strandedTime = (strandedByte / state.current.fileLength) * state.current.duration;
+      // Self-heal: if this exit was NOT a teardown (cancelled), NOT a user pause,
+      // and this is still the current loop generation (no newer loop already
+      // running), respawn the loop so the stranded seek gets served. This is the
+      // final safety net beneath contiguousBufferedAhead() + the pendingSeek-first
+      // break; those prevent the deadlock, this recovers from any unforeseen exit.
+      const loopFn = downloadLoopRef.current;
+      const canSelfHeal =
+        !cancelledRef.current &&
+        !isPausedRef.current &&
+        gen === loopGeneration.current &&
+        !!loopFn &&
+        // Guard against a tight respawn loop: the target must be fetchable (a
+        // real seek sets currentOffset = seekByte < fileLength; the "Seek at
+        // end" branch already clears pendingSeek, so this is belt-and-braces).
+        state.current.currentOffset < state.current.fileLength;
+      if (canSelfHeal && loopFn) {
+        console.warn(`[SEEK-DIAG] downloadLoop EXITED with STRANDED pendingSeek=${strandedByte} (${strandedTime.toFixed(1)}s) — respawning loop to serve it`);
+        state.current.downloading = true;
+        setIsPrefetching(true);
+        loopFn(url);
+        return; // new loop instance owns completion/state from here
+      }
+      console.warn(`[SEEK-DIAG] downloadLoop EXITED with STRANDED pendingSeek=${strandedByte} (${strandedTime.toFixed(1)}s) — not served (cancelled=${cancelledRef.current} paused=${isPausedRef.current} genStale=${gen !== loopGeneration.current})`);
+    }
     if (!cancelledRef.current) {
       // Flush any remaining range reports
       flushRangeReport();
