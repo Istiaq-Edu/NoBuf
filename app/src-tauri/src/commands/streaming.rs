@@ -940,13 +940,12 @@ async fn proactive_prebuffer_download(
                 {
                     let targets = state.proactive_targets.read().await;
                     if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
-                        // Update last_target_byte FIRST, before any break.
-                        // If we break below, this line must have already run,
-                        // otherwise the next iteration sees stale last_target_byte
-                        // and the backward jump loops forever.
-                        let target_changed = last_target_byte != Some(target_byte);
+                        // Capture the PREVIOUS observed target, then update. The
+                        // update must happen before any break so the next iteration
+                        // never sees a stale value.
+                        let prev_target = last_target_byte;
                         last_target_byte = Some(target_byte);
-                        
+
                         if target_byte > offset + 10 * 1024 * 1024 {
                             log::info!(
                                 "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
@@ -954,17 +953,27 @@ async fn proactive_prebuffer_download(
                             );
                             jumped = true;
                             break;
-                        } else if target_byte + 50 * 1024 * 1024 < offset
-                                   && target_changed {
-                            // Backward seek — but ONLY if the target changed (new seek).
-                            // If target hasn't changed, PROACTIVE is just ahead of the
-                            // seek position = normal prebuffering, NOT a backward seek.
-                            log::info!(
-                                "[PROACTIVE] msg {}: playhead jumped backward to byte {} (current offset {}), re-evaluating gaps",
-                                message_id, target_byte, offset
-                            );
-                            jumped = true;
-                            break;
+                        } else if let Some(prev) = prev_target {
+                            // Backward seek: the reported playhead target moved
+                            // BACKWARD from the previously observed target by a
+                            // meaningful margin (>10MB). During normal forward
+                            // playback the target (derived from currentTime)
+                            // increases monotonically — MP4's periodic position
+                            // reporter sends an advancing playhead every 2s — so the
+                            // old "target_changed" test fired on EVERY tick once
+                            // PROACTIVE raced >50MB ahead, tearing down the download
+                            // iterator ~1/s and forcing 5s yields (the green-bar
+                            // pulsing). Requiring an actual backward delta fires only
+                            // on a real backward seek / VBR correction, never on
+                            // forward playback advancement.
+                            if target_byte + 10 * 1024 * 1024 < prev {
+                                log::info!(
+                                    "[PROACTIVE] msg {}: playhead jumped backward to byte {} (prev target {}, current offset {}), re-evaluating gaps",
+                                    message_id, target_byte, prev, offset
+                                );
+                                jumped = true;
+                                break;
+                            }
                         }
                     }
                 }

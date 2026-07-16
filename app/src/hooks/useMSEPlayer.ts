@@ -802,6 +802,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const downloadedTimeRangesRef = useRef<[number, number][]>([]);
 
   const downloadLoopRef = useRef<((url: string) => void) | null>(null);
+  // MP4 green-bar-to-EOF prebuffer reporter — assigned once downloadLoop is defined.
+  const startMp4ProactiveReporterRef = useRef<(() => void) | null>(null);
+  // True when the downloadLoop's most recent /stream chunk was served from disk
+  // cache (X-Cache: HIT) rather than fetched from Telegram. When PROACTIVE has
+  // raced ahead, refills topping the MSE buffer are disk HITs — they are NOT
+  // competing for the Telegram rate limiter, so PROACTIVE must NOT yield for them
+  // (that yield is what made the green bar pulse/stall). Only a genuine MISS
+  // (cold seek into unwarmed data) should make the reporter flag the player as
+  // actively downloading. Starts true: an idle loop isn't pulling from Telegram.
+  const lastDownloadWasCacheHitRef = useRef(true);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const loopGeneration = useRef(0); // Prevents stale loops from running after seek
@@ -5850,6 +5860,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // Start downloading and appending (faststarted MP4 — normal path)
       downloadLoop(url);
+      // Drive the backend PROACTIVE prebuffer so the disk cache (green bar)
+      // marches 0→EOF, independent of the bounded MSE playback buffer above.
+      // MP4-only: this callback only fires for the mp4box path.
+      startMp4ProactiveReporterRef.current?.();
       // Prefetch audio data in parallel if audio samples are far from the start
       // (moov-at-end files with sequential video→audio layout). Without this,
       // mp4box.js never generates audio segments because the download loop
@@ -6015,6 +6029,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           break;
         }
 
+        // Track whether this chunk came from disk cache (HIT) or Telegram (MISS).
+        // Drives the PROACTIVE reporter: disk HITs must NOT make PROACTIVE yield.
+        lastDownloadWasCacheHitRef.current = response.headers.get('X-Cache') === 'HIT';
+
         const data = await response.arrayBuffer();
         if (cancelledRef.current) break;
 
@@ -6089,6 +6107,85 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
   };
   downloadLoopRef.current = downloadLoop;
+
+  /**
+   * MP4 green-bar-to-EOF prebuffer driver.
+   *
+   * The frontend downloadLoop only fills the bounded MSE playback buffer
+   * (capped at `maxBufferAhead` seconds to avoid QuotaExceededError), so on its
+   * own the disk cache — and therefore the green bar — never marches past ~30s
+   * ahead of the playhead. The backend PROACTIVE prebuffer
+   * (proactive_prebuffer_download) DOES fill disk 0→EOF and already handles the
+   * initial forward march, the +40s-ahead seek offset, and rate-limiter yielding
+   * to /stream. It is triggered purely by cmd_report_playback_position — which
+   * every path EXCEPT MP4 already calls. This reporter wires MP4 up to it.
+   *
+   * COORDINATION: is_player_downloading is reported TRUE only while the
+   * downloadLoop is actively pulling its bounded window (buffer below the cap).
+   * When the window is full the loop sleeps → we report FALSE → the backend
+   * PROACTIVE fills disk ahead to EOF during those gaps. This preserves the
+   * "never two Telegram downloads at once" (FLOOD_PREMIUM_WAIT) invariant: the
+   * player always wins the budget while it needs data; PROACTIVE fills the rest
+   * during idle. Once PROACTIVE races ahead, the loop's /stream reads become
+   * disk cache HITs (no Telegram), so there is no real contention.
+   *
+   * PAUSE: honored via pausePrefetch(), which already calls
+   * cmd_stop_proactive_prebuffer and clears proactiveIntervalRef using the refs
+   * this function sets. Paused stays paused across seeks (the seek reposition
+   * report is gated on !isPausedRef).
+   */
+  const startMp4ProactiveReporter = () => {
+    const fileId = file?.id;
+    const folderId = activeFolderId;
+    const fileSize = state.current.fileLength;
+    // Only MP4 (mp4box) playback; never TS (mpegts) or MKV (transmuxer).
+    if (!fileId || folderId === null || !fileSize || fileSize <= 0) return;
+    if (isPausedRef.current) return;
+    // Don't stack intervals — one reporter per file.
+    if (proactiveIntervalRef.current) return;
+
+    proactivePrebufferMsgIdRef.current = fileId;
+    const tick = async () => {
+      const v = videoRef.current;
+      if (!v) return;
+      const dur = state.current.duration || 0;
+      if (dur <= 0) return;
+      // Report TRUE only when the player is genuinely pulling from Telegram and
+      // thus competing with PROACTIVE for the rate limiter. Three gates:
+      //   1. loop is filling its bounded window (buffer below cap), AND
+      //   2. not complete, AND
+      //   3. the last chunk was a real Telegram fetch (cache MISS) — NOT a disk
+      //      HIT. Once PROACTIVE races ahead, refills are disk HITs; flagging
+      //      those as "downloading" made PROACTIVE needlessly yield → the green
+      //      bar pulsed/stalled. Disk refills cost no Telegram budget, so we let
+      //      PROACTIVE keep marching. Only a cold seek into unwarmed data (MISS)
+      //      makes the player win the budget again.
+      const isDownloading =
+        state.current.downloading &&
+        !isCompleteRef.current &&
+        !lastDownloadWasCacheHitRef.current &&
+        getBufferedAheadSeconds() < maxBufferAhead;
+      try {
+        await invoke('cmd_report_playback_position', {
+          messageId: fileId,
+          folderId: folderId,
+          currentTimeS: v.currentTime,
+          durationS: dur,
+          fileSize: fileSize,
+          isPlayerDownloading: isDownloading,
+          playbackRate: v.playbackRate || 1.0,
+          byteOffset: null, // periodic reports use linear estimate; seek reports pass an explicit byte
+        });
+      } catch { /* ignore */ }
+    };
+    // 2s cadence: fine enough to track the loop's backpressure cycle and slide
+    // the backend window smoothly, cheap enough to be negligible.
+    const id = setInterval(tick, 2000);
+    proactiveIntervalRef.current = id;
+    // Fire one immediately so PROACTIVE can start without a 2s delay.
+    tick();
+  };
+  startMp4ProactiveReporterRef.current = startMp4ProactiveReporter;
 
   // Direct seek function — avoids hard-restarting the download loop.
   // For already-buffered positions: just set currentTime, no download restart.
@@ -6857,6 +6954,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         state.current.fileLength - 1  // Clamp: clampedTime ≈ duration can produce seekByte ≈ fileLength
       );
       state.current.pendingSeek = seekByte;
+      // Cold seek: assume the target is unwarmed (MISS) until a chunk proves
+      // otherwise, so the PROACTIVE reporter yields to the player during the
+      // seek bootstrap instead of trusting a stale pre-seek HIT.
+      lastDownloadWasCacheHitRef.current = false;
       // Bug fix: reset currentOffset so the download loop can re-enter after
       // completion. When the video finishes, currentOffset >= fileLength,
       // which makes the while condition (currentOffset < fileLength) false,
@@ -6880,6 +6981,35 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         state.current.downloading = true;
         setIsPrefetching(true);
         downloadLoopRef.current(streamUrl);
+      }
+
+      // Reposition the backend PROACTIVE prebuffer to the seek target. Passing an
+      // explicit byteOffset makes the backend detect the playhead jump and apply
+      // its +40s-ahead offset (proactive_start_byte) so it warms disk AHEAD of
+      // where the downloadLoop's fresh window lands — no double-download of the
+      // ~30s the loop pulls at the seek point. Gated on !isPausedRef so a seek
+      // never silently un-pauses a user-paused prebuffer ("paused means paused").
+      if (!isPausedRef.current) {
+        const fileId = file?.id;
+        const folderId = activeFolderId;
+        const fileSize = state.current.fileLength;
+        const dur = state.current.duration || 0;
+        if (fileId && folderId !== null && fileSize > 0 && dur > 0) {
+          proactivePrebufferMsgIdRef.current = fileId;
+          invoke('cmd_report_playback_position', {
+            messageId: fileId,
+            folderId: folderId,
+            currentTimeS: clampedTime,
+            durationS: dur,
+            fileSize: fileSize,
+            isPlayerDownloading: true, // player is about to fetch its window at the seek point
+            playbackRate: 1.0,
+            byteOffset: seekByte,
+          }).catch(() => {});
+          // Ensure the periodic reporter is running so the window keeps sliding
+          // to EOF after this seek (it may have been cleared on a prior pause).
+          if (!proactiveIntervalRef.current) startMp4ProactiveReporterRef.current?.();
+        }
       }
     };
 
@@ -7003,6 +7133,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // MP4/MKV/WebM: restart download loop
     if (!state.current.downloading && streamUrl && downloadLoopRef.current) {
       downloadLoopRef.current(streamUrl);
+    }
+    // MP4: restart the backend PROACTIVE reporter so the green bar resumes its
+    // march to EOF. pausePrefetch stopped the backend task and cleared the
+    // interval; the reporter's first tick re-triggers cmd_report_playback_position.
+    // No-op for MKV/WebM (proactiveIntervalRef stays null unless MP4 set it).
+    if (state.current.mp4box && !proactiveIntervalRef.current) {
+      startMp4ProactiveReporterRef.current?.();
     }
   };
 

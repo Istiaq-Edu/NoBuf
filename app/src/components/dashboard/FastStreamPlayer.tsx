@@ -10,6 +10,9 @@ import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
+import { useSubtitles } from '../../hooks/useSubtitles';
+import { SubtitleOverlay } from './SubtitleOverlay';
+import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -124,8 +127,10 @@ interface FastStreamPlayerProps {
   const vidRef = useRef<HTMLVideoElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
+  const subFileInputRef = useRef<HTMLInputElement>(null);
   const { settings, updateSetting } = useSettings();
   const cacheSession = useCacheSession();
+  const subs = useSubtitles();
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -139,6 +144,12 @@ interface FastStreamPlayerProps {
   useEffect(() => {
     setRate(settings.playerSpeed);
   }, [file.id, settings.playerSpeed]);
+
+  // Drop any loaded subtitle tracks when the source file changes.
+  useEffect(() => {
+    subs.clearTracks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.id]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -147,6 +158,7 @@ interface FastStreamPlayerProps {
   const [vis, setVis] = useState(true);
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
+  const [subMenu, setSubMenu] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
   // Settings panel state
@@ -1386,6 +1398,22 @@ interface FastStreamPlayerProps {
   const fs2 = useCallback(() => { document.fullscreenElement ? document.exitFullscreen() : boxRef.current?.requestFullscreen(); }, []);
   const rate2 = useCallback((r: number) => { const v = vidRef.current; if (v) { v.playbackRate = r; setRate(r); } setMenu(false); }, []);
 
+  // Load a sidecar subtitle file (.srt/.vtt/.ass/.ssa) chosen by the user.
+  const loadSubFile = useCallback(async (fileList: FileList | null) => {
+    const f = fileList?.[0];
+    if (!f) return;
+    try {
+      const text = await f.text();
+      const track = new SubtitleTrack(f.name.replace(/\.[^.]+$/, ''), null);
+      track.loadText(text);
+      subs.activateTrack(subs.addTrack(track));
+      toast.success(`Loaded subtitles: ${f.name}`);
+    } catch (e) {
+      toast.error('Failed to load subtitle file');
+      console.error('[Subtitles] sidecar load failed:', e);
+    }
+  }, [subs]);
+
   // Settings panel resize: drag the left edge. Width is clamped to the player box
   // and persisted so it's remembered across sessions. Panel grows leftward, so a
   // drag to the LEFT (smaller clientX) = wider panel.
@@ -1421,7 +1449,7 @@ interface FastStreamPlayerProps {
   // positionable on the bar like any chip, but it can never live inside the tray
   // popover (it IS the popover) and must always be present somewhere on the bar.
   const TRAY = '__tray__';
-  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
+  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'captions', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
   const barLayout = useMemo(() => {
     const raw = settings.playerBarLayout ?? { left: [], right: [], tray: [] };
     const seen = new Set<string>();
@@ -1595,11 +1623,19 @@ interface FastStreamPlayerProps {
         case '.': e.preventDefault(); rate2(Math.min(4, rate + 0.25)); break;
         case '<': e.preventDefault(); rate2(Math.max(0.25, rate / 2)); break;
         case '>': e.preventDefault(); rate2(Math.min(4, rate * 2)); break;
+        case 'c':
+          e.preventDefault();
+          // Toggle subtitles: if none loaded, no-op; if none active, enable the
+          // first track; otherwise toggle off/on remembering the last-active set.
+          if (subs.tracks.length === 0) break;
+          if (subs.activeTracks.length === 0 && !subs.hasLastActive) subs.activateTrack(subs.tracks[0]);
+          else subs.toggleSubtitles();
+          break;
       }
     };
     document.addEventListener('keydown', h);
     return () => document.removeEventListener('keydown', h);
-  }, [toggle, seek, setVol2, mute, fs2, handleClose, onNext, onPrev, vol, rate, rate2, dur]);
+  }, [toggle, seek, setVol2, mute, fs2, handleClose, onNext, onPrev, vol, rate, rate2, dur, subs]);
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
 
@@ -1615,6 +1651,25 @@ interface FastStreamPlayerProps {
         <button onClick={skip30Fwd} className="p-1.5 hover:bg-white/10 rounded text-white" title="Forward 30s">
           <svg className="w-5 h-5 block" fill="currentColor" viewBox="0 0 24 24"><path d="M12.5 3C7.81 3 4 6.81 4 11.5S7.81 20 12.5 20s8.5-3.81 8.5-8.5c0-.53-.05-1.05-.14-1.55l-1.63.55c.05.33.07.66.07 1 0 3.58-2.92 6.5-6.5 6.5S6 15.08 6 11.5 8.92 5 12.5 5V8l4-4-4-4v3z"/><text x="12" y="15" fontSize="8" fontFamily="monospace" fill="currentColor" textAnchor="middle" fontWeight="bold">30</text></svg>
         </button> };
+      case 'captions': return { label: 'Subtitles', el:
+        <div className="relative">
+          <button onClick={(e) => { e.stopPropagation(); setSubMenu(m => !m); }} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${subs.activeTracks.length ? 'text-nobuf-primary' : 'text-white'}`} title="Subtitles">
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 12h4v2H4v-2zm10 6H4v-2h10v2zm6 0h-4v-2h4v2zm0-4H10v-2h10v2z"/></svg>
+          </button>
+          {subMenu && (
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
+              <button onClick={() => { subs.activeTracks.forEach(subs.deactivateTrack); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
+              {subs.tracks.map((t, i) => (
+                <button key={i} onClick={() => subs.toggleTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
+                  {t.label || t.language || `Track ${i + 1}`}{t.isASS ? ' (ASS)' : ''}
+                </button>
+              ))}
+              <div className="border-t border-white/10 mt-1 pt-1">
+                <button onClick={() => { setSubMenu(false); subFileInputRef.current?.click(); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Load subtitle file…</button>
+              </div>
+            </div>
+          )}
+        </div> };
       case 'loop': return { label: 'Loop', el:
         <button onClick={() => setLoop(l => !l)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${loop ? 'text-nobuf-primary' : 'text-white'}`} title={loop ? 'Loop on' : 'Loop off'}>
           <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
@@ -1775,6 +1830,14 @@ interface FastStreamPlayerProps {
         if (dragKind) { e.preventDefault(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }
       }}
     >
+      {/* Hidden file input for sidecar subtitle loading (.srt/.vtt/.ass/.ssa) */}
+      <input
+        ref={subFileInputRef}
+        type="file"
+        accept=".srt,.vtt,.ass,.ssa"
+        className="hidden"
+        onChange={(e) => { loadSubFile(e.target.files); e.target.value = ''; }}
+      />
       {/* Video - FastStream's DirectVideoPlayer approach */}
       <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
         {err ? (
@@ -1803,6 +1866,9 @@ interface FastStreamPlayerProps {
               transform: rotation ? `rotate(${rotation}deg)` : undefined,
             }}
           />
+        )}
+        {!err && (
+          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} />
         )}
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
