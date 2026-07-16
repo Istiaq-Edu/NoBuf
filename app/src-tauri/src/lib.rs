@@ -105,6 +105,7 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
                     .app_data(api_state.clone())
                     .configure(api_routes::configure_api)
             })
+            .workers(crate::server::resolve_streaming_worker_count())
             .bind(("127.0.0.1", api_port)) {
                 Ok(bound) => {
                     let server = bound.run();
