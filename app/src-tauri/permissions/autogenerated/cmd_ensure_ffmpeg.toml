@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-ensure-ffmpeg"
+description = "Enables the cmd_ensure_ffmpeg command without any pre-configured scope."
+commands.allow = ["cmd_ensure_ffmpeg"]
+
+[[permission]]
+identifier = "deny-cmd-ensure-ffmpeg"
+description = "Denies the cmd_ensure_ffmpeg command without any pre-configured scope."
+commands.deny = ["cmd_ensure_ffmpeg"]
