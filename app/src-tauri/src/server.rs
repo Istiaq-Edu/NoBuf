@@ -1557,7 +1557,13 @@ async fn download_and_cache_range(
                     // to ensure the keyframe search eventually completes.
                     if yield_count > 100 {
                         log::info!("[DAC] Keyframe search yielded {} times, now blocking for permit", yield_count);
-                        data.download_semaphore.acquire().await.unwrap()
+                        match data.download_semaphore.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                log::error!("[DAC] msg {}: download semaphore closed during keyframe search", message_id);
+                                return Err("Download semaphore closed".to_string());
+                            }
+                        }
                     } else {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         continue;
@@ -2079,7 +2085,18 @@ async fn remux_ts_to_mp4(
     // Identify real video/audio streams (skip ID3 fake audio in Telegram TS).
     // Use small probesize for fast detection (~2-3s).
 
-    let probe_output = TokioCommand::new("ffprobe")
+    // Resolve ffprobe path (PATH → exe_dir → sidecar) so release builds work
+    // even when ffprobe isn't in the GUI process's PATH.
+    let ffprobe_path = match crate::ffmpeg_util::ensure_ffprobe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[REMUX] msg {}: ffprobe not found: {}", message_id, e);
+            // Use defaults — ffprobe is best-effort for stream indices
+            return HttpResponse::InternalServerError()
+                .body(format!("ffprobe not found: {}", e));
+        }
+    };
+    let probe_output = TokioCommand::new(&ffprobe_path)
         .args([
             "-hide_banner", "-loglevel", "error",
             "-print_format", "json",
@@ -2157,12 +2174,31 @@ async fn remux_ts_to_mp4(
         log::info!("[REMUX] msg {}: file cached — remuxing to disk with faststart (video_idx={}, audio_idx={})...",
             message_id, video_stream_idx, audio_stream_idx);
 
-        let mut cmd = TokioCommand::new("ffmpeg");
+        // Resolve ffmpeg path (PATH → exe_dir → sidecar) for release builds.
+        let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[REMUX] msg {}: ffmpeg not found: {}", message_id, e);
+                return HttpResponse::InternalServerError()
+                    .body(format!("ffmpeg not found: {}", e));
+            }
+        };
+        let mut cmd = TokioCommand::new(&ffmpeg_path);
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
+            // +genpts: regenerate PTS from DTS (fixes non-monotonic audio timestamps)
+            // +discardcorrupt: drop damaged packets before they reach the filter chain
+            "-fflags", "+genpts+discardcorrupt",
+            // Shift all timestamps to start at zero — prevents negative DTS that
+            // the MPEG-TS muxer rejects with EINVAL.
+            "-avoid_negative_ts", "make_zero",
             "-i", &input_source,
-            "-map", "0:v:0", "-map", "0:a:0",
+            // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
+            // Files with timed_id3 metadata may have the id3 stream as the first
+            // audio stream; 0:a:0 would map the wrong stream → AAC muxing error.
+            "-map", &format!("0:{}", video_stream_idx),
+            "-map", &format!("0:{}", audio_stream_idx),
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
             "-f", "mpegts",
@@ -2253,7 +2289,16 @@ async fn remux_ts_to_mp4(
         log::info!("[REMUX] msg {}: file NOT cached — streaming fMP4 immediately + background disk remux (video_idx={}, audio_idx={}, duration={:.1}s)",
             message_id, video_stream_idx, audio_stream_idx, probed_duration);
 
-        let mut cmd = TokioCommand::new("ffmpeg");
+        // Resolve ffmpeg path (PATH → exe_dir → sidecar) for release builds.
+        let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[REMUX] msg {}: ffmpeg not found: {}", message_id, e);
+                return HttpResponse::InternalServerError()
+                    .body(format!("ffmpeg not found: {}", e));
+            }
+        };
+        let mut cmd = TokioCommand::new(&ffmpeg_path);
         cmd.args(["-hide_banner", "-loglevel", "warning"]);
         // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking
         let ss_secs = query.ss.unwrap_or(0.0);
@@ -2266,8 +2311,14 @@ async fn remux_ts_to_mp4(
         // +discardcorrupt: drop damaged packets before they reach the filter chain
         cmd.args([
             "-fflags", "+genpts+discardcorrupt",
+            // Shift all timestamps to start at zero — prevents negative DTS that
+            // the MPEG-TS muxer rejects with EINVAL ("Error submitting a packet
+            // to the muxer: Invalid argument", exit code -22).
+            "-avoid_negative_ts", "make_zero",
             "-i", &input_source,
-            "-map", "0:v:0", "-map", "0:a:0",
+            // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
+            "-map", &format!("0:{}", video_stream_idx),
+            "-map", &format!("0:{}", audio_stream_idx),
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
             // asetpts=N/SR/TB: force monotonically increasing audio PTS by construction.
@@ -2369,11 +2420,20 @@ async fn remux_ts_to_mp4(
                     tokio::spawn(async move {
                         // Small delay to let stream cache cool down
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let mut bg_cmd = TokioCommand::new("ffmpeg");
+                        // Resolve ffmpeg path for the background task too.
+                        let bg_ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::error!("[REMUX-BG] ffmpeg not found: {}", e);
+                                return;
+                            }
+                        };
+                        let mut bg_cmd = TokioCommand::new(&bg_ffmpeg_path);
                         bg_cmd.args([
                             "-hide_banner", "-loglevel", "warning",
                             "-ignore_unknown",
                             "-fflags", "+genpts+discardcorrupt",
+                            "-avoid_negative_ts", "make_zero",
                             "-probesize", "50000000", "-analyzeduration", "50000000",
                             "-i", &bg_input,
                         ]);
@@ -2381,10 +2441,18 @@ async fn remux_ts_to_mp4(
                         bg_cmd.args(["-map", &format!("0:{}", bg_aud_idx)]);
                         bg_cmd.args([
                             "-sn",
-                            "-c:v", "copy", "-c:a", "copy",
-                            "-bsf:a", "aac_adtstoasc",
-                            "-f", "mp4",
-                            "-movflags", "+faststart",
+                            "-c:v", "copy",
+                            // Re-encode audio to AAC (not copy) — the source TS may have
+                            // overlapping PTS that corrupt stream copy. Re-encoding + asetpts
+                            // guarantees monotonically increasing timestamps.
+                            "-c:a", "aac", "-b:a", "192k",
+                            "-af", "asetpts=N/SR/TB",
+                            // Output MPEG-TS (NOT MP4) to match the serving Content-Type
+                            // (video/mp2t) and the Strategy A output format. The previous
+                            // -f mp4 + -movflags +faststart produced an MP4 file served as
+                            // video/mp2t → mpegts.js parse failure on second play.
+                            "-f", "mpegts",
+                            "-mpegts_flags", "resend_headers",
                         ]);
                         bg_cmd.arg(&bg_remux_tmp);
                         bg_cmd.stdout(std::process::Stdio::null());
@@ -3038,7 +3106,7 @@ async fn fmp4_segment(
 
                 loop {
                     let chunk_result = {
-                        let _permit = data.download_semaphore.acquire().await.unwrap();
+                        let _permit = match data.download_semaphore.acquire().await { Ok(p) => p, Err(_) => { log::error!("[FMP4] download semaphore closed"); break; } };
                         throttle_api_calls(&data.rate_limiter).await;
                         iter.next().await
                     };
@@ -3773,7 +3841,7 @@ async fn fmp4_metadata(
                                         let mut tail_retries = 0u32;
                                         loop {
                                             let chunk_result = {
-                                                let _permit = data.download_semaphore.acquire().await.unwrap();
+                                                let _permit = match data.download_semaphore.acquire().await { Ok(p) => p, Err(_) => { log::error!("[FMP4] download semaphore closed"); break; } };
                                                 throttle_api_calls(&data.rate_limiter).await;
                                                 iter.next().await
                                             };
@@ -4462,7 +4530,7 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use actix_cors::Cors;
-    use actix_web::{test, web, App, HttpResponse, http::Method, http::header as actix_header};
+    use actix_web::{test as actix_test, web, App, HttpResponse, http::Method, http::header as actix_header};
 
     async fn test_handler() -> HttpResponse {
         HttpResponse::Ok().body("test")
@@ -4483,13 +4551,13 @@ mod tests {
             .allow_private_network_access()
             .max_age(3600);
 
-        let app = test::init_service(
+        let app = actix_test::init_service(
             App::new()
                 .wrap(cors)
                 .route("/test", web::get().to(test_handler))
         ).await;
 
-        let req = test::TestRequest::default()
+        let req = actix_test::TestRequest::default()
             .method(Method::OPTIONS)
             .uri("/test")
             .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
@@ -4497,7 +4565,7 @@ mod tests {
             .insert_header(("Access-Control-Request-Private-Network", "true"))
             .to_request();
 
-        let resp = test::call_service(&app, req).await;
+        let resp = actix_test::call_service(&app, req).await;
         assert!(resp.status().is_success());
 
         // The critical header: Access-Control-Allow-Private-Network: true
@@ -4527,20 +4595,20 @@ mod tests {
             .allow_private_network_access()
             .max_age(3600);
 
-        let app = test::init_service(
+        let app = actix_test::init_service(
             App::new()
                 .wrap(cors)
                 .route("/test", web::get().to(test_handler))
         ).await;
 
-        let req = test::TestRequest::default()
+        let req = actix_test::TestRequest::default()
             .method(Method::OPTIONS)
             .uri("/test")
             .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
             .insert_header((actix_header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
             .to_request();
 
-        let resp = test::call_service(&app, req).await;
+        let resp = actix_test::call_service(&app, req).await;
         assert!(resp.status().is_success());
 
         // PNA header should NOT be present when not requested
@@ -4562,20 +4630,20 @@ mod tests {
             .allow_private_network_access()
             .max_age(3600);
 
-        let app = test::init_service(
+        let app = actix_test::init_service(
             App::new()
                 .wrap(cors)
                 .route("/test", web::get().to(test_handler))
         ).await;
 
         // Use a regular GET request (not OPTIONS) — Expose-Headers only appears in actual responses
-        let req = test::TestRequest::default()
+        let req = actix_test::TestRequest::default()
             .method(Method::GET)
             .uri("/test")
             .insert_header((actix_header::ORIGIN, "http://localhost:14200"))
             .to_request();
 
-        let resp = test::call_service(&app, req).await;
+        let resp = actix_test::call_service(&app, req).await;
         assert!(resp.status().is_success());
 
         let expose_headers = resp.headers().get("Access-Control-Expose-Headers");
@@ -4587,6 +4655,182 @@ mod tests {
         assert!(lower.contains("content-length"), "Content-Length must be exposed");
         assert!(lower.contains("accept-ranges"), "Accept-Ranges must be exposed");
         assert!(lower.contains("x-reason"), "X-Reason must be exposed");
+    }
+
+    // ========================================================================
+    // Remux command construction tests
+    // ========================================================================
+
+    /// Build the ffmpeg argument list for Strategy A (cached file → disk remux).
+    /// Extracted as a pure function so tests can verify correctness without
+    /// spawning ffmpeg or needing a real TS file.
+    fn build_strategy_a_args(
+        input_source: &str,
+        video_stream_idx: i32,
+        audio_stream_idx: i32,
+    ) -> Vec<String> {
+        vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(), "warning".to_string(),
+            "-fflags".to_string(), "+genpts+discardcorrupt".to_string(),
+            "-avoid_negative_ts".to_string(), "make_zero".to_string(),
+            "-i".to_string(), input_source.to_string(),
+            "-map".to_string(), format!("0:{}", video_stream_idx),
+            "-map".to_string(), format!("0:{}", audio_stream_idx),
+            "-c:v".to_string(), "copy".to_string(),
+            "-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "192k".to_string(),
+            "-f".to_string(), "mpegts".to_string(),
+            "-mpegts_flags".to_string(), "resend_headers".to_string(),
+        ]
+    }
+
+    /// Build the ffmpeg argument list for the background disk remux.
+    /// MUST output MPEG-TS (not MP4) to match the serving Content-Type (video/mp2t).
+    fn build_background_remux_args(
+        input_source: &str,
+        video_stream_idx: i32,
+        audio_stream_idx: i32,
+    ) -> Vec<String> {
+        vec![
+            "-hide_banner".to_string(), "-loglevel".to_string(), "warning".to_string(),
+            "-ignore_unknown".to_string(),
+            "-fflags".to_string(), "+genpts+discardcorrupt".to_string(),
+            "-avoid_negative_ts".to_string(), "make_zero".to_string(),
+            "-probesize".to_string(), "50000000".to_string(),
+            "-analyzeduration".to_string(), "50000000".to_string(),
+            "-i".to_string(), input_source.to_string(),
+            "-map".to_string(), format!("0:{}", video_stream_idx),
+            "-map".to_string(), format!("0:{}", audio_stream_idx),
+            "-sn".to_string(),
+            "-c:v".to_string(), "copy".to_string(),
+            "-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "192k".to_string(),
+            "-af".to_string(), "asetpts=N/SR/TB".to_string(),
+            "-f".to_string(), "mpegts".to_string(),
+            "-mpegts_flags".to_string(), "resend_headers".to_string(),
+        ]
+    }
+
+    /// Strategy A must use ffprobe-resolved stream indices, not hardcoded 0:v:0/0:a:0.
+    #[test]
+    fn strategy_a_uses_ffprobe_stream_indices() {
+        let args = build_strategy_a_args("input.ts", 0, 1);
+        let map_args: Vec<&String> = args.iter().filter(|a| a.as_str() == "-map").collect();
+        assert_eq!(map_args.len(), 2, "Should have exactly 2 -map args");
+
+        // Find the values after -map
+        let mut map_values = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if arg == "-map" {
+                map_values.push(args[i + 1].as_str());
+            }
+        }
+        assert!(map_values.contains(&"0:0"), "Should map video stream 0:0");
+        assert!(map_values.contains(&"0:1"), "Should map audio stream 0:1");
+
+        // Must NOT contain the old hardcoded values
+        assert!(
+            !args.iter().any(|a| a == "0:v:0"),
+            "Must not use hardcoded 0:v:0"
+        );
+        assert!(
+            !args.iter().any(|a| a == "0:a:0"),
+            "Must not use hardcoded 0:a:0"
+        );
+    }
+
+    /// Strategy A must handle files where audio is at index 2 (id3 stream at index 1).
+    #[test]
+    fn strategy_a_maps_correct_audio_when_id3_is_first_audio() {
+        // File layout: stream 0=video, stream 1=id3(metadata), stream 2=aac(audio)
+        // ffprobe should return video_stream_idx=0, audio_stream_idx=2
+        let args = build_strategy_a_args("input.ts", 0, 2);
+        let mut map_values = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if arg == "-map" {
+                map_values.push(args[i + 1].as_str());
+            }
+        }
+        assert!(map_values.contains(&"0:0"), "Should map video at 0:0");
+        assert!(map_values.contains(&"0:2"), "Should map audio at 0:2 (not 0:1 where id3 is)");
+    }
+
+    /// Strategy A must output MPEG-TS format (not MP4).
+    #[test]
+    fn strategy_a_outputs_mpegts_not_mp4() {
+        let args = build_strategy_a_args("input.ts", 0, 1);
+        let has_mpegts = args.iter().any(|a| a == "mpegts");
+        let has_mp4 = args.iter().any(|a| a == "mp4");
+        assert!(has_mpegts, "Must output mpegts format");
+        assert!(!has_mp4, "Must NOT output mp4 format");
+    }
+
+    /// Strategy A must include -avoid_negative_ts make_zero to prevent EINVAL.
+    #[test]
+    fn strategy_a_includes_avoid_negative_ts() {
+        let args = build_strategy_a_args("input.ts", 0, 1);
+        let has_avoid = args.iter().any(|a| a == "-avoid_negative_ts");
+        assert!(has_avoid, "Must include -avoid_negative_ts to prevent EINVAL muxer error");
+        let has_make_zero = args.iter().any(|a| a == "make_zero");
+        assert!(has_make_zero, "Must use make_zero mode");
+    }
+
+    /// Strategy A must include -fflags +genpts+discardcorrupt.
+    #[test]
+    fn strategy_a_includes_genpts_discardcorrupt() {
+        let args = build_strategy_a_args("input.ts", 0, 1);
+        let has_fflags = args.iter().any(|a| a == "-fflags");
+        assert!(has_fflags, "Must include -fflags");
+        let fflags_val = args.iter()
+            .skip_while(|a| a.as_str() != "-fflags")
+            .nth(1);
+        if let Some(val) = fflags_val {
+            assert!(val.contains("genpts"), "Must include +genpts");
+            assert!(val.contains("discardcorrupt"), "Must include +discardcorrupt");
+        } else {
+            panic!("-fflags value not found");
+        }
+    }
+
+    /// Background remux MUST output MPEG-TS (not MP4) to match serving Content-Type.
+    /// This was the root cause of second-play failures: MP4 file served as video/mp2t.
+    #[test]
+    fn background_remux_outputs_mpegts_not_mp4() {
+        let args = build_background_remux_args("input.ts", 0, 1);
+        let has_mpegts = args.iter().any(|a| a == "mpegts");
+        let has_mp4 = args.iter().any(|a| a == "mp4");
+        let has_faststart = args.iter().any(|a| a == "+faststart");
+        assert!(has_mpegts, "Background remux MUST output mpegts to match serving Content-Type");
+        assert!(!has_mp4, "Background remux must NOT output mp4 — causes format mismatch on second play");
+        assert!(!has_faststart, "Background remux must NOT use +faststart (that's MP4-only)");
+    }
+
+    /// Background remux must use ffprobe stream indices.
+    #[test]
+    fn background_remux_uses_ffprobe_indices() {
+        let args = build_background_remux_args("input.ts", 0, 2);
+        let mut map_values = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if arg == "-map" {
+                map_values.push(args[i + 1].as_str());
+            }
+        }
+        assert!(map_values.contains(&"0:2"), "Should map audio at 0:2");
+    }
+
+    /// Background remux must include asetpts filter for timestamp normalization.
+    #[test]
+    fn background_remux_includes_asetpts() {
+        let args = build_background_remux_args("input.ts", 0, 1);
+        let has_asetpts = args.iter().any(|a| a == "asetpts=N/SR/TB");
+        assert!(has_asetpts, "Background remux must include asetpts filter");
+    }
+
+    /// All strategies must NOT use -bsf:a aac_adtstoasc (that's MP4-only, not for MPEG-TS).
+    #[test]
+    fn background_remux_does_not_use_aac_adtstoasc() {
+        let args = build_background_remux_args("input.ts", 0, 1);
+        let has_bsf = args.iter().any(|a| a == "aac_adtstoasc");
+        assert!(!has_bsf, "aac_adtstoasc is MP4-only; MPEG-TS doesn't need it");
     }
 }
 
