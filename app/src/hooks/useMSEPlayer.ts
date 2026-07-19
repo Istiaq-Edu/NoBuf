@@ -7360,9 +7360,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // Prefer the REAL VBR cluster byte from mediabunny's parsed Cues; fall
             // back to the linear estimate only if the cue index is unavailable.
             const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(clampedTime) ?? -1;
-            const targetByte = realByte >= 0
+            const rawTargetByte = realByte >= 0
               ? realByte
               : Math.floor((clampedTime / state.current.duration) * _fsz);
+            // SEEK-BACKOFF: the proactive download starts forward FROM the byte we
+            // report, and the backend only treats a download as "covering" a read
+            // when download.start_byte <= read.start_byte (stream_cache.rs
+            // find_best_covering_download). But mediabunny's actual first cluster
+            // read lands SLIGHTLY BEFORE the cue's clusterPosition (it parses the
+            // EBML cluster header / element IDs that precede the cue byte — observed
+            // ~88KB earlier: cue=628973912 vs real read=628883456). Reporting the
+            // exact cue byte leaves that prefix permanently uncached: the read falls
+            // through to the cache-poll, the proactive fill never writes those bytes,
+            // and TauriStreamSource empty-retries until the 30s fallback — the seek
+            // hangs with no playback and no prebuffer (proven: trace 19, seek 1256.9s).
+            // Back off 2MB so the download always starts before mediabunny's real
+            // read. Cost is a one-time ~2MB pre-roll that's parsed through to the
+            // keyframe; playback is unaffected.
+            const SEEK_BYTE_BACKOFF = 2 * 1024 * 1024;
+            const targetByte = Math.max(0, rawTargetByte - SEEK_BYTE_BACKOFF);
             invoke('cmd_report_playback_position', {
               messageId: _fid,
               folderId: _folder,
