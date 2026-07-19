@@ -250,6 +250,40 @@ export class MediabunnyTransmuxer {
     return idx[0].time < 1.0 && time < 1.0 ? idx[0].time : null;
   }
 
+  /** Snap `time` to the nearest cue keyframe when it lies within `tolerance`
+   *  seconds of one; otherwise return `time` unchanged. Fixes the abutting-refill
+   *  waste: a refill stops by breaking at `packet.timestamp >= stopKf`, so it
+   *  appends every sample strictly BELOW the stop keyframe. SourceBuffer.buffered.end
+   *  then reports ~1ms below that keyframe (the last muxed sample's end — a
+   *  DIFFERENT float clock than the MKV cue time). The next refill uses that
+   *  bufEnd as its seek position, and nearestCueKeyframeAtOrBefore() rounds it
+   *  DOWN a full GOP (the stop keyframe is 1ms ABOVE bufEnd, so "at or before"
+   *  skips it), re-transmuxing ~10s already buffered (observed: bufEnd=1515.336
+   *  → re-seek to 1505.327, overlap=10.009s). Snapping bufEnd up to the cue
+   *  keyframe (1515.337) makes the refill abut cleanly. Tolerance 0.25s ≫ the
+   *  ~1ms clock skew yet ≪ any real GOP interval (~10s here), so it can never
+   *  mis-snap across a keyframe. No-op (returns `time`) when the cue index is
+   *  unavailable (TS / pre-parse), preserving that path unchanged. */
+  snapToCueKeyframe(time: number, tolerance: number = 0.25): number {
+    const idx = this.mkvCueIndex;
+    if (idx.length === 0 || !Number.isFinite(time)) return time;
+    // Binary search for the insertion point, then compare the neighbours on
+    // either side — the nearest cue may be just above or just below `time`.
+    let lo = 0, hi = idx.length; // first idx[i].time >= time
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (idx[mid].time < time) lo = mid + 1; else hi = mid;
+    }
+    let best = time;
+    let bestDelta = tolerance;
+    for (const i of [lo - 1, lo]) {
+      if (i < 0 || i >= idx.length) continue;
+      const delta = Math.abs(idx[i].time - time);
+      if (delta <= bestDelta) { bestDelta = delta; best = idx[i].time; }
+    }
+    return best;
+  }
+
   async init(): Promise<TransmuxerInitResult | null> {
     if (this.disposed) return null;
 

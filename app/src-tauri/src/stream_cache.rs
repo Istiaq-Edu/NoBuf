@@ -129,6 +129,53 @@ fn source_ids_match(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// Byte distance from a playhead to a [start, end] read range (0 if inside).
+fn dist_to_playhead(start: u64, end: u64, playhead: u64) -> u64 {
+    if playhead < start {
+        start - playhead
+    } else if playhead > end {
+        playhead - end
+    } else {
+        0
+    }
+}
+
+/// Decide whether a NEW download request should cancel an EXISTING same-message,
+/// same-source_id download as a zombie. Pure so it can be unit-tested.
+///
+/// `gap` is the byte gap between the two ranges (0 when they overlap/adjoin).
+/// `playhead` is the latest known playhead byte for the message, if any.
+///
+/// Rules (trace-23 fix):
+/// - Never cancel a near/overlapping read (`gap <= cancel_distance`).
+/// - Far apart + playhead known: cancel the existing read ONLY if the new
+///   request is at least as close to the playhead (`new_dist <= old_dist`).
+///   The read nearest the playhead is the live one the user is waiting on; a
+///   forward-walk left far behind by a seek is the true zombie.
+/// - Far apart + playhead unknown: fall back to the original distance-only
+///   behaviour (cancel), so nothing regresses when no position was reported.
+fn should_cancel_zombie(
+    gap: u64,
+    cancel_distance: u64,
+    new_start: u64,
+    new_end: u64,
+    old_start: u64,
+    old_end: u64,
+    playhead: Option<u64>,
+) -> bool {
+    if gap <= cancel_distance {
+        return false;
+    }
+    match playhead {
+        Some(ph) => {
+            let new_d = dist_to_playhead(new_start, new_end, ph);
+            let old_d = dist_to_playhead(old_start, old_end, ph);
+            new_d <= old_d
+        }
+        None => true,
+    }
+}
+
 /// Tracks an active SEQUENTIAL download for a message.
 /// Other overlapping range requests subscribe via the progress channel
 /// and read from cache as data becomes available.
@@ -270,6 +317,14 @@ pub struct StreamCacheManager {
     /// should be nulled (PID→0x1FFF) in the stream response so mpegts.js
     /// never sees their PES data.
     stripped_pids_cache: Arc<std::sync::Mutex<HashMap<i32, Vec<u16>>>>,
+    /// Latest playhead byte per message, reported by cmd_report_playback_position.
+    /// Used by register_download's zombie-cancel to distinguish the LIVE read
+    /// (near the playhead — a seek target or current playback) from a STALE read
+    /// (a forward-prebuffer walk left far behind after a seek). Without this,
+    /// two source_id=playback reads far apart cross-cancel each other endlessly
+    /// (trace 23: seek to 2645s → 40 EMPTY-BODY + 39 superseded cancels, 30s
+    /// getKeyPacket freeze). Only the read closer to the playhead survives.
+    playhead_bytes: Arc<std::sync::Mutex<HashMap<i32, u64>>>,
 }
 
 /// Cached HLS layout info for a message, including the Media object
@@ -306,6 +361,7 @@ impl StreamCacheManager {
             hls_layout_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             init_prefix_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stripped_pids_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            playhead_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -697,20 +753,37 @@ impl StreamCacheManager {
                 // issues overlapping/nearby range requests during normal playback — each
                 // new request cancels the previous one before it can make progress.
                 const CANCEL_DISTANCE_BYTES: u64 = 8 * 1024 * 1024; // 8 MB
+                // PLAYHEAD-AWARE cancel (trace-23 fix): the old rule cancelled ANY
+                // same-source_id download >8MB from the new request. That is wrong
+                // when TWO legitimate reads coexist far apart — e.g. a seek target
+                // near the playhead AND a forward-prebuffer walk left behind by the
+                // seek. Both are source_id=playback, both >8MB apart, so they
+                // cross-cancelled each other endlessly (40 EMPTY-BODY + 39 superseded
+                // cancels, 30s getKeyPacket freeze). Fix: when the playhead byte is
+                // known, only cancel the existing download if the NEW request is
+                // strictly CLOSER to the playhead than the existing one — i.e. the
+                // new read supersedes it. The read nearest the playhead is the one
+                // the user is actually waiting on; a walk far behind it is the zombie.
+                // When the playhead is unknown (None), fall back to the original
+                // distance-only behaviour so nothing regresses.
+                let playhead = self.playhead_bytes.lock().unwrap().get(&message_id).copied();
                 if let Some(dls) = downloads.get_mut(&message_id) {
                     for dl in dls.iter() {
                         if dl.start_byte != start_byte && source_ids_match(&dl.source_id, &source_id) {
-                            let distance = if start_byte > dl.end_byte {
+                            let gap = if start_byte > dl.end_byte {
                                 start_byte.saturating_sub(dl.end_byte)
                             } else if end_byte < dl.start_byte {
                                 dl.start_byte.saturating_sub(end_byte)
                             } else {
                                 0 // overlap or adjacent — don't cancel
                             };
-                            if distance > CANCEL_DISTANCE_BYTES {
-                                log::debug!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?}, distance={}MB)",
-                                    message_id, dl.start_byte, dl.end_byte, start_byte, source_id, distance / (1024*1024));
+                            if should_cancel_zombie(gap, CANCEL_DISTANCE_BYTES, start_byte, end_byte, dl.start_byte, dl.end_byte, playhead) {
+                                log::debug!("[COORDINATOR] Cancelling zombie download for msg {} range {}-{} (new request at {} from {:?}, gap={}MB, playhead={:?})",
+                                    message_id, dl.start_byte, dl.end_byte, start_byte, source_id, gap / (1024*1024), playhead);
                                 dl.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            } else if gap > CANCEL_DISTANCE_BYTES {
+                                log::debug!("[COORDINATOR] Keeping live download for msg {} range {}-{} (closer to playhead than new request at {}, playhead={:?})",
+                                    message_id, dl.start_byte, dl.end_byte, start_byte, playhead);
                             }
                         }
                     }
@@ -745,6 +818,14 @@ impl StreamCacheManager {
             is_continuation,
             cancel_flag,
         })
+    }
+
+    /// Record the latest playhead byte for a message. Called by
+    /// cmd_report_playback_position (seek + periodic reporter). Read by
+    /// register_download's playhead-aware zombie-cancel to keep the read
+    /// nearest the playhead and cancel only the stale one (trace-23 fix).
+    pub fn set_playhead_byte(&self, message_id: i32, byte: u64) {
+        self.playhead_bytes.lock().unwrap().insert(message_id, byte);
     }
 
     /// Update download progress (last byte written to cache). Called by
@@ -1379,5 +1460,63 @@ mod tests {
         assert!(is_range_cached(&meta.cached_ranges, gap_start, gap_start + gap_size - 1));
         assert_eq!(meta.cached_ranges.len(), 1);
         assert_eq!(meta.cached_ranges[0], (0, gap_start + gap_size - 1));
+    }
+
+    // ── should_cancel_zombie (trace-23 playhead-aware cancel) ────────────────
+    const MB: u64 = 1024 * 1024;
+    const CANCEL_DIST: u64 = 8 * MB;
+
+    #[test]
+    fn test_zombie_near_never_cancels() {
+        // Gap within 8MB → never cancel, regardless of playhead.
+        assert!(!should_cancel_zombie(4 * MB, CANCEL_DIST, 100, 200, 300, 400, None));
+        assert!(!should_cancel_zombie(0, CANCEL_DIST, 100, 200, 150, 250, Some(1000)));
+    }
+
+    #[test]
+    fn test_zombie_far_no_playhead_falls_back_to_cancel() {
+        // Far apart + no playhead → original distance-only behaviour (cancel).
+        assert!(should_cancel_zombie(500 * MB, CANCEL_DIST, 1000 * MB, 1008 * MB, 50 * MB, 58 * MB, None));
+    }
+
+    /// THE trace-23 case. Seek target near playhead must NOT be cancelled by a
+    /// stale forward-walk far behind it; the stale walk MUST be cancelled by the
+    /// seek target. Playhead = 1390MB, seek read at 1392MB, walk at ~54MB.
+    #[test]
+    fn test_zombie_seek_target_survives_stale_walk() {
+        let ph = Some(1390 * MB);
+        // NEW = seek read (1392MB), EXISTING = stale walk (54MB): new is closer → cancel walk.
+        assert!(should_cancel_zombie(
+            1338 * MB, CANCEL_DIST,
+            1392 * MB, 1400 * MB,   // new: seek target
+            54 * MB, 62 * MB,       // old: stale walk
+            ph,
+        ));
+        // NEW = walk re-issue (54MB), EXISTING = seek read (1392MB): new is FARTHER → keep seek.
+        assert!(!should_cancel_zombie(
+            1338 * MB, CANCEL_DIST,
+            54 * MB, 62 * MB,       // new: walk re-issue
+            1392 * MB, 1400 * MB,   // old: live seek target
+            ph,
+        ));
+    }
+
+    #[test]
+    fn test_zombie_equal_distance_cancels_existing() {
+        // Tie → new_d <= old_d is true → cancel (new request wins the slot).
+        let ph = Some(500 * MB);
+        assert!(should_cancel_zombie(
+            100 * MB, CANCEL_DIST,
+            600 * MB, 608 * MB,     // new: 100MB above playhead
+            392 * MB, 400 * MB,     // old: 100MB below playhead
+            ph,
+        ));
+    }
+
+    #[test]
+    fn test_dist_to_playhead() {
+        assert_eq!(dist_to_playhead(100, 200, 50), 50);  // below
+        assert_eq!(dist_to_playhead(100, 200, 250), 50); // above
+        assert_eq!(dist_to_playhead(100, 200, 150), 0);  // inside
     }
 }

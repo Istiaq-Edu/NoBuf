@@ -89,6 +89,83 @@ export function shouldSkipRemuxPositionReport(
 }
 
 /**
+ * Decide how to dispatch an unbuffered transmuxer seek: run it now ('execute')
+ * or hold it for the debounce timer ('defer').
+ *
+ * ROOT CAUSE THIS FIXES (trace 21, cross-validated): the old logic fired a seek
+ * immediately whenever the debounce window had elapsed since the last seek —
+ * EVEN when a previous transmuxer seek was still in flight. During a rapid burst
+ * of spaced-out seeks (each >debounce apart) that spawned TWO concurrent seeks
+ * sharing source_id=playback on the persistent MKV Input; one got orphaned, its
+ * backend read returned empty 206s, and the frontend empty-retried ~32s → "video
+ * doesn't play / prebuffer never starts". The single decisive change: while a
+ * seek is in flight, ALWAYS defer — never start a second concurrent seek. The
+ * deferred timer re-checks this flag and re-arms until the in-flight seek clears,
+ * then fires the LATEST target (last-target-wins coalescing preserved).
+ *
+ * Pure + exported for testing. Callers still handle the buffered-range instant
+ * seek BEFORE reaching here (that path is untouched).
+ */
+export function decideSeekDispatch(
+  now: number,
+  lastSeekTime: number,
+  debounceMs: number,
+  seekInProgress: boolean,
+  firstSeekEver: boolean,
+): 'execute' | 'defer' {
+  // A seek already running → never race a second one. Defer and let the timer
+  // re-arm until it clears. This is the line that fixes the trace-21 freeze.
+  if (seekInProgress) return 'defer';
+  // Idle: the very first seek (or one spaced beyond the debounce window) runs now.
+  if (firstSeekEver) return 'execute';
+  return (now - lastSeekTime) >= debounceMs ? 'execute' : 'defer';
+}
+
+/**
+ * True when a transmuxer seek's async completion is STALE and must NOT commit
+ * its result (video.currentTime, startStreamingChain, refill). A seek captures
+ * its generation at start; if a newer user seek has since bumped the live
+ * generation, the older seek — which may take 5-8s on a cold far jump — has been
+ * superseded and committing it would plant playback on a PREVIOUS position
+ * (trace-22 "backward seek goes to previous point"). Pure + exported for testing.
+ */
+export function isSeekSuperseded(capturedGen: number, liveGen: number): boolean {
+  return capturedGen !== liveGen;
+}
+
+/**
+ * Decide where to place video.currentTime after a transmuxer seek resolves.
+ *
+ * WHY: a seek snaps to the cue keyframe AT/BELOW the requested time, so the
+ * keyframe is typically 3-9s BEFORE the target (sparse VBR keyframes, ~8.5s
+ * apart). Setting currentTime to the keyframe makes playback start early — the
+ * trace-24 "backward seek to 875s starts at 872s" undershoot. The seek buffers
+ * [keyframe, target + SEEK_START_DURATION], so the requested target sits INSIDE
+ * the decoded range: setting currentTime to the target lets the decoder
+ * decode-and-discard from the keyframe up to it (standard MSE), landing exactly.
+ *
+ * Guards:
+ * - Prefer the requested `target` when it's within the buffered span
+ *   [keyframe, bufferedEnd]. The decoder needs the keyframe ≤ target (always
+ *   true here since keyframe is at/below target) and coverage up to target.
+ * - If target > bufferedEnd (window too short / short tail), clamp to
+ *   bufferedEnd so we never seek into an unbuffered hole (would re-stall).
+ * - If target < keyframe (shouldn't happen — keyframe is at/below target), fall
+ *   back to the keyframe.
+ *
+ * Pure + exported for testing.
+ */
+export function computeSeekLandingTime(
+  target: number,
+  keyframe: number,
+  bufferedEnd: number,
+): number {
+  if (target < keyframe) return keyframe;        // defensive: never before the keyframe
+  if (target > bufferedEnd) return bufferedEnd;  // never into an unbuffered hole
+  return target;                                  // land exactly on the requested time
+}
+
+/**
  * Pin a freshly-created mpegts.js MP4Remuxer to an ABSOLUTE timeline (_dtsBase=0).
  *
  * WHY: /remux?ss=T emits MPEG-TS whose first sample PTS/DTS is ABSOLUTE (≈T·90000),
@@ -1041,6 +1118,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // subsequent seeks during a long-running getKeyPacket pass the debounce check
   // and start concurrently — wasting bandwidth and coordinator slots.
   const transmuxerSeekInProgressRef = useRef(false); // DEPRECATED: Only used by mux.js fallback seeking. The fMP4 pipeline uses keyframe index.
+  // Monotonic generation for MKV transmuxer USER seeks. Bumped at the start of
+  // every executeTransmuxerSeek; the async completion handler captures its value
+  // and bails if a newer seek has since been requested — so a slow (5-8s cold)
+  // stale seek can't hijack video.currentTime / startStreamingChain / the refill
+  // and plant playback on a PREVIOUS seek's position (trace-22 "backward seek
+  // goes to previous point"). Distinct from the transmuxer's internal
+  // seekGeneration (which guards packet callbacks, not this frontend commit).
+  const transmuxerSeekGenRef = useRef(0);
   // Downloaded byte ranges — merged and converted to time for green buffer bar
   const downloadedRangesRef = useRef<[number, number][]>([]);
   // Transmuxer for TS/MKV format playback (null when not active)
@@ -1955,7 +2040,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // merges the new data with existing buffer. getKeyPacket for cached data
       // is fast (~1-2ms), making the setTimestampOffset overhead negligible.
       const ahead = getBufferedAheadSeconds();
-      const refillPosition = video.currentTime + ahead;
+      const rawRefillPosition = video.currentTime + ahead;
+
+      // Snap the refill start to the cue keyframe the PREVIOUS refill stopped on.
+      // A refill stops by breaking at `packet.timestamp >= stopKf`, so it appends
+      // every sample strictly BELOW the stop keyframe; SourceBuffer.buffered.end
+      // then reports ~1ms below that keyframe (last muxed sample end — a different
+      // float clock than the MKV cue time). Left unsnapped, seekTo →
+      // nearestCueKeyframeAtOrBefore(bufEnd) rounds DOWN a full GOP (the stop
+      // keyframe sits 1ms above bufEnd) and re-transmuxes ~10s already buffered
+      // (observed: bufEnd=1515.336 → re-seek 1505.327, overlap=10.009s). Snapping
+      // up to the cue keyframe within a 0.25s tolerance (≫ 1ms skew, ≪ GOP) makes
+      // the next refill abut cleanly. No-op for TS/indexless (returns input).
+      const refillPosition = transmuxer.snapToCueKeyframe(rawRefillPosition);
 
       // maxDuration is the FALLBACK cutoff used only when no cue index exists
       // (TS / pre-parse). For MKV we stop on a keyframe boundary instead (below).
@@ -7343,6 +7440,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         isCompleteRef.current = false;
         lastSeekTimeRef.current = Date.now();
         transmuxerSeekInProgressRef.current = true; // Prevent concurrent seeks
+        // Bump + capture the seek generation. The async completion below checks
+        // this via isSeekSuperseded() and bails if a newer seek arrived while
+        // this one was resolving (5-8s on a cold far jump) — preventing a stale
+        // seek from committing currentTime/chain/refill on a PREVIOUS position.
+        const seekGen = ++transmuxerSeekGenRef.current;
         clearDownloadedRanges();
 
         // Re-target the backend proactive download to the seek position. Without
@@ -7423,6 +7525,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
             bufferingForSeekRef.current = false;
 
+            // SUPERSESSION GUARD: a newer user seek was requested while this one
+            // was resolving (cold far seeks take 5-8s). Committing this stale
+            // result would set currentTime/startStreamingChain/refill on a
+            // PREVIOUS position — the trace-22 "backward seek jumps to previous
+            // point". Bail: drop the buffered segments, leave transmuxerSeek-
+            // InProgress true is WRONG (the drain waits on it), so clear it so
+            // the pending latest target can run. The transmuxer's own seekGen
+            // already discarded this seek's packets on the next seekTo().
+            if (isSeekSuperseded(seekGen, transmuxerSeekGenRef.current)) {
+              seekBufferRef.current = [];
+              transmuxerSeekInProgressRef.current = false;
+              console.log(`[MSE] Transmuxer seek superseded (gen ${seekGen} vs ${transmuxerSeekGenRef.current}) — discarding stale commit`);
+              return;
+            }
+
             if (keyframeTimestamp !== null) {
               const tsOffset = keyframeTimestamp;
               seekOffsetRef.current = tsOffset;
@@ -7482,8 +7599,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 }
               } catch { /* buffered may throw if SB detached mid-seek — ignore */ }
 
-              // Set video.currentTime to the actual keyframe position for accurate playback start
-              video.currentTime = keyframeTimestamp;
+              // Land playback on the REQUESTED target, not the keyframe. The seek
+              // snaps to the cue keyframe at/below the target (3-9s earlier for
+              // sparse VBR keyframes); setting currentTime to the keyframe caused
+              // the trace-24 undershoot ("seek to 875s starts at 872s"). The seek
+              // buffered [keyframe, target + SEEK_START_DURATION], so the target
+              // sits inside the decoded range — the decoder decode-and-discards
+              // from the keyframe up to it. computeSeekLandingTime clamps to the
+              // buffered end so we never seek into an unbuffered hole.
+              const bufferedEnd = (() => {
+                try {
+                  const b = sbVideo.buffered;
+                  for (let i = 0; i < b.length; i++) {
+                    if (b.start(i) <= keyframeTimestamp + 0.001 && b.end(i) >= keyframeTimestamp) return b.end(i);
+                  }
+                  return b.length > 0 ? b.end(b.length - 1) : keyframeTimestamp;
+                } catch { return keyframeTimestamp; }
+              })();
+              video.currentTime = computeSeekLandingTime(clampedTime, keyframeTimestamp, bufferedEnd);
 
               // Start streaming chain for continuous playback after limited seek
               startStreamingChain();
@@ -7533,31 +7666,63 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         }
       };
 
-      const timeSinceLastSeek = Date.now() - lastSeekTimeRef.current;
-      // Fire immediately when the debounce window has elapsed since the last
-      // seek — EVEN if a previous seek is still in flight. A deliberate, spaced
-      // seek should take effect now, not wait an extra debounce; it supersedes
-      // the running one (transmuxer.seekTo bumps seekGeneration + cancels the
-      // Conversion, so the stale seek bails and the NEW seek always wins). Only
-      // when events arrive WITHIN the debounce window (rapid drag) do we coalesce
-      // to the last target, avoiding overlapping cold getKeyPacket downloads.
-      if (timeSinceLastSeek >= debounceMs || lastSeekTimeRef.current === 0) {
+      // Dispatch decision (decideSeekDispatch, pure + tested): run now only when
+      // idle AND (first seek OR debounce window elapsed). CRITICAL fix (trace 21):
+      // while a transmuxer seek is IN FLIGHT we always defer — never start a
+      // second concurrent seek, which previously spawned two source_id=playback
+      // reads on the shared MKV Input, orphaned one, and froze playback ~32s.
+      const decision = decideSeekDispatch(
+        Date.now(),
+        lastSeekTimeRef.current,
+        debounceMs,
+        transmuxerSeekInProgressRef.current,
+        lastSeekTimeRef.current === 0,
+      );
+      if (decision === 'execute') {
         if (seekDebounceTimerRef.current !== null) {
           clearTimeout(seekDebounceTimerRef.current);
           seekDebounceTimerRef.current = null;
         }
         executeTransmuxerSeek();
       } else {
-        // Within the debounce window — coalesce. Re-arming with each event means
-        // the LAST target wins when the timer finally fires.
+        // Defer. Two defer reasons — within the debounce window (rapid drag) OR a
+        // seek is in flight. A self-rescheduling drain re-checks each fire and
+        // fires the LATEST captured target once idle AND the window has elapsed.
+        // Re-arm is bounded (belt-and-braces against a stuck in-flight flag never
+        // clearing → we'd rather force the seek than hang silently forever).
         if (seekDebounceTimerRef.current !== null) {
           clearTimeout(seekDebounceTimerRef.current);
         }
-        const remainingDebounce = debounceMs - timeSinceLastSeek;
-        seekDebounceTimerRef.current = window.setTimeout(() => {
-          seekDebounceTimerRef.current = null;
-          executeTransmuxerSeek();
-        }, remainingDebounce);
+        const SEEK_INFLIGHT_POLL_MS = 120;
+        const MAX_REARM_ATTEMPTS = 250; // ~30s hard cap on waiting for in-flight
+        let rearmAttempts = 0;
+        const scheduleDrain = () => {
+          const sinceLast = Date.now() - lastSeekTimeRef.current;
+          const busy = transmuxerSeekInProgressRef.current;
+          const delay = busy ? SEEK_INFLIGHT_POLL_MS : Math.max(0, debounceMs - sinceLast);
+          seekDebounceTimerRef.current = window.setTimeout(() => {
+            seekDebounceTimerRef.current = null;
+            const d = decideSeekDispatch(
+              Date.now(),
+              lastSeekTimeRef.current,
+              debounceMs,
+              transmuxerSeekInProgressRef.current,
+              lastSeekTimeRef.current === 0,
+            );
+            if (d === 'execute') {
+              executeTransmuxerSeek();
+            } else if (++rearmAttempts <= MAX_REARM_ATTEMPTS) {
+              scheduleDrain();
+            } else {
+              // In-flight flag stuck past the cap — force the seek rather than
+              // leave the user's final target stranded (seekTo bumps generation,
+              // so the stale in-flight seek bails and this one wins).
+              console.warn(`[MSE] Seek drain re-arm cap hit (${MAX_REARM_ATTEMPTS}) — forcing seek`);
+              executeTransmuxerSeek();
+            }
+          }, delay);
+        };
+        scheduleDrain();
       }
       return;
     }
