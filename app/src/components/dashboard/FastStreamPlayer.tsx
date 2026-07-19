@@ -260,6 +260,7 @@ interface FastStreamPlayerProps {
     setVideoRef: msePlayer.setVideoRef,
     downloadedTimeRanges: msePlayer.downloadedTimeRanges,
     byteToTime: msePlayer.byteToTime,
+    recordByteTimeAnchor: msePlayer.recordByteTimeAnchor,
     setSuppressBackendReports: msePlayer.setSuppressBackendReports,
     thumbnailDataReady: msePlayer.thumbnailDataReady,
     moovBufferReady: msePlayer.moovBufferReady,
@@ -302,6 +303,7 @@ interface FastStreamPlayerProps {
     setVideoRef,
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
+    recordByteTimeAnchor,
     setSuppressBackendReports,
     thumbnailDataReady,
     moovBufferReady,
@@ -360,8 +362,8 @@ interface FastStreamPlayerProps {
   // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
   // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config,
-  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, getKnownDuration: msePlayer.getKnownDuration, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.getKnownDuration, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config]);
 
   const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -542,11 +544,64 @@ interface FastStreamPlayerProps {
           const durForBar = durRef.current || (window as any).__nobuf_estimateDuration || 0;
           const ranges: [number, number][] = [];
 
-          // Backend ranges (disk cache) — only show ranges ahead of playhead
+          // Backend ranges (disk cache) → green prebuffer bar. Two corrections,
+          // both proven from remux-seek logs (5-c/5-t.md):
+          //
+          // (A) EFFECTIVE PLAYHEAD. A remux seek RECREATES the mpegts player, so
+          //     video.currentTime resets to 0 while the seek gap downloads — the
+          //     logs showed playhead=0.0s on every poll after a seek, so a raw
+          //     currentTime filter drops nothing and stale chunks (cold-start
+          //     0-46s, previous seek's region) linger. Use the seek target
+          //     (__nobuf_seekTargetTime) as the playhead until currentTime catches
+          //     up past it.
+          //
+          // (B) VBR ANCHOR CAPTURE. byteToTime is LINEAR for HEVC/remux (the
+          //     keyframe-index poll is gated off for MKV — useMSEPlayer:7704), and
+          //     linear is badly wrong for VBR: seeking to 1802.7s, ffmpeg actually
+          //     read byte 813MB, but linear mapped 813MB→1979s (+177s). After a
+          //     seek to T, the cached range whose START byte is nearest the linear
+          //     estimate of T IS the region ffmpeg read for T — a ground-truth
+          //     (byte,time) anchor. Feed it to recordByteTimeAnchor (monotonicity-
+          //     guarded) so byteToTime self-calibrates off the linear fallback.
           if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
-            for (const [s, e] of status.cached_ranges as [number, number][]) {
+            const cachedRanges = status.cached_ranges as [number, number][];
+            const seekTarget = (window as any).__nobuf_seekTargetTime;
+            const rawPlayhead = vidRef.current?.currentTime ?? 0;
+            // (B) Capture a VBR anchor for the active seek before converting.
+            if (typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
+              const linearByte = (seekTarget / durForBar) * status.total_bytes;
+              // Nearest cached-range START to the linear estimate = ffmpeg's real
+              // cluster read for this seek. Ignore the front (0) and tail ranges.
+              let best: number | null = null;
+              let bestDist = Infinity;
+              for (const [s] of cachedRanges) {
+                if (s < 4 * 1024 * 1024) continue; // skip cold-start front reads
+                const d = Math.abs(s - linearByte);
+                if (d < bestDist) { bestDist = d; best = s; }
+              }
+              // Only trust it when the range start is within 128MB of the estimate
+              // (VBR skew is large but bounded — see backend max_window 256MB).
+              if (best !== null && bestDist < 128 * 1024 * 1024) {
+                recordByteTimeAnchor(best, seekTarget);
+              }
+            }
+            // Show EVERY cached range. This bar is sourced from the backend disk
+            // cache (status.cached_ranges) — every range in it is ON DISK and
+            // INSTANTLY SEEKABLE, so all of it is genuinely available and must
+            // stay lit. A prior recency filter (drop anything >60s behind the
+            // effective playhead) made regions VANISH on every forward seek even
+            // though they were never evicted (proven: trace 18-t — 0-46s, 52-82s,
+            // 679-756s all persist in cached_ranges after a seek to 1262s). That
+            // filter conflated an in-memory playback window with disk-cache
+            // availability; the two are different. Removed — the bar now mirrors
+            // exactly what the disk cache holds.
+            for (const [s, e] of cachedRanges) {
               ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
+            // DIAGNOSTIC (remove once green-bar persistence is confirmed): dumps
+            // the byte→time conversion the bar renders. rawPlayhead/seekTarget are
+            // kept only for context now — no range is filtered by recency.
+            console.log(`[GREEN-BAR] raw=${rawPlayhead.toFixed(1)}s seekTgt=${typeof seekTarget==='number'?seekTarget.toFixed(1):'-'} dur=${durForBar.toFixed(1)}s | cached bytes→time: ${cachedRanges.map(([s,e]) => `${(s/1e6).toFixed(0)}-${(e/1e6).toFixed(0)}MB→${byteToTime(s).toFixed(0)}-${byteToTime(e+1).toFixed(0)}s`).join(', ')} | shown: ${ranges.map(([a,b])=>`${a.toFixed(0)}-${b.toFixed(0)}s`).join(', ') || 'none'}`);
           }
 
           // Shadow cache ranges are NOT shown on the green bar.
