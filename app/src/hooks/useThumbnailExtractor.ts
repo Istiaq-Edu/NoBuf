@@ -593,9 +593,16 @@ class TransmuxerThumbnailPipeline {
     format: string,
     canvas: HTMLCanvasElement,
     keyframeTimestamps?: number[],
+    knownDuration?: number,
   ) {
     this.canvas = canvas;
     this.format = format;
+    // Probed/metadata duration from the player. When available, init() uses it
+    // instead of mediabunny's computeDuration(), which for a headerless MKV
+    // (no Segment duration element) scans every packet to EOF — an 8MB
+    // sequential front-march over /stream that pollutes the disk cache and
+    // starves the seek prebuffer on the single rate-limited Telegram pipe.
+    this.duration = knownDuration && knownDuration > 0 ? knownDuration : 0;
     // The pipeline's Input reads small amounts at the beginning of the file
     // (canRead, getPrimaryVideoTrack, etc.) — these subscribe to the
     // sequential download, not targeted downloads. With prefetchProfile:
@@ -663,8 +670,12 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
-      // Get duration
-      this.duration = await this.input.computeDuration();
+      // Get duration. Skip computeDuration() when the player already probed it
+      // — for headerless MKV that call scans to EOF (8MB front-march) and hangs
+      // init before "Ready", starving the seek prebuffer.
+      if (this.duration <= 0) {
+        this.duration = await this.input.computeDuration();
+      }
 
       // Get video track
       this.videoTrack = await this.input.getPrimaryVideoTrack();
@@ -689,10 +700,16 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
-      // Check if the codec is supported by VideoDecoder
+      // Check if the codec is supported by VideoDecoder. Expected to fail for
+      // 10-bit HEVC (e.g. hev1.2.4.H120.90) on Chromium/WebView2 — WebCodecs has
+      // no software fallback for it. This is NOT an error: scrub-preview
+      // thumbnails are simply disabled for this file (the hover handler in
+      // FastStreamPlayer degrades to a time-only tooltip). Playback is unaffected —
+      // HEVC plays via the /remux → mpegts.js path. Log at info level so it does
+      // not surface as a broken-pipeline warning.
       const support = await VideoDecoder.isConfigSupported(this.decoderConfig);
       if (!support.supported) {
-        console.warn('[TransmuxerThumbnailPipeline] Codec not supported by VideoDecoder:', this.decoderConfig.codec);
+        console.info('[TransmuxerThumbnailPipeline] Codec not supported by VideoDecoder (expected for 10-bit HEVC); scrub thumbnails disabled for this file:', this.decoderConfig.codec);
         return false;
       }
 
@@ -1655,6 +1672,7 @@ export function useThumbnailExtractor(
       format,
       canvasRef.current!,
       getters.getKeyframeTimestamps(), // Cached keyframe index for fast seek
+      getters.getKnownDuration?.() ?? 0, // Probed duration — skips EOF-scanning computeDuration() for headerless MKV
     );
 
     transmuxerPipelineRef.current = pipeline;
@@ -1665,7 +1683,11 @@ export function useThumbnailExtractor(
         console.log('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialized successfully');
         setReady(true); readyRef.current = true;
       } else {
-        console.warn('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialization failed');
+        // Not necessarily an error: for 10-bit HEVC (WebCodecs-unsupported) init
+        // returns false by design. Scrub-preview thumbnails are disabled for this
+        // file; the hover handler degrades to a time-only tooltip and playback is
+        // unaffected. Log at info level so it does not look like a broken pipeline.
+        console.info('[ThumbnailExtractor] Transmuxer thumbnail pipeline unavailable (scrub thumbnails disabled for this file; playback unaffected)');
         pipeline.destroy();
         transmuxerPipelineRef.current = null;
       }

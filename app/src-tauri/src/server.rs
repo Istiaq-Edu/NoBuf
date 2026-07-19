@@ -288,9 +288,21 @@ impl Drop for DownloadGuard {
             let msg_id = self.message_id;
             let start = self.start_byte;
             let end = self.end_byte;
-            tokio::spawn(async move {
-                cm_clone.unregister_download(msg_id, start, end).await;
-            });
+            // At app shutdown this Drop can run on the actix arbiter thread AFTER
+            // the Tokio runtime is gone → tokio::spawn panics ("there is no reactor
+            // running"). Only spawn when a runtime is actually present; on shutdown
+            // the in-memory active_downloads map is torn down anyway, so skipping
+            // the unregister is harmless.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        cm_clone.unregister_download(msg_id, start, end).await;
+                    });
+                }
+                Err(_) => {
+                    log::debug!("[DownloadGuard] no Tokio runtime (shutdown) — skipping unregister for msg {}", msg_id);
+                }
+            }
         }
     }
 }
@@ -334,6 +346,16 @@ pub(crate) struct StreamQuery {
     /// uses `-ss` to start remuxing from this position instead of the
     /// beginning, enabling byte-range-like seeking through the remux pipe.
     pub(crate) ss: Option<f64>,
+    /// Frontend capability hint for the /remux endpoint: does THIS WebView
+    /// runtime's MSE/native pipeline accept 8-bit HEVC (hvc1)? Derived from
+    /// `video.canPlayType('video/mp4;codecs=hvc1...')` on the client (which
+    /// reflects whether the Windows "HEVC Video Extensions" is installed).
+    /// - Some(true)  → 8-bit HEVC can be `-c:v copy`'d (player decodes it).
+    /// - Some(false) / None → 8-bit HEVC must be transcoded to H.264.
+    /// NOTE: 10-bit HEVC (Main 10) is ALWAYS transcoded regardless of this
+    /// hint — the mpegts.js MSE path rejects hvc1.2 (Main10) even when the
+    /// extension is present. This flag only governs the 8-bit HEVC case.
+    pub(crate) hevc_ok: Option<bool>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -349,6 +371,18 @@ const TELEGRAM_CHUNK_SIZE: i32 = 512 * 1024;
 /// 250ms gave 4 req/s — still triggered FLOOD_PREMIUM_WAIT (25 occurrences
 /// in 4 min). 300ms gives more headroom at the cost of ~10% throughput.
 const MIN_API_CALL_INTERVAL_MS: u64 = 300;
+
+/// Audio filter that constrains the AAC encoder to standard channel
+/// configurations. A source layout AAC can't express as a standard config
+/// (notably "5.1(side)", common in AMZN WEB-DL) forces the encoder to emit a
+/// PCE (Program Config Element). Chromium's MSE fMP4 parser rejects PCE-based
+/// AAC with CHUNK_DEMUXER_ERROR_APPEND_FAILED, which tears down the /remux
+/// output pipe and kills ffmpeg with exit -22 on the trailer write.
+/// `aformat` remaps non-standard layouts to the matching standard one WITHOUT
+/// downmixing (5.1(side) → 5.1, still 6ch) and is a no-op for layouts already
+/// in the list. Verified via ffprobe: emits no PCE, preserves channel count.
+/// Chained BEFORE asetpts (ffmpeg allows only one -af per stream).
+const AAC_LAYOUT_FILTER: &str = "aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1|7.1";
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -628,6 +662,15 @@ async fn stream_media(
     };
 
     let content_length = end_byte - start_byte + 1;
+
+    // SEEK DIAGNOSTIC (temporary): log every incoming /stream Range so we can see
+    // exactly which bytes the remux ffmpeg input requests after a seek. If a seek
+    // to T only ever produces front-of-file ranges (and never the target cluster
+    // byte), that confirms ffmpeg is linear-reading instead of Cue-jumping. Remove
+    // with the [REMUX-SEEK-DIAG] block once the front-read root cause is confirmed.
+    log::info!("[STREAM-REQ] msg {} incoming range {}-{} ({:.1}MB start, len {}B, partial={}, source_id={})",
+        message_id, start_byte, end_byte, start_byte as f64 / 1_048_576.0, content_length, is_partial,
+        query.source_id.as_deref().unwrap_or("-"));
 
     // FAST PATH: if the requested range is fully cached, serve from disk immediately
     // Acquire lock_meta before load_meta to prevent concurrent save_meta from
@@ -1478,6 +1521,12 @@ struct Fmp4MetadataResponse {
     total_size: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     has_timed_id3: bool,
+    /// True when duration_s is a bitrate/PTS ESTIMATE, not the exact /remux ffprobe
+    /// value. The frontend uses this to retry the fetch until the probe lands (the
+    /// probe finishes ~2s after the first metadata fetch), avoiding a permanently
+    /// wrong seek-bar length for HEVC MKV. Omitted (false) once probed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    duration_is_estimate: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1880,7 +1929,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, hevc_ok: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2007,6 +2056,154 @@ fn strip_m2ts_prefix(data: &[u8], is_m2ts: bool) -> Vec<u8> {
     out
 }
 
+/// One-shot cached probe: does this machine's ffmpeg support the h264_qsv
+/// encoder AND can it actually open an encode session? (Presence in
+/// `-encoders` is not enough — driver/session init can still fail with
+/// texture error 80070057.) Spawns a tiny 1-frame encode of a lavfi source
+/// and checks exit 0. Computed once; reused for every /remux decision because
+/// the piped path streams bytes immediately and cannot fall back mid-stream.
+fn qsv_h264_available() -> bool {
+    static QSV_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *QSV_OK.get_or_init(|| {
+        let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let output = std::process::Command::new(&ffmpeg_path)
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:d=1",
+                "-frames:v", "1",
+                "-c:v", "h264_qsv",
+                "-f", "null", "-",
+            ])
+            .output();
+        let ok = matches!(output, Ok(o) if o.status.success());
+        log::info!("[REMUX-CAP] h264_qsv available: {}", ok);
+        ok
+    })
+}
+
+/// Build the `-c:v` argument set for the remux/transcode command.
+///
+/// Capability-based gating (Option B): only transcode video that the player
+/// genuinely cannot decode; everything else stays `-c:v copy` (zero CPU,
+/// no quality loss).
+/// - `needs_transcode == false` → `["-c:v","copy"]` (h264 8-bit, or 8-bit HEVC
+///   on a machine whose HEVC extension is present).
+/// - `needs_transcode == true`  → h264_qsv (if available) else libx264 veryfast.
+///
+/// QSV uses the verified `vpp_qsv=format=nv12` / `format=nv12` scalers (NOT
+/// `hwupload`, which errors 80070057 on this GPU). Returns (pre_input_args,
+/// output_args) so the caller places hwaccel/decoder flags BEFORE `-i` and
+/// encoder flags AFTER the stream maps.
+///
+/// Every emitted combination is one that was execution-verified on the real
+/// Panchayat file over HTTP (Probe 3):
+///  - HEVC + QSV  → variant A, full-HW: `-hwaccel qsv -hwaccel_output_format qsv
+///    -c:v hevc_qsv` (pre-input) + `-vf vpp_qsv=format=nv12 -c:v h264_qsv`
+///    (8.29x realtime, ~2.1s cold-start, decode-clean).
+///  - other codec + QSV → variant B, sw-decode→GPU-encode: `-vf format=nv12
+///    -c:v h264_qsv` (5.86x, decode-clean). Used when the input decoder isn't
+///    a QSV-accelerated one we verified (only hevc_qsv decode was verified).
+///  - QSV unavailable → libx264 veryfast (5.87x, decode-clean).
+/// Pre-input `-ss` seek args for the /remux pipe. Returns empty when no seek is
+/// requested (ss <= 0 or non-finite). `-ss` BEFORE `-i` = fast input seeking;
+/// ffmpeg decodes from the nearest keyframe at/behind the target. Frame-accurate
+/// enough for a scrub. NaN/negative are treated as "no seek" (defensive: the
+/// value comes from a query string).
+fn build_ss_seek_args(ss_secs: f64) -> Vec<String> {
+    if ss_secs.is_finite() && ss_secs > 0.0 {
+        vec!["-ss".to_string(), format!("{:.3}", ss_secs)]
+    } else {
+        vec![]
+    }
+}
+
+/// Post-input timestamp args that MUST accompany a `-ss` seek so the output PTS
+/// stay ABSOLUTE (e.g. seek to 580s → output PTS ≈581s), which the frontend's
+/// _dtsBase=0 mapping relies on to place video.currentTime correctly. Empty when
+/// not seeking (a from-zero remux needs neither).
+fn build_ss_timestamp_args(ss_secs: f64) -> Vec<String> {
+    if ss_secs.is_finite() && ss_secs > 0.0 {
+        vec!["-copyts".to_string(), "-start_at_zero".to_string()]
+    } else {
+        vec![]
+    }
+}
+
+/// Audio `-af` chain for the piped remux. The tail filter DEPENDS on whether we
+/// seek, because it must stay consistent with the video timeline:
+///
+/// - Non-seek: `asetpts=N/SR/TB` rebuilds audio PTS from sample count (starts at
+///   0). Video also starts at 0 → aligned. Guards against overlapping-PTS AAC
+///   frames that crash the mpegts muxer. AAC_LAYOUT_FILTER leads (strips the PCE).
+/// - Seek (with `-copyts -start_at_zero`): `asetpts=N/SR/TB` is FATAL — it resets
+///   audio to ~0 while video stays absolute (seek 721s → video 721s, audio 0s).
+///   The ~700s A/V desync stops mpegts.js from ever completing MediaInfo, so the
+///   seek never plays. `aresample=async=1` keeps audio absolute AND monotonic
+///   (proven: seek 30s → audio 31.38s vs video 31.4s, 0 backwards PTS).
+///
+/// FILTER ORDER MATTERS on the seek path: `aresample` MUST come BEFORE the
+/// AAC_LAYOUT_FILTER, not after. Real files carry layouts like `5.1(side)` that
+/// are NOT in the allow-list; with `aformat` first, `aresample` re-emits a layout
+/// `format_out` then rejects → "Cannot select channel layout / Error reinitializing
+/// filters" → audio filtergraph dies with -22 → muxer gets no packets → empty
+/// output → frontend refetches → ffmpeg spawn storm (proven from 13-t.md, eac3
+/// 5.1(side)). Putting `aresample` first normalizes `(side)`/`(back)` variants to
+/// a canonical layout the allow-list accepts, and passes stereo/5.1 through
+/// unchanged (no upmix — verified by execution, so a bare `ochl=5.1` was rejected).
+fn build_remux_audio_filter(is_seek: bool) -> String {
+    if is_seek {
+        format!("aresample=async=1,{}", AAC_LAYOUT_FILTER)
+    } else {
+        format!("{},asetpts=N/SR/TB", AAC_LAYOUT_FILTER)
+    }
+}
+
+fn build_video_encoder_args(needs_transcode: bool, qsv_ok: bool, video_codec: &str) -> (Vec<String>, Vec<String>) {
+    if !needs_transcode {
+        return (vec![], vec!["-c:v".into(), "copy".into()]);
+    }
+    if qsv_ok && (video_codec == "hevc" || video_codec == "h265") {
+        // Variant A (VERIFIED): full-HW HEVC decode → VPP nv12 → h264_qsv encode.
+        (
+            vec![
+                "-hwaccel".into(), "qsv".into(),
+                "-hwaccel_output_format".into(), "qsv".into(),
+                "-c:v".into(), "hevc_qsv".into(),
+            ],
+            vec![
+                "-vf".into(), "vpp_qsv=format=nv12".into(),
+                "-c:v".into(), "h264_qsv".into(),
+                "-global_quality".into(), "23".into(),
+            ],
+        )
+    } else if qsv_ok {
+        // Variant B (VERIFIED): software decode → nv12 → h264_qsv GPU encode.
+        // No -hwaccel: the input decoder stays software (we only verified the
+        // hevc_qsv HW decoder), but the encode still runs on the QSV block.
+        (
+            vec![],
+            vec![
+                "-vf".into(), "format=nv12".into(),
+                "-c:v".into(), "h264_qsv".into(),
+                "-global_quality".into(), "23".into(),
+            ],
+        )
+    } else {
+        // Software fallback (VERIFIED): 5.87x realtime on the i9-13900H.
+        (
+            vec![],
+            vec![
+                "-c:v".into(), "libx264".into(),
+                "-preset".into(), "veryfast".into(),
+                "-pix_fmt".into(), "yuv420p".into(),
+            ],
+        )
+    }
+}
+
 /// FFmpeg-based TS→MPEG-TS remux endpoint.
 ///
 /// Spawns `ffmpeg -i INPUT -c:v copy -c:a aac -b:a 192k -f mpegts -mpegts_flags resend_headers pipe:1`
@@ -2113,6 +2310,14 @@ async fn remux_ts_to_mp4(
     let mut video_stream_idx: i32 = 0;
     let mut audio_stream_idx: i32 = 1;
     let mut probed_duration: f64 = 0.0;
+    // Phase 2 classification (Option B — capability-based gating).
+    let mut video_codec_name: String = String::new();
+    let mut video_pix_fmt: String = String::new();
+    // NOTE: non-standard audio layouts (e.g. "5.1(side)") make the AAC encoder
+    // emit a PCE (Program Config Element), which Chromium's MSE fMP4 parser
+    // rejects → CHUNK_DEMUXER_ERROR_APPEND_FAILED, tearing down the /remux pipe
+    // and killing ffmpeg with -22 on the trailer write. Fixed by
+    // AAC_LAYOUT_FILTER at all three encode sites; layout is logged below.
 
     match probe_output {
         Ok(output) if output.status.success() => {
@@ -2130,12 +2335,21 @@ async fn remux_ts_to_mp4(
                         if codec_type == "video" && !found_video {
                             video_stream_idx = idx as i32;
                             found_video = true;
-                            log::info!("[REMUX-PROBE] msg {}: video stream idx={}", message_id, idx);
+                            // Capture codec + pixel format for the transcode decision.
+                            // NOTE: the FIRST video stream is the real one; a 2nd video
+                            // stream (e.g. mjpeg cover-art attachment) is ignored here
+                            // and excluded by the explicit -map at encode time.
+                            video_codec_name = codec_name.to_string();
+                            video_pix_fmt = stream.get("pix_fmt").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                            log::info!("[REMUX-PROBE] msg {}: video stream idx={} (codec={}, pix_fmt={})", message_id, idx, codec_name, video_pix_fmt);
                         }
                         if codec_type == "audio" && !found_audio && channels > 0 && codec_name != "id3" {
                             audio_stream_idx = idx as i32;
                             found_audio = true;
-                            log::info!("[REMUX-PROBE] msg {}: audio stream idx={} (codec={}, ch={})", message_id, idx, codec_name, channels);
+                            let layout = stream.get("channel_layout")
+                                .and_then(|l| l.as_str()).unwrap_or("");
+                            log::info!("[REMUX-PROBE] msg {}: audio stream idx={} (codec={}, ch={}, layout={})",
+                                message_id, idx, codec_name, channels, layout);
                         }
                     }
                     if !found_audio {
@@ -2148,6 +2362,9 @@ async fn remux_ts_to_mp4(
                         if dur > 0.0 {
                             probed_duration = dur;
                             log::info!("[REMUX-PROBE] msg {}: ffprobe duration={:.1}s", message_id, dur);
+                            // Cache the exact duration so /fmp4/metadata (which the seek
+                            // bar reads) can return it instead of the bitrate estimate.
+                            data.probed_durations.write().await.insert(message_id, dur);
                         }
                     }
                 }
@@ -2161,6 +2378,60 @@ async fn remux_ts_to_mp4(
             log::warn!("[REMUX-PROBE] msg {}: ffprobe spawn failed: {}", message_id, e);
         }
     }
+
+    // ── Phase 2: classify — needs_transcode (capability-based) + is_hdr ──
+    // Decision (Option B): only transcode video the player genuinely can't decode.
+    //   h264            → copy (client transmuxer / mpegts.js both accept avc1)
+    //   hevc 10/12-bit  → transcode ALWAYS (mpegts.js MSE rejects hvc1.2 Main10,
+    //                     even with the Windows HEVC extension installed)
+    //   hevc 8-bit      → copy IFF the frontend says the runtime can decode hvc1
+    //                     (hevc_ok hint from canPlayType); else transcode
+    //   anything else muxable into TS as-is is rare — default to transcode to be safe,
+    //   EXCEPT vp8/vp9/av1 which never reach /remux (frontend routes them native).
+    let is_10bit_plus = video_pix_fmt.contains("10le") || video_pix_fmt.contains("12le")
+        || video_pix_fmt.contains("10be") || video_pix_fmt.contains("12be")
+        || video_pix_fmt.contains("p010") || video_pix_fmt.contains("p012");
+    let hevc_ok = query.hevc_ok.unwrap_or(false);
+    let needs_transcode = match video_codec_name.as_str() {
+        "h264" => false,                       // always cheap-path
+        "hevc" | "h265" => is_10bit_plus || !hevc_ok, // 10-bit always; 8-bit only if runtime can't decode
+        "" => false,                           // probe failed — preserve old behavior (copy)
+        _ => true,                             // unknown/other → transcode to be safe
+    };
+
+    // HDR detection MUST be frame-level: stream-level ffprobe misses color_transfer
+    // (proven — see cross-validation report C3/C4). Only probe when the video will
+    // be handled by us (needs_transcode) — a cheap-path h264 copy doesn't need it.
+    let mut is_hdr = false;
+    if needs_transcode {
+        let frame_probe = TokioCommand::new(&ffprobe_path)
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-print_format", "json",
+                "-select_streams", &format!("{}", video_stream_idx),
+                "-show_frames", "-read_intervals", "%+#1",
+                "-show_entries", "frame=color_transfer,color_primaries,color_space",
+                "-probesize", "50000000", "-analyzeduration", "50000000",
+                &input_source,
+            ])
+            .output()
+            .await;
+        if let Ok(fout) = frame_probe {
+            if fout.status.success() {
+                let fjson = String::from_utf8_lossy(&fout.stdout);
+                if let Ok(fval) = serde_json::from_str::<serde_json::Value>(&fjson) {
+                    if let Some(frame) = fval.get("frames").and_then(|f| f.as_array()).and_then(|a| a.first()) {
+                        let transfer = frame.get("color_transfer").and_then(|t| t.as_str()).unwrap_or("");
+                        let primaries = frame.get("color_primaries").and_then(|p| p.as_str()).unwrap_or("");
+                        is_hdr = transfer == "smpte2084" || transfer == "arib-std-b67" || primaries == "bt2020";
+                        log::info!("[REMUX-PROBE] msg {}: frame color transfer={} primaries={}", message_id, transfer, primaries);
+                    }
+                }
+            }
+        }
+    }
+    log::info!("[REMUX-PROBE] msg {}: needs_transcode={} is_hdr={} vcodec={} pix_fmt={} hevc_ok={}",
+        message_id, needs_transcode, is_hdr, video_codec_name, video_pix_fmt, hevc_ok);
 
     // ── Phase 2b: Choose strategy based on cache availability ──
 
@@ -2201,6 +2472,9 @@ async fn remux_ts_to_mp4(
             "-map", &format!("0:{}", audio_stream_idx),
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
+            // Remap non-standard layouts (e.g. 5.1(side)) so AAC avoids a PCE
+            // that Chromium MSE can't parse. See AAC_LAYOUT_FILTER.
+            "-af", AAC_LAYOUT_FILTER,
             "-f", "mpegts",
             "-mpegts_flags", "resend_headers",
         ]);
@@ -2298,19 +2572,50 @@ async fn remux_ts_to_mp4(
                     .body(format!("ffmpeg not found: {}", e));
             }
         };
+        // Capability-based encoder selection (Option B). Decide QSV/libx264/copy
+        // BEFORE spawning — the piped stream can't fall back mid-flight.
+        let (pre_input_args, video_enc_args) =
+            build_video_encoder_args(needs_transcode, qsv_h264_available(), &video_codec_name);
+        log::info!("[REMUX] msg {}: piped stream — needs_transcode={} video_enc={:?}",
+            message_id, needs_transcode, video_enc_args);
+
         let mut cmd = TokioCommand::new(&ffmpeg_path);
-        cmd.args(["-hide_banner", "-loglevel", "warning"]);
-        // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking
+        // SEEK DIAGNOSTIC (temporary): when this is a seek (ss>0) over the live
+        // /stream HTTP input, bump ffmpeg to debug so it logs the protocol/demuxer
+        // seek path — we need to see whether it issues an HTTP Range at the target
+        // cluster byte or falls back to a linear read from the front. Remove once
+        // the front-read root cause is confirmed. Non-seek remux stays at warning.
         let ss_secs = query.ss.unwrap_or(0.0);
-        if ss_secs > 0.0 {
-            let ss_str = format!("{:.3}", ss_secs);
-            log::info!("[REMUX] msg {}: seeking to {}s before remux", message_id, ss_str);
-            cmd.args(["-ss", &ss_str]);
+        let is_seek = ss_secs.is_finite() && ss_secs > 0.0;
+        // NOTE: -loglevel debug on the seek path floods the terminal with per-packet
+        // "sq: send/receive" sync-queue lines (thousands/sec). It was invaluable —
+        // it revealed the A/V PTS desync root cause — but keep it at `warning` now
+        // that the audio filter fix is in, or it drowns out every other log line.
+        cmd.args(["-hide_banner", "-loglevel", "warning"]);
+        // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking.
+        // build_ss_seek_args returns [] for ss<=0 / NaN (see helper + tests).
+        // (ss_secs computed above for the seek diagnostic.)
+        let ss_seek_args = build_ss_seek_args(ss_secs);
+        if !ss_seek_args.is_empty() {
+            log::info!("[REMUX] msg {}: seeking to {:.3}s before remux", message_id, ss_secs);
+            for a in &ss_seek_args { cmd.arg(a); }
         }
+        // Pre-input args: QSV hwaccel + hardware decoder (empty for copy/libx264).
+        // MUST come before -i so ffmpeg initializes the GPU decode session.
+        for a in &pre_input_args { cmd.arg(a); }
         // +genpts: regenerate PTS from DTS (fixes non-monotonic audio timestamps)
         // +discardcorrupt: drop damaged packets before they reach the filter chain
         cmd.args([
             "-fflags", "+genpts+discardcorrupt",
+            // NOTE: a 50MB probesize was tried here and REVERTED — on a stalling
+            // live /stream pipe it made ffmpeg block ~15s trying to fill the probe
+            // buffer (chasing the cover-art "stream 3") without fixing the real
+            // fault. FFREPORT diagnosis proved the transcode itself is FINE (0
+            // decode errors, 64 frames encoded); the "PPS out of range" lines are
+            // harmless probe-time noise. The actual fault: ffmpeg hit input EOF
+            // after ~1.7MB / 2.5s because /stream signals EOF instead of blocking
+            // for the progressively-downloaded remainder, then failed the trailer
+            // write to the (already torn-down) output pipe with -22.
             // Shift all timestamps to start at zero — prevents negative DTS that
             // the MPEG-TS muxer rejects with EINVAL ("Error submitting a packet
             // to the muxer: Invalid argument", exit code -22).
@@ -2319,18 +2624,33 @@ async fn remux_ts_to_mp4(
             // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
             "-map", &format!("0:{}", video_stream_idx),
             "-map", &format!("0:{}", audio_stream_idx),
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            // asetpts=N/SR/TB: force monotonically increasing audio PTS by construction.
-            // The source TS has AAC frames with overlapping PTS that crash the mpegts
-            // output muxer. This filter rewrites PTS from sample count, guaranteeing
-            // forward progression regardless of source corruption.
-            "-af", "asetpts=N/SR/TB",
+            // Drop subtitles (e.g. ass) — they aren't muxable into MPEG-TS here and
+            // the explicit maps already exclude any 2nd video stream (mjpeg cover art).
+            "-sn",
         ]);
-        // Preserve original timestamps so MSE timeline matches video.currentTime
-        if ss_secs > 0.0 {
-            cmd.args(["-copyts", "-start_at_zero"]);
-        }
+        // Video encoder: copy / h264_qsv / libx264 (from build_video_encoder_args).
+        for a in &video_enc_args { cmd.arg(a); }
+        // Audio monotonicity fix — filter choice DEPENDS on whether we're seeking:
+        //
+        //   Non-seek (ss=0): asetpts=N/SR/TB rewrites audio PTS from sample count,
+        //   starting at 0. Video also starts at 0, so A/V stay aligned. This guards
+        //   against source AAC frames with overlapping PTS that crash the mpegts muxer.
+        //
+        //   Seek (ss>0): asetpts=N/SR/TB is FATAL. It resets audio to ~0 while
+        //   -copyts keeps video ABSOLUTE (seek 721s → video PTS 721s, audio PTS 0s).
+        //   The ~700s A/V desync floods ffmpeg's sync queue ("queue head -1 ts N/A")
+        //   and mpegts.js can never complete MediaInfo (needs both tracks' DTS close),
+        //   so MEDIA_INFO never fires and nothing appends → seek never plays.
+        //   Proven by execution: seek 30s → asetpts gives audio=1.4s vs video=31.4s.
+        //   aresample=async=1 instead keeps audio ABSOLUTE and monotonic (0 backwards
+        //   PTS, audio 31.38s vs video 31.4s) — the correct fix for the seek path.
+        //   AAC_LAYOUT_FILTER is chained first (single -af only) to avoid the MSE PCE.
+        let audio_filter = build_remux_audio_filter(is_seek);
+        cmd.args(["-c:a", "aac", "-b:a", "192k", "-af", &audio_filter]);
+        // Preserve original timestamps so MSE timeline matches video.currentTime.
+        // Output PTS stay absolute (seek 580s → PTS ≈581s) — verified by execution;
+        // the frontend _dtsBase=0 mapping depends on it. Empty when not seeking.
+        for a in &build_ss_timestamp_args(ss_secs) { cmd.arg(a); }
         cmd.args([
             // Disable interleave check: prevent muxer from rejecting audio packets
             // that arrive slightly out-of-order relative to video DTS
@@ -2341,6 +2661,13 @@ async fn remux_ts_to_mp4(
         ]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // Reap this ffmpeg if the response stream is dropped before EOF. A seek
+        // aborts the HTTP connection → actix drops the async_stream → the owned
+        // `child` drops. tokio does NOT kill a child on drop by default
+        // (kill_on_drop=false), so without this each seek would orphan a live
+        // ffmpeg still transcoding into a dead pipe (QSV/CPU pileup under
+        // scrubbing). kill_on_drop(true) makes the drop reap the process.
+        cmd.kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -2429,6 +2756,7 @@ async fn remux_ts_to_mp4(
                             }
                         };
                         let mut bg_cmd = TokioCommand::new(&bg_ffmpeg_path);
+                        let bg_audio_filter = format!("{},asetpts=N/SR/TB", AAC_LAYOUT_FILTER);
                         bg_cmd.args([
                             "-hide_banner", "-loglevel", "warning",
                             "-ignore_unknown",
@@ -2446,7 +2774,9 @@ async fn remux_ts_to_mp4(
                             // overlapping PTS that corrupt stream copy. Re-encoding + asetpts
                             // guarantees monotonically increasing timestamps.
                             "-c:a", "aac", "-b:a", "192k",
-                            "-af", "asetpts=N/SR/TB",
+                            // AAC_LAYOUT_FILTER chained before asetpts (single -af)
+                            // to avoid the MSE-breaking PCE on non-standard layouts.
+                            "-af", &bg_audio_filter,
                             // Output MPEG-TS (NOT MP4) to match the serving Content-Type
                             // (video/mp2t) and the Strategy A output format. The previous
                             // -f mp4 + -movflags +faststart produced an MP4 file served as
@@ -3075,7 +3405,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, hevc_ok: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -4041,7 +4371,16 @@ async fn fmp4_metadata(
         None
     };
 
-    let duration_s = if let Some(d) = telegram_duration {
+    // Prefer the exact duration resolved by the /remux ffprobe pass if available.
+    // For HEVC MKV the Telegram/PTS/bitrate estimates below are wrong (e.g. 1904s
+    // vs a real 2317s), which truncates the seek bar and mis-maps every seek. The
+    // probe writes state.probed_durations; when present it is authoritative.
+    let probed_duration_opt = data.probed_durations.read().await.get(&message_id).copied();
+
+    let duration_s = if let Some(d) = probed_duration_opt.filter(|d| *d > 0.0) {
+        log::info!("[FMP4-META] msg {} using ffprobe duration={:.1}s (from /remux probe)", message_id, d);
+        d
+    } else if let Some(d) = telegram_duration {
         d
     } else if let Some(d) = pts_duration {
         d
@@ -4053,6 +4392,7 @@ async fn fmp4_metadata(
     };
 
     let has_timed_id3 = !cache_mgr.get_stripped_pids(message_id).is_empty();
+    let duration_is_probed = probed_duration_opt.filter(|d| *d > 0.0).is_some();
 
     let response = Fmp4MetadataResponse {
         duration_s,
@@ -4064,6 +4404,7 @@ async fn fmp4_metadata(
         audio_codec_string,
         total_size,
         has_timed_id3,
+        duration_is_estimate: !duration_is_probed,
     };
 
     let body = match serde_json::to_vec(&response) {
@@ -4074,9 +4415,18 @@ async fn fmp4_metadata(
         }
     };
 
-    // Cache the result
-    if let Ok(mut c) = metadata_cache.0.lock() {
-        c.cache.insert(message_id, body.clone());
+    // Cache the result — but ONLY when the duration is authoritative (from the
+    // /remux ffprobe). Caching an early bitrate ESTIMATE would lock the seek bar
+    // to a wrong length: the metadata fetch fires ~2s before the probe completes,
+    // so an estimate cached here is served forever on subsequent HITs. When we
+    // only have an estimate, skip the cache so a later fetch (after the probe) can
+    // return the real value. (duration_is_probed computed above.)
+    if duration_is_probed {
+        if let Ok(mut c) = metadata_cache.0.lock() {
+            c.cache.insert(message_id, body.clone());
+        }
+    } else {
+        log::info!("[FMP4-META] msg {} duration is an estimate ({:.1}s) — NOT caching so a post-probe fetch can correct it", message_id, duration_s);
     }
 
     HttpResponse::Ok()
@@ -4831,6 +5181,103 @@ mod tests {
         let args = build_background_remux_args("input.ts", 0, 1);
         let has_bsf = args.iter().any(|a| a == "aac_adtstoasc");
         assert!(!has_bsf, "aac_adtstoasc is MP4-only; MPEG-TS doesn't need it");
+    }
+
+    // ── /remux?ss= seek-arg builders (HEVC/MKV remux-seek path) ──
+
+    #[test]
+    fn ss_seek_args_absent_when_no_seek() {
+        // ss=0 / negative / NaN → no -ss (initial from-zero remux).
+        assert!(super::build_ss_seek_args(0.0).is_empty(), "ss=0 must not emit -ss");
+        assert!(super::build_ss_seek_args(-5.0).is_empty(), "negative ss must not emit -ss");
+        assert!(super::build_ss_seek_args(f64::NAN).is_empty(), "NaN ss must not emit -ss");
+        assert!(super::build_ss_seek_args(f64::INFINITY).is_empty(), "inf ss must not emit -ss");
+    }
+
+    #[test]
+    fn ss_seek_args_emit_ss_before_input_when_seeking() {
+        let args = super::build_ss_seek_args(580.6);
+        assert_eq!(args, vec!["-ss".to_string(), "580.600".to_string()],
+            "-ss must be emitted with 3-decimal seconds");
+    }
+
+    #[test]
+    fn ss_seek_args_format_is_three_decimals() {
+        // Millisecond precision is enough for a scrub; assert stable formatting.
+        assert_eq!(super::build_ss_seek_args(12.0), vec!["-ss".to_string(), "12.000".to_string()]);
+        assert_eq!(super::build_ss_seek_args(0.001), vec!["-ss".to_string(), "0.001".to_string()]);
+    }
+
+    #[test]
+    fn ss_timestamp_args_present_only_when_seeking() {
+        // A seek MUST carry -copyts -start_at_zero so output PTS stay absolute
+        // (verified: ss=580 → PTS ≈581s), which the frontend _dtsBase=0 relies on.
+        assert_eq!(
+            super::build_ss_timestamp_args(580.0),
+            vec!["-copyts".to_string(), "-start_at_zero".to_string()],
+            "seek must preserve absolute timestamps"
+        );
+        // From-zero remux needs neither.
+        assert!(super::build_ss_timestamp_args(0.0).is_empty(), "no seek → no -copyts");
+        assert!(super::build_ss_timestamp_args(f64::NAN).is_empty(), "NaN → no -copyts");
+    }
+
+    #[test]
+    fn ss_seek_and_timestamp_args_agree_on_when_to_fire() {
+        // Invariant: the two builders must both fire, or both stay silent, for a
+        // given ss — otherwise we'd emit -ss without -copyts (PTS rebased to 0,
+        // breaking the seek-position mapping) or vice versa.
+        for ss in [-1.0, 0.0, 0.001, 12.0, 580.6, f64::NAN, f64::INFINITY] {
+            let seek = !super::build_ss_seek_args(ss).is_empty();
+            let ts = !super::build_ss_timestamp_args(ss).is_empty();
+            assert_eq!(seek, ts, "seek/timestamp arg emission disagree for ss={ss}");
+        }
+    }
+
+    #[test]
+    fn remux_audio_filter_never_uses_asetpts_on_seek() {
+        // THE regression guard for the "seek never plays" bug: asetpts=N/SR/TB
+        // rebuilds audio PTS from 0, but a seek keeps video absolute via -copyts.
+        // The resulting A/V desync stops mpegts.js completing MediaInfo → no play.
+        // A seek MUST use aresample (absolute + monotonic), NEVER asetpts.
+        let seek = super::build_remux_audio_filter(true);
+        assert!(!seek.contains("asetpts"), "seek filter must not reset PTS: {seek}");
+        assert!(seek.contains("aresample=async=1"), "seek needs aresample: {seek}");
+    }
+
+    #[test]
+    fn remux_seek_filter_puts_aresample_before_layout() {
+        // Regression guard for the eac3 5.1(side) spawn-storm: if AAC_LAYOUT_FILTER
+        // (aformat) runs BEFORE aresample, a non-allow-listed layout like 5.1(side)
+        // makes aresample re-emit a layout aformat rejects → filtergraph dies -22 →
+        // empty output → frontend refetch storm. aresample MUST come first so it
+        // normalizes (side)/(back) variants into a layout the allow-list accepts.
+        let seek = super::build_remux_audio_filter(true);
+        let ares = seek.find("aresample").expect("seek needs aresample");
+        let afmt = seek.find("aformat").expect("seek needs aformat layout guard");
+        assert!(ares < afmt, "aresample must precede aformat on seek: {seek}");
+    }
+
+    #[test]
+    fn remux_audio_filter_uses_asetpts_when_not_seeking() {
+        // From-zero remux: video also starts at 0, so asetpts is correct and
+        // guards against overlapping-PTS AAC frames crashing the mpegts muxer.
+        let no_seek = super::build_remux_audio_filter(false);
+        assert!(no_seek.contains("asetpts=N/SR/TB"), "non-seek needs asetpts: {no_seek}");
+        assert!(!no_seek.contains("aresample"), "non-seek must not aresample: {no_seek}");
+    }
+
+    #[test]
+    fn remux_audio_filter_always_includes_pce_layout_guard() {
+        // Both variants MUST include AAC_LAYOUT_FILTER (single -af only) so the
+        // PCE channel layout Chromium MSE can't parse is stripped in every case.
+        // Non-seek leads with it; seek runs aresample first (see ordering test).
+        for is_seek in [true, false] {
+            let f = super::build_remux_audio_filter(is_seek);
+            assert!(f.contains(super::AAC_LAYOUT_FILTER), "layout guard must be present: {f}");
+        }
+        assert!(super::build_remux_audio_filter(false).starts_with(super::AAC_LAYOUT_FILTER),
+            "non-seek must lead with the layout guard");
     }
 }
 
