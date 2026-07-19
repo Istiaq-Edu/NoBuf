@@ -1280,7 +1280,14 @@ async fn stream_media(
                 // message with a different range has arrived. Break immediately
                 // to stop this zombie download from competing for the rate limiter.
                 if stream_cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    log::debug!("[STREAM-FALLBACK] Cancelled zombie download for msg {} at offset {}", message_id, current_offset);
+                    // Trace-21 diagnostic: promoted debug→info. If this fires with
+                    // bytes_sent==0 it is the "orphaned read returns empty 206"
+                    // branch — a sibling seek's register_download cancelled THIS
+                    // read before it yielded a single byte. Confirms whether the
+                    // backend single-flight fix (FIX 2) is needed.
+                    log::info!("[STREAM-FALLBACK] msg {} cancelled at offset {} (bytes_sent={} of {}) — {}",
+                        message_id, current_offset, bytes_sent, content_length,
+                        if bytes_sent == 0 { "EMPTY-BODY orphaned read" } else { "partial, superseded" });
                     break;
                 }
                 match chunk {

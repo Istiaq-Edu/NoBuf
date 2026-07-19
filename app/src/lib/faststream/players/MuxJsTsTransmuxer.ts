@@ -827,6 +827,9 @@ export class MuxJsTsTransmuxer {
   /** TS has no MKV cue index, so abutting-refill keyframe stops don't apply —
    *  always null so callers fall back to the maxDuration cutoff (Fix #1). */
   nextKeyframeAtOrAfter(_time: number): number | null { return null; }
+  /** TS has no MKV cue index — no snapping applies, so the refill position is
+   *  returned unchanged (Fix #1 no-op parity with MediabunnyTransmuxer). */
+  snapToCueKeyframe(time: number, _tolerance?: number): number { return time; }
   getKeyframeByteOffsets(): TSKeyframeEntry[] { return this.keyframeByteOffsets; }
   getTsHeaderData(): Uint8Array | null { return this.tsHeaderData; }
   getSourceConfig(): any { return null; }

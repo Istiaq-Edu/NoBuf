@@ -578,6 +578,11 @@ pub async fn cmd_report_playback_position(
         (current_byte, duration_s, playback_rate, file_size)
     );
 
+    // Record the playhead byte for the coordinator's playhead-aware zombie-cancel
+    // (trace-23 fix): register_download uses it to keep the read nearest the
+    // playhead alive and cancel only the stale forward-walk left behind by a seek.
+    cache_state.set_playhead_byte(message_id, current_byte);
+
     // Don't start if a proactive prebuffer is already running for this message.
     // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
     // download is tracked there too — it would always return true during playback,
