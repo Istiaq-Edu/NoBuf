@@ -834,6 +834,13 @@ export class MuxJsTsTransmuxer {
   getTsHeaderData(): Uint8Array | null { return this.tsHeaderData; }
   getSourceConfig(): any { return null; }
   abortSeek(): void { this.seekGeneration++; }
+  /** Interrupt an in-flight seek so a superseding one can start immediately.
+   *  The MediabunnyTransmuxer version also aborts the shared stream source's
+   *  in-flight fetch; this deprecated mux.js path has no such fetch to abort, so
+   *  bumping the generation (which discards the stale seek's segments — same as
+   *  abortSeek) is the complete interrupt here. Present so the shared seek drain
+   *  in useMSEPlayer can call interruptSeek() across both transmuxer types. */
+  interruptSeek(): void { this.seekGeneration++; }
 
   /** Clear mux.js VideoSegmentStream's GOP cache to prevent GOP fusion.
    * GOP fusion prepends cached video GOPs to mid-GOP flushes, but only

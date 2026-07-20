@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { decideSeekDispatch, isSeekSuperseded, computeSeekLandingTime } from '../hooks/useMSEPlayer';
+import {
+  decideSeekDispatch,
+  isSeekSuperseded,
+  computeSeekLandingTime,
+  shouldInterruptInflightSeek,
+  shouldWarmerYield,
+} from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -171,5 +177,153 @@ describe('computeSeekLandingTime', () => {
 
   it('target exactly at bufferedEnd → lands there (boundary)', () => {
     expect(computeSeekLandingTime(880, 871.9, 880)).toBe(880);
+  });
+});
+
+/**
+ * shouldInterruptInflightSeek decides whether the seek drain actively INTERRUPTS
+ * an in-flight seek so a newer target runs immediately, instead of waiting out
+ * the abandoned seek's full lifecycle (cold getKeyPacket + multi-second transmux
+ * iteration — up to ~13-16s in trace-29/30). The fix that closed the rapid-seek
+ * latency gap; proven live in trace-30 (6 clean supersessions, zero abandoned
+ * positions ran a full iteration, zero stale commits).
+ *
+ * Two guards, both required: seekInProgress (never interrupt when idle — a pure
+ * debounce-window defer has nothing to interrupt) and !interruptSent (fire once
+ * per drain — the interrupt is idempotent, re-firing every 120ms poll is noise).
+ *
+ * Signature: (interruptSent, seekInProgress) → true when we should interrupt now.
+ */
+describe('shouldInterruptInflightSeek', () => {
+  // ── Truth table (both guards) ─────────────────────────────────────────────
+  it('seek in flight + not yet interrupted → interrupt (the trace-30 fix)', () => {
+    expect(shouldInterruptInflightSeek(false, true)).toBe(true);
+  });
+
+  it('seek in flight + already interrupted this drain → do not re-fire (latch)', () => {
+    // Once-per-drain: interruptSent latches so we do not spam interruptSeek()
+    // (and re-bump the generation) every 120ms poll while the seek winds down.
+    expect(shouldInterruptInflightSeek(true, true)).toBe(false);
+  });
+
+  it('no seek in flight (pure debounce defer) → do not interrupt (busy-only guard)', () => {
+    // Rapid drag where the prior seek already completed. Firing interruptSeek()
+    // here would set a stale seekAbortFlag the NEXT seek must reset. Never fire.
+    expect(shouldInterruptInflightSeek(false, false)).toBe(false);
+  });
+
+  it('idle + already interrupted → do not interrupt', () => {
+    expect(shouldInterruptInflightSeek(true, false)).toBe(false);
+  });
+});
+
+/**
+ * Composition proofs: the interrupt path does not stand alone. It (a) fires at
+ * most once per drain even under a burst of supersessions, (b) bumps the seek
+ * generation so the interrupted seek is caught by isSeekSuperseded and never
+ * commits its abandoned position, and (c) hands off cleanly to decideSeekDispatch
+ * so the LATEST target runs once the in-flight flag clears — never a concurrent
+ * seek. These model the exact wiring in the scheduleDrain closure.
+ */
+describe('interrupt-on-supersede: composition with the drain', () => {
+  it('a burst of N supersedes fires the interrupt EXACTLY once (interruptSent latches)', () => {
+    // Model the drain: seek is in flight; a burst of superseding targets arrives.
+    // maybeInterrupt() is called once at drain entry, then again on each poll.
+    let interruptSent = false;
+    let interruptCount = 0;
+    const seekInProgress = true; // stays in flight across the burst window
+
+    const maybeInterrupt = () => {
+      if (shouldInterruptInflightSeek(interruptSent, seekInProgress)) {
+        interruptSent = true;
+        interruptCount++;
+      }
+    };
+
+    // Entry + 5 polls while the seek is still winding down.
+    maybeInterrupt();
+    for (let i = 0; i < 5; i++) maybeInterrupt();
+
+    expect(interruptCount).toBe(1);
+    expect(interruptSent).toBe(true);
+  });
+
+  it('the gen bump makes the interrupted seek stale → its completion must NOT commit', () => {
+    // The interrupted seek captured gen N at start. maybeInterrupt bumps the
+    // live gen to N+1. When the (aborted) seek resolves — even the no-throw
+    // already-buffered case that returns a NON-null keyframe — isSeekSuperseded
+    // sees the mismatch and bails the commit.
+    const capturedGen = 6; // interrupted seek's generation
+    let liveGen = 6;
+
+    // maybeInterrupt fires → bumps the live generation.
+    const interruptSent = false;
+    if (shouldInterruptInflightSeek(interruptSent, /* seekInProgress */ true)) {
+      liveGen = capturedGen + 1; // ++transmuxerSeekGenRef.current
+    }
+
+    expect(liveGen).toBe(7);
+    // The abandoned seek's completion handler bails — no stale position committed.
+    expect(isSeekSuperseded(capturedGen, liveGen)).toBe(true);
+  });
+
+  it('interrupt then flag clears → drain executes the latest target (no concurrent seek)', () => {
+    // After interrupting, the drain keeps polling until seekInProgress clears.
+    // While still in flight → decideSeekDispatch defers (never a 2nd seek). Once
+    // the aborted seek resolves and clears the flag → the drain executes the
+    // captured latest target. This is the trace-21 no-concurrent-seek invariant
+    // preserved through the interrupt.
+    const DEBOUNCE = 500;
+
+    // Poll 1: still in flight → defer (interrupt already sent, we just wait).
+    expect(decideSeekDispatch(2000, 1000, DEBOUNCE, /* inFlight */ true, false)).toBe('defer');
+
+    // Poll 2: aborted seek resolved → flag clear, window elapsed → execute.
+    expect(decideSeekDispatch(2000, 1000, DEBOUNCE, /* inFlight */ false, false)).toBe('execute');
+  });
+});
+
+/**
+ * shouldWarmerYield decides whether the MKV disk warmer sleeps this iteration
+ * instead of fetching. The warmer is best-effort green-bar background work; it
+ * must yield the throttled Telegram pipe whenever the player itself needs it.
+ *
+ * Yields on downloading OR bufferingForSeek OR seekInProgress. The seekInProgress
+ * term is the trace-31 fix: bufferingForSeek flips false when the keyframe
+ * resolves, but the multi-second transmux ITERATION runs after that — so without
+ * seekInProgress the warmer fetched at full rate for the whole 10-17s iteration,
+ * starving the seek's own reads and inflating seek-to-play latency.
+ *
+ * Signature: (downloading, bufferingForSeek, seekInProgress) → true = yield.
+ */
+describe('shouldWarmerYield', () => {
+  // ── The regression term (seekInProgress) ──────────────────────────────────
+  it('seek in progress, not buffering, not downloading → YIELD (the trace-31 fix)', () => {
+    // This is the during-iteration case: bufferingForSeek already flipped false,
+    // downloading is false, but the transmux iteration is still running. Before
+    // the fix the warmer did NOT yield here and competed for the whole iteration.
+    expect(shouldWarmerYield(false, false, true)).toBe(true);
+  });
+
+  // ── Original two terms still yield ─────────────────────────────────────────
+  it('downloading → yield', () => {
+    expect(shouldWarmerYield(true, false, false)).toBe(true);
+  });
+
+  it('buffering for seek → yield', () => {
+    expect(shouldWarmerYield(false, true, false)).toBe(true);
+  });
+
+  // ── The only non-yield case: everything idle ──────────────────────────────
+  it('all idle → do NOT yield (warmer fetches its background chunk)', () => {
+    expect(shouldWarmerYield(false, false, false)).toBe(false);
+  });
+
+  // ── Combinations collapse to OR ───────────────────────────────────────────
+  it('any combination of active flags → yield', () => {
+    expect(shouldWarmerYield(true, true, false)).toBe(true);
+    expect(shouldWarmerYield(true, false, true)).toBe(true);
+    expect(shouldWarmerYield(false, true, true)).toBe(true);
+    expect(shouldWarmerYield(true, true, true)).toBe(true);
   });
 });

@@ -1667,6 +1667,33 @@ export class MediabunnyTransmuxer {
     this.seekAbortFlag = true;
   }
 
+  /**
+   * Interrupt an in-flight USER seek so a superseding seek can start NOW instead
+   * of waiting for this one's full lifecycle (getKeyPacket search + the multi-
+   * second transmux iteration) to finish on its own.
+   *
+   * WHY THIS IS DISTINCT FROM abortSeek():
+   *   abortSeek() only sets seekAbortFlag, which stops the packet iteration loop
+   *   (checked per-packet at iterateVideoPackets/iterateAudioPackets). That alone
+   *   is NOT enough when the seek is blocked EARLIER — inside getKeyPacket, which
+   *   awaits a cold cluster HTTP range. seekAbortFlag isn't checked during that
+   *   network wait, so the seek would still hang for the full fetch. We ALSO
+   *   abort the shared stream source's in-flight fetch so getKeyPacket's await
+   *   rejects immediately (surfaces as the expected "read aborted" error, caught
+   *   as isAborted in seekTo's handler → returns null cleanly). Two levers,
+   *   because the cost lives in two places: network (getKeyPacket) and CPU
+   *   (iteration). Named separately from abortSeek() so the thumbnail pipeline's
+   *   collect-a-few-frames abort keeps its original network-preserving behavior.
+   *
+   * Safe to call when no seek is running: seekAbortFlag is reset at the top of
+   * the next seekTo (before the new iteration), and abortInFlight() is a no-op
+   * when nothing is fetching.
+   */
+  interruptSeek(): void {
+    this.seekAbortFlag = true;
+    (this.streamSource as any)?.abortInFlight?.();
+  }
+
   dispose(): void {
     this.disposed = true;
     this.seekAbortFlag = true;

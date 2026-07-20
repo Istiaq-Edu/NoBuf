@@ -23,6 +23,14 @@ const MAX_EMPTY_RETRIES = 60;
 const EMPTY_RETRY_DELAY_MS = 500;
 const PARTIAL_RETRY_DELAY_MS = 100;
 const READAHEAD_CHUNK_SIZE = 8 * 1024 * 1024;
+// Scattered (seek-search) reads fetch a SMALLER window than sequential playback.
+// A cold seek's getKeyPacket walks from the cue cluster to the target keyframe;
+// trace-28 measured it CONSUMING only ~2-3MB (max 3.10MB) while we FETCHED the
+// full 8MB — ~5MB of pure over-fetch that the seek blocks on at contended
+// bandwidth. 4MB covers the observed max with margin in a single fetch (1MB
+// failed before because <the ~3MB need forced a 2nd blocking read). Sequential
+// playback keeps the full 8MB so throughput/prefetch-ahead is unchanged.
+const SCATTERED_READAHEAD_SIZE = 4 * 1024 * 1024;
 
 export function createTauriStreamSource(config: TauriStreamSourceConfig): CustomSource {
   const { url, fileSize, headers = {}, maxCacheSize, prefetchProfile = 'network', seedData, sourceId } = config;
@@ -70,7 +78,13 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
   // completion and keeping its backend download registered — which otherwise
   // ping-pongs with the new seek's download in the coordinator's zombie-cancel
   // logic (both share source_id=None), and neither ever finishes → seek hangs.
-  let inFlightAbort: AbortController | null = null;
+  // Set (not a single var) because TWO fetches can be in flight at once: the
+  // main read AND the background prefetch (startPrefetch). A shared scalar would
+  // let the later fetch overwrite the earlier's controller, so abortInFlight()
+  // would silently orphan one — the stale read keeps its backend slot and the
+  // zombie-cancel ping-pong returns. Tracking every live controller makes abort
+  // airtight: it cancels the read AND the prefetch together.
+  const inFlightAborts = new Set<AbortController>();
   // Byte position of the cluster where the last seek's forward fMP4 iteration
   // began — the REAL (byte, keyframeTime) pair for VBR byte↔time calibration.
   // NOT the Cues/SeekHead tail read (~fileLength) that getKeyPacket does to
@@ -110,42 +124,50 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
         if (disposed) throw new Error('[TauriStreamSource] disposed during fetch');
 
-        inFlightAbort = new AbortController();
-        let response: Response;
+        const abort = new AbortController();
+        inFlightAborts.add(abort);
+        // finally removes THIS controller from the live set at every exit
+        // (break/continue/throw) so a settled fetch is never abort-able and the
+        // set holds only genuinely in-flight controllers.
         try {
-          response = await fetch(urlForPos(pos), {
-            headers: { ...allHeaders, Range: `bytes=${pos}-${rangeEnd}` },
-            signal: inFlightAbort.signal,
-          });
-        } catch (e: any) {
-          if (e?.name === 'AbortError') {
-            // Superseded by a newer seek — stop cleanly so the backend download
-            // slot is freed immediately for the new seek (no zombie ping-pong).
-            throw new Error('[TauriStreamSource] read aborted (superseded by seek)');
+          let response: Response;
+          try {
+            response = await fetch(urlForPos(pos), {
+              headers: { ...allHeaders, Range: `bytes=${pos}-${rangeEnd}` },
+              signal: abort.signal,
+            });
+          } catch (e: any) {
+            if (e?.name === 'AbortError') {
+              // Superseded by a newer seek — stop cleanly so the backend download
+              // slot is freed immediately for the new seek (no zombie ping-pong).
+              throw new Error('[TauriStreamSource] read aborted (superseded by seek)');
+            }
+            throw e;
           }
-          throw e;
-        }
 
-        if (response.ok || response.status === 206) {
-          chunk = new Uint8Array(await response.arrayBuffer());
-          break;
-        }
-
-        if (response.status === 503) {
-          const reason = response.headers.get('X-Reason') || '';
-          if (reason === 'cached-only-miss') {
-            throw new Error(`[TauriStreamSource] Range ${pos}-${rangeEnd} not cached (cached_only=503)`);
+          if (response.ok || response.status === 206) {
+            chunk = new Uint8Array(await response.arrayBuffer());
+            break;
           }
-          if (attempt < MAX_503_RETRIES) {
-            const retryAfter = parseInt(response.headers.get('Retry-After') || '30', 10);
-            const delay = Math.min(retryAfter * 1000, RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS);
-            console.warn(`[TauriStreamSource] HTTP 503 for range ${pos}-${rangeEnd}, retry ${attempt + 1}/${MAX_503_RETRIES} in ${delay}ms`);
-            await new Promise(r => setTimeout(r, delay));
-            continue;
-          }
-        }
 
-        throw new Error(`[TauriStreamSource] HTTP ${response.status} for range ${pos}-${rangeEnd}`);
+          if (response.status === 503) {
+            const reason = response.headers.get('X-Reason') || '';
+            if (reason === 'cached-only-miss') {
+              throw new Error(`[TauriStreamSource] Range ${pos}-${rangeEnd} not cached (cached_only=503)`);
+            }
+            if (attempt < MAX_503_RETRIES) {
+              const retryAfter = parseInt(response.headers.get('Retry-After') || '30', 10);
+              const delay = Math.min(retryAfter * 1000, RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS);
+              console.warn(`[TauriStreamSource] HTTP 503 for range ${pos}-${rangeEnd}, retry ${attempt + 1}/${MAX_503_RETRIES} in ${delay}ms`);
+              await new Promise(r => setTimeout(r, delay));
+              continue;
+            }
+          }
+
+          throw new Error(`[TauriStreamSource] HTTP ${response.status} for range ${pos}-${rangeEnd}`);
+        } finally {
+          inFlightAborts.delete(abort);
+        }
       }
 
       if (!chunk) throw new Error(`[TauriStreamSource] HTTP 503 max retries exceeded for range ${pos}-${rangeEnd}`);
@@ -213,8 +235,11 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       if (readaheadBuf && neededStart >= readaheadStart && neededStart < readaheadEnd) return;
     }
 
+    // Scattered seek reads fetch the smaller 4MB window (trace-28: getKeyPacket
+    // consumes ≤3.1MB); sequential playback fetches the full 8MB for throughput.
+    const readaheadSize = sequential ? READAHEAD_CHUNK_SIZE : SCATTERED_READAHEAD_SIZE;
     const fetchStart = neededStart;
-    const fetchEnd = Math.min(fetchStart + READAHEAD_CHUNK_SIZE - 1, fileSize - 1);
+    const fetchEnd = Math.min(fetchStart + readaheadSize - 1, fileSize - 1);
     const chunk = await fetchRange(fetchStart, fetchEnd);
     readaheadBuf = chunk;
     readaheadStart = fetchStart;
@@ -343,10 +368,12 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
   // download slot immediately (see inFlightAbort comment). Attached to the
   // instance because CustomSource's options don't include a control channel.
   (source as any).abortInFlight = () => {
-    if (inFlightAbort) {
-      inFlightAbort.abort();
-      inFlightAbort = null;
-    }
+    // Abort EVERY live fetch (read + prefetch), not just the last one, so no
+    // stale request survives to keep its backend slot. Each fetch's finally
+    // removes itself from the set; abort() on an already-settled controller is
+    // a no-op, so iterating a snapshot is safe.
+    for (const abort of inFlightAborts) abort.abort();
+    inFlightAborts.clear();
   };
   // PROBE (trace-27): arm search byte-accounting at seekTo entry.
   (source as any).markSeekStart = () => { seekSearchActive = true; seekSearchBytes = 0; seekSearchConsumed = 0; };
