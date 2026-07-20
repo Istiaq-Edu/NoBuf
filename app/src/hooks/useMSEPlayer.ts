@@ -134,6 +134,62 @@ export function isSeekSuperseded(capturedGen: number, liveGen: number): boolean 
 }
 
 /**
+ * Decide whether the seek drain should INTERRUPT an in-flight seek so a newer
+ * (superseding) target can run without waiting for the in-flight seek's full
+ * lifecycle — cold getKeyPacket search + the multi-second transmux iteration,
+ * up to ~13-16s in trace-29/30 for a position the user already abandoned.
+ *
+ * Two conditions, both required:
+ *   - seekInProgress: a seek is genuinely running. If false we're in a pure
+ *     debounce-window defer (rapid drag where the prior seek already completed)
+ *     — there is nothing to interrupt, and firing interruptSeek() would set a
+ *     stale seekAbortFlag that the NEXT seek would have to reset. So: never
+ *     interrupt when idle.
+ *   - !interruptSent: we haven't already interrupted during THIS drain. The
+ *     interrupt is idempotent in effect (seekAbortFlag stays set, abortInFlight
+ *     is a no-op once nothing is fetching, and the gen bump only needs to happen
+ *     once), so re-firing every 120ms poll is wasted work and noise. Latch it.
+ *
+ * Pure + exported for testing. The caller (maybeInterrupt in the drain) owns the
+ * side effects: bumping the frontend seek generation (so the interrupted seek's
+ * completion is caught by isSeekSuperseded and never commits its abandoned
+ * position) and calling transmuxer.interruptSeek().
+ */
+export function shouldInterruptInflightSeek(
+  interruptSent: boolean,
+  seekInProgress: boolean,
+): boolean {
+  return !interruptSent && seekInProgress;
+}
+
+/**
+ * Decide whether the MKV disk warmer should YIELD (sleep) this iteration instead
+ * of fetching a chunk. The warmer is best-effort background work that fills the
+ * green bar; it must never compete with the player's own reads for the throttled
+ * Telegram pipe.
+ *
+ * Yields when ANY of:
+ *   - downloading: the player's cold-start / refill fetch is active.
+ *   - bufferingForSeek: a seek is buffering segments (set true at seek start,
+ *     false the instant the keyframe resolves — BEFORE the transmux iteration).
+ *   - seekInProgress: a transmuxer seek is running. THIS is the term that was
+ *     missing (trace-31 root cause): bufferingForSeek flips false when the
+ *     keyframe resolves, but the multi-second transmux ITERATION runs after that
+ *     — so without this term the warmer fetched at full rate for the whole 10-17s
+ *     iteration, starving the seek's own reads. transmuxerSeekInProgressRef stays
+ *     true from seek entry through completion, covering the entire window.
+ *
+ * Pure + exported for testing.
+ */
+export function shouldWarmerYield(
+  downloading: boolean,
+  bufferingForSeek: boolean,
+  seekInProgress: boolean,
+): boolean {
+  return downloading || bufferingForSeek || seekInProgress;
+}
+
+/**
  * Decide where to place video.currentTime after a transmuxer seek resolves.
  *
  * WHY: a seek snaps to the cue keyframe AT/BELOW the requested time, so the
@@ -5385,7 +5441,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // Yield to playback: if the player is actively downloading (cold
           // start / seek / refill fetching), sleep so /stream gets the full
           // rate-limiter budget. The disk warm is best-effort background work.
-          if (state.current.downloading || bufferingForSeekRef.current) {
+          // Includes transmuxerSeekInProgressRef so the warmer stays throttled
+          // for the ENTIRE seek — including the multi-second transmux iteration
+          // that runs after bufferingForSeekRef flips false (trace-31 fix).
+          if (shouldWarmerYield(
+            state.current.downloading,
+            bufferingForSeekRef.current,
+            transmuxerSeekInProgressRef.current,
+          )) {
             await new Promise((r) => setTimeout(r, 1000));
             continue;
           }
@@ -7447,6 +7510,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const seekGen = ++transmuxerSeekGenRef.current;
         clearDownloadedRanges();
 
+        // Cancel the stale MKV disk warmer NOW, at seek START. WHY HERE (not at
+        // completion): the warmer is repositioned in the seek's .then() block
+        // AFTER the 10-17s transmux iteration — so without this, the pre-seek
+        // warmer (e.g. warming 0-68MB) keeps competing for the throttled pipe
+        // during the ENTIRE iteration, starving the seek's own reads and
+        // inflating iteration to 10-17s (trace-31 root cause). Bumping the gen
+        // makes the in-flight warmer loop bail at its next gen check; the
+        // completion handler starts a fresh warmer at the resolved target. A
+        // superseded seek bails before that reposition (isSeekSuperseded guard),
+        // so no orphan warmer is left at an abandoned position.
+        mkvWarmerGenRef.current++;
+        mkvWarmerActiveRef.current = false;
+
         // Re-target the backend proactive download to the seek position. Without
         // this, the Rust prebuffer keeps downloading SEQUENTIALLY from the OLD
         // playhead while mediabunny's getKeyPacket blocks on cold seek-target
@@ -7696,12 +7772,62 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const SEEK_INFLIGHT_POLL_MS = 120;
         const MAX_REARM_ATTEMPTS = 250; // ~30s hard cap on waiting for in-flight
         let rearmAttempts = 0;
+
+        // INTERRUPT-ON-SUPERSEDE: if a seek is ALREADY in flight when a newer
+        // target arrives, don't passively wait for its full lifecycle to finish
+        // (cold getKeyPacket search + the multi-second transmux iteration — up to
+        // ~13s in trace-29 for a position the user already abandoned). Actively
+        // interrupt it so it returns null within ~1 poll and the drain fires the
+        // LATEST target near-immediately. We do NOT execute the pending target
+        // here — we still poll until transmuxerSeekInProgressRef clears, so there
+        // is never more than one seek running at a time (preserves the trace-21
+        // no-concurrent-seek invariant). interruptSeek() sets seekAbortFlag (cuts
+        // the iteration loop) AND aborts the in-flight fetch (cuts a getKeyPacket
+        // network wait). The aborted seek's generation is discarded by its own
+        // supersession guard; its .then() null-branch clears seekBufferRef and
+        // transmuxerSeekInProgressRef, leaving a clean slate.
+        //
+        // GUARDED so it only fires for a genuine in-flight seek, never for a
+        // pure debounce-window defer (rapid drag where the prior seek already
+        // completed — busy=false — and we're just inside the 500ms window). One
+        // interrupt is enough (seekAbortFlag stays set; a second abortInFlight is
+        // a no-op), but the flag also lets a later poll interrupt a seek that is
+        // still busy without spamming every 120ms.
+        let interruptSent = false;
+        const maybeInterrupt = () => {
+          if (shouldInterruptInflightSeek(interruptSent, transmuxerSeekInProgressRef.current)) {
+            interruptSent = true;
+            // Bump the FRONTEND seek generation so the interrupted seek's
+            // completion handler sees itself as superseded and bails at the
+            // supersession guard (does NOT commit its abandoned position). This
+            // is REQUIRED for the edge case where interruptSeek() stops the
+            // iteration AFTER packets were already fetched/buffered: with nothing
+            // in flight, abortInFlight() is a no-op and the packet loop exits
+            // WITHOUT throwing, so seekTo returns a NON-NULL keyframeTimestamp
+            // instead of null. Without this bump the guard (isSeekSuperseded)
+            // would pass and the stale result would setTimestampOffset +
+            // startStreamingChain on the position the user already left — a
+            // visible glitch before the real target runs. The bump makes the
+            // guard catch it every time, regardless of null-vs-non-null return.
+            const supersededGen = ++transmuxerSeekGenRef.current;
+            console.log(`[MSE] Superseding in-flight seek (gen→${supersededGen}) — interrupting so the latest target runs now`);
+            transmuxerRef.current?.interruptSeek();
+          }
+        };
+        maybeInterrupt(); // interrupt at entry if a seek is already running
+
         const scheduleDrain = () => {
           const sinceLast = Date.now() - lastSeekTimeRef.current;
           const busy = transmuxerSeekInProgressRef.current;
           const delay = busy ? SEEK_INFLIGHT_POLL_MS : Math.max(0, debounceMs - sinceLast);
           seekDebounceTimerRef.current = window.setTimeout(() => {
             seekDebounceTimerRef.current = null;
+            // Defensive: if a seek is somehow still in flight, ensure it has been
+            // interrupted (no-op once interruptSent). Cannot go false→true within
+            // one drain — a seek only starts via executeTransmuxerSeek, which is
+            // only reached on d==='execute' (which stops draining) — but this
+            // keeps the interrupt correct even if that invariant ever changes.
+            maybeInterrupt();
             const d = decideSeekDispatch(
               Date.now(),
               lastSeekTimeRef.current,
