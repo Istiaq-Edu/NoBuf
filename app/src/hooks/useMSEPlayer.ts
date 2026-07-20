@@ -1182,6 +1182,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // goes to previous point"). Distinct from the transmuxer's internal
   // seekGeneration (which guards packet callbacks, not this frontend commit).
   const transmuxerSeekGenRef = useRef(0);
+  // PROBE (seek-to-play): wall-clock (performance.now) captured when an unbuffered
+  // transmuxer seek is ISSUED, plus its target time. The video's 'seeked' event
+  // (fires after the new currentTime is decodable and playback can resume) reads
+  // it to log the TRUE click→first-frame window — which spans reset + getKeyPacket
+  // + transmux iteration + append + decode, not just the transmux 'total=' number.
+  const seekToPlayStartRef = useRef<number>(0);
+  const seekToPlayTargetRef = useRef<number>(-1);
   // Downloaded byte ranges — merged and converted to time for green buffer bar
   const downloadedRangesRef = useRef<[number, number][]>([]);
   // Transmuxer for TS/MKV format playback (null when not active)
@@ -7503,6 +7510,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         isCompleteRef.current = false;
         lastSeekTimeRef.current = Date.now();
         transmuxerSeekInProgressRef.current = true; // Prevent concurrent seeks
+        // PROBE (seek-to-play): mark the true start of this executed seek. The
+        // 'seeked' handler logs the delta to first decodable frame. Captured per
+        // executed seek; a superseded seek bails before its commit, so the value
+        // is overwritten by the winning seek's execute — measuring the winner.
+        seekToPlayStartRef.current = performance.now();
+        seekToPlayTargetRef.current = clampedTime;
         // Bump + capture the seek generation. The async completion below checks
         // this via isSeekSuperseded() and bails if a newer seek arrived while
         // this one was resolving (5-8s on a cold far jump) — preventing a stale
@@ -7693,6 +7706,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 } catch { return keyframeTimestamp; }
               })();
               video.currentTime = computeSeekLandingTime(clampedTime, keyframeTimestamp, bufferedEnd);
+
+              // PROBE (seek-to-play): the 'seeked' event fires once the browser
+              // has decoded the target position and playback can resume — the true
+              // end of the click→first-frame window. One-shot listener logs the
+              // delta from executeTransmuxerSeek entry, capturing reset +
+              // getKeyPacket + transmux + append + decode (not just transmux 'total=').
+              if (seekToPlayStartRef.current > 0) {
+                const startedAt = seekToPlayStartRef.current;
+                const tgt = seekToPlayTargetRef.current;
+                seekToPlayStartRef.current = 0;
+                const onSeeked = () => {
+                  video.removeEventListener('seeked', onSeeked);
+                  console.log(`[MSE] SEEK-TO-PLAY: ${(performance.now() - startedAt).toFixed(0)}ms (click→first frame) for target ${tgt.toFixed(1)}s`);
+                };
+                video.addEventListener('seeked', onSeeked, { once: true });
+              }
 
               // Start streaming chain for continuous playback after limited seek
               startStreamingChain();
