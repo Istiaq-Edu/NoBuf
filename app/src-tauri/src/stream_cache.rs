@@ -1390,6 +1390,50 @@ mod tests {
         assert!(!is_range_cached(&[], 0, 999));
     }
 
+    #[test]
+    fn test_is_range_cached_single_byte() {
+        // A single-byte request that sits inside a cached range is covered.
+        assert!(is_range_cached(&[(0, 100)], 50, 50));
+        // A single-byte request that falls before the first covering range is a gap.
+        assert!(!is_range_cached(&[(60, 100)], 50, 50));
+    }
+
+    #[test]
+    fn test_is_range_cached_known_quirk_request_past_range_end() {
+        // DOCUMENTED LATENT QUIRK (not a fix target here — is_range_cached is used
+        // in 8+ call sites, high blast radius): when the request start sits PAST an
+        // earlier range's end, the loop still advances covered_start off that range
+        // (covered_start = end.max(covered_start)+1). So a byte in the gap AFTER a
+        // range but before the next reports as covered. Documented so a future
+        // reader knows this is known, deliberate-to-leave behavior, not an oversight.
+        // byte 50 is in the gap 41..59 yet this returns true:
+        assert!(is_range_cached(&[(0, 40), (60, 100)], 50, 50));
+    }
+
+    #[test]
+    fn test_is_range_cached_exact_fit() {
+        // Request exactly equal to the cached range boundaries is covered.
+        assert!(is_range_cached(&[(1000, 2000)], 1000, 2000));
+    }
+
+    #[test]
+    fn test_is_range_cached_tail_at_eof() {
+        // Mirrors the A1 tail scenario: only the last 512KB is cached. A request
+        // for that exact tail is covered; a request for the last 10MB is NOT
+        // (this is precisely why the old tail-reuse gate could never hit and the
+        // A1 memo was needed).
+        let total = 1_313_957_192u64;
+        let tail_512k = vec![(total - 512 * 1024, total - 1)];
+        assert!(is_range_cached(&tail_512k, total - 512 * 1024, total - 1));
+        assert!(!is_range_cached(&tail_512k, total - 10 * 1024 * 1024, total - 1));
+    }
+
+    #[test]
+    fn test_is_range_cached_range_extends_past_request() {
+        // Cached range strictly larger than the request on both ends: covered.
+        assert!(is_range_cached(&[(0, 5000)], 1000, 2000));
+    }
+
     /// Simulates the per-chunk incremental meta update pattern used in cmd_download_file.
     /// Each chunk of a gap pushes (offset, chunk_end-1), then merge_ranges collapses them.
     /// Before the fix, `gap_start` was used instead of `offset`, causing all chunks to

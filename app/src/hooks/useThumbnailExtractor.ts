@@ -80,6 +80,46 @@ const THUMBNAIL_NB_SAMPLES = 1; // 1 sample per segment — ensures every sample
 // the start), so a far hover must NOT snap to a stale near-start keyframe.
 const THUMB_INDEX_MAX_GAP = 12; // one conservative GOP
 
+// Frontend timeout for the backend /fmp4/keyframe-at search. MUST be >= the
+// backend's own search deadline (15s, server.rs find_keyframe_at_or_before_time)
+// plus a small margin for network/serialisation. Previously this was 5s, which
+// GUARANTEED the frontend aborted before the backend could ever return a real
+// keyframe — every far hover fell back to the crude linear byte estimate and
+// then failed to seek (VBR skew). With the backward-biased window search the
+// backend now converges within its deadline, so we wait for the real answer.
+// The subsequent segment fetch keeps its own independent 10s timeout, and the
+// `busy` flag + hover debounce prevent scrub pile-up, so a slow keyframe search
+// can't stack up concurrent requests.
+export const KEYFRAME_AT_TIMEOUT_MS = 9000; // backend deadline 8s + 1s margin
+// Mirror of the backend search deadline (server.rs find_keyframe_at_or_before_time,
+// `search_deadline = Duration::from_secs(8)`). Exported so a unit test can assert
+// the frontend timeout stays >= the backend deadline; if the backend value changes,
+// the test fails and forces this to be re-synced.
+export const BACKEND_KEYFRAME_SEARCH_DEADLINE_MS = 8000;
+
+/** Backend /fmp4/keyframe-at response (subset used for segment routing). */
+export interface KeyframeAtResponse { byte_offset?: number | null; fallback?: boolean; }
+
+/**
+ * Decide how a hover thumbnail resolves its /segment fetch from a keyframe-at
+ * response. Returns `{ mode: 'byte', byteOffset }` when the backend gave a usable
+ * position — BOTH the exact keyframe (fallback:false) AND the deadline fallback
+ * (fallback:true), whose byte is the linear estimate (time/duration)*size and is
+ * the correct ~position for `time`. Returns `{ mode: 'time' }` only when there is
+ * no byte at all (fall back to the original time-based URL).
+ *
+ * Regression guard (log 3-c): the old code used the byte ONLY when !fallback, so a
+ * fallback:true response fell through to the time URL → backend's SPARSE
+ * Fmp4ByteTimeCache → wrong early-file frame (time=878s captured the 58s frame).
+ * Pure + exported so this routing is unit-tested without a live backend.
+ */
+export function resolveKeyframeSegmentMode(
+  kf: KeyframeAtResponse | null | undefined,
+): { mode: 'byte'; byteOffset: number } | { mode: 'time' } {
+  if (kf && kf.byte_offset != null) return { mode: 'byte', byteOffset: kf.byte_offset };
+  return { mode: 'time' };
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
@@ -407,9 +447,11 @@ class ThumbnailPipeline {
       // 1. Remove all old SourceBuffer data
       await this._removeAllBufferedData();
 
-      // 2. Re-append init segment
+      // 2. Re-append init segment (teardown-guarded: destroy() nulls sourceBuffer
+      //    mid-await when the streaming chain stops during a hover)
       if (this.initSegment) {
-        this.sourceBuffer!.appendBuffer(this.initSegment);
+        if (!this.active || !this.sourceBuffer) return false;
+        this.sourceBuffer.appendBuffer(this.initSegment);
         await this._waitForUpdateEnd();
       }
 
@@ -476,8 +518,9 @@ class ThumbnailPipeline {
       }
       await this._waitForUpdateEnd();
 
-      // 9. Check if SourceBuffer covers the desired time
-      const sbBuffered = this.sourceBuffer!.buffered;
+      // 9. Check if SourceBuffer covers the desired time (teardown-guarded)
+      if (!this.active || !this.sourceBuffer) return false;
+      const sbBuffered = this.sourceBuffer.buffered;
       let coversDesiredTime = false;
       for (let i = 0; i < sbBuffered.length; i++) {
         if (sbBuffered.start(i) <= time && sbBuffered.end(i) >= time) {
@@ -497,7 +540,8 @@ class ThumbnailPipeline {
       // Wait for the decoder to render the frame at the seek position
       await this._waitForFrameRender(seekTarget, adjustedTime);
 
-      // 10. Capture frame
+      // 10. Capture frame (teardown-guarded: destroy() nulls canvas/video)
+      if (!this.active || !this.canvas || !this.video) return false;
       const canvas = this.canvas;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
@@ -1295,25 +1339,32 @@ class Fmp4ThumbnailPipeline {
 
       // 2. Re-append init segment
       if (this.initSegment) {
-        this.sourceBuffer!.appendBuffer(this.initSegment);
+        if (!this.active || !this.sourceBuffer) return false;
+        this.sourceBuffer.appendBuffer(this.initSegment);
         await this._waitForUpdateEnd();
       }
 
       // 3. Fetch keyframe byte offset from backend for precise seeking.
-      //    Timeout: 5s — if the keyframe search takes longer (FLOOD_PREMIUM_WAIT,
-      //    expanding window search), fall back to linear byte estimate.
+      //    Timeout: KEYFRAME_AT_TIMEOUT_MS (>= backend 15s deadline) — the backend
+      //    now converges within its deadline (backward-biased window search), so
+      //    we wait for the real keyframe instead of preempting it with a crude
+      //    linear byte estimate that then fails to seek on VBR content.
       let segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=0.5`;
       try {
         const kfUrl = `${this.fmp4BaseUrl}/keyframe-at/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=${this.duration.toFixed(3)}`;
         const kfController = new AbortController();
-        const kfTimeoutId = setTimeout(() => kfController.abort(), 5000);
+        const kfTimeoutId = setTimeout(() => kfController.abort(), KEYFRAME_AT_TIMEOUT_MS);
         const kfResp = await fetch(kfUrl, { signal: kfController.signal });
         clearTimeout(kfTimeoutId);
         if (kfResp.ok) {
           const kfData = await kfResp.json();
-          if (kfData.byte_offset != null && !kfData.fallback) {
-            segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${kfData.byte_offset}&duration=0.5&align=keyframe`;
-            console.log('[Fmp4ThumbnailPipeline] Using keyframe-at byte_offset=' + kfData.byte_offset + ' for time=' + time.toFixed(2) + 's');
+          // Route via the pure, unit-tested resolver (resolveKeyframeSegmentMode).
+          // BOTH exact keyframe and deadline fallback carry a usable byte_offset;
+          // only a byte-less response falls back to the original time URL.
+          const seg = resolveKeyframeSegmentMode(kfData);
+          if (seg.mode === 'byte') {
+            segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${seg.byteOffset}&duration=0.5&align=keyframe`;
+            console.log(`[Fmp4ThumbnailPipeline] Using ${kfData.fallback ? 'fallback (linear)' : 'keyframe-at'} byte_offset=${seg.byteOffset} for time=${time.toFixed(2)}s`);
           }
         }
       } catch {
@@ -1367,13 +1418,20 @@ class Fmp4ThumbnailPipeline {
         return false;
       }
 
-      // 6. Append segment to SourceBuffer
+      // 6. Append segment to SourceBuffer.
+      //    Guard against a teardown race: destroy() (fired when the streaming
+      //    chain stops mid-hover) sets active=false and nulls sourceBuffer while
+      //    this async method is parked on an await above. Dereferencing
+      //    this.sourceBuffer! then throws "Cannot read properties of null
+      //    (reading 'appendBuffer')". Bail cleanly instead.
       await this._waitForUpdateEnd();
-      this.sourceBuffer!.appendBuffer(segData);
+      if (!this.active || !this.sourceBuffer) return false;
+      this.sourceBuffer.appendBuffer(segData);
       await this._waitForUpdateEnd();
 
       // 5. Check if SourceBuffer covers the desired time
-      const sbBuffered = this.sourceBuffer!.buffered;
+      if (!this.active || !this.sourceBuffer) return false;
+      const sbBuffered = this.sourceBuffer.buffered;
       let seekTarget = time;
       if (sbBuffered.length > 0) {
         // Find the range that covers our target time
@@ -1401,7 +1459,9 @@ class Fmp4ThumbnailPipeline {
       // 7. Wait for frame render
       await this._waitForFrameRender(seekTarget);
 
-      // 8. Capture frame
+      // 8. Capture frame. Guard again: teardown during the seek/render awaits
+      //    nulls this.canvas/this.video (destroy() sets them to null as any).
+      if (!this.active || !this.canvas || !this.video) return false;
       const canvas = this.canvas;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);

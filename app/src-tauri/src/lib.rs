@@ -262,6 +262,8 @@ pub fn run() {
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 probed_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                tail_pts_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                telegram_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 qr_token: Arc::new(tokio::sync::Mutex::new(None)),
                 stored_api_hash: Arc::new(tokio::sync::Mutex::new(None)),

@@ -1693,6 +1693,52 @@ async fn download_and_cache_range(
     Ok(downloaded)
 }
 
+/// Compute the [start, end] byte window to download+scan for a keyframe, given
+/// the linear-estimate `approx_byte`, the current `window_size`, the file
+/// `total_size`, and the TS packet `alignment` (188 or 192 for m2ts).
+///
+/// BACKWARD-BIASED: 75% of the window is placed before `approx_byte` and 25%
+/// after. For VBR video the real keyframe is almost always earlier than the
+/// linear estimate, so this reaches it in fewer expansions than a symmetric
+/// split. `start` is rounded DOWN to a packet boundary; `end` is clamped to the
+/// last byte of the file. Pure + deterministic so it can be unit-tested.
+fn keyframe_search_window(
+    approx_byte: u64,
+    window_size: u64,
+    total_size: u64,
+    alignment: u64,
+) -> (u64, u64) {
+    let alignment = alignment.max(1);
+    let back = window_size / 4 * 3; // 75% backward
+    let forward = window_size / 4; // 25% forward
+    let start = (approx_byte.saturating_sub(back) / alignment) * alignment;
+    let end = if total_size == 0 {
+        0
+    } else {
+        approx_byte.saturating_add(forward).min(total_size - 1)
+    };
+    (start, end)
+}
+
+/// Deadline-first budget decision for the keyframe-search loop. Given how much
+/// time has `elapsed` since the search began and the total `deadline`, return
+/// `Some(remaining)` if there's enough budget left to plausibly start another
+/// window download, or `None` to stop and fall back to the linear byte estimate.
+///
+/// `min_slice` is the smallest remaining budget worth starting a download with
+/// (a download needing at least one rate-limited round trip). Pure so the
+/// deadline logic is unit-tested without a live Telegram stream.
+fn keyframe_search_remaining_budget(
+    elapsed: std::time::Duration,
+    deadline: std::time::Duration,
+    min_slice: std::time::Duration,
+) -> Option<std::time::Duration> {
+    match deadline.checked_sub(elapsed) {
+        Some(r) if r >= min_slice => Some(r),
+        _ => None,
+    }
+}
+
 /// Find the byte offset of the nearest video keyframe at or before `target_time_s`.
 /// First checks the cached keyframe index; if not covered, downloads a window
 /// from Telegram and scans it. Returns (timestamp_s, byte_offset, cached).
@@ -1759,18 +1805,52 @@ async fn find_keyframe_at_or_before_time(
     //    video, the actual keyframe is almost always BEFORE the linear
     //    estimate (higher bitrate early in the file), so the forward half
     //    of a symmetric window is wasted.
-    let mut window_size: u64 = 4 * 1024 * 1024; // 4MB initial
+    let mut window_size: u64 = 6 * 1024 * 1024; // 6MB initial (was 4MB)
     let max_window: u64 = 256 * 1024 * 1024; // 256MB max (for extreme VBR offsets up to ~128MB forward)
     let search_start = std::time::Instant::now();
-    let search_deadline = std::time::Duration::from_secs(15);
+    // 8s (was 15s). The search STARTS at approx_byte — the linear time→byte
+    // estimate — which is exactly the byte the frontend falls back to on
+    // timeout. So a long deadline just delays the inevitable linear fallback
+    // under playback contention (the keyframe download yields to /stream and
+    // trickles in at ~800KB/s). 8s finds the real keyframe in the common,
+    // uncontended case (~2 window iterations) yet bails to the proven linear
+    // path ~7s sooner when /stream is saturating the pipe. Frontend
+    // KEYFRAME_AT_TIMEOUT_MS is paired at 9s (deadline + 1s margin).
+    let search_deadline = std::time::Duration::from_secs(8);
 
     while window_size <= max_window {
-        // Symmetric search: 50% backward, 50% forward.
-        let back = window_size / 2;
-        let forward = window_size / 2;
+        // DEADLINE-FIRST: check the budget at loop TOP, before starting another
+        // download. Cross-validation (2-t lines 212→217) proved a bug: the old
+        // end-of-loop check let a single in-flight 12MB window download run ~15s
+        // under playback contention, sailing 7s past the 8s budget — the deadline
+        // was cosmetic. Now: if the remaining budget is too small to plausibly
+        // finish another window, bail immediately to the linear fallback; and the
+        // download itself (below) is wrapped in tokio::time::timeout(remaining) so
+        // even a started download is interrupted at the deadline. On cancel the
+        // download's in-memory buffer is dropped BEFORE its single post-loop disk
+        // write (server.rs ~1673), so a timed-out window writes nothing — no
+        // partial/corrupt cache range. Verified against download_and_cache_range.
+        let remaining = match keyframe_search_remaining_budget(
+            search_start.elapsed(),
+            search_deadline,
+            std::time::Duration::from_millis(500),
+        ) {
+            Some(r) => r,
+            None => {
+                log::warn!("[FMP4-KF-AT] Search deadline ({}s) reached for msg {} at {}s before next window, returning fallback",
+                    search_deadline.as_secs(), message_id, target_time_s);
+                return None;
+            }
+        };
+        // BACKWARD-BIASED search: 75% backward, 25% forward. For VBR video the
+        // real keyframe is almost always BEFORE the linear byte estimate (higher
+        // bitrate early in the file pushes the true cluster earlier), so a 50/50
+        // split wasted half of every window on the forward side and repeatedly
+        // failed to reach the keyframe before the 15s deadline ("No keyframe <= T"
+        // looping in the logs). A small forward slice is retained as a guard for
+        // the occasional case where the keyframe sits just past the estimate.
         let alignment: u64 = if is_m2ts { 192 } else { 188 };
-        let start = (approx_byte.saturating_sub(back) / alignment) * alignment;
-        let end = (approx_byte + forward).min(total_size - 1);
+        let (start, end) = keyframe_search_window(approx_byte, window_size, total_size, alignment);
 
         // Try reading from disk cache FIRST — the proactive prebuffer may have
         // already downloaded this region. Disk reads are instant (no Telegram
@@ -1793,25 +1873,41 @@ async fn find_keyframe_at_or_before_time(
                         if f.seek(SeekFrom::Start(start)).is_ok() && f.read_exact(&mut buf).is_ok() {
                             buf
                         } else {
-                            // Disk read failed — fall back to Telegram download
-                            match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
-                                Ok(d) => d,
-                                Err(_) => { window_size *= 2; continue; }
+                            // Disk read failed — fall back to Telegram download (deadline-bounded)
+                            match tokio::time::timeout(remaining, download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data)).await {
+                                Ok(Ok(d)) => d,
+                                Ok(Err(_)) => { window_size *= 2; continue; }
+                                Err(_) => {
+                                    log::warn!("[FMP4-KF-AT] Window download exceeded deadline ({}s) for msg {} at {}s, returning fallback",
+                                        search_deadline.as_secs(), message_id, target_time_s);
+                                    return None;
+                                }
                             }
                         }
                     }
                     Err(_) => {
-                        match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
-                            Ok(d) => d,
-                            Err(_) => { window_size *= 2; continue; }
+                        match tokio::time::timeout(remaining, download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data)).await {
+                            Ok(Ok(d)) => d,
+                            Ok(Err(_)) => { window_size *= 2; continue; }
+                            Err(_) => {
+                                log::warn!("[FMP4-KF-AT] Window download exceeded deadline ({}s) for msg {} at {}s, returning fallback",
+                                    search_deadline.as_secs(), message_id, target_time_s);
+                                return None;
+                            }
                         }
                     }
                 }
             } else {
-                // Not on disk — download from Telegram
-                match download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data).await {
-                    Ok(d) => d,
-                    Err(_) => { window_size *= 2; continue; }
+                // Not on disk — download from Telegram (deadline-bounded so a slow
+                // window can't blow past the search budget; partial bytes stay cached)
+                match tokio::time::timeout(remaining, download_and_cache_range(message_id, start, end, total_size, media, cache_mgr, data)).await {
+                    Ok(Ok(d)) => d,
+                    Ok(Err(_)) => { window_size *= 2; continue; }
+                    Err(_) => {
+                        log::warn!("[FMP4-KF-AT] Window download exceeded deadline ({}s) for msg {} at {}s, returning fallback",
+                            search_deadline.as_secs(), message_id, target_time_s);
+                        return None;
+                    }
                 }
             }
         };
@@ -1861,14 +1957,13 @@ async fn find_keyframe_at_or_before_time(
 
         window_size *= 2;
 
-        // Search deadline: if the search has been running for >15s (due to
-        // FLOOD_PREMIUM_WAIT on each download), stop expanding and return None.
-        // The caller returns a linear byte estimate fallback. The frontend's
-        // 5s AbortController has already fired by this point, but the backend
-        // keeps running and caches the result for future seeks.
+        // Backstop deadline check (defensive — the loop-TOP deadline-first check
+        // and the per-download tokio::time::timeout are the primary guards). Kept
+        // so any future code path that reaches here without a download still can't
+        // loop past the budget. Returns None → caller uses linear byte fallback.
         if search_start.elapsed() >= search_deadline {
-            log::warn!("[FMP4-KF-AT] Search deadline (15s) exceeded for msg {} at {}s, returning fallback",
-                message_id, target_time_s);
+            log::warn!("[FMP4-KF-AT] Search deadline ({}s) exceeded for msg {} at {}s, returning fallback",
+                search_deadline.as_secs(), message_id, target_time_s);
             return None;
         }
     }
@@ -2211,6 +2306,142 @@ fn build_video_encoder_args(needs_transcode: bool, qsv_ok: bool, video_codec: &s
     }
 }
 
+/// Parsed result of an ffprobe `-show_streams -show_format` JSON pass.
+/// Pure data — extracted so the JSON→indices logic can be unit-tested without
+/// spawning ffprobe.
+#[derive(Debug, Clone)]
+struct StreamProbeResult {
+    video_stream_idx: i32,
+    audio_stream_idx: i32,
+    found_video: bool,
+    found_audio: bool,
+    video_codec_name: String,
+    video_pix_fmt: String,
+    audio_codec_name: String,
+    audio_channel_layout: String,
+    probed_duration: f64,
+}
+
+impl Default for StreamProbeResult {
+    fn default() -> Self {
+        // Defaults preserve the historical fallback indices (video 0:v, audio 1)
+        // used when ffprobe fails entirely, so behavior on TOTAL probe failure is
+        // byte-for-byte unchanged from before this refactor.
+        Self {
+            video_stream_idx: 0,
+            audio_stream_idx: 1,
+            found_video: false,
+            found_audio: false,
+            video_codec_name: String::new(),
+            video_pix_fmt: String::new(),
+            audio_codec_name: String::new(),
+            audio_channel_layout: String::new(),
+            probed_duration: 0.0,
+        }
+    }
+}
+
+/// Parse ffprobe JSON (`-show_streams -show_format -print_format json`) into a
+/// [`StreamProbeResult`]. Selects the FIRST video stream and the FIRST *real*
+/// audio stream (channels > 0 AND codec != "id3" — skips Telegram's sparse
+/// timed-ID3 track). A 2nd video stream (e.g. mjpeg cover art) is ignored.
+/// Returns [`StreamProbeResult::default`] (found_video = found_audio = false) on
+/// malformed/empty JSON so the caller can decide whether to re-probe.
+fn parse_probe_json(json_str: &str) -> StreamProbeResult {
+    let mut result = StreamProbeResult::default();
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    if let Some(streams) = val.get("streams").and_then(|s| s.as_array()) {
+        for stream in streams {
+            let idx = stream.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+            if idx < 0 {
+                continue;
+            }
+            let codec_type = stream.get("codec_type").and_then(|t| t.as_str()).unwrap_or("");
+            let codec_name = stream.get("codec_name").and_then(|n| n.as_str()).unwrap_or("");
+            let channels = stream.get("channels").and_then(|c| c.as_i64()).unwrap_or(0);
+
+            if codec_type == "video" && !result.found_video {
+                result.video_stream_idx = idx as i32;
+                result.found_video = true;
+                result.video_codec_name = codec_name.to_string();
+                result.video_pix_fmt = stream
+                    .get("pix_fmt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if codec_type == "audio" && !result.found_audio && channels > 0 && codec_name != "id3" {
+                result.audio_stream_idx = idx as i32;
+                result.found_audio = true;
+                result.audio_codec_name = codec_name.to_string();
+                result.audio_channel_layout = stream
+                    .get("channel_layout")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+    }
+    if let Some(dur_str) = val
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+    {
+        if let Ok(dur) = dur_str.parse::<f64>() {
+            if dur > 0.0 {
+                result.probed_duration = dur;
+            }
+        }
+    }
+    result
+}
+
+/// Run ONE ffprobe `-show_streams -show_format` pass over `input_source` with the
+/// given probe budget, returning parsed streams/duration. Logs failures and
+/// returns [`StreamProbeResult::default`] on spawn error / non-zero exit /
+/// malformed output (never panics — the caller decides how to degrade).
+async fn run_stream_probe(
+    ffprobe_path: &std::path::Path,
+    input_source: &str,
+    probesize: &str,
+    analyzeduration: &str,
+    message_id: i32,
+) -> StreamProbeResult {
+    let probe_output = TokioCommand::new(ffprobe_path)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-print_format", "json",
+            "-show_streams", "-show_format",
+            "-probesize", probesize, "-analyzeduration", analyzeduration,
+            input_source,
+        ])
+        .output()
+        .await;
+    match probe_output {
+        Ok(output) if output.status.success() => {
+            parse_probe_json(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "[REMUX-PROBE] msg {}: ffprobe failed (probesize={}): {}",
+                message_id, probesize, stderr.trim()
+            );
+            StreamProbeResult::default()
+        }
+        Err(e) => {
+            log::warn!(
+                "[REMUX-PROBE] msg {}: ffprobe spawn failed (probesize={}): {}",
+                message_id, probesize, e
+            );
+            StreamProbeResult::default()
+        }
+    }
+}
+
 /// FFmpeg-based TS→MPEG-TS remux endpoint.
 ///
 /// Spawns `ffmpeg -i INPUT -c:v copy -c:a aac -b:a 192k -f mpegts -mpegts_flags resend_headers pipe:1`
@@ -2300,90 +2531,87 @@ async fn remux_ts_to_mp4(
                 .body(format!("ffprobe not found: {}", e));
         }
     };
-    let probe_output = TokioCommand::new(&ffprobe_path)
-        .args([
-            "-hide_banner", "-loglevel", "error",
-            "-print_format", "json",
-            "-show_streams", "-show_format",
-            // Use LARGE probesize (matching ffmpeg's 50MB) to discover ALL streams
-            // including sparse ID3 streams. Small probesize misses late streams,
-            // causing index mismatch between ffprobe and ffmpeg.
-            "-probesize", "50000000", "-analyzeduration", "50000000",
-            &input_source,
-        ])
-        .output()
-        .await;
+    // ── FAST PROBE (Change 1): 5MB / 5s budget ──
+    // The old budget was 50MB / 50s. On the Telegram-backed /stream input the
+    // analyzeduration=50s limit was the binding constraint: ffprobe pulled ~50
+    // seconds-of-video worth of bytes (11–37 MB depending on bitrate) before
+    // returning, at the ~1.8 MB/s single-stream ceiling → 6–21s blocking wait
+    // before ffmpeg (and thus playback) could start (verified against logs
+    // 2-t.md: served-byte ranges == 50s-of-video for all three files). A 5s
+    // window still covers standard TS A/V interleaving and cuts the wait to
+    // ~1–3s. The rare file whose real audio starts later than 5s is handled by
+    // the guarded fallback below.
+    const FAST_PROBESIZE: &str = "5000000";        // 5 MB
+    const FAST_ANALYZEDURATION: &str = "5000000";  // 5 s (µs units)
+    const FULL_PROBESIZE: &str = "50000000";       // 50 MB
+    const FULL_ANALYZEDURATION: &str = "50000000"; // 50 s (µs units)
 
-    let mut video_stream_idx: i32 = 0;
-    let mut audio_stream_idx: i32 = 1;
-    let mut probed_duration: f64 = 0.0;
-    // Phase 2 classification (Option B — capability-based gating).
-    let mut video_codec_name: String = String::new();
-    let mut video_pix_fmt: String = String::new();
+    let mut probe = run_stream_probe(
+        &ffprobe_path, &input_source, FAST_PROBESIZE, FAST_ANALYZEDURATION, message_id,
+    ).await;
+
+    // ── GUARDED FALLBACK (Change 2): re-probe at the old 50MB/50s budget ──
+    // ONLY when the fast probe failed to find a real video OR audio stream. A
+    // successful fast probe (both found) never pays this cost. This preserves
+    // the original "large probesize discovers late/sparse streams" guarantee for
+    // the pathological files while keeping the common case fast. Duration alone
+    // does NOT trigger a re-probe (it's best-effort and also filled from the
+    // /remux ffprobe estimate elsewhere).
+    if !probe.found_video || !probe.found_audio {
+        log::warn!(
+            "[REMUX-PROBE] msg {}: fast probe incomplete (video={}, audio={}) — re-probing at {}B/{}µs",
+            message_id, probe.found_video, probe.found_audio, FULL_PROBESIZE, FULL_ANALYZEDURATION
+        );
+        let full = run_stream_probe(
+            &ffprobe_path, &input_source, FULL_PROBESIZE, FULL_ANALYZEDURATION, message_id,
+        ).await;
+        // Merge: prefer any stream the full probe found that the fast one missed,
+        // so a fast-found video isn't lost if the full probe somehow regresses.
+        if full.found_video && !probe.found_video {
+            probe.video_stream_idx = full.video_stream_idx;
+            probe.found_video = true;
+            probe.video_codec_name = full.video_codec_name.clone();
+            probe.video_pix_fmt = full.video_pix_fmt.clone();
+        }
+        if full.found_audio && !probe.found_audio {
+            probe.audio_stream_idx = full.audio_stream_idx;
+            probe.found_audio = true;
+            probe.audio_codec_name = full.audio_codec_name.clone();
+            probe.audio_channel_layout = full.audio_channel_layout.clone();
+        }
+        if probe.probed_duration <= 0.0 && full.probed_duration > 0.0 {
+            probe.probed_duration = full.probed_duration;
+        }
+    }
+
+    // Unpack into the downstream variable names (unchanged below this point).
     // NOTE: non-standard audio layouts (e.g. "5.1(side)") make the AAC encoder
     // emit a PCE (Program Config Element), which Chromium's MSE fMP4 parser
     // rejects → CHUNK_DEMUXER_ERROR_APPEND_FAILED, tearing down the /remux pipe
     // and killing ffmpeg with -22 on the trailer write. Fixed by
     // AAC_LAYOUT_FILTER at all three encode sites; layout is logged below.
+    let video_stream_idx: i32 = probe.video_stream_idx;
+    let audio_stream_idx: i32 = probe.audio_stream_idx;
+    let probed_duration: f64 = probe.probed_duration;
+    let video_codec_name: String = probe.video_codec_name.clone();
+    let video_pix_fmt: String = probe.video_pix_fmt.clone();
 
-    match probe_output {
-        Ok(output) if output.status.success() => {
-            let json_str = String::from_utf8_lossy(&output.stdout);
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                if let Some(streams) = val.get("streams").and_then(|s| s.as_array()) {
-                    let mut found_video = false;
-                    let mut found_audio = false;
-                    for stream in streams {
-                        let idx = stream.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
-                        let codec_type = stream.get("codec_type").and_then(|t| t.as_str()).unwrap_or("");
-                        let codec_name = stream.get("codec_name").and_then(|n| n.as_str()).unwrap_or("");
-                        let channels = stream.get("channels").and_then(|c| c.as_i64()).unwrap_or(0);
-
-                        if codec_type == "video" && !found_video {
-                            video_stream_idx = idx as i32;
-                            found_video = true;
-                            // Capture codec + pixel format for the transcode decision.
-                            // NOTE: the FIRST video stream is the real one; a 2nd video
-                            // stream (e.g. mjpeg cover-art attachment) is ignored here
-                            // and excluded by the explicit -map at encode time.
-                            video_codec_name = codec_name.to_string();
-                            video_pix_fmt = stream.get("pix_fmt").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                            log::info!("[REMUX-PROBE] msg {}: video stream idx={} (codec={}, pix_fmt={})", message_id, idx, codec_name, video_pix_fmt);
-                        }
-                        if codec_type == "audio" && !found_audio && channels > 0 && codec_name != "id3" {
-                            audio_stream_idx = idx as i32;
-                            found_audio = true;
-                            let layout = stream.get("channel_layout")
-                                .and_then(|l| l.as_str()).unwrap_or("");
-                            log::info!("[REMUX-PROBE] msg {}: audio stream idx={} (codec={}, ch={}, layout={})",
-                                message_id, idx, codec_name, channels, layout);
-                        }
-                    }
-                    if !found_audio {
-                        log::warn!("[REMUX-PROBE] msg {}: no real audio stream found, using idx={}", message_id, audio_stream_idx);
-                    }
-                }
-                // Get duration from format
-                if let Some(dur_str) = val.get("format").and_then(|f| f.get("duration")).and_then(|d| d.as_str()) {
-                    if let Ok(dur) = dur_str.parse::<f64>() {
-                        if dur > 0.0 {
-                            probed_duration = dur;
-                            log::info!("[REMUX-PROBE] msg {}: ffprobe duration={:.1}s", message_id, dur);
-                            // Cache the exact duration so /fmp4/metadata (which the seek
-                            // bar reads) can return it instead of the bitrate estimate.
-                            data.probed_durations.write().await.insert(message_id, dur);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::warn!("[REMUX-PROBE] msg {}: ffprobe failed: {}", message_id, stderr.trim());
-        }
-        Err(e) => {
-            log::warn!("[REMUX-PROBE] msg {}: ffprobe spawn failed: {}", message_id, e);
-        }
+    if probe.found_video {
+        log::info!("[REMUX-PROBE] msg {}: video stream idx={} (codec={}, pix_fmt={})",
+            message_id, video_stream_idx, video_codec_name, video_pix_fmt);
+    }
+    if probe.found_audio {
+        log::info!("[REMUX-PROBE] msg {}: audio stream idx={} (codec={}, layout={})",
+            message_id, audio_stream_idx, probe.audio_codec_name, probe.audio_channel_layout);
+    } else {
+        log::warn!("[REMUX-PROBE] msg {}: no real audio stream found (after fallback), using idx={}",
+            message_id, audio_stream_idx);
+    }
+    if probed_duration > 0.0 {
+        log::info!("[REMUX-PROBE] msg {}: ffprobe duration={:.1}s", message_id, probed_duration);
+        // Cache the exact duration so /fmp4/metadata (which the seek bar reads)
+        // can return it instead of the bitrate estimate.
+        data.probed_durations.write().await.insert(message_id, probed_duration);
     }
 
     // ── Phase 2: classify — needs_transcode (capability-based) + is_hdr ──
@@ -3349,7 +3577,37 @@ async fn fmp4_segment(
             let cancel_flag = dl.cancel_flag.clone();
             let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
 
-            loop {
+            // PROXIMITY GUARD (random-access hover thumbnails): a covering
+            // download whose CURRENT progress is far behind read_start — e.g. a
+            // sequential PROACTIVE fill sitting at ~72MB while this thumbnail
+            // needs ~534MB — cannot crawl to our range before the client's 10s
+            // abort. Subscribing to it just guarantees the observed
+            // "[FMP4-SEG] Timeout waiting for download to reach read_start"
+            // and the hover thumbnail never renders. find_best_covering_download
+            // matches on the download's DECLARED start/end (which for PROACTIVE
+            // is ~EOF), not its live progress, so it happily returns that
+            // far-behind download. Do a targeted own-download of just this GOP
+            // instead. (Only fmp4-seg needs this — the /stream sequential path
+            // genuinely benefits from riding a covering download.)
+            // Binding constraint is the FRONTEND's 10s segment-fetch abort (not
+            // the 20s backend wait). A targeted own-download starts AT read_start
+            // and fetches a gap-independent ~read_len (~2.7MB), so riding a
+            // covering download only wins when it's about to reach us anyway
+            // (gap of a chunk or two). 4MB ≈ 8s @ 500KB/s leaves margin under 10s.
+            const MAX_CATCHUP_DISTANCE: u64 = 4 * 1024 * 1024;
+            let initial_progress = *progress_rx.borrow();
+            if read_start > initial_progress
+                && read_start - initial_progress > MAX_CATCHUP_DISTANCE
+            {
+                log::info!(
+                    "[FMP4-SEG] covering download too far behind for msg {} (progress={} read_start={}, gap={}MB) — targeted own-download",
+                    message_id, initial_progress, read_start,
+                    (read_start - initial_progress) / 1024 / 1024
+                );
+                need_own_download = true;
+            }
+
+            while !need_own_download {
                 let progress = *progress_rx.borrow();
 
                 // Check if the range is now fully cached
@@ -4007,7 +4265,18 @@ async fn fmp4_metadata(
     // This is far more accurate than bitrate estimation (which assumes ~500KB/s
     // and is wildly wrong for high-bitrate or low-bitrate files).
     let mut telegram_duration: Option<f64> = None;
-    {
+    // MEMO: the DocumentAttributeVideo lookup below calls get_messages_by_id (an
+    // uncached, unthrottled API call). The frontend retries /fmp4/metadata up to
+    // 6× waiting for the ffprobe duration, so this fired 6× per cold start — even
+    // for files with no video attrs (returns the same result every time). The raw
+    // message attributes are immutable per file; reuse the memoized outcome.
+    let telegram_dur_memo = data.telegram_durations.read().await.get(&message_id).copied();
+    if let Some(memo) = telegram_dur_memo {
+        telegram_duration = memo;
+        if memo.is_some() {
+            log::info!("[FMP4-META] msg {} reusing memoized Telegram duration={:.1}s (skipping get_messages_by_id)", message_id, memo.unwrap());
+        }
+    } else {
         let folder_id = if folder_id_str == "me" || folder_id_str == "home" || folder_id_str == "null" {
             None
         } else {
@@ -4039,8 +4308,15 @@ async fn fmp4_metadata(
                         if let Some((dur, _w, _h)) = extract_video_attrs_from_raw_msg(&msg.raw) {
                             telegram_duration = Some(dur);
                             log::info!("[FMP4-META] msg {} Telegram duration={:.1}s", message_id, dur);
+                            // MEMO a GENUINE outcome (message fetched + attrs read).
+                            data.telegram_durations.write().await.insert(message_id, Some(dur));
                         } else {
                             log::warn!("[FMP4-META] msg {} extract_video_attrs_from_raw_msg returned None — message type or document attributes don't contain Video", message_id);
+                            // MEMO the genuine "no video attrs" outcome so retries stop
+                            // re-calling get_messages_by_id. NOT cached for transient
+                            // failures (no client / peer / fetch error) below — those must
+                            // stay retryable so a later-connected client can resolve them.
+                            data.telegram_durations.write().await.insert(message_id, None);
                         }
                     } else {
                         log::warn!("[FMP4-META] msg {} not found in messages result", message_id);
@@ -4058,7 +4334,21 @@ async fn fmp4_metadata(
 
     // Estimate duration: prefer Telegram metadata, fall back to PTS-based
     // calculation from demuxer, then bitrate estimation as last resort.
-    let pts_duration: Option<f64> = if telegram_duration.is_none() {
+    //
+    // MEMO SHORT-CIRCUIT: the tail-PTS path below downloads the last 512KB from
+    // Telegram to read the final video PTS. That value is immutable for a given
+    // file, but the frontend retries /fmp4/metadata up to 6× (waiting for the
+    // ffprobe duration), and the tail-reuse gate checks for the last 10MB cached
+    // while the tail path only writes back 512KB — so every retry re-downloaded
+    // the tail over the rate-limited pipe during cold start. If we already
+    // computed the tail PTS once, reuse it and skip the download entirely.
+    let memoized_tail_pts = data.tail_pts_durations.read().await.get(&message_id).copied();
+    let pts_duration: Option<f64> = if telegram_duration.is_some() {
+        None
+    } else if let Some(memo) = memoized_tail_pts.filter(|d| *d > 0.0) {
+        log::info!("[FMP4-META] msg {} reusing memoized tail PTS duration={:.1}s (skipping tail download)", message_id, memo);
+        Some(memo)
+    } else {
         // Try to compute duration from PTS values in the TS stream.
         // Progressive approach: use whatever data IS currently cached to
         // estimate the average bitrate, then compute duration from that.
@@ -4245,6 +4535,13 @@ async fn fmp4_metadata(
                                                     log::info!("[FMP4-META] msg {} Tail-download PTS duration={:.1}s (init_pts={}, final_pts={})", message_id, dur, init_pts, final_pts);
                                                     tail_pts_duration = Some(dur);
 
+                                                    // MEMO: store the tail-derived PTS duration so
+                                                    // subsequent /fmp4/metadata calls (the frontend
+                                                    // retries up to 6×) short-circuit at the block
+                                                    // head above instead of re-downloading the tail
+                                                    // over the rate-limited Telegram pipe.
+                                                    data.tail_pts_durations.write().await.insert(message_id, dur);
+
                                                     // Also cache the tail data for reuse by streaming
                                                     {
                                                         let _lock4 = cache_mgr.lock_meta(message_id).await;
@@ -4374,8 +4671,6 @@ async fn fmp4_metadata(
         } else {
             None
         }
-    } else {
-        None
     };
 
     // Prefer the exact duration resolved by the /remux ffprobe pass if available.
@@ -5285,6 +5580,225 @@ mod tests {
         }
         assert!(super::build_remux_audio_filter(false).starts_with(super::AAC_LAYOUT_FILTER),
             "non-seek must lead with the layout guard");
+    }
+
+    // ── keyframe_search_window (C1: backward-biased VBR keyframe search) ──
+
+    #[test]
+    fn keyframe_window_is_backward_biased() {
+        // For a mid-file target the window must place the MAJORITY of its bytes
+        // BEFORE approx_byte (VBR keyframes sit earlier than the linear estimate).
+        let approx = 500_000_000u64;
+        let window = 4 * 1024 * 1024u64;
+        let total = 1_313_957_192u64;
+        let (start, end) = super::keyframe_search_window(approx, window, total, 188);
+        assert!(start < approx, "start must be before approx_byte");
+        assert!(end >= approx, "end must reach approx_byte");
+        let back = approx - start;
+        let forward = end - approx;
+        assert!(back > forward, "window must be backward-biased: back={back} forward={forward}");
+        // 75/25 split (allowing for alignment rounding on the back edge).
+        assert!(back >= forward * 2, "back should be ~3x forward: back={back} forward={forward}");
+    }
+
+    #[test]
+    fn keyframe_window_is_packet_aligned() {
+        // start must round DOWN to a TS packet boundary for both 188 and 192 (m2ts).
+        for alignment in [188u64, 192u64] {
+            let (start, _end) = super::keyframe_search_window(500_000_123, 4 * 1024 * 1024, 1_000_000_000, alignment);
+            assert_eq!(start % alignment, 0, "start must be {alignment}-aligned, got {start}");
+        }
+    }
+
+    #[test]
+    fn keyframe_window_clamps_to_end_of_file() {
+        // A target near EOF must clamp `end` to total_size-1, never past it.
+        let total = 100_000_000u64;
+        let (_start, end) = super::keyframe_search_window(total - 100, 4 * 1024 * 1024, total, 188);
+        assert!(end <= total - 1, "end must clamp to total_size-1: end={end} total={total}");
+    }
+
+    #[test]
+    fn keyframe_window_handles_start_of_file() {
+        // approx_byte=0 must not underflow; start stays 0.
+        let (start, end) = super::keyframe_search_window(0, 4 * 1024 * 1024, 1_000_000_000, 188);
+        assert_eq!(start, 0, "start must be 0 at file head, got {start}");
+        assert!(end > 0, "end must extend forward from file head, got {end}");
+    }
+
+    #[test]
+    fn keyframe_window_total_size_zero_guard() {
+        // Degenerate total_size==0 must not panic (underflow on total_size-1).
+        let (start, end) = super::keyframe_search_window(0, 4 * 1024 * 1024, 0, 188);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0, "end must be 0 when total_size is 0");
+    }
+
+    #[test]
+    fn keyframe_window_zero_alignment_guard() {
+        // alignment=0 must be treated as 1 (no divide-by-zero).
+        let (start, _end) = super::keyframe_search_window(1000, 512, 1_000_000, 0);
+        assert!(start <= 1000);
+    }
+
+    // ── keyframe_search_remaining_budget (deadline-first: the bug 2-t exposed) ──
+    use std::time::Duration;
+
+    #[test]
+    fn budget_returns_remaining_when_ample() {
+        // 2s elapsed of an 8s deadline → 6s left, well above the 500ms floor.
+        let r = super::keyframe_search_remaining_budget(
+            Duration::from_secs(2), Duration::from_secs(8), Duration::from_millis(500));
+        assert_eq!(r, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn budget_stops_when_past_deadline() {
+        // Elapsed beyond the deadline → None (checked_sub underflow guarded).
+        let r = super::keyframe_search_remaining_budget(
+            Duration::from_secs(9), Duration::from_secs(8), Duration::from_millis(500));
+        assert_eq!(r, None, "must not loop once the budget is spent");
+    }
+
+    #[test]
+    fn budget_stops_when_slice_too_small() {
+        // 7.8s elapsed → 200ms left, below the 500ms floor: not worth a round trip.
+        let r = super::keyframe_search_remaining_budget(
+            Duration::from_millis(7800), Duration::from_secs(8), Duration::from_millis(500));
+        assert_eq!(r, None, "sub-min_slice budget must bail to linear fallback");
+    }
+
+    #[test]
+    fn budget_floor_is_inclusive() {
+        // Exactly min_slice remaining is still usable (>= comparison).
+        let r = super::keyframe_search_remaining_budget(
+            Duration::from_millis(7500), Duration::from_secs(8), Duration::from_millis(500));
+        assert_eq!(r, Some(Duration::from_millis(500)));
+    }
+
+    // ── parse_probe_json tests (fast-probe / guarded-fallback change) ──
+    // These lock the JSON→stream-index contract the fast/full probe both rely on.
+
+    /// Standard Telegram TS: video idx 0, real AAC audio idx 1, sparse id3 idx 2.
+    /// Must pick video 0 + audio 1, skip the id3 stream, and read format duration.
+    #[test]
+    fn probe_json_standard_ts_video0_audio1_id3_skipped() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":2,"channel_layout":"stereo"},
+                {"index":2,"codec_type":"data","codec_name":"id3"}
+            ],
+            "format": {"duration":"2073.019000"}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert!(r.found_video && r.found_audio);
+        assert_eq!(r.video_stream_idx, 0);
+        assert_eq!(r.audio_stream_idx, 1);
+        assert_eq!(r.video_codec_name, "h264");
+        assert_eq!(r.video_pix_fmt, "yuv420p");
+        assert_eq!(r.audio_codec_name, "aac");
+        assert!((r.probed_duration - 2073.019).abs() < 0.01);
+    }
+
+    /// An `audio` stream literally named codec "id3" with 0 channels must NOT be
+    /// selected as the audio track (the exact bug the channels>0 && !=id3 guard
+    /// prevents — a wrong -map here yields no audio).
+    #[test]
+    fn probe_json_id3_as_audio_codec_is_skipped() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},
+                {"index":1,"codec_type":"audio","codec_name":"id3","channels":0},
+                {"index":2,"codec_type":"audio","codec_name":"aac","channels":2,"channel_layout":"stereo"}
+            ],
+            "format": {"duration":"100.0"}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert!(r.found_audio, "real aac audio must be found");
+        assert_eq!(r.audio_stream_idx, 2, "must skip id3-codec audio and pick the aac at idx 2");
+        assert_eq!(r.audio_codec_name, "aac");
+    }
+
+    /// Cover-art: a 2nd video stream (mjpeg) must be ignored — the FIRST video wins.
+    #[test]
+    fn probe_json_second_video_is_cover_art_ignored() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"hevc","pix_fmt":"yuv420p10le"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":6,"channel_layout":"5.1(side)"},
+                {"index":2,"codec_type":"video","codec_name":"mjpeg","pix_fmt":"yuvj420p"}
+            ],
+            "format": {"duration":"5471.0"}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert_eq!(r.video_stream_idx, 0);
+        assert_eq!(r.video_codec_name, "hevc");
+        assert_eq!(r.video_pix_fmt, "yuv420p10le");
+        assert_eq!(r.audio_stream_idx, 1);
+        assert_eq!(r.audio_channel_layout, "5.1(side)");
+    }
+
+    /// Late-audio miss: fast probe window sees ONLY video (audio not yet appeared).
+    /// found_audio must be false → this is exactly what triggers the guarded
+    /// fallback re-probe in remux_ts_to_mp4.
+    #[test]
+    fn probe_json_video_only_triggers_fallback_signal() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"}
+            ],
+            "format": {"duration":"600.0"}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert!(r.found_video);
+        assert!(!r.found_audio, "no audio in window → fallback must be signalled");
+        // Falls back to the historical default audio index.
+        assert_eq!(r.audio_stream_idx, 1);
+    }
+
+    /// Malformed / empty / non-JSON input must degrade to defaults (found=false,
+    /// idx 0/1) and never panic — this is the ffprobe-garbage-output edge case.
+    #[test]
+    fn probe_json_malformed_degrades_to_defaults() {
+        for bad in ["", "not json", "{", "{\"streams\": \"oops\"}", "null", "[]"] {
+            let r = super::parse_probe_json(bad);
+            assert!(!r.found_video, "malformed {:?} must not report video", bad);
+            assert!(!r.found_audio, "malformed {:?} must not report audio", bad);
+            assert_eq!(r.video_stream_idx, 0);
+            assert_eq!(r.audio_stream_idx, 1);
+            assert_eq!(r.probed_duration, 0.0);
+        }
+    }
+
+    /// Zero / negative / unparseable duration must NOT be accepted (stays 0.0 so
+    /// the caller keeps the bitrate estimate instead of caching a bad value).
+    #[test]
+    fn probe_json_bad_duration_stays_zero() {
+        for dur in ["0", "0.0", "-5.0", "N/A", ""] {
+            let json = format!(
+                r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264"}}],"format":{{"duration":"{}"}}}}"#,
+                dur
+            );
+            let r = super::parse_probe_json(&json);
+            assert_eq!(r.probed_duration, 0.0, "duration {:?} must be rejected", dur);
+        }
+    }
+
+    /// Streams with a negative/missing index are skipped (defensive — a bad index
+    /// cast to i32 must never become a -map target).
+    #[test]
+    fn probe_json_negative_index_skipped() {
+        let json = r#"{
+            "streams": [
+                {"index":-1,"codec_type":"video","codec_name":"h264"},
+                {"index":3,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},
+                {"index":4,"codec_type":"audio","codec_name":"aac","channels":2}
+            ]
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert_eq!(r.video_stream_idx, 3, "must skip the index=-1 stream and pick idx 3");
+        assert_eq!(r.audio_stream_idx, 4);
     }
 }
 
