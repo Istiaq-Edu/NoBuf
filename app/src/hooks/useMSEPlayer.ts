@@ -8401,3 +8401,34 @@ export function formatSpeed(bps: number): string {
   if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
   return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
 }
+
+/**
+ * Choose the bytes/sec value to show on the download-speed meter.
+ *
+ * The meter historically read ONLY `greenBarSpeed` (derived from the delta of
+ * the backend disk cache's cached_bytes). During cold start the disk cache
+ * barely grows for the first ~40s (proactive prebuffer hasn't spawned; the
+ * /remux pipe feeds mpegts.js directly without growing cached_ranges), so
+ * greenBarSpeed sat at 0 and the meter showed "—" even though bytes were
+ * actively streaming from Telegram.
+ *
+ * `mseSpeed` (useMSEPlayer's `speed`, computed from the mpegts.js IOController
+ * _currentRange delta OR the custom-loader read history) DOES measure that live
+ * pipe throughput. So: prefer greenBarSpeed when it's live (disk prebuffer is
+ * the real signal once running), otherwise fall back to the MSE pipe speed.
+ * Both are genuine Telegram throughput measured at different points — no lie.
+ *
+ * "paused means paused": when the user has paused prefetch, the meter must show
+ * nothing regardless of any residual in-flight bytes. Returns 0 → caller renders
+ * the "—" placeholder. Pure + deterministic for unit testing.
+ */
+export function speedMeterValue(
+  greenBarSpeed: number,
+  mseSpeed: number,
+  prefetchPaused: boolean,
+): number {
+  if (prefetchPaused) return 0;
+  if (greenBarSpeed > 0) return greenBarSpeed;
+  if (mseSpeed > 0) return mseSpeed;
+  return 0;
+}

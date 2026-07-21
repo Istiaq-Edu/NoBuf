@@ -5,7 +5,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
-import { useMSEPlayer, formatSpeed } from '../../hooks/useMSEPlayer';
+import { useMSEPlayer, formatSpeed, speedMeterValue } from '../../hooks/useMSEPlayer';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
@@ -295,7 +295,7 @@ interface FastStreamPlayerProps {
     isPrefetching: _isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
-    speed: _whiteBarSpeed,  // kept for MSE hook internals, but speed meter now uses greenBarSpeed
+    speed: mseSpeed,  // live MSE pipe throughput — fallback for the speed meter during cold start when greenBarSpeed (disk delta) is still 0
     pausePrefetch,
     resumePrefetch,
     seekTo,
@@ -541,7 +541,13 @@ interface FastStreamPlayerProps {
           }
           // Build ranges from BOTH backend + shadow cache, regardless of status
           // Use real duration if available, fall back to estimate for green bar calculation
-          const durForBar = durRef.current || (window as any).__nobuf_estimateDuration || 0;
+          // Prefer the accurate PTS duration (set from /fmp4/metadata ~2s after
+          // open) over the 4Mbps estimate. Without __nobuf_ptsDuration here the
+          // green bar stayed dark for the entire ~12s duration-probe retry window
+          // even though the real duration was known almost immediately — the bar's
+          // data gate (durForBar > 0) and this whole block never ran. durRef stays
+          // authoritative once the seek-bar duration is confirmed.
+          const durForBar = durRef.current || (window as any).__nobuf_ptsDuration || (window as any).__nobuf_estimateDuration || 0;
           const ranges: [number, number][] = [];
 
           // Backend ranges (disk cache) → green prebuffer bar. Two corrections,
@@ -566,7 +572,8 @@ interface FastStreamPlayerProps {
           if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
             const cachedRanges = status.cached_ranges as [number, number][];
             const seekTarget = (window as any).__nobuf_seekTargetTime;
-            const rawPlayhead = vidRef.current?.currentTime ?? 0;
+            // (rawPlayhead removed with the GREEN-BAR diagnostic log; re-add
+            //  `const rawPlayhead = vidRef.current?.currentTime ?? 0;` if re-enabling.)
             // (B) Capture a VBR anchor for the active seek before converting.
             if (typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
               const linearByte = (seekTarget / durForBar) * status.total_bytes;
@@ -598,10 +605,9 @@ interface FastStreamPlayerProps {
             for (const [s, e] of cachedRanges) {
               ranges.push([byteToTime(s), byteToTime(e + 1)]);
             }
-            // DIAGNOSTIC (remove once green-bar persistence is confirmed): dumps
-            // the byte→time conversion the bar renders. rawPlayhead/seekTarget are
-            // kept only for context now — no range is filtered by recency.
-            console.log(`[GREEN-BAR] raw=${rawPlayhead.toFixed(1)}s seekTgt=${typeof seekTarget==='number'?seekTarget.toFixed(1):'-'} dur=${durForBar.toFixed(1)}s | cached bytes→time: ${cachedRanges.map(([s,e]) => `${(s/1e6).toFixed(0)}-${(e/1e6).toFixed(0)}MB→${byteToTime(s).toFixed(0)}-${byteToTime(e+1).toFixed(0)}s`).join(', ')} | shown: ${ranges.map(([a,b])=>`${a.toFixed(0)}-${b.toFixed(0)}s`).join(', ') || 'none'}`);
+            // DIAGNOSTIC (disabled — green-bar persistence confirmed). Re-enable
+            // by uncommenting if the byte→time conversion needs inspection again.
+            // console.log(`[GREEN-BAR] raw=${rawPlayhead.toFixed(1)}s seekTgt=${typeof seekTarget==='number'?seekTarget.toFixed(1):'-'} dur=${durForBar.toFixed(1)}s | cached bytes→time: ${cachedRanges.map(([s,e]) => `${(s/1e6).toFixed(0)}-${(e/1e6).toFixed(0)}MB→${byteToTime(s).toFixed(0)}-${byteToTime(e+1).toFixed(0)}s`).join(', ')} | shown: ${ranges.map(([a,b])=>`${a.toFixed(0)}-${b.toFixed(0)}s`).join(', ') || 'none'}`);
           }
 
           // Shadow cache ranges are NOT shown on the green bar.
@@ -1694,6 +1700,16 @@ interface FastStreamPlayerProps {
 
   const pct = dur > 0 ? (time / dur) * 100 : 0;
 
+  // Duration used ONLY for the prebuffer/green bar + buffer-ahead readout. The
+  // seek-bar `dur` is intentionally held at 0 on the remux path until the real
+  // PTS duration is confirmed (avoids a wrong growing-duration seek bar). But the
+  // accurate PTS duration (__nobuf_ptsDuration) is known ~2s after open — ~10s
+  // before `dur` is set — and gating the green bar / buffer-ahead on `dur > 0`
+  // left them dark for that whole window even though cached ranges existed. Fall
+  // back to the PTS (then estimate) duration so those indicators light up
+  // immediately. Does NOT touch the seek bar / time readout.
+  const barDur = dur || (window as any).__nobuf_ptsDuration || (window as any).__nobuf_estimateDuration || 0;
+
   // Chip registry: id → button JSX. Each movable control lives here once and is
   // placed by the persisted layout into left/right/tray zones.
   const chipButton = (id: string): { el: React.ReactNode; label: string } => {
@@ -2003,7 +2019,7 @@ interface FastStreamPlayerProps {
               </button>
             )}
             <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
-              {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+              {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
             </span>
           </div>
           <div className="relative h-[2px] bg-white/20">
@@ -2064,7 +2080,7 @@ interface FastStreamPlayerProps {
             {/* Playback position (red) — z-10, ON TOP of white bar */}
             <div className="absolute inset-y-0 left-0 bg-red-500 rounded-full z-10" style={{ width: `${pct}%` }} />
             {/* Green bar — disk + shadow cache (thin, above red bar, bottom edge) */}
-            {cachedTimeRanges.length > 0 && dur > 0 && (() => {
+            {cachedTimeRanges.length > 0 && barDur > 0 && (() => {
               // Merge overlapping cached ranges
               const sorted = [...cachedTimeRanges].sort((a, b) => a[0] - b[0]);
               const merged: [number, number][] = [];
@@ -2082,8 +2098,8 @@ interface FastStreamPlayerProps {
                 }
               }
               return merged.map(([ts, te], i) => {
-                const leftPct = (ts / dur) * 100;
-                const widthPct = ((te - ts) / dur) * 100;
+                const leftPct = (ts / barDur) * 100;
+                const widthPct = ((te - ts) / barDur) * 100;
                 return (
                   <div
                     key={`cache-${i}`}
@@ -2199,7 +2215,7 @@ interface FastStreamPlayerProps {
                 }
               }
               let cacheAhead = 0;
-              if (cachedTimeRanges.length > 0 && dur > 0) {
+              if (cachedTimeRanges.length > 0 && barDur > 0) {
                 for (const [s, e] of cachedTimeRanges) {
                   if (e > curTime) {
                     cacheAhead += e - Math.max(s, curTime);
@@ -2233,7 +2249,7 @@ interface FastStreamPlayerProps {
                   </button>
                   {/* Download speed */}
                   <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {greenBarSpeed > 0 ? formatSpeed(greenBarSpeed) : '—'}
+                    {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
                   </span>
                   {/* Buffer ahead */}
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
