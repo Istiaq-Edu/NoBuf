@@ -346,6 +346,14 @@ pub(crate) struct StreamQuery {
     /// uses `-ss` to start remuxing from this position instead of the
     /// beginning, enabling byte-range-like seeking through the remux pipe.
     pub(crate) ss: Option<f64>,
+    /// Byte-forward seek offset for the remux endpoint (alternative to `ss`).
+    /// When set, the backend prepends the cached init-prefix (PAT/PMT, 376B)
+    /// and then streams /stream bytes from this TS-aligned offset forward into
+    /// ffmpeg's stdin (pipe:0). No ffmpeg `-ss` is used — ffmpeg reads
+    /// sequentially from its own byte 0, which works on uncached Telegram
+    /// streams where `-ss` fails with `read_timestamp() failed in the middle`.
+    /// Takes precedence over `ss` when both are present.
+    pub(crate) start_byte: Option<u64>,
     /// Frontend capability hint for the /remux endpoint: does THIS WebView
     /// runtime's MSE/native pipeline accept 8-bit HEVC (hvc1)? Derived from
     /// `video.canPlayType('video/mp4;codecs=hvc1...')` on the client (which
@@ -2031,7 +2039,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, hevc_ok: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2220,6 +2228,44 @@ fn build_ss_seek_args(ss_secs: f64) -> Vec<String> {
     } else {
         vec![]
     }
+}
+
+/// Output timestamp offset args for the BYTE-FORWARD seek path.
+///
+/// The byte-forward pipe feeds ffmpeg a fresh TS substream from the aligned
+/// offset; with `-copyts -start_at_zero` the OUTPUT timeline comes out rebased
+/// to ~0 (empirically proven: buffer lands at ~1.7-3.5s regardless of the seek
+/// target — logs 6/7/8). That makes `video.currentTime` ≈ 2s while the user
+/// seeked to e.g. 840s, so the scrubber / green (buffered) / white (loaded) bars
+/// all read the wrong position (and StartupStallJumper keeps firing "stuck at 0").
+///
+/// `-output_ts_offset <seek>` shifts the whole output timeline (video AND audio,
+/// uniformly, so A/V stay in sync) up by the seek time, restoring the ABSOLUTE
+/// timeline the frontend's align-poll + `_dtsBase=0` pin were designed for (same
+/// as the old `-ss` path produced). Returns [] for non-positive/non-finite seek.
+fn build_output_ts_offset_args(seek_secs: f64) -> Vec<String> {
+    if seek_secs.is_finite() && seek_secs > 0.0 {
+        vec!["-output_ts_offset".to_string(), format!("{:.3}", seek_secs)]
+    } else {
+        vec![]
+    }
+}
+
+/// Align a byte offset DOWN to a 188-byte MPEG-TS packet boundary.
+///
+/// The byte-forward seek path (stdin feeder) streams file bytes from an
+/// estimated offset into ffmpeg. That offset comes from a linear time→byte
+/// estimate on the frontend and can land mid-packet. Feeding ffmpeg a stream
+/// that starts mid-TS-packet makes the demuxer resync-scan for the next 0x47
+/// sync byte anyway, but aligning down to the packet boundary hands it a clean
+/// packet start immediately (fewer discarded bytes, faster first-keyframe lock).
+///
+/// Always rounds DOWN (never past the target) so we never skip the keyframe the
+/// estimate was aiming at. `0` stays `0` (front of file → init prefix covers it).
+/// Standard TS is 188; M2TS (192-byte) callers pass `packet_size = 192`.
+fn ts_align_byte(byte: u64, packet_size: u64) -> u64 {
+    let ps = if packet_size == 0 { 188 } else { packet_size };
+    byte - (byte % ps)
 }
 
 /// Post-input timestamp args that MUST accompany a `-ss` seek so the output PTS
@@ -2820,20 +2866,36 @@ async fn remux_ts_to_mp4(
         // seek path — we need to see whether it issues an HTTP Range at the target
         // cluster byte or falls back to a linear read from the front. Remove once
         // the front-read root cause is confirmed. Non-seek remux stays at warning.
+        // ── SEEK MODE SELECTION ──
+        // Two mutually-exclusive seek mechanisms:
+        //   (A) BYTE-FORWARD (start_byte set): the robust path for uncached
+        //       Telegram streams. We feed ffmpeg [init_prefix + /stream bytes
+        //       from a TS-aligned offset] via stdin (pipe:0). ffmpeg reads
+        //       SEQUENTIALLY from its own byte 0 — it never issues a timestamp
+        //       seek, so it cannot fail with "read_timestamp() failed in the
+        //       middle / could not seek" the way `-ss` over the HTTP input does
+        //       when the target region isn't downloaded (proven: logs 4-t/5-t).
+        //       Output PTS stay ABSOLUTE (input TS carries real PTS), so the
+        //       frontend _dtsBase=0 pin + align poll land the playhead correctly,
+        //       same as the -ss path did when it worked on cached files.
+        //   (B) TIME `-ss` (ss set, no start_byte): legacy path, kept for cached
+        //       files / MKV where the input is seekable.
+        // start_byte takes precedence when both are present.
         let ss_secs = query.ss.unwrap_or(0.0);
-        let is_seek = ss_secs.is_finite() && ss_secs > 0.0;
-        // NOTE: -loglevel debug on the seek path floods the terminal with per-packet
-        // "sq: send/receive" sync-queue lines (thousands/sec). It was invaluable —
-        // it revealed the A/V PTS desync root cause — but keep it at `warning` now
-        // that the audio filter fix is in, or it drowns out every other log line.
+        let byte_seek = query.start_byte.filter(|&b| b > 0);
+        // is_seek drives the audio filter choice (aresample=async=1 vs asetpts):
+        // BOTH seek modes need the seek-variant filter (absolute audio PTS), so
+        // is_seek is true for a byte-forward seek too.
+        let is_seek = byte_seek.is_some() || (ss_secs.is_finite() && ss_secs > 0.0);
         cmd.args(["-hide_banner", "-loglevel", "warning"]);
-        // If ss (seek start) is provided, add -ss BEFORE -i for fast input seeking.
+        // Mode A: NO -ss (we seek by feeding bytes). Mode B: -ss before -i.
         // build_ss_seek_args returns [] for ss<=0 / NaN (see helper + tests).
-        // (ss_secs computed above for the seek diagnostic.)
-        let ss_seek_args = build_ss_seek_args(ss_secs);
-        if !ss_seek_args.is_empty() {
-            log::info!("[REMUX] msg {}: seeking to {:.3}s before remux", message_id, ss_secs);
-            for a in &ss_seek_args { cmd.arg(a); }
+        if byte_seek.is_none() {
+            let ss_seek_args = build_ss_seek_args(ss_secs);
+            if !ss_seek_args.is_empty() {
+                log::info!("[REMUX] msg {}: seeking to {:.3}s before remux", message_id, ss_secs);
+                for a in &ss_seek_args { cmd.arg(a); }
+            }
         }
         // Pre-input args: QSV hwaccel + hardware decoder (empty for copy/libx264).
         // MUST come before -i so ffmpeg initializes the GPU decode session.
@@ -2855,7 +2917,16 @@ async fn remux_ts_to_mp4(
             // the MPEG-TS muxer rejects with EINVAL ("Error submitting a packet
             // to the muxer: Invalid argument", exit code -22).
             "-avoid_negative_ts", "make_zero",
-            "-i", &input_source,
+        ]);
+        // Input: Mode A (byte-forward) reads from stdin pipe:0 (fed below with
+        // init_prefix + /stream bytes from the aligned offset). Mode B reads the
+        // /stream HTTP URL (or cached file) directly.
+        if byte_seek.is_some() {
+            cmd.arg("-i").arg("pipe:0");
+        } else {
+            cmd.arg("-i").arg(&input_source);
+        }
+        cmd.args([
             // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
             "-map", &format!("0:{}", video_stream_idx),
             "-map", &format!("0:{}", audio_stream_idx),
@@ -2885,7 +2956,21 @@ async fn remux_ts_to_mp4(
         // Preserve original timestamps so MSE timeline matches video.currentTime.
         // Output PTS stay absolute (seek 580s → PTS ≈581s) — verified by execution;
         // the frontend _dtsBase=0 mapping depends on it. Empty when not seeking.
-        for a in &build_ss_timestamp_args(ss_secs) { cmd.arg(a); }
+        // Byte-forward mode also needs -copyts -start_at_zero (normalizes the
+        // fed substream's timestamps to start at 0); pass a non-zero sentinel so
+        // build_ss_timestamp_args emits them on that path too.
+        let ts_arg_ss = if byte_seek.is_some() && ss_secs <= 0.0 { 1.0 } else { ss_secs };
+        for a in &build_ss_timestamp_args(ts_arg_ss) { cmd.arg(a); }
+        // BYTE-FORWARD absolute-timeline fix: -start_at_zero rebased the output to
+        // ~0, so video.currentTime landed at ~2s while the user seeked to e.g. 840s
+        // → scrubber/green/white bars all wrong (proven logs 6/7/8: "buffer start
+        // 1.7s (delta -839.1s)"). Shift the whole output up to the seek time so the
+        // timeline is ABSOLUTE (what the frontend align-poll + _dtsBase=0 expect).
+        // ss_secs carries the seek time (frontend sends BOTH start_byte and ss).
+        // Only on byte-forward — the -ss path is already absolute via input seek.
+        if byte_seek.is_some() {
+            for a in &build_output_ts_offset_args(ss_secs) { cmd.arg(a); }
+        }
         cmd.args([
             // Disable interleave check: prevent muxer from rejecting audio packets
             // that arrive slightly out-of-order relative to video DTS
@@ -2896,6 +2981,10 @@ async fn remux_ts_to_mp4(
         ]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // Byte-forward mode feeds the input through stdin; open the pipe.
+        if byte_seek.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
         // Reap this ffmpeg if the response stream is dropped before EOF. A seek
         // aborts the HTTP connection → actix drops the async_stream → the owned
         // `child` drops. tokio does NOT kill a child on drop by default
@@ -2920,6 +3009,89 @@ async fn remux_ts_to_mp4(
                 return HttpResponse::InternalServerError().body("ffmpeg stdout not captured");
             }
         };
+
+        // ── BYTE-FORWARD STDIN FEEDER (Mode A) ──
+        // Feed ffmpeg's stdin with [init_prefix (rewritten PAT/PMT)] + [/stream
+        // bytes from the TS-aligned offset forward]. ffmpeg then demuxes a valid
+        // TS stream starting at a packet boundary, sees the PMT immediately, and
+        // reads sequentially to EOF — no timestamp seek, so no "could not seek"
+        // failure on uncached Telegram data. The /stream GET handler is reused
+        // UNCHANGED (it already downloads-on-demand + rewrites TS PIDs), so the
+        // whole tuned range/coordinator/prebuffer path is untouched.
+        if let Some(raw_offset) = byte_seek {
+            // Align down to a TS packet boundary (188, or 192 for M2TS).
+            let (ps, _is_m2ts) = if let Some(ref cm) = **cache {
+                cm.get_hls_layout(message_id)
+                    .map(|(_, _, pkt, m2ts)| (pkt, m2ts))
+                    .unwrap_or((188, false))
+            } else {
+                (188, false)
+            };
+            let aligned = ts_align_byte(raw_offset, ps);
+            // Cached rewritten init-prefix (PAT/PMT). If absent we still proceed —
+            // ffmpeg will resync at the first inline PAT/PMT in the byte stream.
+            let init_prefix: Vec<u8> = (**cache)
+                .as_ref()
+                .and_then(|cm| cm.get_init_prefix(message_id))
+                .unwrap_or_default();
+            log::info!(
+                "[REMUX] msg {}: BYTE-FORWARD seek — raw offset {} → TS-aligned {} (packet {}B), init_prefix {}B, feeding stdin",
+                message_id, raw_offset, aligned, ps, init_prefix.len()
+            );
+            let feeder_url = input_source.clone();
+            let stdin = child.stdin.take();
+            let msg_id_feed = message_id;
+            if let Some(mut stdin) = stdin {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    // 1) init prefix first
+                    if !init_prefix.is_empty() {
+                        if let Err(e) = stdin.write_all(&init_prefix).await {
+                            log::warn!("[REMUX] msg {}: feeder init_prefix write failed: {}", msg_id_feed, e);
+                            return;
+                        }
+                    }
+                    // 2) stream body from `aligned` forward, fetched via the
+                    //    unchanged /stream GET (Range). ureq is blocking, so the
+                    //    HTTP read runs on a blocking thread and hands chunks back
+                    //    over a bounded channel; we write them to stdin async.
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+                    let range_val = format!("bytes={}-", aligned);
+                    std::thread::spawn(move || {
+                        match ureq::get(&feeder_url).set("Range", &range_val).call() {
+                            Ok(resp) => {
+                                let mut reader = resp.into_reader();
+                                let mut buf = vec![0u8; 256 * 1024];
+                                loop {
+                                    match std::io::Read::read(&mut reader, &mut buf) {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                                break; // receiver gone (ffmpeg died / seek superseded)
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[REMUX] msg {}: feeder /stream GET failed: {}", msg_id_feed, e);
+                            }
+                        }
+                    });
+                    while let Some(chunk) = rx.recv().await {
+                        if let Err(_e) = stdin.write_all(&chunk).await {
+                            // ffmpeg closed stdin (EOF reached / process reaped) —
+                            // normal on seek supersede; stop feeding.
+                            break;
+                        }
+                    }
+                    let _ = stdin.shutdown().await;
+                });
+            } else {
+                log::warn!("[REMUX] msg {}: BYTE-FORWARD requested but ffmpeg stdin not captured", message_id);
+            }
+        }
 
         // Read stderr in background
         let stderr = child.stderr.take();
@@ -3670,7 +3842,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, hevc_ok: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -5534,6 +5706,53 @@ mod tests {
             let ts = !super::build_ss_timestamp_args(ss).is_empty();
             assert_eq!(seek, ts, "seek/timestamp arg emission disagree for ss={ss}");
         }
+    }
+
+    /// ts_align_byte underpins the BYTE-FORWARD seek: the frontend's linear
+    /// time→byte estimate can land mid-packet, and feeding ffmpeg a stream that
+    /// begins mid-TS-packet costs it a resync scan. Aligning DOWN to the packet
+    /// boundary hands ffmpeg a clean packet start. Must never round UP (that could
+    /// skip past the keyframe the estimate targeted).
+    #[test]
+    fn ts_align_byte_rounds_down_to_packet_boundary() {
+        // Standard 188-byte TS.
+        assert_eq!(super::ts_align_byte(0, 188), 0, "0 stays 0 (front of file)");
+        assert_eq!(super::ts_align_byte(187, 188), 0, "mid first packet → 0");
+        assert_eq!(super::ts_align_byte(188, 188), 188, "exact boundary unchanged");
+        assert_eq!(super::ts_align_byte(189, 188), 188, "just past boundary → down");
+        assert_eq!(super::ts_align_byte(425_710_346, 188), 425_710_346 / 188 * 188);
+        // Result is always <= input (never overshoots the target keyframe).
+        for b in [1u64, 375, 500_000, 1_000_003, 1_313_957_191] {
+            assert!(super::ts_align_byte(b, 188) <= b, "must not round up (b={b})");
+            assert_eq!(super::ts_align_byte(b, 188) % 188, 0, "must be 188-aligned (b={b})");
+        }
+    }
+
+    /// build_output_ts_offset_args shifts the byte-forward output timeline up to
+    /// the seek time (fixes the "bars land at ~2s" bug from logs 6/7/8).
+    #[test]
+    fn output_ts_offset_emits_only_for_positive_finite_seek() {
+        assert_eq!(
+            super::build_output_ts_offset_args(840.782),
+            vec!["-output_ts_offset".to_string(), "840.782".to_string()],
+            "positive seek must emit the offset with 3-decimal seconds"
+        );
+        assert_eq!(super::build_output_ts_offset_args(12.0), vec!["-output_ts_offset".to_string(), "12.000".to_string()]);
+        // Non-positive / non-finite → no offset (initial from-zero remux, or the
+        // -ss path which is already absolute).
+        assert!(super::build_output_ts_offset_args(0.0).is_empty(), "0 → no offset");
+        assert!(super::build_output_ts_offset_args(-5.0).is_empty(), "negative → no offset");
+        assert!(super::build_output_ts_offset_args(f64::NAN).is_empty(), "NaN → no offset");
+        assert!(super::build_output_ts_offset_args(f64::INFINITY).is_empty(), "inf → no offset");
+    }
+
+    #[test]
+    fn ts_align_byte_supports_m2ts_and_zero_packet() {
+        // M2TS = 192-byte packets.
+        assert_eq!(super::ts_align_byte(500, 192), 384, "192-aligned");
+        assert_eq!(super::ts_align_byte(500, 192) % 192, 0);
+        // Defensive: packet_size 0 falls back to 188 (never divide-by-zero).
+        assert_eq!(super::ts_align_byte(500, 0), 500 / 188 * 188);
     }
 
     #[test]

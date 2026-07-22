@@ -1898,6 +1898,21 @@ export function useThumbnailExtractor(
 
     const onDurationChange = () => {
       durationRef.current = video.duration;
+      // THUMBNAIL DURATION CORRECTION. The thumbnail pipelines are constructed at
+      // MEDIA_INFO time with the 4Mbps ESTIMATE duration (real PTS duration isn't
+      // known yet). When the real duration later arrives it fires `durationchange`
+      // on the main video — push it into the live pipeline(s) so hover byte offsets
+      // (time/duration*fileSize) and the /keyframe-at duration= param are computed
+      // against the TRUE duration. Without this the preview shows a frame 170-280s
+      // off the hover point on VBR (proven logs 12-c). Guard on a finite, positive,
+      // meaningfully-different value so we never clobber a good duration with NaN/0.
+      const d = video.duration;
+      if (Number.isFinite(d) && d > 0) {
+        const fp = fmp4PipelineRef.current;
+        if (fp && Math.abs(fp.duration - d) > 0.5) fp.duration = d;
+        const tp = transmuxerPipelineRef.current;
+        if (tp && Math.abs(tp.duration - d) > 0.5) tp.duration = d;
+      }
     };
 
     video.addEventListener('durationchange', onDurationChange);

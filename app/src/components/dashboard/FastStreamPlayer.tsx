@@ -490,6 +490,9 @@ interface FastStreamPlayerProps {
   // not the white bar speed (which is now just local disk reads).
   const greenBarSpeedHistoryRef = useRef<{ bytes: number; time: number }[]>([]);
   const [greenBarSpeed, setGreenBarSpeed] = useState(0);
+  // When the green-bar poll gate (seek-settle) first engaged, for the bounded-
+  // freeze safety timeout below. 0 = gate not currently engaged.
+  const seekSettleStartRef = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -497,11 +500,38 @@ interface FastStreamPlayerProps {
     const poll = async () => {
       while (active) {
         try {
-          // Skip cache status polling during seek/VBR correction.
-          // The initial /stream download at the linear estimate shows on the green bar,
-          // then VBR correction flushes it → green bar disappears → confusing flash.
-          // Wait until seek completes (__nobuf_userSeekInProgress = false) before polling.
-          if ((window as any).__nobuf_userSeekInProgress !== true) {
+          // Skip cache status polling during seek/VBR correction AND through the
+          // post-seek align-settle window. The green bar converts disk-cache BYTE
+          // ranges to TIME via byteToTime(), which for TS/remux is a LINEAR map on
+          // VBR content (no keyframe index). During a seek the backend adds new
+          // cached ranges and recordByteTimeAnchor mutates the byte→time table, so
+          // polling mid-settle repaints segments at provisional positions and then
+          // shifts them when the table updates — the "green bar falsely shows then
+          // fixes itself" flicker (proven logs 10). Gate on BOTH:
+          //   - __nobuf_userSeekInProgress (set at seek dispatch, cleared when the
+          //     new player is wired — but that's BEFORE the ~3s align settle), and
+          //   - __nobuf_seekTargetTime > 0 (held until currentTime catches up to the
+          //     seek target, i.e. the seek has truly settled — see onTime).
+          // Holding through both means the bar keeps its last-good segments and
+          // updates ONCE, atomically, after the seek settles — no visible reshuffle.
+          const _seekSettling =
+            (window as any).__nobuf_userSeekInProgress === true ||
+            ((window as any).__nobuf_seekTargetTime > 0);
+          // BOUNDED FREEZE: never gate the bar for more than ~8s. If a seek's
+          // buffer never populates, __nobuf_seekTargetTime can stay >0 forever
+          // (onTime only clears it when currentTime catches up), which would
+          // freeze the green bar permanently. Track when the gate first engaged;
+          // once it's been held ~8s, force a poll so the bar can't get stuck.
+          const _nowMs = Date.now();
+          if (_seekSettling) {
+            if (seekSettleStartRef.current === 0) seekSettleStartRef.current = _nowMs;
+          } else {
+            seekSettleStartRef.current = 0;
+          }
+          const _gateExpired =
+            seekSettleStartRef.current > 0 && _nowMs - seekSettleStartRef.current > 8000;
+          if (!_seekSettling || _gateExpired) {
+            if (_gateExpired) seekSettleStartRef.current = 0; // reset so next seek re-arms
             const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status) {
             setCachePercent(status.percentage);

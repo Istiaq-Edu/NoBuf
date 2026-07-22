@@ -61,11 +61,51 @@ export function clampSeekTime(requested: number, duration: number, tailMargin = 
  * null for a missing/blank base so callers can bail cleanly. Pure + exported
  * for testing.
  */
-export function buildRemuxSeekUrl(baseUrl: string | null, seekTime: number): string | null {
+export function buildRemuxSeekUrl(
+  baseUrl: string | null,
+  seekTime: number,
+  startByte?: number,
+): string | null {
   if (!baseUrl) return null;
-  const t = Number.isFinite(seekTime) && seekTime > 0 ? seekTime : 0;
   const sep = baseUrl.includes('?') ? '&' : '?';
+  // BYTE-FORWARD seek (preferred for timed_id3 TS over uncached Telegram data):
+  // pass start_byte so the backend feeds ffmpeg [init_prefix + /stream bytes from
+  // that offset] via stdin — no ffmpeg `-ss`, which fails to timestamp-seek an
+  // undownloaded HTTP stream ("could not seek to position", empty output → the
+  // player loads forever; proven logs 4-t/5-t). When a valid byte offset is given
+  // we use it; otherwise fall back to the time `-ss` form (cached files / MKV).
+  const t = Number.isFinite(seekTime) && seekTime > 0 ? seekTime : 0;
+  if (typeof startByte === 'number' && Number.isFinite(startByte) && startByte > 0) {
+    // Send BOTH: start_byte selects the input mechanism (stdin feeder, no ffmpeg
+    // -ss), and ss carries the seek TIME the backend uses for -output_ts_offset so
+    // the output timeline is ABSOLUTE (video.currentTime ≈ seek time). Without ss
+    // here the output rebases to ~0 and the scrubber/green/white bars read wrong
+    // (proven logs 6/7/8). The backend does NOT apply ffmpeg -ss when start_byte
+    // is present, so ss is used ONLY as the output offset, not an input seek.
+    return `${baseUrl}${sep}start_byte=${Math.floor(startByte)}&ss=${t.toFixed(3)}`;
+  }
   return `${baseUrl}${sep}ss=${t.toFixed(3)}`;
+}
+
+/**
+ * Decide whether an unbuffered seek should be routed through the ffmpeg-driven
+ * /remux?ss= path (frame-accurate, audio-preserving, one recreation) rather than
+ * the raw /stream byte-seek video-only path (linear estimate, muted audio,
+ * scattered prebuffer). True IFF the source is served via /remux AND we captured
+ * a base remux URL to seek against.
+ *
+ * This encodes the guard at the top of _mpegtsUnbufferedSeek. It is set for BOTH
+ * transcoded MKV/HEVC (whose /stream is un-byte-seekable Matroska) AND timed_id3
+ * TS (whose /stream IS real TS, but for which /remux?ss= is still strictly better:
+ * ffmpeg -ss is frame-accurate and the seek-safe audio filter keeps sound, vs the
+ * byte path which muted audio + guessed the byte offset on VBR content). Pure +
+ * exported for testing.
+ */
+export function shouldUseRemuxSeek(
+  needsRemuxSeek: boolean,
+  remuxSeekBaseUrl: string | null,
+): boolean {
+  return needsRemuxSeek && !!remuxSeekBaseUrl;
 }
 
 /**
@@ -2556,6 +2596,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
             diagLog(`[MSE] Routing to remux: ${remuxUrl}`);
             remuxUrlRef.current = remuxUrl;
+            // Route SEEKS through the /remux endpoint using BYTE-FORWARD seeking
+            // (start_byte), NOT the raw /stream byte-seek recreation. This fixes
+            // all three byte-seek bugs (muted audio, VBR-inaccurate landing,
+            // scattered prebuffer) because ffmpeg does the remux (clean AAC-LC
+            // audio) — while AVOIDING the /remux?ss= regression (ffmpeg `-ss`
+            // can't timestamp-seek uncached /stream data → empty output →
+            // infinite load; logs 4-t/5-t). Byte-forward feeds ffmpeg
+            // [init_prefix + /stream bytes from the offset] via stdin, so ffmpeg
+            // reads sequentially from its own byte 0 and never seeks. The
+            // buildRemuxSeekUrl call in _mpegtsRecreatePlayerForRemuxSeek emits
+            // &start_byte= (see that fn + seek-issues-findings.md "Option 2").
+            needsRemuxSeekRef.current = true;
+            remuxSeekBaseUrlRef.current = remuxUrl;
             // Don't use native fallback — the /remux endpoint now outputs MPEG-TS
             // which mpegts.js can play directly with full features (seeking, progress bar).
             // Fall through to the mpegts.js init path below with the remux URL.
@@ -3252,6 +3305,22 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               mpegtsDurationRef.current = metaDur;
               knownDuration = metaDur;
 
+              // THUMBNAIL PIPELINE DURATION FIX. The fMP4 thumbnail config
+              // (fmp4ConfigRef) is built at MEDIA_INFO time with `duration:
+              // knownDuration || estimatedDurationS` — at that moment the real PTS
+              // duration is NOT yet known, so it bakes in the 4Mbps ESTIMATE
+              // (e.g. 2627.9s vs the real 2073.1s). Every hover then computes its
+              // byte offset as `time/duration*fileSize`, landing ~21% too far into
+              // the file, so the preview shows a frame 170-280s AWAY from the hover
+              // point (proven logs 12-c: hover 799s → thumbnail 633s). Correct the
+              // config ref here so any pipeline (re)created later is accurate; the
+              // ALREADY-running pipeline is corrected via the durationchange
+              // listener in useThumbnailExtractor.ts (it reads video.duration, which
+              // we just updated on the mediaSource above).
+              if (fmp4ConfigRef.current) {
+                fmp4ConfigRef.current.duration = metaDur;
+              }
+
               // PROACTIVE prebuffer disabled for TS — it downloads the entire
               // file and causes FLOOD_PREMIUM_WAIT on non-premium accounts.
               // /stream alone handles on-demand downloads like MP4 files.
@@ -3899,7 +3968,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // _dtsBase=0 logic maps straight to video.currentTime. This skips ALL the
     // byte-offset machinery below (keyframe index, VBR align, linear estimate)
     // because none of it applies when ffmpeg owns the seek.
-    if (needsRemuxSeekRef.current && remuxSeekBaseUrlRef.current) {
+    if (shouldUseRemuxSeek(needsRemuxSeekRef.current, remuxSeekBaseUrlRef.current)) {
       // E4: clamp to the valid range. Leave headroom before EOF so ffmpeg has
       // frames to emit (a seek to exactly duration produces an empty stream).
       const clampedTime = clampSeekTime(timeSeconds, duration);
@@ -5032,8 +5101,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const gen = ++mpegtsRecreationGenRef.current;
     const wasPaused = isPausedRef.current || video.paused;
 
-    // Build /remux?ss=<time>. baseUrl already carries ?token=…, so append &ss=.
-    const seekUrl = buildRemuxSeekUrl(baseUrl, timeSeconds);
+    // Build the seek URL. Prefer BYTE-FORWARD (start_byte) so the backend feeds
+    // ffmpeg via stdin instead of `-ss` — the latter fails to seek uncached
+    // Telegram /stream data (empty output → infinite load; logs 4-t/5-t). The
+    // byte offset uses the same linear time→byte estimate the proactive reporter
+    // uses below (Math.round(t/dur * fileSize)); the backend TS-aligns it and
+    // ffmpeg resyncs to the first keyframe. Falls back to ss= if we lack a valid
+    // fileLength/duration (e.g. cached file / MKV where -ss works).
+    const _seekDur = mpegtsDurationRef.current || state.current.duration || 0;
+    const _seekFileSize = state.current.fileLength;
+    const startByteEstimate =
+      _seekFileSize > 0 && _seekDur > 0
+        ? Math.round((timeSeconds / _seekDur) * _seekFileSize)
+        : undefined;
+    const seekUrl = buildRemuxSeekUrl(baseUrl, timeSeconds, startByteEstimate);
     if (!seekUrl) {
       diagLog('[MPEGTS] Remux seek: could not build seek URL — bailing');
       return;
@@ -5256,13 +5337,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       (window as any).__nobuf_seekTargetTime = timeSeconds;
 
       // E5: honor pause. Only autoplay if we were playing before the seek.
-      if (!wasPaused) {
-        const pr = newPlayer.play();
-        if (pr && typeof pr.catch === 'function') pr.catch(() => {});
-        diagLog(`[MPEGTS] Remux seek: play() fired for ${timeSeconds.toFixed(1)}s`);
-      } else {
+      // DEFERRED PLAY (stutter fix): do NOT call play() here. The buffer is still
+      // EMPTY at this point (the align-poll below waits ~6 ticks / ~3s for the
+      // first ss-stream frames to append). Calling play() now parks the freshly
+      // recreated <video> element "playing at currentTime=0 with an empty buffer",
+      // which (a) shows a frozen frame at 0, (b) trips faststream's StartupStallJumper
+      // watchdog ("stuck at 0, seek to X") which issues its OWN competing seek, and
+      // (c) then visibly JUMPS 0 → ~seekTarget when the buffer finally appears — the
+      // "split-second back-and-forth stutter" the user reported (proven logs 9-c:
+      // L98 "stuck at 0, seek to 944.331" fired before the L105 buffer at 944.3).
+      // Instead: leave it effectively paused during the align window; the align-poll
+      // starts playback (v.play()) exactly once, AFTER it snaps currentTime into the
+      // populated buffer. wasPaused is captured above and consumed there.
+      if (wasPaused) {
         if (!video.paused) video.pause();
         diagLog(`[MPEGTS] Remux seek: stayed paused at ${timeSeconds.toFixed(1)}s (paused means paused)`);
+      } else {
+        // Keep the element paused until the align-poll has real content to show, so
+        // it never sits "playing" over an empty buffer at ct=0.
+        if (!video.paused) video.pause();
+        diagLog(`[MPEGTS] Remux seek: play() DEFERRED until buffer populated (align-poll) for ${timeSeconds.toFixed(1)}s`);
       }
 
       // ── ALIGN POLL (the fix for "prebuffer starts but video won't play") ──
@@ -5287,6 +5381,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               : alignTicks > 30 ? 'timeout-15s(buffer never populated)' : 'unmounted';
             diagLog(`[MPEGTS] Remux seek align: BAIL (${reason}) after ${alignTicks} ticks, gen=${gen}`);
             clearInterval(alignIv);
+            // DEFERRED-PLAY safety net: we withheld play() at seek time (stutter fix).
+            // If we bail on TIMEOUT (buffer genuinely never populated) but we were
+            // supposed to be playing, resume so the element isn't left paused forever
+            // on a legit slow seek — the native waiting/canplay will take over. Do NOT
+            // resume on 'superseded' (a newer seek now owns playback) or 'unmounted'.
+            if (reason.startsWith('timeout') && !wasPaused) {
+              const bv = videoRef.current;
+              if (bv && bv.paused) { const pr = bv.play(); if (pr && typeof pr.catch === 'function') pr.catch(() => {}); }
+            }
             return;
           }
           const v = videoRef.current;
@@ -5334,8 +5437,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // DON'T clear __nobuf_seekTargetTime here — the onTime handler clears
             // it when currentTime catches up within 2s, avoiding a bar jump if
             // bufStart differs slightly from the target.
-            // Resume playback if we were playing (currentTime jump can re-pause).
-            if (!wasPaused && v.paused) v.play().catch(() => {});
+            // DEFERRED-PLAY resume: play() was intentionally NOT called at seek time
+            // (see above) to avoid the "playing over an empty buffer at ct=0" stutter
+            // + StartupStallJumper race. Now that currentTime is snapped INTO the
+            // populated buffer, start playback exactly once (only if we were playing
+            // before the seek — "paused means paused"). Guard on v.paused is dropped:
+            // the directSeek above can leave it paused, and we always paused up-front.
+            if (!wasPaused) {
+              const pr = v.play();
+              if (pr && typeof pr.catch === 'function') pr.catch(() => {});
+              diagLog(`[MPEGTS] Remux seek: play() started after align snap (ct=${v.currentTime.toFixed(2)}s)`);
+            }
           }
         }, 500);
       }
