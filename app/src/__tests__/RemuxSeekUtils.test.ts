@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { clampSeekTime, buildRemuxSeekUrl, shouldSkipRemuxPositionReport, pinRemuxerDtsBase } from '../hooks/useMSEPlayer';
+import { clampSeekTime, buildRemuxSeekUrl, shouldSkipRemuxPositionReport, shouldUseRemuxSeek, pinRemuxerDtsBase } from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
@@ -78,6 +78,44 @@ describe('buildRemuxSeekUrl', () => {
     expect(buildRemuxSeekUrl('', 100)).toBeNull();
   });
 
+  // ── BYTE-FORWARD seek (start_byte) ──
+  // For timed_id3 TS over uncached Telegram data, ffmpeg `-ss` fails to seek
+  // (empty output → infinite load). Passing start_byte makes the backend feed
+  // ffmpeg [init_prefix + /stream from that offset] via stdin instead — no -ss.
+  it('emits BOTH start_byte AND ss when a valid byte offset is given', () => {
+    // start_byte = input mechanism (stdin feeder); ss = the seek TIME the backend
+    // uses for -output_ts_offset so the output timeline is ABSOLUTE (bars correct).
+    expect(buildRemuxSeekUrl(base, 671.68, 425710346)).toBe(
+      'http://localhost:14201/remux/3574767635/19?token=abc%3D&start_byte=425710346&ss=671.680'
+    );
+    // Must carry both — start_byte for the feeder, ss for the output offset.
+    expect(buildRemuxSeekUrl(base, 671.68, 425710346)).toContain('start_byte=425710346');
+    expect(buildRemuxSeekUrl(base, 671.68, 425710346)).toContain('ss=671.680');
+  });
+
+  it('floors a fractional byte offset (backend expects an integer)', () => {
+    expect(buildRemuxSeekUrl(base, 100, 12345.9)).toContain('start_byte=12345');
+    expect(buildRemuxSeekUrl(base, 100, 12345.9)).not.toContain('.9');
+  });
+
+  it('uses ? for start_byte when the base has no query string', () => {
+    expect(buildRemuxSeekUrl('http://x/remux/1/2', 12, 999)).toBe('http://x/remux/1/2?start_byte=999&ss=12.000');
+  });
+
+  it('falls back to ss= when byte offset is absent/zero/non-finite (cached file / MKV)', () => {
+    expect(buildRemuxSeekUrl(base, 580.6, undefined)).toContain('ss=580.600');
+    expect(buildRemuxSeekUrl(base, 580.6, 0)).toContain('ss=580.600');       // 0 = front → not a byte seek
+    expect(buildRemuxSeekUrl(base, 580.6, -1)).toContain('ss=580.600');      // negative → invalid
+    expect(buildRemuxSeekUrl(base, 580.6, NaN)).toContain('ss=580.600');     // non-finite → invalid
+    expect(buildRemuxSeekUrl(base, 580.6, Infinity)).toContain('ss=580.600');
+    // None of the fallbacks leak a start_byte.
+    expect(buildRemuxSeekUrl(base, 580.6, 0)).not.toContain('start_byte');
+  });
+
+  it('null base → null even with a byte offset', () => {
+    expect(buildRemuxSeekUrl(null, 100, 5000)).toBeNull();
+  });
+
   it('round-trips with clampSeekTime (real call-site composition)', () => {
     // The seek path clamps first, then builds the URL from the clamped value.
     const clamped = clampSeekTime(99999, 1200);
@@ -117,6 +155,48 @@ describe('shouldSkipRemuxPositionReport', () => {
   it('native TS / timed_id3 (needsRemuxSeek=false) → guard inert, always report', () => {
     expect(shouldSkipRemuxPositionReport(false, false, 0)).toBe(false);
     expect(shouldSkipRemuxPositionReport(false, true, 600)).toBe(false); // even mid-seek
+  });
+});
+
+/**
+ * shouldUseRemuxSeek is the routing guard at the top of _mpegtsUnbufferedSeek:
+ * TRUE → ffmpeg-driven /remux?ss= recreation (frame-accurate, keeps audio, ONE
+ * recreation, proactive repositioned). FALSE → the raw /stream byte-seek
+ * video-only path (linear estimate on VBR, muted audio, scattered prebuffer).
+ *
+ * The fix this session sets needsRemuxSeek=true + a base URL for timed_id3 TS
+ * (previously only MKV/HEVC did), so these files now take the good path. These
+ * tests lock that routing decision so a future refactor can't silently drop
+ * timed_id3 back onto the byte-seek path (which reintroduces all three bugs:
+ * no audio after seek, inaccurate landing, multiple prebuffer points).
+ */
+describe('shouldUseRemuxSeek', () => {
+  const base = 'http://127.0.0.1:14201/remux/3574767635/3?token=abc';
+
+  it('timed_id3 TS / MKV / HEVC (flag set + base URL) → remux-seek path', () => {
+    expect(shouldUseRemuxSeek(true, base)).toBe(true);
+  });
+
+  it('flag set but NO base URL captured → cannot remux-seek (fall through)', () => {
+    // Defensive: without a base URL buildRemuxSeekUrl would return null anyway,
+    // so routing here would strand the seek. Must be false.
+    expect(shouldUseRemuxSeek(true, null)).toBe(false);
+    expect(shouldUseRemuxSeek(true, '')).toBe(false);
+  });
+
+  it('native TS (no timed_id3, byte-seekable /stream) → byte-seek path', () => {
+    // A plain TS file whose /stream is directly mpegts-parseable never sets the
+    // flag; it uses the byte-seek path (correct for it — /stream IS seekable TS).
+    expect(shouldUseRemuxSeek(false, base)).toBe(false);
+    expect(shouldUseRemuxSeek(false, null)).toBe(false);
+  });
+
+  it('composes with buildRemuxSeekUrl — when routed, a valid ss URL is always buildable', () => {
+    // The invariant the guard protects: if shouldUseRemuxSeek is true, the base
+    // URL is non-empty, so buildRemuxSeekUrl cannot return null.
+    if (shouldUseRemuxSeek(true, base)) {
+      expect(buildRemuxSeekUrl(base, clampSeekTime(1190, 2073))).toContain('ss=1190.000');
+    }
   });
 });
 
