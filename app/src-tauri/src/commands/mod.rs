@@ -121,6 +121,17 @@ pub struct TelegramState {
         /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
         /// Used to throttle calls to every ~15 seconds to avoid flood waits.
         pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
+    /// Progressive hover-thumbnail keyframe index, keyed by message_id. Built
+    /// incrementally by the background/proactive download loops as they sweep
+    /// bytes to disk (they scan each written chunk with scan_keyframes_chunked
+    /// and merge here), and READ by the Actix /fmp4 keyframe-at hover lookup.
+    /// This is the ONLY meeting point between the Tauri-spawned download task and
+    /// the Actix HTTP handlers (the fmp4 byte_time_cache is Actix web::Data and
+    /// unreachable from the download task). In-memory only — rebuilt per session,
+    /// so there is no cross-restart staleness. Lets warm hovers resolve instantly
+    /// from bytes already downloaded instead of triggering an 8s on-demand scan.
+    pub proactive_keyframe_index:
+        Arc<tokio::sync::RwLock<HashMap<i32, crate::ts_demux::KeyframeIndex>>>,
 }
 
 pub mod auth;

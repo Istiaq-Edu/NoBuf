@@ -270,6 +270,7 @@ pub fn run() {
                 stored_api_id: Arc::new(std::sync::atomic::AtomicI32::new(0)),
                 qr_finalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                proactive_keyframe_index: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
