@@ -34,6 +34,109 @@ pub struct StreamConfig {
     pub port: u16,
 }
 
+/// Per-download-task keyframe-indexing context. Carries the lazily-resolved
+/// TsStreamInfo and the cross-chunk KeyframeScanState so that keyframes whose
+/// PES straddles a 512KB chunk boundary are still detected (scan_keyframes_chunked
+/// assembles partial PES across calls when handed the same state). `is_m2ts` is
+/// auto-detected from the cached head during the first successful resolve.
+struct KeyframeIndexer {
+    stream_info: Option<crate::ts_demux::TsStreamInfo>,
+    scan_state: crate::ts_demux::KeyframeScanState,
+    is_m2ts: bool,
+}
+
+impl KeyframeIndexer {
+    fn new() -> Self {
+        Self {
+            stream_info: None,
+            scan_state: crate::ts_demux::KeyframeScanState::default(),
+            is_m2ts: false,
+        }
+    }
+}
+
+/// Scan a just-written chunk for video keyframes and merge them into the shared
+/// progressive index on TelegramState. Best-effort: any failure logs at debug
+/// and returns without disturbing the download. MUST be called OUTSIDE any
+/// cache_mgr.lock_meta() critical section (it takes the index write lock, and we
+/// never want to nest those two locks).
+///
+/// `abs_offset` is the file byte position of `chunk` (the bytes just written).
+/// stream_info + m2ts flag are resolved lazily from the cached head the first
+/// time it's available; until then chunks are skipped (and re-tried as the head
+/// fills).
+async fn index_keyframes_from_chunk(
+    indexer: &mut KeyframeIndexer,
+    chunk: &[u8],
+    abs_offset: u64,
+    message_id: i32,
+    total_size: u64,
+    cache_mgr: &StreamCacheManager,
+    state: &Arc<TelegramState>,
+) {
+    // Resolve stream_info once from the cached head (PAT/PMT live in the first
+    // packets). If not yet available, skip — a later cycle will retry.
+    if indexer.stream_info.is_none() {
+        let data_path = cache_mgr.data_path(message_id);
+        let head_len = (5 * 1024 * 1024).min(total_size as usize);
+        if head_len > 0 {
+            if let Ok(mut f) = std::fs::File::open(&data_path) {
+                let mut head = vec![0u8; head_len];
+                use std::io::Read;
+                if f.read_exact(&mut head).is_ok() {
+                    // Detect packet layout from sync-byte stride. Regular TS has
+                    // 0x47 at 0/188/376; M2TS/BDAV has a 4-byte prefix so 0x47 is
+                    // at 4/196/388. Prefer the plain-TS interpretation; only treat
+                    // as M2TS when the 188-stride check fails AND the 192+4 does.
+                    let plain_ts = head.len() >= 377
+                        && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47;
+                    let is_m2ts = !plain_ts
+                        && head.len() >= 389
+                        && head[4] == 0x47 && head[196] == 0x47 && head[388] == 0x47;
+                    let head_ts = crate::ts_demux::strip_m2ts_prefix(&head, is_m2ts);
+                    if let Some(si) = crate::ts_demux::extract_stream_info(&head_ts) {
+                        indexer.is_m2ts = is_m2ts;
+                        indexer.stream_info = Some(si);
+                    }
+                }
+            }
+        }
+        if indexer.stream_info.is_none() {
+            return; // head not ready yet; retry on a later chunk
+        }
+    }
+
+    let si = match &indexer.stream_info {
+        Some(si) => si,
+        None => return,
+    };
+
+    // M2TS chunks carry a 4-byte prefix per packet; strip so PID parsing aligns.
+    let scan_buf: std::borrow::Cow<[u8]> = if indexer.is_m2ts {
+        std::borrow::Cow::Owned(crate::ts_demux::strip_m2ts_prefix(chunk, true))
+    } else {
+        std::borrow::Cow::Borrowed(chunk)
+    };
+
+    let kfs = crate::ts_demux::scan_keyframes_chunked(
+        &scan_buf, abs_offset, si, &mut indexer.scan_state,
+    );
+    if kfs.is_empty() {
+        return;
+    }
+
+    let scanned_range = (abs_offset, abs_offset + chunk.len() as u64 - 1);
+    let mut index = state.proactive_keyframe_index.write().await;
+    let entry = index.entry(message_id).or_default();
+    crate::ts_demux::merge_keyframe_samples(entry, total_size, &kfs, scanned_range);
+    let n = entry.samples.len();
+    drop(index);
+    log::debug!(
+        "[KF-INDEX] msg {}: +{} keyframes from chunk @{} ({} total)",
+        message_id, kfs.len(), abs_offset, n
+    );
+}
+
 /// Returned to the frontend so it can construct stream URLs dynamically
 #[derive(serde::Serialize)]
 pub struct StreamInfo {
@@ -401,6 +504,9 @@ async fn background_cache_download(
     let chunk_size: i32 = 512 * 1024;
     let transfer_id = format!("bg-cache-{}", message_id);
 
+    // Progressive keyframe indexer (feeds the hover-thumbnail index as we cache).
+    let mut kf_indexer = KeyframeIndexer::new();
+
     // Always use sequential iter_download — Telegram triggers FLOOD_PREMIUM_WAIT
     // on parallel connections (same approach as .mp4 streaming).
     let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
@@ -457,6 +563,8 @@ async fn background_cache_download(
             let remaining_in_gap = (gap_end - offset + 1) as usize;
             let to_write = chunk_slice.len().min(remaining_in_gap);
 
+            let write_offset = offset; // absolute pos of these bytes
+
             cache_file
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| format!("Seek error: {}", e))?;
@@ -466,19 +574,28 @@ async fn background_cache_download(
 
             offset += to_write as u64;
 
-            // Update meta (serialized via per-message lock)
-            let _lock = cache_mgr.lock_meta(message_id).await;
-            let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                message_id,
-                folder_id,
-                total_size,
-                filename: filename.clone(),
-                cached_ranges: Vec::new(),
-                mime_type: mime_type.clone(),
-            });
-            meta.cached_ranges.push((gap_start, offset - 1));
-            merge_ranges(&mut meta.cached_ranges);
-            let _ = cache_mgr.save_meta(&meta);
+            // Update meta (serialized via per-message lock). Scoped so the lock
+            // drops BEFORE the keyframe-index update below (never nest the two).
+            {
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                    message_id,
+                    folder_id,
+                    total_size,
+                    filename: filename.clone(),
+                    cached_ranges: Vec::new(),
+                    mime_type: mime_type.clone(),
+                });
+                meta.cached_ranges.push((gap_start, offset - 1));
+                merge_ranges(&mut meta.cached_ranges);
+                let _ = cache_mgr.save_meta(&meta);
+            }
+
+            // Progressive keyframe indexing (outside lock_meta). Best-effort.
+            index_keyframes_from_chunk(
+                &mut kf_indexer, &chunk_slice[..to_write], write_offset,
+                message_id, total_size, &cache_mgr, &state,
+            ).await;
 
             // Throttle: sleep to enforce download speed limit for background cache.
             // Semaphore is released after chunk fetch, so other tasks can use
@@ -812,6 +929,11 @@ async fn proactive_prebuffer_download(
     let chunk_size: i32 = 512 * 1024;
     let mut total_downloaded: u64 = 0;
 
+    // Progressive keyframe indexer: scans each downloaded chunk for keyframes and
+    // feeds the shared hover-thumbnail index (see index_keyframes_from_chunk).
+    // One per task so PES spanning chunk boundaries is assembled correctly.
+    let mut kf_indexer = KeyframeIndexer::new();
+
     // NEVER use DownloadPool for streaming — Telegram triggers FLOOD_PREMIUM_WAIT
     // on ANY parallel downloads from the same account. Always use sequential
     // iter_download via the main client (same approach as .mp4 streaming).
@@ -1115,6 +1237,8 @@ async fn proactive_prebuffer_download(
                         let remaining_in_gap = (gap_end - offset + 1) as usize;
                         let to_write = chunk_slice.len().min(remaining_in_gap);
 
+                        let write_offset = offset; // absolute pos of these bytes
+
                         cache_file
                             .seek(SeekFrom::Start(offset))
                             .map_err(|e| format!("Seek error: {}", e))?;
@@ -1141,6 +1265,14 @@ async fn proactive_prebuffer_download(
                             merge_ranges(&mut meta.cached_ranges);
                             let _ = cache_mgr.save_meta(&meta);
                         }
+
+                        // Progressive keyframe indexing (OUTSIDE the lock_meta scope
+                        // above — never nest the index lock inside lock_meta).
+                        // Best-effort; failures never disturb the download.
+                        index_keyframes_from_chunk(
+                            &mut kf_indexer, &chunk_slice[..to_write], write_offset,
+                            message_id, total_size, &cache_mgr, &state,
+                        ).await;
 
                         if offset > gap_end {
                             break;

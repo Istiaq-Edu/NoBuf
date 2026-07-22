@@ -1808,6 +1808,63 @@ async fn find_keyframe_at_or_before_time(
         }
     }
 
+    // 1b. GROUND-TRUTH FAST PATH for the UNCACHED region (no disk data near target).
+    //     A prior playback/seek scan may have left a real (ts,byte) keyframe sample
+    //     in byte_time_cache. If one sits within ONE GOP (~4MB) of the target byte
+    //     AND within 30s of the target time, it's exact + instant — return it
+    //     without any download. This is a pure WIN (no downside): when present it
+    //     saves the whole scan; when absent we fall through to the full scan below.
+    //
+    //     NOTE: an earlier "fast-fail" here (return None when no covering download
+    //     was near) was REVERTED. It looked free — "the 8s scan times out and
+    //     returns the linear byte anyway" — but logs 14-c/14-t proved it REGRESSED
+    //     thumbnail GENERATION: the scan's expanding backward-window DOWNLOADS were
+    //     load-bearing. They warm ~6-12MB of bytes BEFORE the target, which is
+    //     exactly what /fmp4/segment's demuxer needs to reach the GOP keyframe on a
+    //     cold VBR region. Skipping the scan left the segment with a narrow ~4.5MB
+    //     cold window that missed the keyframe for high-skew timestamps (316s, 1805s
+    //     in log 14) → P-frames only → undecodable → empty SourceBuffer → no
+    //     thumbnail. So we KEEP the full scan for the uncached case; only the
+    //     genuinely-free cache hit short-circuits it.
+    if !region_covered {
+        // 1b-i. PROGRESSIVE INDEX (the real win): the background/proactive download
+        //       loops scan every chunk they sweep to disk and record keyframes in
+        //       TelegramState.proactive_keyframe_index. If the playhead has already
+        //       swept past this region, the exact keyframe is in the index →
+        //       instant, no download, no 8s scan. Guards (30s behind + 4MB byte
+        //       distance) live in lookup_keyframe and stop a sparse index returning
+        //       a far/stale sample. This is what makes warm hovers instant.
+        {
+            let index = data.proactive_keyframe_index.read().await;
+            if let Some(entry) = index.get(&message_id) {
+                if let Some((ts, off)) = crate::ts_demux::lookup_keyframe(
+                    entry, total_size, target_time_s, approx_byte, 30.0, 4 * 1024 * 1024,
+                ) {
+                    log::info!("[FMP4-KF-AT] proactive_keyframe_index hit near byte {} for msg {} at {}s -> {}s/byte {} (instant, no download)",
+                        approx_byte, message_id, target_time_s, ts, off);
+                    return Some((ts, off, true));
+                }
+            }
+        }
+
+        let cache_lock = byte_time_cache.0.lock().ok();
+        if let Some(ref c) = cache_lock {
+            if let Some(entry) = c.cache.get(&message_id) {
+                if entry.total_size == total_size {
+                    let idx = entry.samples.partition_point(|(ts, _)| *ts <= target_time_s);
+                    if idx > 0 {
+                        let (ts, off) = entry.samples[idx - 1];
+                        if target_time_s - ts <= 30.0 && approx_byte.abs_diff(off) <= 4 * 1024 * 1024 {
+                            log::info!("[FMP4-KF-AT] byte_time_cache hit near byte {} for msg {} at {}s -> {}s/byte {} (instant, no download)",
+                                approx_byte, message_id, target_time_s, ts, off);
+                            return Some((ts, off, true));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 2. Download/scan expanding windows. Use BACKWARD-BIASED windows:
     //    search from the approximate byte backward, not symmetric. For VBR
     //    video, the actual keyframe is almost always BEFORE the linear
@@ -2148,23 +2205,8 @@ async fn fmp4_keyframe_at(
     }
 }
 
-/// If is_m2ts is false, returns the data unchanged (as a new Vec).
-/// If is_m2ts is true, extracts bytes [4..192] from every 192-byte packet.
-fn strip_m2ts_prefix(data: &[u8], is_m2ts: bool) -> Vec<u8> {
-    if !is_m2ts {
-        return data.to_vec();
-    }
-    let mut out = Vec::with_capacity(data.len() / 192 * 188);
-    let mut offset = 0;
-    while offset + 192 <= data.len() {
-        // Verify sync byte (0x47) is at position 4 (after 4-byte BDAV prefix)
-        if data[offset + 4] == 0x47 {
-            out.extend_from_slice(&data[offset + 4..offset + 192]);
-        }
-        offset += 192;
-    }
-    out
-}
+// M2TS prefix stripping moved to ts_demux (shared with the download loops).
+use crate::ts_demux::strip_m2ts_prefix;
 
 /// One-shot cached probe: does this machine's ffmpeg support the h264_qsv
 /// encoder AND can it actually open an encode session? (Presence in
