@@ -827,10 +827,20 @@ export class MuxJsTsTransmuxer {
   /** TS has no MKV cue index, so abutting-refill keyframe stops don't apply —
    *  always null so callers fall back to the maxDuration cutoff (Fix #1). */
   nextKeyframeAtOrAfter(_time: number): number | null { return null; }
+  /** TS has no MKV cue index — no snapping applies, so the refill position is
+   *  returned unchanged (Fix #1 no-op parity with MediabunnyTransmuxer). */
+  snapToCueKeyframe(time: number, _tolerance?: number): number { return time; }
   getKeyframeByteOffsets(): TSKeyframeEntry[] { return this.keyframeByteOffsets; }
   getTsHeaderData(): Uint8Array | null { return this.tsHeaderData; }
   getSourceConfig(): any { return null; }
   abortSeek(): void { this.seekGeneration++; }
+  /** Interrupt an in-flight seek so a superseding one can start immediately.
+   *  The MediabunnyTransmuxer version also aborts the shared stream source's
+   *  in-flight fetch; this deprecated mux.js path has no such fetch to abort, so
+   *  bumping the generation (which discards the stale seek's segments — same as
+   *  abortSeek) is the complete interrupt here. Present so the shared seek drain
+   *  in useMSEPlayer can call interruptSeek() across both transmuxer types. */
+  interruptSeek(): void { this.seekGeneration++; }
 
   /** Clear mux.js VideoSegmentStream's GOP cache to prevent GOP fusion.
    * GOP fusion prepends cached video GOPs to mid-GOP flushes, but only

@@ -1,4 +1,5 @@
 pub mod models;
+pub mod ffmpeg_util;
 
 pub mod commands;
 pub mod stream_cache;
@@ -105,6 +106,7 @@ pub fn restart_api_server(app: &tauri::AppHandle) {
                     .app_data(api_state.clone())
                     .configure(api_routes::configure_api)
             })
+            .workers(crate::server::resolve_streaming_worker_count())
             .bind(("127.0.0.1", api_port)) {
                 Ok(bound) => {
                     let server = bound.run();
@@ -259,12 +261,16 @@ pub fn run() {
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),
                 player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                probed_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                tail_pts_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                telegram_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 qr_token: Arc::new(tokio::sync::Mutex::new(None)),
                 stored_api_hash: Arc::new(tokio::sync::Mutex::new(None)),
                 stored_api_id: Arc::new(std::sync::atomic::AtomicI32::new(0)),
                 qr_finalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                proactive_keyframe_index: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
@@ -413,6 +419,7 @@ pub fn run() {
             commands::cmd_upload_from_url,
             commands::cmd_connect,
             commands::cmd_log,
+            commands::cmd_ensure_ffmpeg,
             commands::cmd_delete_file,
             commands::cmd_download_file,
             commands::cmd_move_files,

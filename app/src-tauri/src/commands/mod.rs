@@ -73,6 +73,33 @@ pub struct TelegramState {
     /// as the playhead advances instead of being a one-shot fixed-window download.
     /// (current_byte, duration_s, playback_rate, file_size)
     pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
+    /// Exact media duration (seconds) as resolved by the /remux ffprobe pass,
+    /// keyed by message_id. The /fmp4/metadata endpoint (which the seek bar reads)
+    /// otherwise derives duration from Telegram DocumentAttributeVideo → PTS-tail →
+    /// bitrate estimate, and for HEVC MKV that estimate is wrong (e.g. 1904s vs a
+    /// real 2317s), truncating the seek bar and mis-mapping every seek. When /remux
+    /// has probed the file we cache the true value here so /fmp4/metadata can prefer
+    /// it. Only populated for files that went through the remux probe.
+    pub probed_durations: Arc<tokio::sync::RwLock<HashMap<i32, f64>>>,
+    /// PTS-tail-derived duration (seconds) keyed by message_id. Computing this
+    /// requires downloading the last 512KB of the file from Telegram to read the
+    /// final video PTS. That value never changes for a given file, but the
+    /// /fmp4/metadata endpoint previously re-downloaded the tail on EVERY call
+    /// (the frontend retries up to 6× waiting for the ffprobe duration): the
+    /// tail-reuse gate checks for the last 10MB cached, while the tail path only
+    /// writes back 512KB, so the reuse check could never hit. Memoize the
+    /// computed value here so repeat calls short-circuit instead of re-downloading
+    /// over the rate-limited Telegram pipe during cold start.
+    pub tail_pts_durations: Arc<tokio::sync::RwLock<HashMap<i32, f64>>>,
+    /// Memoized outcome of the Telegram DocumentAttributeVideo duration lookup,
+    /// keyed by message_id. Resolving it calls `get_messages_by_id` (an UNCACHED,
+    /// unthrottled API call that contributes to FLOOD_PREMIUM_WAIT). The frontend
+    /// retries /fmp4/metadata up to 6× waiting for the ffprobe duration, and each
+    /// retry previously re-hit that API call — even for files with no video attrs
+    /// (which return the same None every time). The raw message attributes are
+    /// immutable per file, so cache the result: `Some(Some(d))` = duration found,
+    /// `Some(None)` = checked, no video attrs; absent = not yet checked.
+    pub telegram_durations: Arc<tokio::sync::RwLock<HashMap<i32, Option<f64>>>>,
     /// Cache of resolved media objects per message_id. Eliminates repeated
     /// `get_messages_by_id` API calls (which are unthrottled and contribute
     /// to FLOOD_PREMIUM_WAIT). The media object doesn't change between requests
@@ -94,6 +121,17 @@ pub struct TelegramState {
         /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
         /// Used to throttle calls to every ~15 seconds to avoid flood waits.
         pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
+    /// Progressive hover-thumbnail keyframe index, keyed by message_id. Built
+    /// incrementally by the background/proactive download loops as they sweep
+    /// bytes to disk (they scan each written chunk with scan_keyframes_chunked
+    /// and merge here), and READ by the Actix /fmp4 keyframe-at hover lookup.
+    /// This is the ONLY meeting point between the Tauri-spawned download task and
+    /// the Actix HTTP handlers (the fmp4 byte_time_cache is Actix web::Data and
+    /// unreachable from the download task). In-memory only — rebuilt per session,
+    /// so there is no cross-restart staleness. Lets warm hovers resolve instantly
+    /// from bytes already downloaded instead of triggering an 8s on-demand scan.
+    pub proactive_keyframe_index:
+        Arc<tokio::sync::RwLock<HashMap<i32, crate::ts_demux::KeyframeIndex>>>,
 }
 
 pub mod auth;

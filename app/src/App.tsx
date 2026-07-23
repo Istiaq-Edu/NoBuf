@@ -25,11 +25,18 @@ function AppContent() {
   const { theme } = useTheme();
   const { available, version, downloading, progress, downloadAndInstall, dismissUpdate } = useUpdateCheck();
 
-  // On mount: check for a saved session and auto-restore it.
+  // On mount: ensure ffmpeg is available (download if missing), then check session.
   // This is the SINGLE source of truth for the initial connection.
   // useTelegramConnection (inside Dashboard) no longer calls cmd_connect on mount.
   useEffect(() => {
-    const checkSession = async () => {
+    const init = async () => {
+      // Ensure ffmpeg is available — downloads to AppData if not in PATH.
+      // Non-blocking: if it fails, playback will show an error when needed.
+      invoke("cmd_ensure_ffmpeg")
+        .then((path: unknown) => console.log("[FFMPEG] Ready at:", path))
+        .catch((e: unknown) => console.warn("[FFMPEG] Download failed:", e));
+
+      const checkSession = async () => {
       try {
         const store = await load("config.json");
         const savedId = await store.get<string>("api_id");
@@ -69,7 +76,10 @@ function AppContent() {
       }
     };
 
-    checkSession();
+      checkSession();
+    };
+
+    init();
   }, []);
 
   // ── Frontend cleanup on window close ──

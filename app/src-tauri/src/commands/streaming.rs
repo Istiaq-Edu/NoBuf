@@ -9,10 +9,151 @@ use crate::stream_cache::{self, StreamCacheManager, CacheMeta, merge_ranges, fin
 use grammers_client::types::Media;
 use grammers_tl_types as tl;
 
+/// Minimum byte delta before a VBR-corrected proactive target is treated as a
+/// genuinely new target. The frontend re-derives the seek byte from its
+/// keyframe/VBR table on every position report, which routinely produces ±1-byte
+/// (and other sub-chunk) jitter around a stable target (observed in logs:
+/// `1353514972 -> 1353514971`, `703432598 -> 703432597`, etc). Acting on that
+/// jitter re-evaluates gaps and tears down the download iterator for no benefit,
+/// since the proactive downloader fetches in 512KB chunks anyway — a sub-chunk
+/// move lands in the same chunk. 64KB is well below one chunk yet far above the
+/// observed jitter, so real seeks always cross it and jitter never does.
+pub const PROACTIVE_TARGET_EPSILON_BYTES: u64 = 64 * 1024;
+
+/// True if a newly reported proactive target is far enough from the current
+/// target to be worth acting on (re-evaluating gaps / sliding the window).
+/// Pure + saturating so it can be unit-tested and never panics on unordered
+/// operands. A move of exactly the epsilon counts as significant.
+pub fn is_significant_target_change(current: u64, new_target: u64) -> bool {
+    new_target.abs_diff(current) >= PROACTIVE_TARGET_EPSILON_BYTES
+}
+
 /// Holds the per-session streaming config (token + port)
 pub struct StreamConfig {
     pub token: String,
     pub port: u16,
+}
+
+/// Per-download-task keyframe-indexing context. Carries the lazily-resolved
+/// TsStreamInfo and the cross-chunk KeyframeScanState so that keyframes whose
+/// PES straddles a 512KB chunk boundary are still detected (scan_keyframes_chunked
+/// assembles partial PES across calls when handed the same state). `is_m2ts` is
+/// auto-detected from the cached head during the first successful resolve.
+struct KeyframeIndexer {
+    stream_info: Option<crate::ts_demux::TsStreamInfo>,
+    scan_state: crate::ts_demux::KeyframeScanState,
+    is_m2ts: bool,
+    /// Number of times we've tried (and failed) to resolve stream_info from the
+    /// cached head, so we can log the first attempt/failure at info level once
+    /// instead of spamming per chunk.
+    resolve_attempts: u32,
+}
+
+impl KeyframeIndexer {
+    fn new() -> Self {
+        Self {
+            stream_info: None,
+            scan_state: crate::ts_demux::KeyframeScanState::default(),
+            is_m2ts: false,
+            resolve_attempts: 0,
+        }
+    }
+}
+
+/// Scan a just-written chunk for video keyframes and merge them into the shared
+/// progressive index on TelegramState. Best-effort: any failure logs at debug
+/// and returns without disturbing the download. MUST be called OUTSIDE any
+/// cache_mgr.lock_meta() critical section (it takes the index write lock, and we
+/// never want to nest those two locks).
+///
+/// `abs_offset` is the file byte position of `chunk` (the bytes just written).
+/// stream_info + m2ts flag are resolved lazily from the cached head the first
+/// time it's available; until then chunks are skipped (and re-tried as the head
+/// fills).
+async fn index_keyframes_from_chunk(
+    indexer: &mut KeyframeIndexer,
+    chunk: &[u8],
+    abs_offset: u64,
+    message_id: i32,
+    total_size: u64,
+    cache_mgr: &StreamCacheManager,
+    state: &Arc<TelegramState>,
+) {
+    // Resolve stream_info once from the cached head (PAT/PMT live in the first
+    // packets). If not yet available, skip — a later cycle will retry.
+    if indexer.stream_info.is_none() {
+        let data_path = cache_mgr.data_path(message_id);
+        let head_len = (5 * 1024 * 1024).min(total_size as usize);
+        if head_len > 0 {
+            if let Ok(mut f) = std::fs::File::open(&data_path) {
+                let mut head = vec![0u8; head_len];
+                use std::io::Read;
+                if f.read_exact(&mut head).is_ok() {
+                    // Detect packet layout from sync-byte stride. Regular TS has
+                    // 0x47 at 0/188/376; M2TS/BDAV has a 4-byte prefix so 0x47 is
+                    // at 4/196/388. Prefer the plain-TS interpretation; only treat
+                    // as M2TS when the 188-stride check fails AND the 192+4 does.
+                    let plain_ts = head.len() >= 377
+                        && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47;
+                    let is_m2ts = !plain_ts
+                        && head.len() >= 389
+                        && head[4] == 0x47 && head[196] == 0x47 && head[388] == 0x47;
+                    let head_ts = crate::ts_demux::strip_m2ts_prefix(&head, is_m2ts);
+                    if let Some(si) = crate::ts_demux::extract_stream_info(&head_ts) {
+                        log::info!("[KF-INDEX] msg {}: stream_info resolved (video_pid={}, m2ts={}) — indexing enabled",
+                            message_id, si.video_pid, is_m2ts);
+                        indexer.is_m2ts = is_m2ts;
+                        indexer.stream_info = Some(si);
+                    }
+                }
+            }
+        }
+        if indexer.stream_info.is_none() {
+            indexer.resolve_attempts += 1;
+            // Log the first failure at info (once) so a never-indexing run is
+            // diagnosable without debug logging.
+            if indexer.resolve_attempts == 1 {
+                log::info!("[KF-INDEX] msg {}: stream_info not resolvable from cached head yet (will retry as head fills)", message_id);
+            }
+            return; // head not ready yet; retry on a later chunk
+        }
+    }
+
+    let si = match &indexer.stream_info {
+        Some(si) => si,
+        None => return,
+    };
+
+    // M2TS chunks carry a 4-byte prefix per packet; strip so PID parsing aligns.
+    let scan_buf: std::borrow::Cow<[u8]> = if indexer.is_m2ts {
+        std::borrow::Cow::Owned(crate::ts_demux::strip_m2ts_prefix(chunk, true))
+    } else {
+        std::borrow::Cow::Borrowed(chunk)
+    };
+
+    let kfs = crate::ts_demux::scan_keyframes_chunked(
+        &scan_buf, abs_offset, si, &mut indexer.scan_state,
+    );
+    if kfs.is_empty() {
+        return;
+    }
+
+    let scanned_range = (abs_offset, abs_offset + chunk.len() as u64 - 1);
+    let mut index = state.proactive_keyframe_index.write().await;
+    let entry = index.entry(message_id).or_default();
+    let was_empty = entry.samples.is_empty();
+    crate::ts_demux::merge_keyframe_samples(entry, total_size, &kfs, scanned_range);
+    let n = entry.samples.len();
+    drop(index);
+    // Throttled info log: the FIRST batch (proves indexing works) and then every
+    // ~256 samples, so a live run is diagnosable without debug logging but the
+    // log isn't flooded per 512KB chunk.
+    if was_empty || n % 256 < kfs.len() {
+        log::info!(
+            "[KF-INDEX] msg {}: +{} keyframes @byte {} ({} total indexed)",
+            message_id, kfs.len(), abs_offset, n
+        );
+    }
 }
 
 /// Returned to the frontend so it can construct stream URLs dynamically
@@ -66,6 +207,73 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- VBR proactive-target dead-band (issue #4) ---
+
+    #[test]
+    fn dead_band_ignores_plus_minus_one_byte_jitter() {
+        // The exact jitter observed in the logs must NOT count as a retarget.
+        assert!(!is_significant_target_change(1353514972, 1353514971));
+        assert!(!is_significant_target_change(703432598, 703432597));
+        assert!(!is_significant_target_change(472248289, 472248288));
+        // Symmetric: order of operands must not matter.
+        assert!(!is_significant_target_change(1353514971, 1353514972));
+    }
+
+    #[test]
+    fn dead_band_ignores_sub_epsilon_moves() {
+        // Anything below the 64KB epsilon is jitter.
+        assert!(!is_significant_target_change(1_000_000, 1_000_000 + (PROACTIVE_TARGET_EPSILON_BYTES - 1)));
+        assert!(!is_significant_target_change(1_000_000, 1_000_000 - (PROACTIVE_TARGET_EPSILON_BYTES - 1)));
+        // Zero move.
+        assert!(!is_significant_target_change(500, 500));
+    }
+
+    #[test]
+    fn dead_band_accepts_epsilon_and_real_seeks() {
+        // Exactly epsilon counts (>= boundary).
+        assert!(is_significant_target_change(1_000_000, 1_000_000 + PROACTIVE_TARGET_EPSILON_BYTES));
+        // Real seeks from the log (hundreds of MB) always cross.
+        assert!(is_significant_target_change(1353514972, 703432598));
+        assert!(is_significant_target_change(472248289, 260823323));
+        // From byte 0 (cold start) to a real target.
+        assert!(is_significant_target_change(0, 59278028));
+    }
+
+    #[test]
+    fn dead_band_saturating_never_panics_at_extremes() {
+        // abs_diff is saturating/safe at the numeric extremes.
+        assert!(is_significant_target_change(0, u64::MAX));
+        assert!(is_significant_target_change(u64::MAX, 0));
+        assert!(!is_significant_target_change(u64::MAX, u64::MAX));
+    }
+
+    // --- Actix streaming worker-count clamp (issue #d) ---
+
+    #[test]
+    fn worker_count_clamps_high_core_machines() {
+        use crate::server::{streaming_worker_count, MAX_STREAMING_WORKERS};
+        // 20-core machine (the observed case): clamped to the max.
+        assert_eq!(streaming_worker_count(20), MAX_STREAMING_WORKERS);
+        assert_eq!(streaming_worker_count(128), MAX_STREAMING_WORKERS);
+    }
+
+    #[test]
+    fn worker_count_floors_low_core_machines() {
+        use crate::server::{streaming_worker_count, MIN_STREAMING_WORKERS};
+        // Single-core / zero (unavailable) never drops below the floor.
+        assert_eq!(streaming_worker_count(1), MIN_STREAMING_WORKERS);
+        assert_eq!(streaming_worker_count(0), MIN_STREAMING_WORKERS);
+    }
+
+    #[test]
+    fn worker_count_passes_through_mid_range() {
+        use crate::server::{streaming_worker_count, MIN_STREAMING_WORKERS, MAX_STREAMING_WORKERS};
+        // Core counts inside the band are returned unchanged.
+        for cores in MIN_STREAMING_WORKERS..=MAX_STREAMING_WORKERS {
+            assert_eq!(streaming_worker_count(cores), cores);
+        }
+    }
 
     /// Verify base_url uses direct HTTP format (http://localhost:PORT).
     /// This is the URL used for native <video> src with PNA CORS headers.
@@ -315,6 +523,9 @@ async fn background_cache_download(
     let chunk_size: i32 = 512 * 1024;
     let transfer_id = format!("bg-cache-{}", message_id);
 
+    // Progressive keyframe indexer (feeds the hover-thumbnail index as we cache).
+    let mut kf_indexer = KeyframeIndexer::new();
+
     // Always use sequential iter_download — Telegram triggers FLOOD_PREMIUM_WAIT
     // on parallel connections (same approach as .mp4 streaming).
     let _pool_clone = { state.download_pool.lock().await.clone() }; // kept for future non-streaming use
@@ -371,6 +582,8 @@ async fn background_cache_download(
             let remaining_in_gap = (gap_end - offset + 1) as usize;
             let to_write = chunk_slice.len().min(remaining_in_gap);
 
+            let write_offset = offset; // absolute pos of these bytes
+
             cache_file
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| format!("Seek error: {}", e))?;
@@ -380,19 +593,28 @@ async fn background_cache_download(
 
             offset += to_write as u64;
 
-            // Update meta (serialized via per-message lock)
-            let _lock = cache_mgr.lock_meta(message_id).await;
-            let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
-                message_id,
-                folder_id,
-                total_size,
-                filename: filename.clone(),
-                cached_ranges: Vec::new(),
-                mime_type: mime_type.clone(),
-            });
-            meta.cached_ranges.push((gap_start, offset - 1));
-            merge_ranges(&mut meta.cached_ranges);
-            let _ = cache_mgr.save_meta(&meta);
+            // Update meta (serialized via per-message lock). Scoped so the lock
+            // drops BEFORE the keyframe-index update below (never nest the two).
+            {
+                let _lock = cache_mgr.lock_meta(message_id).await;
+                let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
+                    message_id,
+                    folder_id,
+                    total_size,
+                    filename: filename.clone(),
+                    cached_ranges: Vec::new(),
+                    mime_type: mime_type.clone(),
+                });
+                meta.cached_ranges.push((gap_start, offset - 1));
+                merge_ranges(&mut meta.cached_ranges);
+                let _ = cache_mgr.save_meta(&meta);
+            }
+
+            // Progressive keyframe indexing (outside lock_meta). Best-effort.
+            index_keyframes_from_chunk(
+                &mut kf_indexer, &chunk_slice[..to_write], write_offset,
+                message_id, total_size, &cache_mgr, &state,
+            ).await;
 
             // Throttle: sleep to enforce download speed limit for background cache.
             // Semaphore is released after chunk fetch, so other tasks can use
@@ -491,6 +713,11 @@ pub async fn cmd_report_playback_position(
         message_id,
         (current_byte, duration_s, playback_rate, file_size)
     );
+
+    // Record the playhead byte for the coordinator's playhead-aware zombie-cancel
+    // (trace-23 fix): register_download uses it to keep the read nearest the
+    // playhead alive and cancel only the stale forward-walk left behind by a seek.
+    cache_state.set_playhead_byte(message_id, current_byte);
 
     // Don't start if a proactive prebuffer is already running for this message.
     // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
@@ -721,6 +948,11 @@ async fn proactive_prebuffer_download(
     let chunk_size: i32 = 512 * 1024;
     let mut total_downloaded: u64 = 0;
 
+    // Progressive keyframe indexer: scans each downloaded chunk for keyframes and
+    // feeds the shared hover-thumbnail index (see index_keyframes_from_chunk).
+    // One per task so PES spanning chunk boundaries is assembled correctly.
+    let mut kf_indexer = KeyframeIndexer::new();
+
     // NEVER use DownloadPool for streaming — Telegram triggers FLOOD_PREMIUM_WAIT
     // on ANY parallel downloads from the same account. Always use sequential
     // iter_download via the main client (same approach as .mp4 streaming).
@@ -878,7 +1110,10 @@ async fn proactive_prebuffer_download(
                             let targets = state.proactive_targets.read().await;
                             targets.get(&message_id).copied().unwrap_or((start_byte, 0.0, 1.0, total_size))
                         };
-                        if current_target != start_byte {
+                        // Dead-band: ignore sub-chunk VBR jitter (±1 byte etc).
+                        // Only a move of >= PROACTIVE_TARGET_EPSILON_BYTES is a
+                        // real retarget worth re-evaluating gaps for.
+                        if is_significant_target_change(start_byte, current_target) {
                             log::info!("[PROACTIVE] msg {}: target updated during yield: {} -> {} (VBR correction)", 
                                 message_id, start_byte, current_target);
                             start_byte = current_target;
@@ -940,13 +1175,12 @@ async fn proactive_prebuffer_download(
                 {
                     let targets = state.proactive_targets.read().await;
                     if let Some(&(target_byte, _, _, _)) = targets.get(&message_id) {
-                        // Update last_target_byte FIRST, before any break.
-                        // If we break below, this line must have already run,
-                        // otherwise the next iteration sees stale last_target_byte
-                        // and the backward jump loops forever.
-                        let target_changed = last_target_byte != Some(target_byte);
+                        // Capture the PREVIOUS observed target, then update. The
+                        // update must happen before any break so the next iteration
+                        // never sees a stale value.
+                        let prev_target = last_target_byte;
                         last_target_byte = Some(target_byte);
-                        
+
                         if target_byte > offset + 10 * 1024 * 1024 {
                             log::info!(
                                 "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
@@ -954,17 +1188,27 @@ async fn proactive_prebuffer_download(
                             );
                             jumped = true;
                             break;
-                        } else if target_byte + 50 * 1024 * 1024 < offset
-                                   && target_changed {
-                            // Backward seek — but ONLY if the target changed (new seek).
-                            // If target hasn't changed, PROACTIVE is just ahead of the
-                            // seek position = normal prebuffering, NOT a backward seek.
-                            log::info!(
-                                "[PROACTIVE] msg {}: playhead jumped backward to byte {} (current offset {}), re-evaluating gaps",
-                                message_id, target_byte, offset
-                            );
-                            jumped = true;
-                            break;
+                        } else if let Some(prev) = prev_target {
+                            // Backward seek: the reported playhead target moved
+                            // BACKWARD from the previously observed target by a
+                            // meaningful margin (>10MB). During normal forward
+                            // playback the target (derived from currentTime)
+                            // increases monotonically — MP4's periodic position
+                            // reporter sends an advancing playhead every 2s — so the
+                            // old "target_changed" test fired on EVERY tick once
+                            // PROACTIVE raced >50MB ahead, tearing down the download
+                            // iterator ~1/s and forcing 5s yields (the green-bar
+                            // pulsing). Requiring an actual backward delta fires only
+                            // on a real backward seek / VBR correction, never on
+                            // forward playback advancement.
+                            if target_byte + 10 * 1024 * 1024 < prev {
+                                log::info!(
+                                    "[PROACTIVE] msg {}: playhead jumped backward to byte {} (prev target {}, current offset {}), re-evaluating gaps",
+                                    message_id, target_byte, prev, offset
+                                );
+                                jumped = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1012,6 +1256,8 @@ async fn proactive_prebuffer_download(
                         let remaining_in_gap = (gap_end - offset + 1) as usize;
                         let to_write = chunk_slice.len().min(remaining_in_gap);
 
+                        let write_offset = offset; // absolute pos of these bytes
+
                         cache_file
                             .seek(SeekFrom::Start(offset))
                             .map_err(|e| format!("Seek error: {}", e))?;
@@ -1038,6 +1284,14 @@ async fn proactive_prebuffer_download(
                             merge_ranges(&mut meta.cached_ranges);
                             let _ = cache_mgr.save_meta(&meta);
                         }
+
+                        // Progressive keyframe indexing (OUTSIDE the lock_meta scope
+                        // above — never nest the index lock inside lock_meta).
+                        // Best-effort; failures never disturb the download.
+                        index_keyframes_from_chunk(
+                            &mut kf_indexer, &chunk_slice[..to_write], write_offset,
+                            message_id, total_size, &cache_mgr, &state,
+                        ).await;
 
                         if offset > gap_end {
                             break;

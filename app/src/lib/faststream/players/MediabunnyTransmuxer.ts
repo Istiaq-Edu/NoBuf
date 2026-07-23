@@ -250,6 +250,40 @@ export class MediabunnyTransmuxer {
     return idx[0].time < 1.0 && time < 1.0 ? idx[0].time : null;
   }
 
+  /** Snap `time` to the nearest cue keyframe when it lies within `tolerance`
+   *  seconds of one; otherwise return `time` unchanged. Fixes the abutting-refill
+   *  waste: a refill stops by breaking at `packet.timestamp >= stopKf`, so it
+   *  appends every sample strictly BELOW the stop keyframe. SourceBuffer.buffered.end
+   *  then reports ~1ms below that keyframe (the last muxed sample's end — a
+   *  DIFFERENT float clock than the MKV cue time). The next refill uses that
+   *  bufEnd as its seek position, and nearestCueKeyframeAtOrBefore() rounds it
+   *  DOWN a full GOP (the stop keyframe is 1ms ABOVE bufEnd, so "at or before"
+   *  skips it), re-transmuxing ~10s already buffered (observed: bufEnd=1515.336
+   *  → re-seek to 1505.327, overlap=10.009s). Snapping bufEnd up to the cue
+   *  keyframe (1515.337) makes the refill abut cleanly. Tolerance 0.25s ≫ the
+   *  ~1ms clock skew yet ≪ any real GOP interval (~10s here), so it can never
+   *  mis-snap across a keyframe. No-op (returns `time`) when the cue index is
+   *  unavailable (TS / pre-parse), preserving that path unchanged. */
+  snapToCueKeyframe(time: number, tolerance: number = 0.25): number {
+    const idx = this.mkvCueIndex;
+    if (idx.length === 0 || !Number.isFinite(time)) return time;
+    // Binary search for the insertion point, then compare the neighbours on
+    // either side — the nearest cue may be just above or just below `time`.
+    let lo = 0, hi = idx.length; // first idx[i].time >= time
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (idx[mid].time < time) lo = mid + 1; else hi = mid;
+    }
+    let best = time;
+    let bestDelta = tolerance;
+    for (const i of [lo - 1, lo]) {
+      if (i < 0 || i >= idx.length) continue;
+      const delta = Math.abs(idx[i].time - time);
+      if (delta <= bestDelta) { bestDelta = delta; best = idx[i].time; }
+    }
+    return best;
+  }
+
   async init(): Promise<TransmuxerInitResult | null> {
     if (this.disposed) return null;
 
@@ -1328,6 +1362,9 @@ export class MediabunnyTransmuxer {
         ? byteOffsetKeyframe.timestamp // Use byte-offset index timestamp (most accurate)
         : cachedKeyframeTs ?? seekTime;
 
+      // PROBE (trace-27): arm search byte-accounting so markSeekResolved can log
+      // how many bytes THIS getKeyPacket read from the cue cluster to the keyframe.
+      (this.streamSource as any)?.markSeekStart?.();
       if (useCachedIndex || byteOffsetKeyframe !== null) {
         keyPacket = await videoSink.getKeyPacket(seekTargetTs, { verifyKeyPackets: false });
         console.log(`[Transmuxer] seekTo: using keyframe index — seekTargetTs=${seekTargetTs.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s, byteOffset=${byteOffsetKeyframe?.byteOffset ?? 'N/A'}`);
@@ -1628,6 +1665,33 @@ export class MediabunnyTransmuxer {
    *  seek after collecting enough segments (a few frames). */
   abortSeek(): void {
     this.seekAbortFlag = true;
+  }
+
+  /**
+   * Interrupt an in-flight USER seek so a superseding seek can start NOW instead
+   * of waiting for this one's full lifecycle (getKeyPacket search + the multi-
+   * second transmux iteration) to finish on its own.
+   *
+   * WHY THIS IS DISTINCT FROM abortSeek():
+   *   abortSeek() only sets seekAbortFlag, which stops the packet iteration loop
+   *   (checked per-packet at iterateVideoPackets/iterateAudioPackets). That alone
+   *   is NOT enough when the seek is blocked EARLIER — inside getKeyPacket, which
+   *   awaits a cold cluster HTTP range. seekAbortFlag isn't checked during that
+   *   network wait, so the seek would still hang for the full fetch. We ALSO
+   *   abort the shared stream source's in-flight fetch so getKeyPacket's await
+   *   rejects immediately (surfaces as the expected "read aborted" error, caught
+   *   as isAborted in seekTo's handler → returns null cleanly). Two levers,
+   *   because the cost lives in two places: network (getKeyPacket) and CPU
+   *   (iteration). Named separately from abortSeek() so the thumbnail pipeline's
+   *   collect-a-few-frames abort keeps its original network-preserving behavior.
+   *
+   * Safe to call when no seek is running: seekAbortFlag is reset at the top of
+   * the next seekTo (before the new iteration), and abortInFlight() is a no-op
+   * when nothing is fetching.
+   */
+  interruptSeek(): void {
+    this.seekAbortFlag = true;
+    (this.streamSource as any)?.abortInFlight?.();
   }
 
   dispose(): void {

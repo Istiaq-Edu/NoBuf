@@ -83,7 +83,7 @@ const defaultSettings: Settings = {
     playerAutoHideDelay: 3,
     playerShowPinButton: false,
     playerSettingsWidth: 336,
-    playerBarLayout: { left: ['skipBack', 'skipFwd'], right: ['speed', 'download', 'settings', 'pin', 'fullscreen', '__tray__'], tray: ['loop', 'pip'] },
+    playerBarLayout: { left: ['skipBack', 'skipFwd'], right: ['captions', 'speed', 'download', 'settings', 'pin', 'fullscreen', '__tray__'], tray: ['loop', 'pip'] },
     prebufferSpeedLimit: 0,
     downloadSpeedLimit: 0,
 };

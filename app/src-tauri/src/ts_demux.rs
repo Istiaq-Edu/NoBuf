@@ -1052,9 +1052,263 @@ pub fn scan_keyframes(data: &[u8], file_offset: u64, stream_info: &TsStreamInfo)
     result
 }
 
+/// Strip the 4-byte BDAV/M2TS prefix from each 192-byte packet, yielding plain
+/// 188-byte TS. No-op when `is_m2ts` is false. Lives here (the TS parsing module)
+/// so both server.rs and the download loops can share one implementation.
+pub fn strip_m2ts_prefix(data: &[u8], is_m2ts: bool) -> Vec<u8> {
+    if !is_m2ts {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len() / 192 * 188);
+    let mut offset = 0;
+    while offset + 192 <= data.len() {
+        // Verify sync byte (0x47) is at position 4 (after 4-byte BDAV prefix)
+        if data[offset + 4] == 0x47 {
+            out.extend_from_slice(&data[offset + 4..offset + 192]);
+        }
+        offset += 192;
+    }
+    out
+}
+
+/// Progressive keyframe index for one media file, built incrementally as the
+/// background/proactive downloader sweeps bytes to disk. Shared via TelegramState
+/// so the (Tauri-spawned) download task can WRITE it and the (Actix) hover
+/// keyframe-lookup can READ it — the two live in different runtimes and can only
+/// meet on the shared `Arc<TelegramState>`.
+///
+/// `samples` are (timestamp_s, byte_offset) keyframe positions kept sorted by
+/// timestamp and de-duplicated. `covered_ranges` records which byte ranges have
+/// already been scanned (so we don't re-scan). `total_size` guards against a
+/// stale entry being read for a different file that reused the message_id.
+#[derive(Debug, Clone, Default)]
+pub struct KeyframeIndex {
+    pub samples: Vec<(f64, u64)>,
+    pub covered_ranges: Vec<(u64, u64)>,
+    pub total_size: u64,
+}
+
+/// Merge freshly-scanned keyframe samples into an index, in place.
+///
+/// - `total_size` pins the entry to a file; a mismatch replaces the whole entry
+///   (the previous samples belonged to a different file that reused the id).
+/// - Samples are inserted in timestamp order; exact-duplicate timestamps are
+///   skipped (idempotent — safe to call with overlapping scanned ranges, which
+///   happens when both the bg-cache and proactive loops sweep the same file).
+/// - `scanned_range` is appended to `covered_ranges` and coalesced.
+///
+/// Pure (no I/O) so it is fully unit-testable without a live download.
+pub fn merge_keyframe_samples(
+    index: &mut KeyframeIndex,
+    total_size: u64,
+    new_samples: &[(f64, u64)],
+    scanned_range: (u64, u64),
+) {
+    // File identity guard: if the index was for a different-sized file (id reuse),
+    // start fresh rather than mixing byte offsets from two files.
+    if index.total_size != total_size {
+        index.samples.clear();
+        index.covered_ranges.clear();
+        index.total_size = total_size;
+    }
+
+    for &(ts, off) in new_samples {
+        // Insert sorted by timestamp; skip exact-duplicate timestamps.
+        let pos = index.samples.partition_point(|(t, _)| *t < ts);
+        if pos < index.samples.len() && index.samples[pos].0 == ts {
+            continue;
+        }
+        index.samples.insert(pos, (ts, off));
+    }
+
+    if scanned_range.1 >= scanned_range.0 {
+        index.covered_ranges.push(scanned_range);
+        coalesce_ranges(&mut index.covered_ranges);
+    }
+}
+
+/// Coalesce overlapping/adjacent (start,end) inclusive byte ranges in place.
+/// Self-contained (ts_demux has no crate deps) so KeyframeIndex stays portable.
+fn coalesce_ranges(ranges: &mut Vec<(u64, u64)>) {
+    if ranges.len() < 2 {
+        return;
+    }
+    ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges.iter() {
+        if let Some(last) = merged.last_mut() {
+            // Adjacent (last.1 + 1 == s) or overlapping → extend.
+            if s <= last.1.saturating_add(1) {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    *ranges = merged;
+}
+
+/// Look up the nearest keyframe at or before `target_time_s` from an index,
+/// but only if it is trustworthy for a hover at `approx_byte`:
+/// - within 30s BEFORE the target time, and
+/// - within one GOP (~4MB) of the linear-estimate byte.
+///
+/// These guards mirror the byte_time_cache fast path in server.rs: they stop a
+/// sparse index (e.g. only head + tail scanned) from returning a keyframe far
+/// from where the user is hovering. Returns (timestamp_s, byte_offset).
+/// Pure + overflow-safe (abs_diff), so it is unit-testable.
+pub fn lookup_keyframe(
+    index: &KeyframeIndex,
+    total_size: u64,
+    target_time_s: f64,
+    approx_byte: u64,
+    max_time_behind_s: f64,
+    max_byte_distance: u64,
+) -> Option<(f64, u64)> {
+    if index.total_size != total_size || index.samples.is_empty() {
+        return None;
+    }
+    let idx = index.samples.partition_point(|(ts, _)| *ts <= target_time_s);
+    if idx == 0 {
+        return None;
+    }
+    let (ts, off) = index.samples[idx - 1];
+    if target_time_s - ts <= max_time_behind_s && approx_byte.abs_diff(off) <= max_byte_distance {
+        Some((ts, off))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────── Progressive keyframe index (hover-thumbnail) tests ─────────
+    // These lock the pure logic behind the progressive index: merge/dedup,
+    // range coalescing, file-identity guard, and the trust-window lookup.
+
+    fn idx(total: u64) -> KeyframeIndex {
+        KeyframeIndex { samples: Vec::new(), covered_ranges: Vec::new(), total_size: total }
+    }
+
+    #[test]
+    fn t1_merge_inserts_sorted_and_dedups() {
+        let mut i = idx(1000);
+        merge_keyframe_samples(&mut i, 1000, &[(3.0, 300), (1.0, 100), (2.0, 200)], (100, 399));
+        assert_eq!(i.samples, vec![(1.0, 100), (2.0, 200), (3.0, 300)]);
+        // Re-merge overlapping (dup timestamps) — must not duplicate.
+        merge_keyframe_samples(&mut i, 1000, &[(2.0, 200), (4.0, 400)], (200, 499));
+        assert_eq!(i.samples, vec![(1.0, 100), (2.0, 200), (3.0, 300), (4.0, 400)]);
+    }
+
+    #[test]
+    fn t2_covered_ranges_coalesce_adjacent_and_overlap() {
+        let mut i = idx(1000);
+        merge_keyframe_samples(&mut i, 1000, &[(1.0, 100)], (0, 199));
+        merge_keyframe_samples(&mut i, 1000, &[(2.0, 200)], (200, 399)); // adjacent → merges
+        assert_eq!(i.covered_ranges, vec![(0, 399)]);
+        merge_keyframe_samples(&mut i, 1000, &[(5.0, 900)], (600, 799)); // gap → separate
+        assert_eq!(i.covered_ranges, vec![(0, 399), (600, 799)]);
+        merge_keyframe_samples(&mut i, 1000, &[(4.0, 500)], (300, 650)); // bridges → one range
+        assert_eq!(i.covered_ranges, vec![(0, 799)]);
+    }
+
+    #[test]
+    fn t3_total_size_mismatch_resets_entry() {
+        let mut i = idx(1000);
+        merge_keyframe_samples(&mut i, 1000, &[(1.0, 100), (2.0, 200)], (0, 399));
+        // A different file reused the id (different size) → start fresh.
+        merge_keyframe_samples(&mut i, 2000, &[(9.0, 900)], (800, 999));
+        assert_eq!(i.total_size, 2000);
+        assert_eq!(i.samples, vec![(9.0, 900)]);
+        assert_eq!(i.covered_ranges, vec![(800, 999)]);
+    }
+
+    #[test]
+    fn t4_lookup_within_time_and_byte_window_hits() {
+        let mut i = idx(10_000);
+        merge_keyframe_samples(&mut i, 10_000, &[(100.0, 5_000), (110.0, 5_500)], (0, 9999));
+        // Hover at 112s, approx byte 5_600 → nearest <= is (110, 5500), within 30s + 4MB.
+        let hit = lookup_keyframe(&i, 10_000, 112.0, 5_600, 30.0, 4 * 1024 * 1024);
+        assert_eq!(hit, Some((110.0, 5_500)));
+    }
+
+    #[test]
+    fn t5_lookup_rejects_far_byte_distance() {
+        let mut i = idx(2_000_000_000);
+        // Sample byte far from the hover's linear-estimate byte (> 4MB) → reject.
+        merge_keyframe_samples(&mut i, 2_000_000_000, &[(100.0, 100_000_000)], (0, 200_000_000));
+        let hit = lookup_keyframe(&i, 2_000_000_000, 110.0, 100_000_000 + 5 * 1024 * 1024, 30.0, 4 * 1024 * 1024);
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn t6_lookup_rejects_stale_time_distance() {
+        let mut i = idx(10_000);
+        merge_keyframe_samples(&mut i, 10_000, &[(100.0, 5_000)], (0, 9999));
+        // Hover 140s but nearest keyframe is 100s → 40s behind > 30s → reject.
+        let hit = lookup_keyframe(&i, 10_000, 140.0, 5_000, 30.0, 4 * 1024 * 1024);
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn t7_lookup_empty_index_is_none() {
+        let i = idx(10_000);
+        assert_eq!(lookup_keyframe(&i, 10_000, 50.0, 1000, 30.0, 4 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn t8_lookup_target_before_first_sample_is_none() {
+        let mut i = idx(10_000);
+        merge_keyframe_samples(&mut i, 10_000, &[(100.0, 5_000)], (0, 9999));
+        // Target 50s is BEFORE the first sample (100s) → partition_point idx==0 → None.
+        assert_eq!(lookup_keyframe(&i, 10_000, 50.0, 5_000, 30.0, 4 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn t9_lookup_overflow_safe_at_extremes() {
+        let mut i = idx(u64::MAX);
+        // Sample at byte 0; hover approx_byte at u64::MAX must not panic (abs_diff).
+        merge_keyframe_samples(&mut i, u64::MAX, &[(10.0, 0)], (0, 100));
+        assert_eq!(lookup_keyframe(&i, u64::MAX, 12.0, u64::MAX, 30.0, 4 * 1024 * 1024), None);
+        // And a within-window hit at byte 0 works.
+        assert_eq!(lookup_keyframe(&i, u64::MAX, 12.0, 10, 30.0, 4 * 1024 * 1024), Some((10.0, 0)));
+    }
+
+    #[test]
+    fn t10_lookup_total_size_mismatch_is_none() {
+        let mut i = idx(10_000);
+        merge_keyframe_samples(&mut i, 10_000, &[(100.0, 5_000)], (0, 9999));
+        // Caller's total_size disagrees with the index → treat as stale → None.
+        assert_eq!(lookup_keyframe(&i, 9_999, 110.0, 5_000, 30.0, 4 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn t11_strip_m2ts_prefix_yields_188_packets() {
+        // Build two 192-byte M2TS packets (4-byte prefix + 0x47 + 187 bytes).
+        let mut m2ts = Vec::new();
+        for _ in 0..2 {
+            m2ts.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // BDAV prefix
+            m2ts.push(0x47);
+            m2ts.extend_from_slice(&[0u8; 187]);
+        }
+        let stripped = strip_m2ts_prefix(&m2ts, true);
+        assert_eq!(stripped.len(), 376); // 2 × 188
+        assert_eq!(stripped[0], 0x47);
+        assert_eq!(stripped[188], 0x47);
+        // is_m2ts=false is a pass-through copy.
+        assert_eq!(strip_m2ts_prefix(&[1, 2, 3], false), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn t12_merge_ignores_empty_scanned_range() {
+        // A degenerate (start>end) range must not be pushed.
+        let mut i = idx(1000);
+        merge_keyframe_samples(&mut i, 1000, &[(1.0, 100)], (500, 100));
+        assert!(i.covered_ranges.is_empty());
+        assert_eq!(i.samples, vec![(1.0, 100)]);
+    }
 
     fn make_ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
         let mut pkt = vec![0u8; TS_PACKET_SIZE];

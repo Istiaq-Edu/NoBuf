@@ -1,5 +1,6 @@
 use tauri::State;
 use crate::commands::streaming::StreamConfig;
+use crate::ffmpeg_util;
 use base64::{Engine as _, engine::general_purpose};
 
 const SPRITE_COLUMNS: u32 = 10;
@@ -20,44 +21,10 @@ pub struct SpriteSheetResult {
 
 /// Ensure ffmpeg binary is available.
 /// Returns the path to the ffmpeg binary.
+/// Delegates to the shared `ffmpeg_util` module so server.rs and sprite.rs
+/// use the same 3-tier resolution (PATH → exe_dir → sidecar).
 fn ensure_ffmpeg() -> Result<std::path::PathBuf, String> {
-    // Try system ffmpeg first (most reliable)
-    if let Ok(output) = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        if output.success() {
-            log::info!("Using system ffmpeg from PATH");
-            return Ok(std::path::PathBuf::from("ffmpeg"));
-        }
-    }
-
-    // Try next to the running executable (sidecar pattern)
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let sidecar = exe_dir.join(if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" });
-            log::info!("Checking exe dir: {:?}", sidecar);
-            if sidecar.exists() {
-                log::info!("Found ffmpeg at: {:?}", sidecar);
-                return Ok(sidecar);
-            }
-        }
-    }
-
-    // Try ffmpeg-sidecar's sidecar_path
-    if let Ok(sidecar_path) = ffmpeg_sidecar::paths::sidecar_path() {
-        log::info!("Checking ffmpeg-sidecar path: {:?}", sidecar_path);
-        if sidecar_path.exists() {
-            return Ok(sidecar_path);
-        }
-    }
-
-    // Auto-download removed for security — user must install ffmpeg manually.
-    // A MITM on the auto-download could deliver a malicious binary (RCE).
-    log::warn!("ffmpeg not found. Install ffmpeg and add it to PATH, or place ffmpeg.exe next to the app executable.");
-    return Err("ffmpeg not found. Install ffmpeg and add it to PATH.".to_string());
+    ffmpeg_util::ensure_ffmpeg()
 }
 
 /// Run ffprobe to get video duration in seconds

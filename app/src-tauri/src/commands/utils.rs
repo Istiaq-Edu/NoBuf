@@ -87,6 +87,14 @@ pub fn cmd_log(message: String) {
     log::info!("[FRONTEND] {}", message);
 }
 
+/// Ensure ffmpeg is available. If not found in PATH/exe_dir/sidecar, downloads
+/// ffmpeg + ffprobe essentials to AppData. Called on app startup.
+#[tauri::command]
+pub async fn cmd_ensure_ffmpeg() -> Result<String, String> {
+    let path = crate::ffmpeg_util::ensure_ffmpeg_or_download()?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// Open a URL in the system's default browser. Only HTTP(S) URLs are allowed.
 #[tauri::command]
 pub async fn cmd_open_url(url: String) -> Result<(), String> {
