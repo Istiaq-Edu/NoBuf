@@ -13,6 +13,21 @@ interface ChunkLoaderConfig {
   chunkSize?: number;
   withCredentials?: boolean;
   headers?: Record<string, string>;
+  // ── Pipe backpressure (non-seekable /remux ffmpeg pipe only) ──
+  // For a byte-seekable source (/stream), mpegts.js lazyLoad throttles the
+  // transmuxer by aborting the loader and later resuming via a byte-seek. On a
+  // /remux pipe that resume re-opens the pipe and spawns a SECOND ffmpeg
+  // transcode (proven: trace 17). Instead, the ss player runs with lazyLoad OFF
+  // and throttles here by simply NOT reading: a stalled reader fills the TCP
+  // window → ffmpeg's pipe write blocks → ffmpeg self-throttles. No abort, no
+  // re-seek, no second transcode.
+  //
+  // getBufferedAheadSeconds: returns seconds buffered ahead of currentTime, or 0
+  //   when currentTime is not yet inside any buffered range (pre-align warmup —
+  //   must NOT throttle then, or the pipe stalls before playback starts).
+  getBufferedAheadSeconds?: () => number;
+  pipeBackpressureMaxAhead?: number;     // start throttling above this (default 60s)
+  pipeBackpressureHysteresis?: number;   // resume reading below max-this (default 15s)
 }
 
 /**
@@ -60,6 +75,12 @@ export function createChunkedFetchLoader(mpegts: any): any {
     private _isSeekStart = false;
     private _pumpGen = 0;
 
+    // Pipe backpressure (see ChunkLoaderConfig). Disabled unless a
+    // getBufferedAheadSeconds callback is supplied by the ss (/remux) player.
+    private _bpAhead: (() => number) | null;
+    private _bpMaxAhead: number;
+    private _bpHysteresis: number;
+
     static isSupported() {
       return typeof self !== 'undefined' && typeof self.fetch === 'function' && typeof self.ReadableStream === 'function' && typeof self.AbortController === 'function';
     }
@@ -73,6 +94,33 @@ export function createChunkedFetchLoader(mpegts: any): any {
       this._chunkSize = alignToPacket(this._config.chunkSize || 2 * 1024 * 1024);
       this._postSeekFirstChunkSize = alignToPacket(this._config.postSeekFirstChunkSize || 8 * 1024 * 1024);
       this._shadowCache = this._config.shadowCache || null;
+
+      this._bpAhead = typeof this._config.getBufferedAheadSeconds === 'function'
+        ? this._config.getBufferedAheadSeconds
+        : null;
+      this._bpMaxAhead = this._config.pipeBackpressureMaxAhead ?? 60;
+      this._bpHysteresis = this._config.pipeBackpressureHysteresis ?? 15;
+    }
+
+    // Pipe backpressure gate: while more than _bpMaxAhead seconds are buffered
+    // ahead of the playhead, stop reading (leave the fetch open) so TCP
+    // backpressure stalls ffmpeg. Resume once the buffer drains to
+    // (_bpMaxAhead - _bpHysteresis). Returns immediately (no throttle) when the
+    // callback is absent or reports 0 (pre-align warmup / playhead not yet in a
+    // buffered range). Bails on abort / stale pump.
+    private async _awaitBackpressure(gen: number): Promise<void> {
+      if (!this._bpAhead) return;
+      let ahead = this._bpAhead();
+      if (ahead <= this._bpMaxAhead) return;
+      const resumeAt = Math.max(0, this._bpMaxAhead - this._bpHysteresis);
+      const _diag = (window as any).__nobuf_diagLog || (() => {});
+      _diag(`[LOADER] pipe backpressure: ${ahead.toFixed(1)}s buffered ahead > ${this._bpMaxAhead}s — pausing reads until ${resumeAt}s`);
+      while (ahead > resumeAt) {
+        if (this._requestAbort || gen !== this._pumpGen || (window as any).__nobuf_mpegtsFatalAbort) return;
+        await new Promise<void>(resolve => setTimeout(resolve, 250));
+        ahead = this._bpAhead();
+      }
+      _diag(`[LOADER] pipe backpressure: drained to ${ahead.toFixed(1)}s — resuming reads`);
     }
 
     destroy() {
@@ -161,7 +209,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
         }
 
         try {
-          await this._fetchRange(from, to);
+          await this._fetchRange(from, to, gen);
         } catch (err: any) {
           if (this._requestAbort || err.name === 'AbortError' || gen !== this._pumpGen) return;
           this._status = mpegts.LoaderStatus.kError;
@@ -171,7 +219,7 @@ export function createChunkedFetchLoader(mpegts: any): any {
       }
     }
 
-    private async _fetchRange(from: number, to: number): Promise<void> {
+    private async _fetchRange(from: number, to: number, gen: number = this._pumpGen): Promise<void> {
       const url = this._dataSource.url;
       this._abortController = new AbortController();
 
@@ -198,13 +246,31 @@ export function createChunkedFetchLoader(mpegts: any): any {
       const reader = response.body.getReader();
       let offset = from;
 
+      // DIAG (remove once remux-seek stall root-caused): the seek feed dies at
+      // ~288KB while ffmpeg keeps producing. Instrument EVERY read so the log
+      // states plainly whether reader.read() stops delivering (transport/WebView2
+      // buffering) or the loop exits via done/abort. Logs response status +
+      // headers once so we can see 200-vs-206 and any Content-Length.
+      const _diag = (window as any).__nobuf_diagLog || ((s: string) => console.log(s));
+      let _readN = 0, _readBytes = 0;
+      _diag(`[LOADER] _fetchRange(${from}-${to}) response: status=${response.status} clen=${response.headers.get('content-length')} ctype=${response.headers.get('content-type')} enc=${response.headers.get('transfer-encoding')}`);
+
       while (true) {
         const { done, value } = await reader.read();
         if (this._requestAbort) {
+          _diag(`[LOADER] _fetchRange(${from}) aborted after ${_readN} reads / ${_readBytes}B`);
           await reader.cancel().catch(() => {});
           return;
         }
-        if (done) break;
+        if (done) {
+          _diag(`[LOADER] _fetchRange(${from}) reader DONE after ${_readN} reads / ${_readBytes}B (offset=${offset})`);
+          break;
+        }
+        _readN++;
+        _readBytes += (value?.byteLength ?? 0);
+        if (_readN <= 8 || _readN % 20 === 0) {
+          _diag(`[LOADER] read #${_readN}: +${value?.byteLength ?? 0}B total=${_readBytes}B offset=${offset}`);
+        }
 
         const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
         // Hard-stop: if a fatal decode error occurred, stop feeding data to
@@ -230,6 +296,16 @@ export function createChunkedFetchLoader(mpegts: any): any {
         this._currentByte = offset;
         this._isFirstChunk = false;
         this._isSeekStart = false;
+
+        // Pipe backpressure: if the buffer is far ahead of the playhead, stop
+        // reading here (fetch stays open) until it drains. Stalling the reader
+        // fills the TCP window so ffmpeg self-throttles — no abort, no re-seek,
+        // no second transcode. No-op for byte-seekable (/stream) players.
+        await this._awaitBackpressure(gen);
+        if (this._requestAbort || gen !== this._pumpGen || (window as any).__nobuf_mpegtsFatalAbort) {
+          await reader.cancel().catch(() => {});
+          return;
+        }
       }
 
       // Validate we got the expected number of bytes when file length is known

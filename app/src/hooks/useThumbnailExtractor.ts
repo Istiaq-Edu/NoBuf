@@ -80,6 +80,83 @@ const THUMBNAIL_NB_SAMPLES = 1; // 1 sample per segment — ensures every sample
 // the start), so a far hover must NOT snap to a stale near-start keyframe.
 const THUMB_INDEX_MAX_GAP = 12; // one conservative GOP
 
+// Frontend timeout for the backend /fmp4/keyframe-at search. MUST be >= the
+// backend's own search deadline (15s, server.rs find_keyframe_at_or_before_time)
+// plus a small margin for network/serialisation. Previously this was 5s, which
+// GUARANTEED the frontend aborted before the backend could ever return a real
+// keyframe — every far hover fell back to the crude linear byte estimate and
+// then failed to seek (VBR skew). With the backward-biased window search the
+// backend now converges within its deadline, so we wait for the real answer.
+// The subsequent segment fetch keeps its own independent 10s timeout, and the
+// `busy` flag + hover debounce prevent scrub pile-up, so a slow keyframe search
+// can't stack up concurrent requests.
+export const KEYFRAME_AT_TIMEOUT_MS = 9000; // backend deadline 8s + 1s margin
+// Mirror of the backend search deadline (server.rs find_keyframe_at_or_before_time,
+// `search_deadline = Duration::from_secs(8)`). Exported so a unit test can assert
+// the frontend timeout stays >= the backend deadline; if the backend value changes,
+// the test fails and forces this to be re-synced.
+export const BACKEND_KEYFRAME_SEARCH_DEADLINE_MS = 8000;
+
+/** Backend /fmp4/keyframe-at response (subset used for segment routing). */
+export interface KeyframeAtResponse { byte_offset?: number | null; fallback?: boolean; }
+
+/**
+ * Decide how a hover thumbnail resolves its /segment fetch from a keyframe-at
+ * response. Returns `{ mode: 'byte', byteOffset }` when the backend gave a usable
+ * position — BOTH the exact keyframe (fallback:false) AND the deadline fallback
+ * (fallback:true), whose byte is the linear estimate (time/duration)*size and is
+ * the correct ~position for `time`. Returns `{ mode: 'time' }` only when there is
+ * no byte at all (fall back to the original time-based URL).
+ *
+ * Regression guard (log 3-c): the old code used the byte ONLY when !fallback, so a
+ * fallback:true response fell through to the time URL → backend's SPARSE
+ * Fmp4ByteTimeCache → wrong early-file frame (time=878s captured the 58s frame).
+ * Pure + exported so this routing is unit-tested without a live backend.
+ */
+export function resolveKeyframeSegmentMode(
+  kf: KeyframeAtResponse | null | undefined,
+): { mode: 'byte'; byteOffset: number } | { mode: 'time' } {
+  if (kf && kf.byte_offset != null) return { mode: 'byte', byteOffset: kf.byte_offset };
+  return { mode: 'time' };
+}
+
+/**
+ * Compute the video.currentTime seek target for a thumbnail capture, given the
+ * requested `time` and the SourceBuffer's buffered ranges after the segment was
+ * appended.
+ *
+ * Why not just seek to `time` or to `buffered.start(0)`:
+ *  - If a buffered range already covers `time`, seek there (accurate frame).
+ *  - Otherwise the segment landed at a different position (VBR skew): seek into
+ *    the FIRST buffered range. Crucially we nudge `epsilon` seconds PAST
+ *    `start(0)` rather than exactly onto it. Seeking to exactly buffered.start(0)
+ *    is a known MSE failure mode: the first sample's presentation time can sit a
+ *    fraction after the range start, so `currentTime = start(0)` lands just
+ *    before any decodable frame, no `seeked` event fires, and the capture times
+ *    out (observed deterministically at t=1633.88 in log 15 while a near-identical
+ *    hover one range over succeeded). Nudging inside the range guarantees a
+ *    decodable sample. `epsilon` is clamped so it never exceeds the range.
+ *
+ * Returns null when there is no buffered range to seek into (caller bails).
+ * Pure + exported so the seek-target logic is unit-tested without a live element.
+ */
+export function computeThumbnailSeekTarget(
+  time: number,
+  ranges: { start: number; end: number }[],
+  epsilon = 0.1,
+): number | null {
+  if (ranges.length === 0) return null;
+  // Already covered → seek to the requested time (most accurate).
+  for (const r of ranges) {
+    if (r.start <= time && r.end >= time) return time;
+  }
+  // Not covered → nudge just inside the first range, but never past its end.
+  const first = ranges[0];
+  if (first.end <= first.start) return first.start; // degenerate range
+  const nudged = first.start + epsilon;
+  return Math.min(nudged, (first.start + first.end) / 2);
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
@@ -407,9 +484,11 @@ class ThumbnailPipeline {
       // 1. Remove all old SourceBuffer data
       await this._removeAllBufferedData();
 
-      // 2. Re-append init segment
+      // 2. Re-append init segment (teardown-guarded: destroy() nulls sourceBuffer
+      //    mid-await when the streaming chain stops during a hover)
       if (this.initSegment) {
-        this.sourceBuffer!.appendBuffer(this.initSegment);
+        if (!this.active || !this.sourceBuffer) return false;
+        this.sourceBuffer.appendBuffer(this.initSegment);
         await this._waitForUpdateEnd();
       }
 
@@ -476,8 +555,9 @@ class ThumbnailPipeline {
       }
       await this._waitForUpdateEnd();
 
-      // 9. Check if SourceBuffer covers the desired time
-      const sbBuffered = this.sourceBuffer!.buffered;
+      // 9. Check if SourceBuffer covers the desired time (teardown-guarded)
+      if (!this.active || !this.sourceBuffer) return false;
+      const sbBuffered = this.sourceBuffer.buffered;
       let coversDesiredTime = false;
       for (let i = 0; i < sbBuffered.length; i++) {
         if (sbBuffered.start(i) <= time && sbBuffered.end(i) >= time) {
@@ -497,7 +577,8 @@ class ThumbnailPipeline {
       // Wait for the decoder to render the frame at the seek position
       await this._waitForFrameRender(seekTarget, adjustedTime);
 
-      // 10. Capture frame
+      // 10. Capture frame (teardown-guarded: destroy() nulls canvas/video)
+      if (!this.active || !this.canvas || !this.video) return false;
       const canvas = this.canvas;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
@@ -593,9 +674,16 @@ class TransmuxerThumbnailPipeline {
     format: string,
     canvas: HTMLCanvasElement,
     keyframeTimestamps?: number[],
+    knownDuration?: number,
   ) {
     this.canvas = canvas;
     this.format = format;
+    // Probed/metadata duration from the player. When available, init() uses it
+    // instead of mediabunny's computeDuration(), which for a headerless MKV
+    // (no Segment duration element) scans every packet to EOF — an 8MB
+    // sequential front-march over /stream that pollutes the disk cache and
+    // starves the seek prebuffer on the single rate-limited Telegram pipe.
+    this.duration = knownDuration && knownDuration > 0 ? knownDuration : 0;
     // The pipeline's Input reads small amounts at the beginning of the file
     // (canRead, getPrimaryVideoTrack, etc.) — these subscribe to the
     // sequential download, not targeted downloads. With prefetchProfile:
@@ -663,8 +751,12 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
-      // Get duration
-      this.duration = await this.input.computeDuration();
+      // Get duration. Skip computeDuration() when the player already probed it
+      // — for headerless MKV that call scans to EOF (8MB front-march) and hangs
+      // init before "Ready", starving the seek prebuffer.
+      if (this.duration <= 0) {
+        this.duration = await this.input.computeDuration();
+      }
 
       // Get video track
       this.videoTrack = await this.input.getPrimaryVideoTrack();
@@ -689,10 +781,16 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
-      // Check if the codec is supported by VideoDecoder
+      // Check if the codec is supported by VideoDecoder. Expected to fail for
+      // 10-bit HEVC (e.g. hev1.2.4.H120.90) on Chromium/WebView2 — WebCodecs has
+      // no software fallback for it. This is NOT an error: scrub-preview
+      // thumbnails are simply disabled for this file (the hover handler in
+      // FastStreamPlayer degrades to a time-only tooltip). Playback is unaffected —
+      // HEVC plays via the /remux → mpegts.js path. Log at info level so it does
+      // not surface as a broken-pipeline warning.
       const support = await VideoDecoder.isConfigSupported(this.decoderConfig);
       if (!support.supported) {
-        console.warn('[TransmuxerThumbnailPipeline] Codec not supported by VideoDecoder:', this.decoderConfig.codec);
+        console.info('[TransmuxerThumbnailPipeline] Codec not supported by VideoDecoder (expected for 10-bit HEVC); scrub thumbnails disabled for this file:', this.decoderConfig.codec);
         return false;
       }
 
@@ -1278,25 +1376,32 @@ class Fmp4ThumbnailPipeline {
 
       // 2. Re-append init segment
       if (this.initSegment) {
-        this.sourceBuffer!.appendBuffer(this.initSegment);
+        if (!this.active || !this.sourceBuffer) return false;
+        this.sourceBuffer.appendBuffer(this.initSegment);
         await this._waitForUpdateEnd();
       }
 
       // 3. Fetch keyframe byte offset from backend for precise seeking.
-      //    Timeout: 5s — if the keyframe search takes longer (FLOOD_PREMIUM_WAIT,
-      //    expanding window search), fall back to linear byte estimate.
+      //    Timeout: KEYFRAME_AT_TIMEOUT_MS (>= backend 15s deadline) — the backend
+      //    now converges within its deadline (backward-biased window search), so
+      //    we wait for the real keyframe instead of preempting it with a crude
+      //    linear byte estimate that then fails to seek on VBR content.
       let segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=0.5`;
       try {
         const kfUrl = `${this.fmp4BaseUrl}/keyframe-at/${this.folderId}/${this.messageId}?${this.queryParams}&time=${time.toFixed(3)}&duration=${this.duration.toFixed(3)}`;
         const kfController = new AbortController();
-        const kfTimeoutId = setTimeout(() => kfController.abort(), 5000);
+        const kfTimeoutId = setTimeout(() => kfController.abort(), KEYFRAME_AT_TIMEOUT_MS);
         const kfResp = await fetch(kfUrl, { signal: kfController.signal });
         clearTimeout(kfTimeoutId);
         if (kfResp.ok) {
           const kfData = await kfResp.json();
-          if (kfData.byte_offset != null && !kfData.fallback) {
-            segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${kfData.byte_offset}&duration=0.5&align=keyframe`;
-            console.log('[Fmp4ThumbnailPipeline] Using keyframe-at byte_offset=' + kfData.byte_offset + ' for time=' + time.toFixed(2) + 's');
+          // Route via the pure, unit-tested resolver (resolveKeyframeSegmentMode).
+          // BOTH exact keyframe and deadline fallback carry a usable byte_offset;
+          // only a byte-less response falls back to the original time URL.
+          const seg = resolveKeyframeSegmentMode(kfData);
+          if (seg.mode === 'byte') {
+            segUrl = `${this.fmp4BaseUrl}/segment/${this.folderId}/${this.messageId}?${this.queryParams}&byte_offset=${seg.byteOffset}&duration=0.5&align=keyframe`;
+            console.log(`[Fmp4ThumbnailPipeline] Using ${kfData.fallback ? 'fallback (linear)' : 'keyframe-at'} byte_offset=${seg.byteOffset} for time=${time.toFixed(2)}s`);
           }
         }
       } catch {
@@ -1350,32 +1455,68 @@ class Fmp4ThumbnailPipeline {
         return false;
       }
 
-      // 6. Append segment to SourceBuffer
+      // 6. Append segment to SourceBuffer.
+      //    Guard against a teardown race: destroy() (fired when the streaming
+      //    chain stops mid-hover) sets active=false and nulls sourceBuffer while
+      //    this async method is parked on an await above. Dereferencing
+      //    this.sourceBuffer! then throws "Cannot read properties of null
+      //    (reading 'appendBuffer')". Bail cleanly instead.
       await this._waitForUpdateEnd();
-      this.sourceBuffer!.appendBuffer(segData);
+      if (!this.active || !this.sourceBuffer) return false;
+      this.sourceBuffer.appendBuffer(segData);
       await this._waitForUpdateEnd();
 
-      // 5. Check if SourceBuffer covers the desired time
-      const sbBuffered = this.sourceBuffer!.buffered;
-      let seekTarget = time;
-      if (sbBuffered.length > 0) {
-        // Find the range that covers our target time
-        let coversTime = false;
-        for (let i = 0; i < sbBuffered.length; i++) {
-          if (sbBuffered.start(i) <= time && sbBuffered.end(i) >= time) {
-            coversTime = true;
-            break;
-          }
-        }
-        // If not covered, seek to the start of the first range
-        if (!coversTime) {
-          seekTarget = sbBuffered.start(0);
-          console.log('[Fmp4ThumbnailPipeline] Target time not in buffer, seeking to ' + seekTarget.toFixed(2));
-        }
+      // 5. Compute the seek target from the buffered ranges. Seeking to exactly
+      //    buffered.start(0) is a known MSE failure mode (first sample's PTS can
+      //    sit a fraction after the range start → no decodable frame at start →
+      //    no 'seeked' event → 5s timeout). computeThumbnailSeekTarget nudges
+      //    just inside the first range when `time` isn't covered.
+      if (!this.active || !this.sourceBuffer) return false;
+      const sbBuffered = this.sourceBuffer.buffered;
+      const ranges: { start: number; end: number }[] = [];
+      for (let i = 0; i < sbBuffered.length; i++) {
+        ranges.push({ start: sbBuffered.start(i), end: sbBuffered.end(i) });
+      }
+      // Diagnostic: exact buffered ranges so a failing capture is provable from
+      // the log (range count + first-range width discriminate the seek-fail case).
+      console.log('[Fmp4ThumbnailPipeline] buffered ranges for time=' + time.toFixed(2)
+        + ': ' + (ranges.length === 0 ? 'EMPTY'
+          : ranges.map(r => `[${r.start.toFixed(2)}-${r.end.toFixed(2)}]`).join(',')));
+
+      const seekTarget = computeThumbnailSeekTarget(time, ranges) ?? time;
+      if (seekTarget !== time) {
+        console.log('[Fmp4ThumbnailPipeline] Target time not in buffer, seeking to ' + seekTarget.toFixed(2));
       }
 
-      // 6. Seek video to target time
-      const seeked = await this._seekVideo(seekTarget);
+      // 6. Seek video to target time. If the seek fails AND we were aiming at a
+      //    (nudged) range start, retry once at the range midpoint — a wider offset
+      //    that is always decodable — before giving up.
+      let seeked = await this._seekVideo(seekTarget);
+      if (!seeked && ranges.length > 0) {
+        const mid = (ranges[0].start + ranges[0].end) / 2;
+        if (Math.abs(mid - seekTarget) > 0.01) {
+          console.warn('[Fmp4ThumbnailPipeline] Seek to ' + seekTarget.toFixed(2)
+            + ' failed — retrying at range midpoint ' + mid.toFixed(2));
+          seeked = await this._seekVideo(mid);
+          if (seeked) {
+            await this._waitForFrameRender(mid);
+            if (!this.active || !this.canvas || !this.video) return false;
+            const c = this.canvas;
+            const cx = c.getContext('2d')!;
+            cx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+            const midUrl = c.toDataURL('image/jpeg', 0.6);
+            frameBuffer.set(bucket, midUrl);
+            insertionOrder.push(bucket);
+            while (frameBuffer.size > MAX_BUFFER_SIZE && insertionOrder.length > 0) {
+              const oldest = insertionOrder.shift()!;
+              frameBuffer.delete(oldest);
+            }
+            forceUpdateCachedTimes();
+            console.log('[Fmp4ThumbnailPipeline] Captured thumbnail at ' + time.toFixed(2) + 's (midpoint retry, seekTarget=' + mid.toFixed(2) + ')');
+            return true;
+          }
+        }
+      }
       if (!seeked) {
         console.warn('[Fmp4ThumbnailPipeline] Video seek failed for time:', seekTarget.toFixed(2));
         return false;
@@ -1384,7 +1525,9 @@ class Fmp4ThumbnailPipeline {
       // 7. Wait for frame render
       await this._waitForFrameRender(seekTarget);
 
-      // 8. Capture frame
+      // 8. Capture frame. Guard again: teardown during the seek/render awaits
+      //    nulls this.canvas/this.video (destroy() sets them to null as any).
+      if (!this.active || !this.canvas || !this.video) return false;
       const canvas = this.canvas;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
@@ -1655,6 +1798,7 @@ export function useThumbnailExtractor(
       format,
       canvasRef.current!,
       getters.getKeyframeTimestamps(), // Cached keyframe index for fast seek
+      getters.getKnownDuration?.() ?? 0, // Probed duration — skips EOF-scanning computeDuration() for headerless MKV
     );
 
     transmuxerPipelineRef.current = pipeline;
@@ -1665,7 +1809,11 @@ export function useThumbnailExtractor(
         console.log('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialized successfully');
         setReady(true); readyRef.current = true;
       } else {
-        console.warn('[ThumbnailExtractor] Transmuxer thumbnail pipeline initialization failed');
+        // Not necessarily an error: for 10-bit HEVC (WebCodecs-unsupported) init
+        // returns false by design. Scrub-preview thumbnails are disabled for this
+        // file; the hover handler degrades to a time-only tooltip and playback is
+        // unaffected. Log at info level so it does not look like a broken pipeline.
+        console.info('[ThumbnailExtractor] Transmuxer thumbnail pipeline unavailable (scrub thumbnails disabled for this file; playback unaffected)');
         pipeline.destroy();
         transmuxerPipelineRef.current = null;
       }
@@ -1816,6 +1964,21 @@ export function useThumbnailExtractor(
 
     const onDurationChange = () => {
       durationRef.current = video.duration;
+      // THUMBNAIL DURATION CORRECTION. The thumbnail pipelines are constructed at
+      // MEDIA_INFO time with the 4Mbps ESTIMATE duration (real PTS duration isn't
+      // known yet). When the real duration later arrives it fires `durationchange`
+      // on the main video — push it into the live pipeline(s) so hover byte offsets
+      // (time/duration*fileSize) and the /keyframe-at duration= param are computed
+      // against the TRUE duration. Without this the preview shows a frame 170-280s
+      // off the hover point on VBR (proven logs 12-c). Guard on a finite, positive,
+      // meaningfully-different value so we never clobber a good duration with NaN/0.
+      const d = video.duration;
+      if (Number.isFinite(d) && d > 0) {
+        const fp = fmp4PipelineRef.current;
+        if (fp && Math.abs(fp.duration - d) > 0.5) fp.duration = d;
+        const tp = transmuxerPipelineRef.current;
+        if (tp && Math.abs(tp.duration - d) > 0.5) tp.duration = d;
+      }
     };
 
     video.addEventListener('durationchange', onDurationChange);

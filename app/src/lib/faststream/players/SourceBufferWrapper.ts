@@ -22,19 +22,28 @@ export class SourceBufferWrapper {
   private appendCounter = 0;
   private appendStartTime = 0;
   private lastAppendSize = 0;
+  // Op-type accounting so the updateend timing log doesn't lie. Both append AND
+  // remove fire 'updateend', but only appends previously set appendStartTime —
+  // so a remove (e.g. resetForSeek's remove-all, fired when the NEXT seek is
+  // issued) printed a bogus multi-second "elapsed" against the PREVIOUS append's
+  // stale start time + byte size (looked like a 7.5s append stall that never
+  // happened). Track the current op's type + start so the log reflects reality.
+  private lastOpType: 'append' | 'remove' = 'append';
+  private lastOpStartTime = 0;
 
   constructor(sourceBuffer: SourceBuffer) {
     this.sourceBuffer = sourceBuffer;
     this.sourceBuffer.addEventListener('updateend', () => {
       this.processing = false;
       this.appendCounter++;
-      const elapsed = Date.now() - this.appendStartTime;
+      const elapsed = Date.now() - this.lastOpStartTime;
       if (this.appendCounter <= 30 || this.appendCounter % 20 === 0) {
         try {
           const b = this.sourceBuffer.buffered;
           let rs = '';
           for (let i = 0; i < b.length; i++) rs += `[${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}s]`;
-          console.log(`[SBW] updateend #${this.appendCounter}: ${elapsed}ms, ${this.lastAppendSize}B, queue=${this.queue.length}, SB=${rs}`);
+          const sizeStr = this.lastOpType === 'append' ? `${this.lastAppendSize}B` : 'remove';
+          console.log(`[SBW] updateend #${this.appendCounter} (${this.lastOpType}): ${elapsed}ms, ${sizeStr}, queue=${this.queue.length}, SB=${rs}`);
         } catch (_) {}
       }
       this.processQueue();
@@ -142,8 +151,12 @@ export class SourceBufferWrapper {
       if (op.type === 'append' && op.data) {
         this.appendStartTime = Date.now();
         this.lastAppendSize = op.data.byteLength;
+        this.lastOpType = 'append';
+        this.lastOpStartTime = this.appendStartTime;
         this.sourceBuffer.appendBuffer(op.data);
       } else if (op.type === 'remove' && op.start !== undefined && op.end !== undefined) {
+        this.lastOpType = 'remove';
+        this.lastOpStartTime = Date.now();
         this.sourceBuffer.remove(op.start, op.end);
       }
     } catch (e: any) {

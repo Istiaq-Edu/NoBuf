@@ -24,6 +24,7 @@
     "allow-cmd-upload-from-url",
     "allow-cmd-connect",
     "allow-cmd-log",
+    "allow-cmd-ensure-ffmpeg",
     "allow-cmd-delete-file",
     "allow-cmd-download-file",
     "allow-cmd-move-files",
