@@ -120,6 +120,43 @@ export function resolveKeyframeSegmentMode(
   return { mode: 'time' };
 }
 
+/**
+ * Compute the video.currentTime seek target for a thumbnail capture, given the
+ * requested `time` and the SourceBuffer's buffered ranges after the segment was
+ * appended.
+ *
+ * Why not just seek to `time` or to `buffered.start(0)`:
+ *  - If a buffered range already covers `time`, seek there (accurate frame).
+ *  - Otherwise the segment landed at a different position (VBR skew): seek into
+ *    the FIRST buffered range. Crucially we nudge `epsilon` seconds PAST
+ *    `start(0)` rather than exactly onto it. Seeking to exactly buffered.start(0)
+ *    is a known MSE failure mode: the first sample's presentation time can sit a
+ *    fraction after the range start, so `currentTime = start(0)` lands just
+ *    before any decodable frame, no `seeked` event fires, and the capture times
+ *    out (observed deterministically at t=1633.88 in log 15 while a near-identical
+ *    hover one range over succeeded). Nudging inside the range guarantees a
+ *    decodable sample. `epsilon` is clamped so it never exceeds the range.
+ *
+ * Returns null when there is no buffered range to seek into (caller bails).
+ * Pure + exported so the seek-target logic is unit-tested without a live element.
+ */
+export function computeThumbnailSeekTarget(
+  time: number,
+  ranges: { start: number; end: number }[],
+  epsilon = 0.1,
+): number | null {
+  if (ranges.length === 0) return null;
+  // Already covered → seek to the requested time (most accurate).
+  for (const r of ranges) {
+    if (r.start <= time && r.end >= time) return time;
+  }
+  // Not covered → nudge just inside the first range, but never past its end.
+  const first = ranges[0];
+  if (first.end <= first.start) return first.start; // degenerate range
+  const nudged = first.start + epsilon;
+  return Math.min(nudged, (first.start + first.end) / 2);
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
@@ -1429,28 +1466,57 @@ class Fmp4ThumbnailPipeline {
       this.sourceBuffer.appendBuffer(segData);
       await this._waitForUpdateEnd();
 
-      // 5. Check if SourceBuffer covers the desired time
+      // 5. Compute the seek target from the buffered ranges. Seeking to exactly
+      //    buffered.start(0) is a known MSE failure mode (first sample's PTS can
+      //    sit a fraction after the range start → no decodable frame at start →
+      //    no 'seeked' event → 5s timeout). computeThumbnailSeekTarget nudges
+      //    just inside the first range when `time` isn't covered.
       if (!this.active || !this.sourceBuffer) return false;
       const sbBuffered = this.sourceBuffer.buffered;
-      let seekTarget = time;
-      if (sbBuffered.length > 0) {
-        // Find the range that covers our target time
-        let coversTime = false;
-        for (let i = 0; i < sbBuffered.length; i++) {
-          if (sbBuffered.start(i) <= time && sbBuffered.end(i) >= time) {
-            coversTime = true;
-            break;
-          }
-        }
-        // If not covered, seek to the start of the first range
-        if (!coversTime) {
-          seekTarget = sbBuffered.start(0);
-          console.log('[Fmp4ThumbnailPipeline] Target time not in buffer, seeking to ' + seekTarget.toFixed(2));
-        }
+      const ranges: { start: number; end: number }[] = [];
+      for (let i = 0; i < sbBuffered.length; i++) {
+        ranges.push({ start: sbBuffered.start(i), end: sbBuffered.end(i) });
+      }
+      // Diagnostic: exact buffered ranges so a failing capture is provable from
+      // the log (range count + first-range width discriminate the seek-fail case).
+      console.log('[Fmp4ThumbnailPipeline] buffered ranges for time=' + time.toFixed(2)
+        + ': ' + (ranges.length === 0 ? 'EMPTY'
+          : ranges.map(r => `[${r.start.toFixed(2)}-${r.end.toFixed(2)}]`).join(',')));
+
+      const seekTarget = computeThumbnailSeekTarget(time, ranges) ?? time;
+      if (seekTarget !== time) {
+        console.log('[Fmp4ThumbnailPipeline] Target time not in buffer, seeking to ' + seekTarget.toFixed(2));
       }
 
-      // 6. Seek video to target time
-      const seeked = await this._seekVideo(seekTarget);
+      // 6. Seek video to target time. If the seek fails AND we were aiming at a
+      //    (nudged) range start, retry once at the range midpoint — a wider offset
+      //    that is always decodable — before giving up.
+      let seeked = await this._seekVideo(seekTarget);
+      if (!seeked && ranges.length > 0) {
+        const mid = (ranges[0].start + ranges[0].end) / 2;
+        if (Math.abs(mid - seekTarget) > 0.01) {
+          console.warn('[Fmp4ThumbnailPipeline] Seek to ' + seekTarget.toFixed(2)
+            + ' failed — retrying at range midpoint ' + mid.toFixed(2));
+          seeked = await this._seekVideo(mid);
+          if (seeked) {
+            await this._waitForFrameRender(mid);
+            if (!this.active || !this.canvas || !this.video) return false;
+            const c = this.canvas;
+            const cx = c.getContext('2d')!;
+            cx.drawImage(this.video, 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+            const midUrl = c.toDataURL('image/jpeg', 0.6);
+            frameBuffer.set(bucket, midUrl);
+            insertionOrder.push(bucket);
+            while (frameBuffer.size > MAX_BUFFER_SIZE && insertionOrder.length > 0) {
+              const oldest = insertionOrder.shift()!;
+              frameBuffer.delete(oldest);
+            }
+            forceUpdateCachedTimes();
+            console.log('[Fmp4ThumbnailPipeline] Captured thumbnail at ' + time.toFixed(2) + 's (midpoint retry, seekTarget=' + mid.toFixed(2) + ')');
+            return true;
+          }
+        }
+      }
       if (!seeked) {
         console.warn('[Fmp4ThumbnailPipeline] Video seek failed for time:', seekTarget.toFixed(2));
         return false;

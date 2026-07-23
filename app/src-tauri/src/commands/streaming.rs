@@ -43,6 +43,10 @@ struct KeyframeIndexer {
     stream_info: Option<crate::ts_demux::TsStreamInfo>,
     scan_state: crate::ts_demux::KeyframeScanState,
     is_m2ts: bool,
+    /// Number of times we've tried (and failed) to resolve stream_info from the
+    /// cached head, so we can log the first attempt/failure at info level once
+    /// instead of spamming per chunk.
+    resolve_attempts: u32,
 }
 
 impl KeyframeIndexer {
@@ -51,6 +55,7 @@ impl KeyframeIndexer {
             stream_info: None,
             scan_state: crate::ts_demux::KeyframeScanState::default(),
             is_m2ts: false,
+            resolve_attempts: 0,
         }
     }
 }
@@ -95,6 +100,8 @@ async fn index_keyframes_from_chunk(
                         && head[4] == 0x47 && head[196] == 0x47 && head[388] == 0x47;
                     let head_ts = crate::ts_demux::strip_m2ts_prefix(&head, is_m2ts);
                     if let Some(si) = crate::ts_demux::extract_stream_info(&head_ts) {
+                        log::info!("[KF-INDEX] msg {}: stream_info resolved (video_pid={}, m2ts={}) — indexing enabled",
+                            message_id, si.video_pid, is_m2ts);
                         indexer.is_m2ts = is_m2ts;
                         indexer.stream_info = Some(si);
                     }
@@ -102,6 +109,12 @@ async fn index_keyframes_from_chunk(
             }
         }
         if indexer.stream_info.is_none() {
+            indexer.resolve_attempts += 1;
+            // Log the first failure at info (once) so a never-indexing run is
+            // diagnosable without debug logging.
+            if indexer.resolve_attempts == 1 {
+                log::info!("[KF-INDEX] msg {}: stream_info not resolvable from cached head yet (will retry as head fills)", message_id);
+            }
             return; // head not ready yet; retry on a later chunk
         }
     }
@@ -128,13 +141,19 @@ async fn index_keyframes_from_chunk(
     let scanned_range = (abs_offset, abs_offset + chunk.len() as u64 - 1);
     let mut index = state.proactive_keyframe_index.write().await;
     let entry = index.entry(message_id).or_default();
+    let was_empty = entry.samples.is_empty();
     crate::ts_demux::merge_keyframe_samples(entry, total_size, &kfs, scanned_range);
     let n = entry.samples.len();
     drop(index);
-    log::debug!(
-        "[KF-INDEX] msg {}: +{} keyframes from chunk @{} ({} total)",
-        message_id, kfs.len(), abs_offset, n
-    );
+    // Throttled info log: the FIRST batch (proves indexing works) and then every
+    // ~256 samples, so a live run is diagnosable without debug logging but the
+    // log isn't flooded per 512KB chunk.
+    if was_empty || n % 256 < kfs.len() {
+        log::info!(
+            "[KF-INDEX] msg {}: +{} keyframes @byte {} ({} total indexed)",
+            message_id, kfs.len(), abs_offset, n
+        );
+    }
 }
 
 /// Returned to the frontend so it can construct stream URLs dynamically
