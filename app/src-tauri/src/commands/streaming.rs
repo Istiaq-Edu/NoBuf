@@ -47,6 +47,16 @@ struct KeyframeIndexer {
     /// cached head, so we can log the first attempt/failure at info level once
     /// instead of spamming per chunk.
     resolve_attempts: u32,
+    /// Absolute byte offset the NEXT contiguous chunk is expected to start at
+    /// (i.e. end+1 of the last scanned chunk). The proactive/bg download feed is
+    /// contiguous WITHIN a gap but JUMPS on seeks; the cross-chunk PES assembler
+    /// (KeyframeScanState) is only valid across a contiguous run, so on a jump we
+    /// flush + reset it. None = no chunk scanned yet.
+    expected_next_offset: Option<u64>,
+    /// Total bytes scanned + last byte-count at which we logged depth, so we can
+    /// report index growth by byte interval (the old %256 throttle hid 1..255).
+    scanned_bytes: u64,
+    last_logged_bytes: u64,
 }
 
 impl KeyframeIndexer {
@@ -56,6 +66,9 @@ impl KeyframeIndexer {
             scan_state: crate::ts_demux::KeyframeScanState::default(),
             is_m2ts: false,
             resolve_attempts: 0,
+            expected_next_offset: None,
+            scanned_bytes: 0,
+            last_logged_bytes: 0,
         }
     }
 }
@@ -119,10 +132,36 @@ async fn index_keyframes_from_chunk(
         }
     }
 
-    let si = match &indexer.stream_info {
+    // DISCONTINUITY HANDLING: the cross-chunk PES assembler in KeyframeScanState
+    // is only valid across a CONTIGUOUS byte run. The proactive/bg feed is
+    // contiguous within a download gap but JUMPS on seeks (playhead jumps to a
+    // far byte). When this chunk doesn't continue the previous one, flush the old
+    // state (emit its final buffered keyframe) and start fresh — otherwise the
+    // assembler corrupts a partial PES with bytes from an unrelated region and
+    // stops emitting keyframes entirely (observed: 63MB downloaded, 1 indexed).
+    let is_discontinuous = match indexer.expected_next_offset {
+        Some(expected) => abs_offset != expected,
+        None => false,
+    };
+
+    // Take stream_info by clone so we don't hold an immutable borrow of `indexer`
+    // while we also mutate its scan_state below.
+    let si = match indexer.stream_info.clone() {
         Some(si) => si,
         None => return,
     };
+
+    if is_discontinuous {
+        // Flush the pre-jump run's trailing PES, merge it, then reset the state.
+        let tail = crate::ts_demux::scan_keyframes_flush(0, &si, &mut indexer.scan_state);
+        if !tail.is_empty() {
+            let mut index = state.proactive_keyframe_index.write().await;
+            let entry = index.entry(message_id).or_default();
+            crate::ts_demux::merge_keyframe_samples(entry, total_size, &tail, (0, 0));
+            drop(index);
+        }
+        indexer.scan_state = crate::ts_demux::KeyframeScanState::default();
+    }
 
     // M2TS chunks carry a 4-byte prefix per packet; strip so PID parsing aligns.
     let scan_buf: std::borrow::Cow<[u8]> = if indexer.is_m2ts {
@@ -132,27 +171,29 @@ async fn index_keyframes_from_chunk(
     };
 
     let kfs = crate::ts_demux::scan_keyframes_chunked(
-        &scan_buf, abs_offset, si, &mut indexer.scan_state,
+        &scan_buf, abs_offset, &si, &mut indexer.scan_state,
     );
-    if kfs.is_empty() {
-        return;
-    }
+    indexer.expected_next_offset = Some(abs_offset + chunk.len() as u64);
+    indexer.scanned_bytes += chunk.len() as u64;
 
-    let scanned_range = (abs_offset, abs_offset + chunk.len() as u64 - 1);
-    let mut index = state.proactive_keyframe_index.write().await;
-    let entry = index.entry(message_id).or_default();
-    let was_empty = entry.samples.is_empty();
-    crate::ts_demux::merge_keyframe_samples(entry, total_size, &kfs, scanned_range);
-    let n = entry.samples.len();
-    drop(index);
-    // Throttled info log: the FIRST batch (proves indexing works) and then every
-    // ~256 samples, so a live run is diagnosable without debug logging but the
-    // log isn't flooded per 512KB chunk.
-    if was_empty || n % 256 < kfs.len() {
-        log::info!(
-            "[KF-INDEX] msg {}: +{} keyframes @byte {} ({} total indexed)",
-            message_id, kfs.len(), abs_offset, n
-        );
+    if !kfs.is_empty() {
+        let scanned_range = (abs_offset, abs_offset + chunk.len() as u64 - 1);
+        let mut index = state.proactive_keyframe_index.write().await;
+        let entry = index.entry(message_id).or_default();
+        crate::ts_demux::merge_keyframe_samples(entry, total_size, &kfs, scanned_range);
+        let n = entry.samples.len();
+        drop(index);
+        // Depth-visible log: report total every ~5MB scanned (not per-256-count,
+        // which hid growth below 256). Shows the index climbing on a live run.
+        if indexer.scanned_bytes - indexer.last_logged_bytes >= 5 * 1024 * 1024
+            || indexer.last_logged_bytes == 0
+        {
+            indexer.last_logged_bytes = indexer.scanned_bytes;
+            log::info!(
+                "[KF-INDEX] msg {}: {} keyframes indexed ({} MB scanned, latest @byte {})",
+                message_id, n, indexer.scanned_bytes / 1024 / 1024, abs_offset
+            );
+        }
     }
 }
 
