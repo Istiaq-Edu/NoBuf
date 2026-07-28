@@ -1141,7 +1141,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // This ref never resets — even if a backward seek resets isComplete=false,
   // the near-end guard still works because hasEverCompleted stays true.
   const hasEverCompletedRef = useRef(false);
-  const [speed, setSpeed] = useState(0);
   // Downloaded byte-range → time-range for green buffer bar
   const [downloadedTimeRanges, setDownloadedTimeRanges] = useState<[number, number][]>([]);
   // Ground-truth time ranges accumulated directly from transmuxer segment
@@ -1164,8 +1163,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const abortRef = useRef<AbortController | null>(null);
   const loopGeneration = useRef(0); // Prevents stale loops from running after seek
   const chunksAfterSeek = useRef(0); // For progressive chunk sizing
-  const pendingRangesRef = useRef<[number, number][]>([]); // Accumulated ranges to report
-  const rangeReportTimer = useRef<number | null>(null); // Debounce timer for range reporting
   // Seek debouncing: for unbuffered positions, delay seek execution by SEEK_DEBOUNCE_MS
   // so rapid clicks/arrow-key skips only trigger the LAST position, reducing wasteful
   // overlapping downloads on unbuffered parts
@@ -1241,7 +1238,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   const suppressLoadingSpinnerRef = useRef(false); // suppress spinner for cache-hit seeks
   const quotaGuardIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // 100ms quota guard
-  const mpegtsSpeedHistoryRef = useRef<{ time: number; byte: number }[]>([]); // download speed tracking for TS
   const mpegtsFailedRef = useRef(false);     // Set true if mpegts.js fails, skip retry
   const mpegtsDurationRef = useRef<number>(0); // Duration from metadata for mpegts.js
   const proactivePrebufferMsgIdRef = useRef<number>(0); // msg_id being proactively prebuffered
@@ -1343,12 +1339,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     pendingSeek: -1,
   });
 
-  const speedHistory = useRef<{ bytes: number; time: number }[]>([]);
   const lastThrottleRef = useRef(0); // For throttling state updates
   const prevUrlRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
-  // When true, suppress reports to backend cache (used during active download)
-  const suppressBackendReportsRef = useRef(false);
   // When true, log the first trackDownloadedRange call after a seek reset
   const justSeekedRef = useRef(false);
 
@@ -1479,62 +1472,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     table.splice(lo, 0, [byteOffset, time]);
   }, []);
 
-  // Debounced range reporter — accumulates fetched byte ranges and
-  // reports them to the Rust backend every 2 seconds (or on completion)
-  const reportRangesToBackend = useCallback((start: number, end: number) => {
-    if (!file || activeFolderId === null) return;
-    if (suppressBackendReportsRef.current) return; // Suppress during active download
-    pendingRangesRef.current.push([start, end]);
-
-    // Debounce: send accumulated ranges every 2s
-    if (rangeReportTimer.current === null) {
-      rangeReportTimer.current = window.setTimeout(() => {
-        const ranges = [...pendingRangesRef.current];
-        pendingRangesRef.current = [];
-        rangeReportTimer.current = null;
-
-        if (ranges.length > 0 && state.current.fileLength > 0) {
-          invoke('cmd_report_cached_ranges', {
-            messageId: file.id,
-            folderId: activeFolderId,
-            totalSize: state.current.fileLength,
-            filename: file.name,
-            mimeType: 'video/mp4',
-            ranges,
-          }).catch(() => {});
-        }
-      }, 2000);
-    }
-  }, [file, activeFolderId]);
-
-  // Flush remaining ranges on unmount or completion
-  const flushRangeReport = useCallback(() => {
-    if (rangeReportTimer.current !== null) {
-      window.clearTimeout(rangeReportTimer.current);
-      rangeReportTimer.current = null;
-    }
-    const ranges = [...pendingRangesRef.current];
-    pendingRangesRef.current = [];
-
-    if (ranges.length > 0 && file && activeFolderId !== null && state.current.fileLength > 0) {
-      invoke('cmd_report_cached_ranges', {
-        messageId: file.id,
-        folderId: activeFolderId,
-        totalSize: state.current.fileLength,
-        filename: file.name,
-        mimeType: 'video/mp4',
-        ranges,
-      }).catch(() => {});
-    }
-  }, [file, activeFolderId]);
-
-  // Ref for flushRangeReport — prevents MSE effect from re-running when
-  // file/activeFolderId change identity (which changes flushRangeReport's
-  // useCallback identity). The MSE player must NOT restart mid-playback just
-  // because the range report callback got a new reference. Using a ref ensures
-  // cleanup always calls the latest function without triggering a re-init.
-  const flushRangeReportRef = useRef(flushRangeReport);
-  flushRangeReportRef.current = flushRangeReport;
+  // (Range reporting to the backend was removed: the backend command
+  // cmd_report_cached_ranges no longer exists — the Rust server records
+  // cached ranges itself at every download site, so the old debounced
+  // reportRangesToBackend/flushRangeReport IPC was rejected on every call.)
 
   // Track downloaded byte ranges for the green buffer bar.
   // Converts byte ranges to time ranges using the duration/fileLength ratio.
@@ -1639,7 +1580,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       currentOffset: 0,
       pendingSeek: -1,
     };
-    speedHistory.current = [];
     initSegmentsRef.current = [];
     moovBufferRef.current = null;
     firstChunkRef.current = null;
@@ -1654,7 +1594,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     isCompleteRef.current = false;
     setThumbnailDataReady(false);
     setMoovBufferReady(false);
-    setSpeed(0);
     setError(null);
     setMseUrl(null);
 
@@ -1774,8 +1713,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         clearInterval(drainTimerRef.current);
         drainTimerRef.current = null;
       }
-      // Flush remaining range reports before cleanup
-      flushRangeReportRef.current();
       // ── React.StrictMode full cleanup ──
       // In dev, React double-invokes effects. The first mount's cleanup
       // must FULLY destroy the mpegts player, quota guard, and video
@@ -2761,9 +2698,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       setColdStartPhase('fetching_metadata');
       setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for MP4 metadata
 
-      // Report initial chunk range to cache backend (even if we don't feed to mp4box yet)
-      reportRangesToBackend(0, firstChunkSize - 1);
-
       // Store first chunk for thumbnail mini-MSE pipeline
       firstChunkRef.current = data.slice(0);
 
@@ -3168,35 +3102,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           diagLog(`[MPEGTS] Stats: speed=${stats.speed?.toFixed(1)}x, decoded=${stats.decodedFrames}`);
         }
 
-        // ── Track download speed from Telegram ──
-        // _currentRange.to = furthest byte received so far.
-        // Compute speed from byte delta over time.
-        try {
-          const ioctl = (player as any)?._player_engine?._transmuxer?._controller?._ioctl;
-          if (ioctl?._currentRange && ioctl._currentRange.to >= 0) {
-            const now = performance.now();
-            const currentByte = ioctl._currentRange.to;
-            const hist = mpegtsSpeedHistoryRef.current;
-            hist.push({ time: now, byte: currentByte });
-            // Keep last 5 seconds of history
-            while (hist.length > 0 && hist[0].time < now - 5000) hist.shift();
-            if (hist.length >= 2) {
-              const first = hist[0];
-              const last = hist[hist.length - 1];
-              const dt = (last.time - first.time) / 1000;
-              if (dt > 0.5) {
-                const bytesPerSec = (last.byte - first.byte) / dt;
-                setSpeed(bytesPerSec);
-              }
-            }
-          }
-        } catch { /* ignore */ }
+        // (Speed tracking removed — the meter now reads the backend's
+        // session_downloaded_bytes counter via cmd_get_cache_status, which
+        // measures real Telegram arrivals instead of this proxy of ffmpeg's
+        // remuxed output bytes. See lib/faststream/speedMeter.ts.)
 
-        // ── Report downloaded byte ranges to backend (green buffer bar) ──
+        // ── Track downloaded byte ranges (green buffer bar) ──
         // mpegts.js fetches data internally via FetchStreamLoader — the front-end
         // never sees the raw HTTP responses. But we can read the IOController's
         // internal _currentRange to track what's been fetched.
-        // This mirrors what the MP4/fMP4 paths do with reportRangesToBackend().
         // _currentRange is {from, to} where 'from' is the start of the current
         // fetch range and 'to' is the furthest byte received so far in this range.
         try {
@@ -3204,8 +3118,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           if (ioctl?._currentRange && ioctl._currentRange.to >= 0) {
             const from = ioctl._currentRange.from;
             const to = ioctl._currentRange.to;
-            // Report the current fetch range to backend (debounced to 2s by reportRangesToBackend)
-            reportRangesToBackend(from, to);
             // Track in front-end for green bar rendering
             trackDownloadedRange(from, to);
           }
@@ -5575,8 +5487,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const end = Math.min(offset + WARMER_CHUNK - 1, fileLen - 1);
 
           // Skip ranges already on disk so we don't re-request cached bytes.
-          // trackDownloadedRange/reportRangesToBackend below still record the
-          // range for the bar; the backend serves cached hits instantly.
+          // trackDownloadedRange below still records the range for the bar;
+          // the backend serves cached hits instantly.
           let resp: Response | null = null;
           try {
             resp = await fetch(warmerUrl, { headers: { Range: `bytes=${offset}-${end}` } });
@@ -5605,15 +5517,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             continue;
           }
 
-          // Warm the disk cache accounting + green bar with the REAL fetched
-          // range (contiguous, unlike the transmuxer's estimated islands).
-          reportRangesToBackend(offset, offset + got - 1);
+          // Warm the green bar with the REAL fetched range (contiguous,
+          // unlike the transmuxer's estimated islands). Disk-cache accounting
+          // happens in the backend at the download site itself.
           trackDownloadedRange(offset, offset + got - 1);
 
           offset += got;
         }
         if (!cancelledRef.current && gen === mkvWarmerGenRef.current) {
-          flushRangeReport();
           diagLog(`[MSE] MKV disk warmer finished at byte ${offset}/${fileLen}`);
         }
       } catch (e: any) {
@@ -5698,7 +5609,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           setTimeout(() => { try { mediaSource.duration = duration; } catch (_) {} }, 100);
         }
       },
-      onSpeedUpdate: (speed: number) => { if (!cancelledRef.current) setSpeed(speed); },
       onProgressUpdate: (_t: number, estimatedBytes: number) => { if (!cancelledRef.current) setPrefetchedBytes(estimatedBytes); },
       onCodecUnsupported: (codec: string) => {
         if (cancelledRef.current) return;
@@ -5809,7 +5719,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     void blobUrl; // blob URL already set as video.src by the caller
 
     setIsPrefetching(true);
-    setSpeed(0);
 
     // Prime the initial buffer with a BOUNDED window, then hand off to the
     // refill-loop streaming chain — the SAME on-demand mechanism the TS seek
@@ -6195,8 +6104,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const tailData = await response.arrayBuffer();
       if (cancelledRef.current) return;
 
-      // Report tail range to backend cache
-      reportRangesToBackend(tailStart, tailStart + tailData.byteLength - 1);
       trackDownloadedRange(tailStart, tailStart + tailData.byteLength - 1);
 
       // Scan the tail data for moov atom (backward scan)
@@ -6263,7 +6170,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         moovBufferRef.current = { buffer: completeData.slice(0), fileStart: moovFetchStart };
         setMoovBufferReady(true);
 
-        reportRangesToBackend(moovFetchStart, moovFetchStart + completeData.byteLength - 1);
         trackDownloadedRange(moovFetchStart, moovFetchStart + completeData.byteLength - 1);
 
         console.log(`[MSE] Fetched complete moov: ${completeData.byteLength} bytes (declared=${moovDeclaredSize})`);
@@ -6430,7 +6336,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
         state.current.currentOffset = offset + data.byteLength;
         setPrefetchedBytes(state.current.currentOffset);
-        reportRangesToBackend(offset, offset + data.byteLength - 1);
         trackDownloadedRange(offset, offset + data.byteLength - 1);
       } catch (e) {
         break;
@@ -6508,8 +6413,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         buffer.fileStart = offset;
         mp4box.appendBuffer(buffer);
 
-        // Report and track ranges
-        reportRangesToBackend(offset, offset + data.byteLength - 1);
+        // Track ranges for the green bar
         trackDownloadedRange(offset, offset + data.byteLength - 1);
 
         offset += data.byteLength;
@@ -6987,8 +6891,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Update tracking
         state.current.currentOffset = offset + data.byteLength;
 
-        // Report this range to cache backend
-        reportRangesToBackend(offset, offset + data.byteLength - 1);
         // Track for green buffer bar
         trackDownloadedRange(offset, offset + data.byteLength - 1);
 
@@ -6997,21 +6899,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         if (now - lastThrottleRef.current > 250) {
           lastThrottleRef.current = now;
           setPrefetchedBytes(state.current.currentOffset);
-
-          // Speed tracking (sliding window)
-          speedHistory.current.push({ bytes: data.byteLength, time: now });
-          while (speedHistory.current.length > 0 && speedHistory.current[0].time < now - 5000) {
-            speedHistory.current.shift();
-          }
-          if (speedHistory.current.length > 1) {
-            const first = speedHistory.current[0];
-            const last = speedHistory.current[speedHistory.current.length - 1];
-            const timeDiff = (last.time - first.time) / 1000;
-            if (timeDiff > 0) {
-              const bytesTotal = speedHistory.current.reduce((sum, s) => sum + s.bytes, 0);
-              setSpeed(bytesTotal / timeDiff);
-            }
-          }
         }
       } catch (e: any) {
         if (cancelledRef.current) break;
@@ -7061,8 +6948,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       console.warn(`[SEEK-DIAG] downloadLoop EXITED with STRANDED pendingSeek=${strandedByte} (${strandedTime.toFixed(1)}s) — not served (cancelled=${cancelledRef.current} paused=${isPausedRef.current} genStale=${gen !== loopGeneration.current})`);
     }
     if (!cancelledRef.current) {
-      // Flush any remaining range reports
-      flushRangeReport();
       if (reachedEnd) {
         console.log('[MSE] isComplete=true — video reached end');
         setIsComplete(true);
@@ -7070,7 +6955,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           hasEverCompletedRef.current = true;
       }
       setIsPrefetching(false);
-      setSpeed(0);
     }
   };
   downloadLoopRef.current = downloadLoop;
@@ -8210,7 +8094,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
     setIsPaused(true);
     setIsPrefetching(false);
-    setSpeed(0);
   };
 
   const resumePrefetch = () => {
@@ -8321,10 +8204,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       });
     }
     videoRef.current = el;
-  }, []);
-
-  const setSuppressBackendReports = useCallback((suppress: boolean) => {
-    suppressBackendReportsRef.current = suppress;
   }, []);
 
   // Stable getter callbacks for MSE thumbnail mini-pipeline.
@@ -8438,7 +8317,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     isPrefetching,
     isPaused,
     isComplete,
-    speed,
     pausePrefetch,
     resumePrefetch,
     seekTo,
@@ -8447,7 +8325,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     downloadedTimeRanges,
     byteToTime,
     recordByteTimeAnchor,
-    setSuppressBackendReports,
     getMp4Box: () => state.current.mp4box,
     getFileLength: getFileLengthCb,
     getMoovBuffer: getMoovBufferCb,
@@ -8506,41 +8383,4 @@ function formatBytes(b: number): string {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)}KB`;
   if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)}MB`;
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)}GB`;
-}
-
-export function formatSpeed(bps: number): string {
-  if (bps < 1024) return `${bps.toFixed(0)} B/s`;
-  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
-  return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
-}
-
-/**
- * Choose the bytes/sec value to show on the download-speed meter.
- *
- * The meter historically read ONLY `greenBarSpeed` (derived from the delta of
- * the backend disk cache's cached_bytes). During cold start the disk cache
- * barely grows for the first ~40s (proactive prebuffer hasn't spawned; the
- * /remux pipe feeds mpegts.js directly without growing cached_ranges), so
- * greenBarSpeed sat at 0 and the meter showed "—" even though bytes were
- * actively streaming from Telegram.
- *
- * `mseSpeed` (useMSEPlayer's `speed`, computed from the mpegts.js IOController
- * _currentRange delta OR the custom-loader read history) DOES measure that live
- * pipe throughput. So: prefer greenBarSpeed when it's live (disk prebuffer is
- * the real signal once running), otherwise fall back to the MSE pipe speed.
- * Both are genuine Telegram throughput measured at different points — no lie.
- *
- * "paused means paused": when the user has paused prefetch, the meter must show
- * nothing regardless of any residual in-flight bytes. Returns 0 → caller renders
- * the "—" placeholder. Pure + deterministic for unit testing.
- */
-export function speedMeterValue(
-  greenBarSpeed: number,
-  mseSpeed: number,
-  prefetchPaused: boolean,
-): number {
-  if (prefetchPaused) return 0;
-  if (greenBarSpeed > 0) return greenBarSpeed;
-  if (mseSpeed > 0) return mseSpeed;
-  return 0;
 }

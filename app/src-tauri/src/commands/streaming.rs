@@ -399,8 +399,6 @@ pub async fn cmd_get_cache_status(
     Ok(cache_state.get_status(message_id))
 }
 
-/// Report byte ranges that the MSE player has fetched — updates cache metadata
-/// so that subsequent downloads can use cached data. The MSE player fetches
 /// Delete cache for a specific message
 #[tauri::command]
 pub async fn cmd_delete_cache(
@@ -624,6 +622,9 @@ async fn background_cache_download(
             let to_write = chunk_slice.len().min(remaining_in_gap);
 
             let write_offset = offset; // absolute pos of these bytes
+
+            // Record Telegram network bytes for the speed meter
+            cache_mgr.add_downloaded_bytes(message_id, to_write as u64);
 
             cache_file
                 .seek(SeekFrom::Start(offset))
@@ -1298,6 +1299,9 @@ async fn proactive_prebuffer_download(
                         let to_write = chunk_slice.len().min(remaining_in_gap);
 
                         let write_offset = offset; // absolute pos of these bytes
+
+                        // Record Telegram network bytes for the speed meter
+                        cache_mgr.add_downloaded_bytes(message_id, to_write as u64);
 
                         cache_file
                             .seek(SeekFrom::Start(offset))

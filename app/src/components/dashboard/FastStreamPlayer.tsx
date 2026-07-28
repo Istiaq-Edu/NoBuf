@@ -5,7 +5,8 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
-import { useMSEPlayer, formatSpeed, speedMeterValue } from '../../hooks/useMSEPlayer';
+import { useMSEPlayer } from '../../hooks/useMSEPlayer';
+import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
@@ -252,7 +253,6 @@ interface FastStreamPlayerProps {
     isPrefetching: msePlayer.isPrefetching,
     isPaused: msePlayer.isPaused,
     isComplete: msePlayer.isComplete,
-    speed: msePlayer.speed,
     pausePrefetch: msePlayer.pausePrefetch,
     resumePrefetch: msePlayer.resumePrefetch,
     seekTo: msePlayer.seekTo,
@@ -261,7 +261,6 @@ interface FastStreamPlayerProps {
     downloadedTimeRanges: msePlayer.downloadedTimeRanges,
     byteToTime: msePlayer.byteToTime,
     recordByteTimeAnchor: msePlayer.recordByteTimeAnchor,
-    setSuppressBackendReports: msePlayer.setSuppressBackendReports,
     thumbnailDataReady: msePlayer.thumbnailDataReady,
     moovBufferReady: msePlayer.moovBufferReady,
     isTransmuxer: msePlayer.isTransmuxer,
@@ -295,7 +294,6 @@ interface FastStreamPlayerProps {
     isPrefetching: _isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
-    speed: mseSpeed,  // live MSE pipe throughput — fallback for the speed meter during cold start when greenBarSpeed (disk delta) is still 0
     pausePrefetch,
     resumePrefetch,
     seekTo,
@@ -304,7 +302,6 @@ interface FastStreamPlayerProps {
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
     recordByteTimeAnchor,
-    setSuppressBackendReports,
     thumbnailDataReady,
     moovBufferReady,
     isTransmuxer,
@@ -486,9 +483,10 @@ interface FastStreamPlayerProps {
 
   // Poll cache status for green bar — updates every 500ms for near-realtime feel.
   // Merges disk cache ranges (from backend) with shadow cache ranges (from JS memory)
-  // Also computes the GREEN BAR download speed (actual Telegram download speed),
-  // not the white bar speed (which is now just local disk reads).
-  const greenBarSpeedHistoryRef = useRef<{ bytes: number; time: number }[]>([]);
+  // Also computes the download-speed meter value from the backend's cumulative
+  // session_downloaded_bytes counter (bytes that actually arrived from Telegram
+  // — disk-cache HITs never touch it). Window math lives in speedMeter.ts.
+  const greenBarSpeedHistoryRef = useRef<SpeedSample[]>([]);
   const [greenBarSpeed, setGreenBarSpeed] = useState(0);
   // When the green-bar poll gate (seek-settle) first engaged, for the bounded-
   // freeze safety timeout below. 0 = gate not currently engaged.
@@ -496,7 +494,6 @@ interface FastStreamPlayerProps {
 
   useEffect(() => {
     let active = true;
-    let lastCachedBytes = 0;
     const poll = async () => {
       while (active) {
         try {
@@ -530,38 +527,35 @@ interface FastStreamPlayerProps {
           }
           const _gateExpired =
             seekSettleStartRef.current > 0 && _nowMs - seekSettleStartRef.current > 8000;
+
+          // Fetch status EVERY tick — the speed meter must never sit behind the
+          // seek-settle gate (a gated sample series reads as a fake stall → 0
+          // during seeks). Only the ranges→time consumers below stay gated.
+          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+
+          // ── Download speed (bytes actually fetched from Telegram) ──
+          // status.session_downloaded_bytes is a backend cumulative counter fed
+          // ONLY at iter_download chunk arrivals — cache HITs can't inflate it.
+          // Windowed cumulative diff + stall-zero + reset guard: speedMeter.ts.
+          {
+            const sampleT = Date.now();
+            const samples = greenBarSpeedHistoryRef.current;
+            if (status?.is_complete) {
+              // Fully cached: nothing can be downloading — snap to 0 now
+              // instead of waiting out the 3s stall window.
+              samples.length = 0;
+              setGreenBarSpeed(0);
+            } else {
+              pushSample(samples, sampleT, status?.session_downloaded_bytes ?? 0);
+              setGreenBarSpeed(computeWindowSpeed(samples, sampleT));
+            }
+          }
+
           if (!_seekSettling || _gateExpired) {
             if (_gateExpired) seekSettleStartRef.current = 0; // reset so next seek re-arms
-            const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
-
-            // ── Green bar download speed (actual Telegram speed) ──
-            // Compute from cached_bytes delta over time, using a 5-second sliding window
-            const now = Date.now();
-            const cachedBytes: number = status.cached_bytes ?? 0;
-            if (lastCachedBytes > 0 && cachedBytes > lastCachedBytes) {
-              const delta = cachedBytes - lastCachedBytes;
-              const hist = greenBarSpeedHistoryRef.current;
-              hist.push({ bytes: delta, time: now });
-              // Keep last 5 seconds of history
-              while (hist.length > 0 && hist[0].time < now - 5000) hist.shift();
-              if (hist.length >= 2) {
-                const totalBytes = hist.reduce((s, e) => s + e.bytes, 0);
-                const dt = (hist[hist.length - 1].time - hist[0].time) / 1000;
-                if (dt > 0.3) {
-                  setGreenBarSpeed(totalBytes / dt);
-                }
-              }
-            }
-            if (cachedBytes > 0) lastCachedBytes = cachedBytes;
-            // Reset speed when cache is complete (no more downloading)
-            if (status.is_complete) {
-              setGreenBarSpeed(0);
-              lastCachedBytes = 0;
-              greenBarSpeedHistoryRef.current = [];
-            }
 
             // Update session cache tracker via ref (avoids re-triggering this effect)
             const cs = cacheSessionRef.current;
@@ -701,7 +695,6 @@ interface FastStreamPlayerProps {
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
-          setSuppressBackendReports(false);
           setDlOverlay(prev => prev ? { ...prev, completed: true } : null);
           dlTransferIdRef.current = '';
         }
@@ -728,12 +721,9 @@ interface FastStreamPlayerProps {
       setDlOverlayVisible(true);
       clearTimeout(dismissTimerRef.current);
 
-      // Suppress player's cache meta reports during download — download updates
-      // CacheMeta per-chunk instead (protected by per-message Mutex in Rust).
-      // Player prebuffer continues running — both interleave through Semaphore(1)
-      // at the Rust level (one Telegram iter_download call at a time → no FLOOD_WAIT).
-      setSuppressBackendReports(true);
-
+      // Player prebuffer continues running — download and prebuffer interleave
+      // through Semaphore(1) at the Rust level (one Telegram iter_download call
+      // at a time → no FLOOD_WAIT). The backend updates CacheMeta per-chunk.
       await invoke('cmd_download_file', {
         messageId: file.id,
         savePath,
@@ -741,11 +731,9 @@ interface FastStreamPlayerProps {
         transferId,
       });
 
-      setSuppressBackendReports(false);
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
-      setSuppressBackendReports(false);
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
@@ -756,7 +744,7 @@ interface FastStreamPlayerProps {
         dlTransferIdRef.current = '';
       }, 300);
     }
-  }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
+  }, [file, activeFolderId, cacheComplete]);
 
   // Cancel or dismiss download overlay
   const handleCancelDownload = useCallback(async () => {
@@ -771,14 +759,13 @@ interface FastStreamPlayerProps {
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
-    setSuppressBackendReports(false);
     setDlOverlayVisible(false);
     clearTimeout(dismissTimerRef.current);
     dismissTimerRef.current = window.setTimeout(() => {
       setDlOverlay(null);
       dlTransferIdRef.current = '';
     }, 300);
-  }, [setSuppressBackendReports, dlOverlay?.completed]);
+  }, [dlOverlay?.completed]);
 
 
   const fmt = (s: number) => {
@@ -2049,7 +2036,7 @@ interface FastStreamPlayerProps {
               </button>
             )}
             <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
-              {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
+              {(() => { const s = speedMeterValue(greenBarSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
             </span>
           </div>
           <div className="relative h-[2px] bg-white/20">
@@ -2279,7 +2266,7 @@ interface FastStreamPlayerProps {
                   </button>
                   {/* Download speed */}
                   <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
+                    {(() => { const s = speedMeterValue(greenBarSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
                   </span>
                   {/* Buffer ahead */}
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
