@@ -275,6 +275,12 @@ pub struct CacheStatus {
     pub filename: String,
     /// Byte ranges that are cached on disk (for green buffer bar)
     pub cached_ranges: Vec<(u64, u64)>,
+    /// Cumulative bytes downloaded from Telegram for this message during this
+    /// app session (in-memory, monotonic until cache delete/app restart).
+    /// Fed by add_downloaded_bytes at every iter_download chunk arrival.
+    /// The frontend speed meter samples this and computes a windowed rate —
+    /// disk-cache HITs never touch it, so the meter can't count local reads.
+    pub session_downloaded_bytes: u64,
 }
 
 /// Manages the disk cache for streamed media
@@ -325,6 +331,11 @@ pub struct StreamCacheManager {
     /// (trace 23: seek to 2645s → 40 EMPTY-BODY + 39 superseded cancels, 30s
     /// getKeyPacket freeze). Only the read closer to the playhead survives.
     playhead_bytes: Arc<std::sync::Mutex<HashMap<i32, u64>>>,
+    /// Cumulative bytes downloaded from Telegram per message this session.
+    /// Incremented ONLY at iter_download chunk arrivals (never on disk-cache
+    /// HITs). In-memory: cleared on cache delete, gone on app restart.
+    /// Source of truth for the frontend download-speed meter.
+    session_downloaded: Arc<std::sync::Mutex<HashMap<i32, u64>>>,
 }
 
 /// Cached HLS layout info for a message, including the Media object
@@ -362,6 +373,7 @@ impl StreamCacheManager {
             init_prefix_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             stripped_pids_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             playhead_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_downloaded: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -571,21 +583,59 @@ impl StreamCacheManager {
 
     /// Get cache status for a message
     pub fn get_status(&self, message_id: i32) -> Option<CacheStatus> {
-        let meta = self.load_meta(message_id)?;
-        Some(CacheStatus {
-            message_id,
-            cached_bytes: meta.cached_bytes(),
-            total_bytes: meta.total_size,
-            percentage: meta.cached_percentage(),
-            is_complete: meta.is_complete(),
-            filename: meta.filename.clone(),
-            cached_ranges: meta.cached_ranges.clone(),
-        })
+        let session_dl = self.session_downloaded_bytes(message_id);
+        match self.load_meta(message_id) {
+            Some(meta) => Some(CacheStatus {
+                message_id,
+                cached_bytes: meta.cached_bytes(),
+                total_bytes: meta.total_size,
+                percentage: meta.cached_percentage(),
+                is_complete: meta.is_complete(),
+                filename: meta.filename.clone(),
+                cached_ranges: meta.cached_ranges.clone(),
+                session_downloaded_bytes: session_dl,
+            }),
+            // Cold start: bytes are already arriving from Telegram (e.g. the
+            // remux pipe downloads before any meta sidecar exists). Return a
+            // synthetic zero-status carrying the counter so the speed meter
+            // is live from the first poll instead of waiting for meta.
+            None if session_dl > 0 => Some(CacheStatus {
+                message_id,
+                cached_bytes: 0,
+                total_bytes: 0,
+                percentage: 0,
+                is_complete: false,
+                filename: String::new(),
+                cached_ranges: Vec::new(),
+                session_downloaded_bytes: session_dl,
+            }),
+            None => None,
+        }
+    }
+
+    /// Record bytes that just arrived from Telegram for this message.
+    /// Call ONLY at iter_download chunk arrivals — never for cache-served
+    /// bytes (dash.js cache-exclusion principle: the speed meter must
+    /// measure network throughput, not disk reads).
+    pub fn add_downloaded_bytes(&self, message_id: i32, n: u64) {
+        if n == 0 { return; }
+        if let Ok(mut map) = self.session_downloaded.lock() {
+            *map.entry(message_id).or_insert(0) += n;
+        }
+    }
+
+    /// Cumulative Telegram bytes downloaded for this message this session.
+    pub fn session_downloaded_bytes(&self, message_id: i32) -> u64 {
+        self.session_downloaded
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&message_id).copied())
+            .unwrap_or(0)
     }
 
     /// Acquire a per-message lock for serializing read-modify-write
-    /// operations on CacheMeta. Prevents race conditions between
-    /// player's cmd_report_cached_ranges and download's per-chunk updates.
+    /// operations on CacheMeta. Prevents race conditions between the
+    /// stream handler's and download tasks' per-chunk meta updates.
     pub async fn lock_meta(&self, message_id: i32) -> tokio::sync::OwnedMutexGuard<()> {
         let mut locks = self.meta_locks.lock().await;
         let entry = locks
@@ -922,6 +972,13 @@ impl StreamCacheManager {
         if meta.exists() {
             std::fs::remove_file(&meta)?;
             log::info!("[CACHE] delete_cache: removed meta for msg {}", message_id);
+        }
+
+        // Reset the session download counter — a fresh (re)download should
+        // start the speed-meter sample series from zero (the frontend's
+        // reset guard clears its window when the sampled value drops).
+        if let Ok(mut map) = self.session_downloaded.lock() {
+            map.remove(&message_id);
         }
 
         // Try to delete the data file. If any handle is still open (stream or
@@ -1367,6 +1424,39 @@ mod tests {
     fn test_is_range_cached_not_covered() {
         let ranges = vec![(0, 499)];
         assert!(!is_range_cached(&ranges, 500, 999));
+    }
+
+    #[test]
+    fn test_session_downloaded_counter() {
+        let dir = std::env::temp_dir().join("nobuf_test_session_dl");
+        let mgr = StreamCacheManager::new(dir).unwrap();
+        let msg = 424242;
+
+        // Starts at zero; zero-adds are no-ops
+        assert_eq!(mgr.session_downloaded_bytes(msg), 0);
+        mgr.add_downloaded_bytes(msg, 0);
+        assert_eq!(mgr.session_downloaded_bytes(msg), 0);
+
+        // Accumulates across calls (chunk arrivals)
+        mgr.add_downloaded_bytes(msg, 512 * 1024);
+        mgr.add_downloaded_bytes(msg, 512 * 1024);
+        assert_eq!(mgr.session_downloaded_bytes(msg), 1024 * 1024);
+
+        // Per-message isolation
+        assert_eq!(mgr.session_downloaded_bytes(msg + 1), 0);
+
+        // No meta on disk but counter live → synthetic cold-start status
+        let status = mgr.get_status(msg).expect("synthetic status expected");
+        assert_eq!(status.session_downloaded_bytes, 1024 * 1024);
+        assert_eq!(status.cached_bytes, 0);
+        assert!(!status.is_complete);
+
+        // No meta AND no counter → None (unchanged behavior)
+        assert!(mgr.get_status(msg + 1).is_none());
+
+        // delete_cache clears the counter (no meta/data files exist — Ok path)
+        mgr.delete_cache(msg).unwrap();
+        assert_eq!(mgr.session_downloaded_bytes(msg), 0);
     }
 
     #[test]

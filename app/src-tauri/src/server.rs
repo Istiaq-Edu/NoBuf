@@ -1322,6 +1322,11 @@ async fn stream_media(
                         let bytes_in_chunk = final_data.len() as u64;
                         let chunk_range_end = current_offset + bytes_in_chunk - 1;
 
+                        // 0) Record Telegram network bytes for the speed meter
+                        if let Some(ref cache_mgr) = cache_mgr_for_stream {
+                            cache_mgr.add_downloaded_bytes(message_id, bytes_in_chunk);
+                        }
+
                         // 1) Write data to cache file
                         if let Some(ref mut cache_file) = cache_file_mut {
                             let _ = cache_file.seek(SeekFrom::Start(current_offset));
@@ -1646,6 +1651,9 @@ async fn download_and_cache_range(
                     first_chunk = false;
                     &chunk
                 };
+                // Record Telegram network bytes for the speed meter (per-chunk,
+                // so the meter ticks during long keyframe-window downloads).
+                cache_mgr.add_downloaded_bytes(message_id, slice.len() as u64);
                 downloaded.extend_from_slice(slice);
                 if downloaded.len() as u64 >= content_length {
                     downloaded.truncate(content_length as usize);
@@ -3936,6 +3944,9 @@ async fn fmp4_segment(
                             let bytes_in_chunk = final_data.len() as u64;
                             let chunk_range_end = offset + bytes_in_chunk - 1;
 
+                            // Record Telegram network bytes for the speed meter
+                            cache_mgr.add_downloaded_bytes(message_id, bytes_in_chunk);
+
                             let _ = cache_file.seek(SeekFrom::Start(offset));
                             let _ = cache_file.write_all(&final_data);
 
@@ -4695,6 +4706,8 @@ async fn fmp4_metadata(
                                                         first_chunk = false;
                                                         &chunk
                                                     };
+                                                    // Record Telegram network bytes for the speed meter
+                                                    cache_mgr.add_downloaded_bytes(message_id, slice.len() as u64);
                                                     tail_buf.extend_from_slice(slice);
                                                     if tail_buf.len() as u64 >= tail_size { break; }
                                                 }
