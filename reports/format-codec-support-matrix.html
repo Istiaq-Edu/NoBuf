@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NoBuf — Video Format &amp; Codec Support Matrix</title>
+<style>
+  :root {
+    --bg: #0f1115; --surface: #161a22; --surface2: #1d2330;
+    --text: #e2e6ee; --sub: #9aa3b5; --border: #2a3244;
+    --green: #34d399; --yellow: #fbbf24; --red: #f87171; --blue: #60a5fa; --purple: #c084fc;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.55 "Segoe UI", system-ui, sans-serif; padding: 32px 24px 64px; }
+  .wrap { max-width: 1060px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 650; margin-bottom: 4px; }
+  .meta { color: var(--sub); font-size: 12.5px; margin-bottom: 28px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 32px 0 10px; color: var(--blue); text-transform: uppercase; letter-spacing: .06em; }
+  p.note { color: var(--sub); font-size: 13px; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 13px; }
+  th { background: var(--surface2); text-align: left; padding: 8px 12px; font-weight: 600; color: var(--sub); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .ok    { color: var(--green); font-weight: 600; }
+  .cond  { color: var(--yellow); font-weight: 600; }
+  .no    { color: var(--red); font-weight: 600; }
+  .tier  { color: var(--purple); font-weight: 600; white-space: nowrap; }
+  code { background: #10131a; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 12px; color: #c4cbd8; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0 4px; font-size: 12.5px; color: var(--sub); }
+  .legend b { font-weight: 600; }
+  .small { font-size: 12px; color: var(--sub); }
+  ul { margin: 6px 0 0 18px; font-size: 13px; }
+  li { margin-bottom: 3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>NoBuf (Telegram-Drive) — Video Format &amp; Codec Support Matrix</h1>
+<div class="meta">Source-audited 2026-07-29 · branch <code>dev</code> @ <code>a6e3ce9</code> + working tree · every cell traced to code (FormatDetector.ts, useMSEPlayer.ts, MediabunnyTransmuxer.ts, server.rs, ts_demux.rs) — nothing assumed · Host: Tauri&nbsp;2 / WebView2 (Windows)</div>
+
+<h2>1 · Detected Containers</h2>
+<p class="note">Detection is magic-bytes first, file-extension fallback (<code>FormatDetector.ts</code>).</p>
+<table>
+<tr><th>Container</th><th>Magic</th><th>Extensions</th><th>Result</th></tr>
+<tr><td>MP4 / MOV / M4V</td><td><code>ftyp</code> or <code>jP&nbsp;&nbsp;</code> box</td><td>.mp4 .m4v .mov</td><td class="ok">Supported</td></tr>
+<tr><td>MPEG-TS / M2TS</td><td><code>0x47</code> sync @ 0/188/376 (M2TS 4-byte prefix handled backend-side)</td><td>.ts .m2ts .mts</td><td class="ok">Supported</td></tr>
+<tr><td>MKV / MK3D</td><td>EBML <code>1A 45 DF A3</code></td><td>.mkv .mk3d</td><td class="ok">Supported (codec-routed)</td></tr>
+<tr><td>WebM</td><td>EBML (same header; routed by extension/DocType)</td><td>.webm</td><td class="ok">Supported (native)</td></tr>
+<tr><td>Anything else (AVI, FLV, WMV, …)</td><td>—</td><td>—</td><td class="cond">Native &lt;video&gt; fallback — plays only if WebView2 can (in practice: not for AVI/WMV)</td></tr>
+</table>
+
+<h2>2 · Video Codec × Container Routing</h2>
+<div class="legend">
+  <span class="ok">●</span> full featured &nbsp; <span class="cond">●</span> conditional / reduced features &nbsp; <span class="no">●</span> unsupported (download-only message)
+</div>
+<table>
+<tr><th>Container</th><th>Video codec</th><th>Playback tier</th><th>Status</th><th>How</th></tr>
+
+<tr><td rowspan="4">MP4/MOV</td>
+  <td>H.264 (avc1)</td><td class="tier">MP4Box → MSE</td><td class="ok">Full</td>
+  <td>mp4box.js segmentation → SourceBuffer; moov-at-end fetched from tail; faststarted handled too</td></tr>
+<tr><td>HEVC 8/10-bit (hvc1/hev1) + Dolby Vision (dvh1/dvhe P5/P8)</td>
+  <td class="tier">/remux → mpegts.js</td><td class="ok">Full</td>
+  <td>ffmpeg transcode→H.264 TS (QSV→NVENC→AMF→libx264 ladder); 8-bit copied instead if HEVC Video Extensions present (<code>hevc_ok</code>)</td></tr>
+<tr><td>AV1 (av01)</td><td class="tier">native probe</td><td class="cond">If WebView2 decodes it</td>
+  <td>MSE rejects → <code>canPlayType</code> probe → native <code>&lt;video&gt;</code> or "unsupported codec" message</td></tr>
+<tr><td>Other (mpeg4, vc1…)</td><td class="tier">native probe</td><td class="cond">Same probe path</td>
+  <td>canPlayType "probably/maybe" → native; else download-only message</td></tr>
+
+<tr><td rowspan="4">MKV</td>
+  <td>H.264 (avc)</td><td class="tier">Mediabunny transmuxer → MSE fMP4</td><td class="ok">Full</td>
+  <td>Client-side Matroska demux → fMP4; VBR cue index for exact seeks; falls back to /remux if init fails</td></tr>
+<tr><td>HEVC 8/10-bit</td><td class="tier">/remux → mpegts.js</td><td class="ok">Full</td>
+  <td>Same encoder ladder + <code>hevc_ok</code> copy path; ffmpeg <code>-ss</code> seeks (Matroska can't byte-seek)</td></tr>
+<tr><td>VP8 / VP9 / AV1</td><td class="tier">native</td><td class="cond">If WebView2 decodes it</td>
+  <td>Can't be muxed into MPEG-TS → native <code>&lt;video&gt;</code> (VP9/AV1 usually OK, licensing-free decoders ship in WebView2)</td></tr>
+<tr><td>Codec undetectable</td><td class="tier">native</td><td class="cond">Best effort</td><td>Header parse failed → native fallback</td></tr>
+
+<tr><td rowspan="3">MPEG-TS</td>
+  <td>H.264</td><td class="tier">mpegts.js (direct)</td><td class="ok">Full</td>
+  <td>Custom chunk loader + shadow cache; backend keyframe index for byte-accurate seeks</td></tr>
+<tr><td>H.265 in TS</td><td class="tier">mpegts.js (direct)</td><td class="cond">Decoder-dependent</td>
+  <td>mpegts.js demuxes H.265 TS (backend <code>ts_demux.rs</code> also parses HEVC 0x24), but MSE append needs the HEVC Extensions; fatal error → auto-fallback to /remux transcode</td></tr>
+<tr><td>H.264 + timed_id3 metadata stream</td><td class="tier">/remux → mpegts.js</td><td class="ok">Full</td>
+  <td>Backend flags <code>has_timed_id3</code> (id3 PTS drift breaks mpegts.js) → ffmpeg re-mux; byte-forward seeking (stdin pipe) since source is real TS</td></tr>
+
+<tr><td>WebM</td><td>VP8 / VP9 (+Opus/Vorbis)</td><td class="tier">native</td><td class="ok">Plays natively</td>
+  <td>WebView2 ships VP8/VP9/Opus decoders; no MSE pipeline engaged at all</td></tr>
+</table>
+
+<h2>3 · Audio Codec Handling</h2>
+<table>
+<tr><th>Tier</th><th>Audio in</th><th>Audio out</th><th>Notes</th></tr>
+<tr><td class="tier">MP4Box → MSE</td><td>AAC (mp4a.*) — whatever MSE accepts</td><td>passthrough</td><td>Unsupported audio codec → video-only playback (warned, not fatal)</td></tr>
+<tr><td class="tier">Mediabunny (MKV)</td><td>AAC passthrough; others per mediabunny conversion</td><td>fMP4 AAC</td><td>Invalid/undecodable track → codec-unsupported → native fallback</td></tr>
+<tr><td class="tier">mpegts.js (TS)</td><td>AAC (ADTS + LOAS/LATM), MP3, AC-3</td><td>MSE AAC</td><td>LATM parser bugs → fatal handler auto-falls back to /remux</td></tr>
+<tr><td class="tier">/remux (ffmpeg)</td><td><b>Anything ffmpeg decodes</b> (AAC, AC-3, E-AC-3, DTS, Opus, FLAC, MP3…)</td><td>AAC-LC 192k</td><td>Layout clamped to mono→7.1 (no PCE); seek path uses <code>aresample=async=1</code> for A/V sync; subtitles dropped (<code>-sn</code>)</td></tr>
+<tr><td class="tier">native</td><td>WebView2 codecs (AAC, MP3, Opus, Vorbis, FLAC)</td><td>—</td><td>No E-AC-3/DTS in stock WebView2 → silent video on such files in native tier</td></tr>
+</table>
+
+<h2>4 · Special Features by Tier</h2>
+<table>
+<tr><th>Feature</th><th>MP4 MSE<br><span class="small">(H.264)</span></th><th>MKV Transmux<br><span class="small">(H.264)</span></th><th>TS mpegts.js<br><span class="small">(H.264)</span></th><th>/remux tier<br><span class="small">(HEVC · DV · timed_id3)</span></th><th>Native<br><span class="small">(WebM/VP9/AV1)</span></th></tr>
+<tr><td>Instant / exact seek</td><td class="ok">✔ byte-exact (moov index)</td><td class="ok">✔ VBR cue index</td><td class="ok">✔ backend keyframe index</td><td class="cond">✔ ffmpeg <code>-ss</code> / byte-forward — keyframe-snapped (≈1.4s), 4-8s cold</td><td class="cond">browser-managed</td></tr>
+<tr><td>Hover thumbnails</td><td class="ok">✔ mini-MSE pipeline</td><td class="ok">✔ WebCodecs pipeline¹</td><td class="ok">✔ backend /fmp4 segments</td><td class="ok">✔ server-side /thumb (ffmpeg 1-frame JPEG, works on unbuffered regions)²</td><td class="ok">✔ hidden &lt;video&gt;</td></tr>
+<tr><td>Proactive prebuffer (PROACTIVE)</td><td class="ok">✔</td><td class="ok">✔</td><td class="ok">✔</td><td class="ok">✔ (incl. null-folder "home" files)²</td><td class="cond">browser buffering only</td></tr>
+<tr><td>Cold-start gate + overlay</td><td class="ok">✔ dynamic threshold</td><td class="ok">✔ 6MB seed</td><td class="ok">✔ 5MB gate</td><td class="ok">✔ indeterminate phase</td><td class="no">—</td></tr>
+<tr><td>Progress bar / duration</td><td class="ok">✔ moov</td><td class="ok">✔ Matroska metadata</td><td class="ok">✔ backend PTS-tail probe</td><td class="ok">✔ moov/ffprobe override</td><td class="ok">✔</td></tr>
+<tr><td>HDR10/HLG → SDR tonemap</td><td class="no">n/a</td><td class="no">n/a</td><td class="no">n/a</td><td class="ok">✔ hable chain (execution-verified)</td><td class="no">—</td></tr>
+<tr><td>HW-accelerated transcode</td><td class="no">n/a (no transcode)</td><td class="no">n/a</td><td class="no">n/a</td><td class="ok">✔ QSV→NVENC→AMF→libx264 (runtime-probed)</td><td class="no">—</td></tr>
+<tr><td>Disk cache reuse / bg faststart remux</td><td class="ok">✔ stream-cache</td><td class="ok">✔</td><td class="ok">✔</td><td class="ok">✔ + background faststart MP4 for next play</td><td class="ok">✔ via /stream</td></tr>
+<tr><td>Subtitles (sidecar .srt/.vtt/.ass/.ssa)</td><td class="ok" colspan="5">✔ all tiers — player-level; ASS/SSA rendered via jassub (libass). Embedded subtitle tracks are NOT extracted (remux drops them with <code>-sn</code>)</td></tr>
+</table>
+<p class="small">¹ MKV-HEVC 10-bit: WebCodecs can't decode → scrub thumbnails auto-disabled for that file (info log, playback unaffected).<br>
+² Shipped in current working tree (commit <code>a6e3ce9</code> + stale-guard patch); e2e-proven in test logs 2-c/2-t.</p>
+
+<h2>5 · Not Supported (download-only)</h2>
+<ul>
+  <li><b>AV1 / VP9 in MP4 or MKV on machines whose WebView2 lacks the decoder</b> — user gets an explicit "download and play externally" message.</li>
+  <li><b>AVI, WMV, FLV, MPEG-2 video</b> — no pipeline; native fallback will fail on stock WebView2 (mpegts.js explicitly does not support mpeg2video).</li>
+  <li><b>Embedded subtitle tracks</b> — never extracted (any tier); only sidecar files.</li>
+  <li><b>Multiple audio tracks</b> — first/primary track only in every tier (no track selector).</li>
+</ul>
+
+<h2>6 · Fallback Chains (safety nets)</h2>
+<ul>
+  <li><b>MP4:</b> MSE unsupported codec → HEVC-family? <code>/remux</code> : native probe → else "unsupported" message.</li>
+  <li><b>MKV H.264:</b> transmuxer init failure → <code>/remux</code> → mpegts.js.</li>
+  <li><b>TS:</b> mpegts.js fatal (LATM bugs, decode errors, unsupported codec) → <code>/remux</code> (native or mpegts.js re-attach).</li>
+  <li><b>Unknown container:</b> straight to native <code>&lt;video&gt;</code>.</li>
+</ul>
+
+</div>
+</body>
+</html>

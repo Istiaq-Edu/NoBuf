@@ -2195,12 +2195,16 @@ export function useThumbnailExtractor(
                   fr.onerror = () => reject(fr.error);
                   fr.readAsDataURL(blob);
                 });
-                // Only store if the hover is still near this bucket (stale
-                // guard: user may have scrubbed away during the fetch).
-                frameBufferRef.current.set(bucket, dataUrl);
-                insertionOrderRef.current.push(bucket);
-                evictIfNeeded();
-                forceUpdateCachedTimes();
+                // Stale guard: if the effect tore down mid-fetch (video
+                // switched / unmounted), drop the frame instead of writing a
+                // previous video's thumbnail into the fresh frame buffer.
+                // (Native path has the same `active` check before capture.)
+                if (active) {
+                  frameBufferRef.current.set(bucket, dataUrl);
+                  insertionOrderRef.current.push(bucket);
+                  evictIfNeeded();
+                  forceUpdateCachedTimes();
+                }
               } else if (resp.status === 429) {
                 // Another hover's ffmpeg is running server-side — retry soon.
                 await new Promise(r => setTimeout(r, 400));
