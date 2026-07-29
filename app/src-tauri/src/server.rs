@@ -364,6 +364,12 @@ pub(crate) struct StreamQuery {
     /// hint — the mpegts.js MSE path rejects hvc1.2 (Main10) even when the
     /// extension is present. This flag only governs the 8-bit HEVC case.
     pub(crate) hevc_ok: Option<bool>,
+    /// User-selected audio stream index for the /remux endpoint (absolute
+    /// ffprobe stream index, from /audio_tracks). Validated against the probed
+    /// audio streams; invalid/absent values fall back to the probe-resolved
+    /// primary (never a 500). Also keys the remux disk cache so outputs made
+    /// with different tracks can never be served interchangeably.
+    pub(crate) audio_idx: Option<i32>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -2104,7 +2110,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2469,6 +2475,26 @@ struct StreamProbeResult {
     audio_codec_name: String,
     audio_channel_layout: String,
     probed_duration: f64,
+    /// ALL real audio streams (channels > 0, codec != "id3"), in file order.
+    /// Used by the audio-track menu (/audio_tracks) and to validate a client
+    /// `audio_idx` override. The legacy single-pick fields above are unchanged.
+    audio_streams: Vec<AudioStreamInfo>,
+}
+
+/// One real audio stream from an ffprobe pass (for track selection).
+#[derive(Debug, Clone, serde::Serialize)]
+struct AudioStreamInfo {
+    /// Absolute ffprobe stream index (usable directly in `-map 0:<index>`).
+    index: i32,
+    codec: String,
+    channels: i32,
+    channel_layout: String,
+    /// ISO 639-2 language tag ("" when untagged).
+    language: String,
+    /// Human title tag ("" when absent).
+    title: String,
+    /// disposition.default == 1
+    is_default: bool,
 }
 
 impl Default for StreamProbeResult {
@@ -2486,7 +2512,34 @@ impl Default for StreamProbeResult {
             audio_codec_name: String::new(),
             audio_channel_layout: String::new(),
             probed_duration: 0.0,
+            audio_streams: Vec::new(),
         }
+    }
+}
+
+/// Remux disk-cache filename, keyed by audio track when a non-default track is
+/// selected. Default (None) keeps the legacy un-suffixed name so existing cache
+/// files remain valid. Suffixed names ensure outputs remuxed with different
+/// audio tracks can NEVER be served interchangeably.
+fn remux_cache_filename(folder_id: &str, message_id: i32, audio_idx: Option<i32>) -> String {
+    match audio_idx {
+        Some(idx) => format!("{}_{}_a{}.mp4", folder_id, message_id, idx),
+        None => format!("{}_{}.mp4", folder_id, message_id),
+    }
+}
+
+/// Validate a client-requested audio stream index against the probed real
+/// audio streams. Returns the validated index, or `None` when the request is
+/// absent/invalid (caller keeps the probe-resolved primary — never a 500).
+fn validate_audio_idx_override(
+    requested: Option<i32>,
+    audio_streams: &[AudioStreamInfo],
+) -> Option<i32> {
+    let req = requested?;
+    if audio_streams.iter().any(|s| s.index == req) {
+        Some(req)
+    } else {
+        None
     }
 }
 
@@ -2522,15 +2575,43 @@ fn parse_probe_json(json_str: &str) -> StreamProbeResult {
                     .unwrap_or("")
                     .to_string();
             }
-            if codec_type == "audio" && !result.found_audio && channels > 0 && codec_name != "id3" {
-                result.audio_stream_idx = idx as i32;
-                result.found_audio = true;
-                result.audio_codec_name = codec_name.to_string();
-                result.audio_channel_layout = stream
-                    .get("channel_layout")
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("")
-                    .to_string();
+            if codec_type == "audio" && channels > 0 && codec_name != "id3" {
+                // Collect EVERY real audio stream for track selection.
+                let tags = stream.get("tags");
+                let get_tag = |key: &str| -> String {
+                    tags.and_then(|t| t.get(key))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                result.audio_streams.push(AudioStreamInfo {
+                    index: idx as i32,
+                    codec: codec_name.to_string(),
+                    channels: channels as i32,
+                    channel_layout: stream
+                        .get("channel_layout")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    language: get_tag("language"),
+                    title: get_tag("title"),
+                    is_default: stream
+                        .get("disposition")
+                        .and_then(|d| d.get("default"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) == 1,
+                });
+                // Legacy primary pick: FIRST real audio stream (unchanged behavior).
+                if !result.found_audio {
+                    result.audio_stream_idx = idx as i32;
+                    result.found_audio = true;
+                    result.audio_codec_name = codec_name.to_string();
+                    result.audio_channel_layout = stream
+                        .get("channel_layout")
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
             }
         }
     }
@@ -2620,11 +2701,16 @@ async fn remux_ts_to_mp4(
         std::path::PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "/tmp".into())).join("nobuf_remux")
     };
     let _ = std::fs::create_dir_all(&remux_dir);
-    let remux_path = remux_dir.join(format!("{}_{}.mp4", folder_id_str, message_id));
-    let remux_tmp = remux_dir.join(format!("{}_{}.mp4.tmp", folder_id_str, message_id));
+    // Requested audio-track override (validated against the probe below).
+    let requested_audio_idx: Option<i32> = query.audio_idx;
+    let mut remux_path = remux_dir.join(remux_cache_filename(&folder_id_str, message_id, None));
+    let mut remux_tmp = remux_dir.join(format!("{}.tmp", remux_cache_filename(&folder_id_str, message_id, None)));
 
     // ── Phase 1: If remuxed MP4 already cached, serve it with byte-range ──
-    if remux_path.exists() {
+    // ONLY on the default (no audio_idx) path: an override must be validated
+    // against the probe FIRST, otherwise a junk/mismatched key could serve the
+    // wrong track's audio. Overridden requests re-run this check post-probe.
+    if requested_audio_idx.is_none() && remux_path.exists() {
         let file_size = match std::fs::metadata(&remux_path) {
             Ok(m) => m.len(),
             Err(_) => return HttpResponse::InternalServerError().body("Failed to read remux cache"),
@@ -2728,8 +2814,65 @@ async fn remux_ts_to_mp4(
             probe.audio_codec_name = full.audio_codec_name.clone();
             probe.audio_channel_layout = full.audio_channel_layout.clone();
         }
+        // Track list: the full probe sees strictly more of the file — prefer
+        // its stream inventory when it found more audio streams.
+        if full.audio_streams.len() > probe.audio_streams.len() {
+            probe.audio_streams = full.audio_streams.clone();
+        }
         if probe.probed_duration <= 0.0 && full.probed_duration > 0.0 {
             probe.probed_duration = full.probed_duration;
+        }
+    }
+
+    // ── Audio-track override (validate-first, see remux_cache_filename) ──
+    // A client-requested audio_idx is honored only if the probe confirms it is
+    // a real audio stream; otherwise keep the probe-resolved primary (never a
+    // 500 — the stream must always play). The validated idx re-keys the disk
+    // cache and re-runs the Phase-1 cached-serve check that was skipped above.
+    let validated_audio_idx = validate_audio_idx_override(requested_audio_idx, &probe.audio_streams);
+    if let Some(requested) = requested_audio_idx {
+        match validated_audio_idx {
+            Some(idx) => {
+                if idx != probe.audio_stream_idx {
+                    // Update the codec/layout metadata to the SELECTED stream so
+                    // downstream logging + AAC layout handling reflect reality.
+                    if let Some(s) = probe.audio_streams.iter().find(|s| s.index == idx) {
+                        probe.audio_codec_name = s.codec.clone();
+                        probe.audio_channel_layout = s.channel_layout.clone();
+                    }
+                    probe.audio_stream_idx = idx;
+                    log::info!("[REMUX] msg {}: audio track override → stream idx={}", message_id, idx);
+                }
+                remux_path = remux_dir.join(remux_cache_filename(&folder_id_str, message_id, Some(idx)));
+                remux_tmp = remux_dir.join(format!("{}.tmp", remux_cache_filename(&folder_id_str, message_id, Some(idx))));
+                if remux_path.exists() {
+                    let file_size = match std::fs::metadata(&remux_path) {
+                        Ok(m) => m.len(),
+                        Err(_) => return HttpResponse::InternalServerError().body("Failed to read remux cache"),
+                    };
+                    log::info!("[REMUX] msg {}: serving cached remux for audio_idx={} ({:.1} MB)",
+                        message_id, idx, file_size as f64 / 1e6);
+                    return serve_local_file(&req, &remux_path, file_size, "video/mp2t");
+                }
+            }
+            None => {
+                log::warn!(
+                    "[REMUX] msg {}: requested audio_idx={} is not a real audio stream (available: {:?}) — using primary idx={}",
+                    message_id, requested,
+                    probe.audio_streams.iter().map(|s| s.index).collect::<Vec<_>>(),
+                    probe.audio_stream_idx
+                );
+                // Fall back to the legacy default cache key (primary track).
+                remux_path = remux_dir.join(remux_cache_filename(&folder_id_str, message_id, None));
+                remux_tmp = remux_dir.join(format!("{}.tmp", remux_cache_filename(&folder_id_str, message_id, None)));
+                if remux_path.exists() {
+                    let file_size = match std::fs::metadata(&remux_path) {
+                        Ok(m) => m.len(),
+                        Err(_) => return HttpResponse::InternalServerError().body("Failed to read remux cache"),
+                    };
+                    return serve_local_file(&req, &remux_path, file_size, "video/mp2t");
+                }
+            }
         }
     }
 
@@ -3961,7 +4104,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -5406,6 +5549,83 @@ fn thumb_inflight() -> &'static StdMutex<std::collections::HashSet<i32>> {
 /// t clamped to [0, duration), zero-size/unprobed files (400), ffmpeg failure
 /// or empty output (502 with stderr tail logged), 15s hard timeout (504),
 /// dead-client cleanup via kill_on_drop.
+
+/// List the real audio streams of a media file for the track-selection menu.
+///
+/// Runs the same fast ffprobe pass as /remux (5MB/5s budget, guarded full
+/// re-probe when nothing is found) over the cached file or the local /stream
+/// endpoint, and returns JSON:
+///   `{ "tracks": [AudioStreamInfo...], "primary_idx": <i32> }`
+/// Results are memoized per message_id (stream layout is immutable), so only
+/// the first call pays the probe cost.
+#[get("/audio_tracks/{folder_id}/{message_id}")]
+async fn audio_tracks_list(
+    path: web::Path<(String, i32)>,
+    query: web::Query<StreamQuery>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id) = path.into_inner();
+    if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
+        return resp;
+    }
+
+    // Memo hit → serve without probing.
+    if let Some(json) = data.audio_tracks_json.read().await.get(&message_id) {
+        return HttpResponse::Ok().content_type("application/json").body(json.clone());
+    }
+
+    // Input source: whole-file cache when complete, else local /stream URL
+    // (same resolution logic as /remux).
+    let mut input_source = format!(
+        "http://127.0.0.1:{}/stream/{}/{}?token={}&source_id=tracks",
+        crate::STREAM_PORT, folder_id_str, message_id,
+        query.token.as_deref().unwrap_or("")
+    );
+    if let Some(ref cache_mgr) = **cache {
+        let data_path = cache_mgr.data_path(message_id);
+        let fully_cached = {
+            let _lock = cache_mgr.lock_meta(message_id).await;
+            cache_mgr.load_meta(message_id).map(|m| {
+                let total: u64 = m.cached_ranges.iter().map(|r| r.1 - r.0 + 1).sum();
+                total >= m.total_size.saturating_sub(1)
+            }).unwrap_or(false)
+        };
+        if fully_cached && data_path.exists() {
+            input_source = data_path.to_string_lossy().to_string();
+        }
+    }
+
+    let ffprobe_path = match crate::ffmpeg_util::ensure_ffprobe() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("ffprobe not found: {}", e)),
+    };
+
+    // Fast probe first; full re-probe only when no audio found (mirrors /remux).
+    let mut probe = run_stream_probe(&ffprobe_path, &input_source, "5000000", "5000000", message_id).await;
+    if probe.audio_streams.is_empty() {
+        let full = run_stream_probe(&ffprobe_path, &input_source, "50000000", "50000000", message_id).await;
+        if full.audio_streams.len() > probe.audio_streams.len() {
+            probe = full;
+        }
+    }
+
+    let body = match serde_json::to_string(&serde_json::json!({
+        "tracks": probe.audio_streams,
+        "primary_idx": if probe.found_audio { probe.audio_stream_idx } else { -1 },
+    })) {
+        Ok(b) => b,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("serialize failed: {}", e)),
+    };
+    // Memoize only non-empty inventories: an early/partial probe of a barely
+    // cached file could legitimately see no audio yet.
+    if !probe.audio_streams.is_empty() {
+        data.audio_tracks_json.write().await.insert(message_id, body.clone());
+    }
+    HttpResponse::Ok().content_type("application/json").body(body)
+}
+
 #[get("/thumb/{folder_id}/{message_id}")]
 async fn remux_hover_thumb(
     path: web::Path<(String, i32)>,
@@ -5420,6 +5640,7 @@ async fn remux_hover_thumb(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        audio_idx: None,
     };
     let (_media, total_size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         Ok(r) => r,
@@ -5616,6 +5837,7 @@ pub async fn start_streaming_server(
             .service(stream_media_head)
             .service(remux_ts_to_mp4)
             .service(remux_hover_thumb)
+            .service(audio_tracks_list)
             .configure(hls::configure_hls)
             .configure(crate::faststart::configure_faststart)
             .configure(|cfg| {
@@ -6235,6 +6457,110 @@ mod tests {
         assert!(r.found_audio, "real aac audio must be found");
         assert_eq!(r.audio_stream_idx, 2, "must skip id3-codec audio and pick the aac at idx 2");
         assert_eq!(r.audio_codec_name, "aac");
+    }
+
+    // ── Audio track selection tests (multi-audio + audio_idx override) ──
+
+    /// Dual-audio MKV: ALL real audio streams collected with language/title/
+    /// disposition metadata; primary pick unchanged (first real audio).
+    #[test]
+    fn probe_json_collects_all_audio_streams_with_tags() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":2,"channel_layout":"stereo",
+                 "tags":{"language":"jpn","title":"Japanese"},"disposition":{"default":1}},
+                {"index":2,"codec_type":"audio","codec_name":"ac3","channels":6,"channel_layout":"5.1",
+                 "tags":{"language":"eng"},"disposition":{"default":0}},
+                {"index":3,"codec_type":"data","codec_name":"id3"}
+            ],
+            "format": {"duration":"1200.0"}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert_eq!(r.audio_streams.len(), 2, "id3/data streams must not be collected");
+        assert_eq!(r.audio_stream_idx, 1, "primary pick stays first real audio");
+        let a = &r.audio_streams[0];
+        assert_eq!((a.index, a.codec.as_str(), a.channels), (1, "aac", 2));
+        assert_eq!((a.language.as_str(), a.title.as_str(), a.is_default), ("jpn", "Japanese", true));
+        let b = &r.audio_streams[1];
+        assert_eq!((b.index, b.codec.as_str(), b.channels), (2, "ac3", 6));
+        assert_eq!((b.language.as_str(), b.title.as_str(), b.is_default), ("eng", "", false));
+    }
+
+    /// Untagged streams: language/title default to "" and is_default to false.
+    #[test]
+    fn probe_json_untagged_audio_defaults() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":2}
+            ],
+            "format": {}
+        }"#;
+        let r = super::parse_probe_json(json);
+        assert_eq!(r.audio_streams.len(), 1);
+        let a = &r.audio_streams[0];
+        assert_eq!((a.language.as_str(), a.title.as_str(), a.is_default), ("", "", false));
+        assert_eq!(a.channel_layout, "");
+    }
+
+    /// Override validation: in-list index accepted; out-of-range, non-audio, and
+    /// id3 indexes rejected (caller falls back to primary — never a 500).
+    #[test]
+    fn audio_idx_override_validation() {
+        let streams = vec![
+            super::AudioStreamInfo {
+                index: 1, codec: "aac".into(), channels: 2, channel_layout: "stereo".into(),
+                language: "jpn".into(), title: String::new(), is_default: true,
+            },
+            super::AudioStreamInfo {
+                index: 2, codec: "ac3".into(), channels: 6, channel_layout: "5.1".into(),
+                language: "eng".into(), title: String::new(), is_default: false,
+            },
+        ];
+        assert_eq!(super::validate_audio_idx_override(Some(2), &streams), Some(2));
+        assert_eq!(super::validate_audio_idx_override(Some(1), &streams), Some(1));
+        assert_eq!(super::validate_audio_idx_override(Some(0), &streams), None, "video idx must be rejected");
+        assert_eq!(super::validate_audio_idx_override(Some(99), &streams), None, "out of range must be rejected");
+        assert_eq!(super::validate_audio_idx_override(Some(-1), &streams), None);
+        assert_eq!(super::validate_audio_idx_override(None, &streams), None);
+        assert_eq!(super::validate_audio_idx_override(Some(1), &[]), None, "empty inventory rejects everything");
+    }
+
+    /// Cache keying: default requests keep the LEGACY un-suffixed filename
+    /// (existing cache files stay valid); overridden requests get a per-track
+    /// suffix so different tracks can never serve each other's output.
+    #[test]
+    fn remux_cache_filename_keyed_by_audio_track() {
+        assert_eq!(super::remux_cache_filename("home", 84, None), "home_84.mp4");
+        assert_eq!(super::remux_cache_filename("home", 84, Some(2)), "home_84_a2.mp4");
+        assert_eq!(super::remux_cache_filename("123", 7, Some(1)), "123_7_a1.mp4");
+        // Distinct tracks → distinct keys; track vs default → distinct keys.
+        assert_ne!(
+            super::remux_cache_filename("home", 84, Some(1)),
+            super::remux_cache_filename("home", 84, Some(2)),
+        );
+        assert_ne!(
+            super::remux_cache_filename("home", 84, Some(1)),
+            super::remux_cache_filename("home", 84, None),
+        );
+    }
+
+    /// Arg builders must map the OVERRIDDEN audio index (regression guard for
+    /// the audio-track feature: one handler local feeds every ffmpeg site).
+    #[test]
+    fn arg_builders_map_overridden_audio_idx() {
+        let a = build_strategy_a_args("input.ts", 0, 2);
+        let maps_a: Vec<&str> = a.iter().enumerate()
+            .filter(|(_, s)| s.as_str() == "-map")
+            .map(|(i, _)| a[i + 1].as_str()).collect();
+        assert_eq!(maps_a, vec!["0:0", "0:2"]);
+
+        let b = build_background_remux_args("input.ts", 0, 3);
+        let maps_b: Vec<&str> = b.iter().enumerate()
+            .filter(|(_, s)| s.as_str() == "-map")
+            .map(|(i, _)| b[i + 1].as_str()).collect();
+        assert_eq!(maps_b, vec!["0:0", "0:3"]);
     }
 
     /// Cover-art: a 2nd video stream (mjpeg) must be ignored — the FIRST video wins.

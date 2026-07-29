@@ -160,6 +160,8 @@ interface FastStreamPlayerProps {
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
   const [subMenu, setSubMenu] = useState(false);
+  const [audioMenu, setAudioMenu] = useState(false);
+  const [audioSwitching, setAudioSwitching] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
   // Settings panel state
@@ -1527,7 +1529,7 @@ interface FastStreamPlayerProps {
   // positionable on the bar like any chip, but it can never live inside the tray
   // popover (it IS the popover) and must always be present somewhere on the bar.
   const TRAY = '__tray__';
-  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'captions', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
+  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'captions', 'audio', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
   const barLayout = useMemo(() => {
     const raw = settings.playerBarLayout ?? { left: [], right: [], tray: [] };
     const seen = new Set<string>();
@@ -1760,6 +1762,46 @@ interface FastStreamPlayerProps {
             </div>
           )}
         </div> };
+      case 'audio': {
+        // Audio-track menu — visual twin of the captions chip. Hidden entirely
+        // when the file has ≤1 audio track (no dead UI). Switching rebuilds the
+        // pipeline like a seek and NEVER unpauses a paused player.
+        const aTracks = msePlayer.audioTracks;
+        if (aTracks.length <= 1) return { label: 'Audio', el: null };
+        const nonDefaultActive = msePlayer.activeAudioTrackId != null
+          && aTracks.some(t => t.id === msePlayer.activeAudioTrackId && !t.isDefault);
+        return { label: 'Audio', el:
+        <div className="relative">
+          <button onClick={(e) => { e.stopPropagation(); setAudioMenu(m => !m); }} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${nonDefaultActive ? 'text-nobuf-primary' : 'text-white'}`} title="Audio track">
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+          </button>
+          {audioMenu && (
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
+              {aTracks.map((t) => (
+                <button
+                  key={t.id}
+                  disabled={audioSwitching || !t.playable}
+                  onClick={async () => {
+                    setAudioMenu(false);
+                    if (t.id === msePlayer.activeAudioTrackId) return;
+                    setAudioSwitching(true);
+                    const ok = await msePlayer.switchAudioTrack(t.id);
+                    setAudioSwitching(false);
+                    if (!ok) toast.error('Audio switch failed — reverted');
+                  }}
+                  className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${
+                    t.id === msePlayer.activeAudioTrackId
+                      ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold'
+                      : t.playable ? 'text-white' : 'text-white/40 cursor-not-allowed'
+                  }`}
+                >
+                  {t.label}{!t.playable ? ' (unsupported)' : ''}
+                </button>
+              ))}
+            </div>
+          )}
+        </div> };
+      }
       case 'loop': return { label: 'Loop', el:
         <button onClick={() => setLoop(l => !l)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${loop ? 'text-nobuf-primary' : 'text-white'}`} title={loop ? 'Loop on' : 'Loop off'}>
           <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
