@@ -115,6 +115,10 @@ export class MediabunnyTransmuxer {
   private audioTrackInfo: TransmuxerTrackInfo | null = null;
   private videoCodec: VideoCodec | null = null;
   private audioCodec: AudioCodec | null = null;
+  // User-selected audio track id (mediabunny InputTrack.id). null = primary.
+  // Consumed by resolveAudioTrack() at init and in the seekTo() hot path, so a
+  // switch = set this + rebuild from playhead (audio-track-selection plan §3).
+  private desiredAudioTrackId: number | null = null;
   private ebmlHeaderData: Uint8Array | null = null;
   private lastProcessedTime: number = 0;
   private seekAbortFlag = false;
@@ -423,9 +427,9 @@ export class MediabunnyTransmuxer {
       if (videoTrack) this.extractMkvCueIndex(videoTrack);
 
       const t3 = performance.now();
-      diagLog(`[Transmuxer] init: calling getPrimaryAudioTrack()`);
-      const audioTrack = await this.input.getPrimaryAudioTrack();
-      diagLog(`[Transmuxer] init: getPrimaryAudioTrack()=${audioTrack ? 'found' : 'null'} took ${((performance.now() - t3)/1000).toFixed(1)}s`);
+      diagLog(`[Transmuxer] init: calling resolveAudioTrack()`);
+      const audioTrack = await this.resolveAudioTrack(this.input);
+      diagLog(`[Transmuxer] init: resolveAudioTrack()=${audioTrack ? 'found' : 'null'} took ${((performance.now() - t3)/1000).toFixed(1)}s`);
 
       this.videoCodec = videoTrack ? await videoTrack.getCodec() : null;
       this.audioCodec = audioTrack ? await audioTrack.getCodec() : null;
@@ -1318,7 +1322,8 @@ export class MediabunnyTransmuxer {
 
       // Get tracks
       const videoTrack = await this.input.getPrimaryVideoTrack();
-      const audioTrack = await this.input.getPrimaryAudioTrack();
+      // Honors the user's audio selection (desiredAudioTrackId); primary otherwise.
+      const audioTrack = await this.resolveAudioTrack(this.input);
 
       if (!videoTrack) {
         throw new Error('No video track found after seek');
@@ -1665,6 +1670,92 @@ export class MediabunnyTransmuxer {
    *  seek after collecting enough segments (a few frames). */
   abortSeek(): void {
     this.seekAbortFlag = true;
+  }
+
+  // ══════════════ Audio track selection (plan §3, MKV tier) ══════════════
+
+  /** Resolve the audio track honoring the user's selection; falls back to the
+   *  primary track when no selection was made or the id no longer resolves. */
+  private async resolveAudioTrack(input: NonNullable<typeof this.input>) {
+    if (this.desiredAudioTrackId != null) {
+      try {
+        const all = await input.getAudioTracks();
+        const picked = all.find(t => t.id === this.desiredAudioTrackId);
+        if (picked) return picked;
+        diagLog(`[Transmuxer] desired audio track id=${this.desiredAudioTrackId} not found — falling back to primary`);
+      } catch (e: any) {
+        diagLog(`[Transmuxer] getAudioTracks failed (${e?.message}) — falling back to primary`);
+      }
+    }
+    return input.getPrimaryAudioTrack();
+  }
+
+  /** Enumerate audio tracks with menu metadata. Cheap on the persistent MKV
+   *  Input (metadata/Cues already parsed — plan I1; timing logged to verify). */
+  async getAudioTracks(): Promise<Array<{
+    id: number; language: string; name: string | null; codec: string;
+    channels: number; isDefault: boolean; codecParameterString: string | null;
+  }>> {
+    if (!this.input) return [];
+    const t0 = performance.now();
+    try {
+      const tracks = await this.input.getAudioTracks();
+      const out = [];
+      for (const t of tracks) {
+        const [language, name, codec, channels, disposition, cps] = await Promise.all([
+          t.getLanguageCode(), t.getName(), t.getCodec(),
+          t.getNumberOfChannels(), t.getDisposition(), t.getCodecParameterString(),
+        ]);
+        out.push({
+          id: t.id,
+          language: language ?? 'und',
+          name,
+          codec: (codec as string | null) ?? 'unknown',
+          channels: channels ?? 0,
+          isDefault: !!disposition?.default,
+          codecParameterString: cps,
+        });
+      }
+      diagLog(`[Transmuxer] getAudioTracks: ${out.length} track(s) in ${(performance.now() - t0).toFixed(0)}ms`);
+      return out;
+    } catch (e: any) {
+      diagLog(`[Transmuxer] getAudioTracks failed: ${e?.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Select the audio track for all FUTURE seekTo() runs and re-derive the
+   * codec-dependent state (audioCodec, audioTrackInfo, mimeType — a different
+   * track may use a different codec, H1). Returns the NEW combined mimeType
+   * (caller decides plain rebuild vs changeType vs reroute via planAudioSwitch)
+   * or null when the track can't be resolved/derived.
+   */
+  async setDesiredAudioTrack(trackId: number | null): Promise<string | null> {
+    const prev = this.desiredAudioTrackId;
+    this.desiredAudioTrackId = trackId;
+    if (!this.input) return this.mimeType || null;
+    try {
+      const audioTrack = await this.resolveAudioTrack(this.input);
+      const videoCodecString = this.videoTrackInfo?.codecParameterString ?? null;
+      this.audioCodec = audioTrack ? await audioTrack.getCodec() : null;
+      const audioCodecString = audioTrack ? await audioTrack.getCodecParameterString() : null;
+      this.audioTrackInfo = audioTrack ? {
+        codec: this.audioCodec || 'unknown',
+        type: 'audio',
+        sampleRate: await audioTrack.getSampleRate(),
+        channels: await audioTrack.getNumberOfChannels(),
+        language: await audioTrack.getLanguageCode(),
+        codecParameterString: audioCodecString,
+      } : null;
+      this.mimeType = this.buildMimeType(videoCodecString, audioCodecString, this.videoCodec, this.audioCodec);
+      diagLog(`[Transmuxer] setDesiredAudioTrack(${trackId}): codec=${this.audioCodec}, mime=${this.mimeType}`);
+      return this.mimeType || null;
+    } catch (e: any) {
+      diagLog(`[Transmuxer] setDesiredAudioTrack(${trackId}) failed: ${e?.message} — reverting to previous selection`);
+      this.desiredAudioTrackId = prev;
+      return null;
+    }
   }
 
   /**

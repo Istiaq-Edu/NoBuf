@@ -81,6 +81,11 @@ pub struct TelegramState {
     /// has probed the file we cache the true value here so /fmp4/metadata can prefer
     /// it. Only populated for files that went through the remux probe.
     pub probed_durations: Arc<tokio::sync::RwLock<HashMap<i32, f64>>>,
+    /// Memoized /audio_tracks probe result (serialized JSON) keyed by
+    /// message_id. A file's stream layout is immutable, and each probe costs an
+    /// ffprobe pass over the (possibly uncached, rate-limited) stream — memoize
+    /// so menu re-opens and player re-inits don't re-probe.
+    pub audio_tracks_json: Arc<tokio::sync::RwLock<HashMap<i32, String>>>,
     /// PTS-tail-derived duration (seconds) keyed by message_id. Computing this
     /// requires downloading the last 512KB of the file from Telegram to read the
     /// final video PTS. That value never changes for a given file, but the
