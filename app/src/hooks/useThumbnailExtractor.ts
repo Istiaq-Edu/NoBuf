@@ -1620,6 +1620,9 @@ export function useThumbnailExtractor(
   const pipelineRef = useRef<ThumbnailPipeline | null>(null);
   const transmuxerPipelineRef = useRef<TransmuxerThumbnailPipeline | null>(null);
   const fmp4PipelineRef = useRef<Fmp4ThumbnailPipeline | null>(null);
+  // MP4-HEVC→/remux reroute: hover thumbnails via backend /thumb (server-side
+  // ffmpeg single-frame JPEG). No client pipeline — just a serialized fetch.
+  const remuxThumbBusyRef = useRef(false);
   
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -2169,7 +2172,49 @@ export function useThumbnailExtractor(
             continue;
           }
 
-          if (fmp4Pipeline && fmp4Pipeline.ready && !fmp4Pipeline.busy) {
+          // MP4-HEVC→/remux reroute: server-side /thumb JPEG fetch. Placed
+          // FIRST — when this config is set no client pipeline exists for the
+          // file (WebView2 can't decode HEVC), so it's the only capture path.
+          const remuxThumbCfg = getters?.getRemuxThumbConfig?.() ?? null;
+          if (remuxThumbCfg) {
+            if (remuxThumbBusyRef.current) {
+              await new Promise(r => setTimeout(r, 150));
+              continue;
+            }
+            remuxThumbBusyRef.current = true;
+            try {
+              const { baseUrl, folderId, messageId, token, duration } = remuxThumbCfg;
+              const url = `${baseUrl}/thumb/${folderId}/${messageId}?token=${encodeURIComponent(token)}&time=${bucket}` +
+                (duration > 0 ? `&duration=${duration}` : '');
+              const resp = await fetch(url);
+              if (resp.ok) {
+                const blob = await resp.blob();
+                const dataUrl = await new Promise<string>((resolve, reject) => {
+                  const fr = new FileReader();
+                  fr.onload = () => resolve(fr.result as string);
+                  fr.onerror = () => reject(fr.error);
+                  fr.readAsDataURL(blob);
+                });
+                // Only store if the hover is still near this bucket (stale
+                // guard: user may have scrubbed away during the fetch).
+                frameBufferRef.current.set(bucket, dataUrl);
+                insertionOrderRef.current.push(bucket);
+                evictIfNeeded();
+                forceUpdateCachedTimes();
+              } else if (resp.status === 429) {
+                // Another hover's ffmpeg is running server-side — retry soon.
+                await new Promise(r => setTimeout(r, 400));
+              } else {
+                console.warn(`[ThumbnailExtractor] /thumb HTTP ${resp.status} for t=${bucket}`);
+                await new Promise(r => setTimeout(r, 1000));
+              }
+            } catch (e) {
+              console.warn('[ThumbnailExtractor] /thumb fetch failed:', e);
+              await new Promise(r => setTimeout(r, 1000));
+            } finally {
+              remuxThumbBusyRef.current = false;
+            }
+          } else if (fmp4Pipeline && fmp4Pipeline.ready && !fmp4Pipeline.busy) {
             // fMP4 backend pipeline (TS→fMP4): fetches segments from backend by timestamp
             console.log('[ThumbnailExtractor] Hover: calling fMP4 captureAtTime for time', desiredTime);
             const captured = await fmp4Pipeline.captureAtTime(

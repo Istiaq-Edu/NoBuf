@@ -109,6 +109,62 @@ export function shouldUseRemuxSeek(
 }
 
 /**
+ * Is this MP4 codec string a member of the HEVC family? Covers plain HEVC
+ * (hvc1/hev1) AND Dolby Vision HEVC (dvh1/dvhe) — DV profiles 5/8 are HEVC
+ * bitstreams with DV RPU metadata, so the same /remux transcode path applies.
+ * Pure + exported for testing.
+ */
+export function isHevcFamilyCodec(codec: string | null | undefined): boolean {
+  if (!codec) return false;
+  const c = codec.toLowerCase();
+  return c.startsWith('hvc1') || c.startsWith('hev1') || c.startsWith('dvh1') || c.startsWith('dvhe');
+}
+
+/**
+ * Compute the BYTE-FORWARD (start_byte) estimate for a /remux seek, or
+ * undefined when byte-forward must NOT be used.
+ *
+ * Byte-forward feeds ffmpeg [TS init_prefix + raw /stream bytes from the
+ * offset] via stdin — that is ONLY valid when the underlying /stream content
+ * is real MPEG-TS (timed_id3 files). For MKV and MP4 sources the /stream
+ * bytes are Matroska/ISOBMFF: feeding a mid-file slice to ffmpeg's stdin
+ * dies instantly with "Invalid data found" (execution-proven), so those
+ * sources must always seek with ffmpeg `-ss` over the seekable HTTP input.
+ * Pure + exported for testing.
+ */
+export function computeRemuxSeekStartByte(
+  sourceIsTs: boolean,
+  timeSeconds: number,
+  durationSeconds: number,
+  fileSizeBytes: number,
+): number | undefined {
+  if (!sourceIsTs) return undefined;
+  if (!Number.isFinite(timeSeconds) || timeSeconds <= 0) return undefined;
+  if (!(durationSeconds > 0) || !(fileSizeBytes > 0)) return undefined;
+  return Math.round((timeSeconds / durationSeconds) * fileSizeBytes);
+}
+
+/**
+ * Can this runtime's MSE actually decode HEVC? True only when the HEVC Video
+ * Extensions are installed (WebView2 uses Edge's Media Foundation path —
+ * verified: stock machines return false even with PlatformHEVCDecoderSupport).
+ * Sent to /remux as `hevc_ok` so 8-bit HEVC can be `-c:v copy`'d instead of
+ * transcoded for the users who CAN decode it. Probe string = Main profile
+ * L4.1 — the common 8-bit case (10-bit is always transcoded server-side
+ * regardless of this hint). Pure-ish (reads MediaSource) + exported for testing.
+ */
+export function hevcMseSupported(
+  isTypeSupported: (mime: string) => boolean = (m) =>
+    typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(m),
+): boolean {
+  try {
+    return isTypeSupported('video/mp4; codecs="hvc1.1.6.L123.B0"');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Should the 10s proactive-position reporter SKIP this tick for a /remux stream?
  * For remux, `video.currentTime` is source-ABSOLUTE (ffmpeg emits absolute PTS,
  * _dtsBase pinned to 0), so the linear byte estimate is normally valid and MUST
@@ -811,6 +867,15 @@ export interface MSEGetters {
     duration: number;
     fileSize: number;
   } | null;
+  // MP4-HEVC→/remux reroute — when set, hover thumbnails come from the
+  // backend /thumb endpoint (server-side ffmpeg single-frame JPEG grab).
+  getRemuxThumbConfig: () => {
+    baseUrl: string;
+    folderId: string;
+    messageId: string;
+    token: string;
+    duration: number;
+  } | null;
 }
 
 const FRAGMENT_SIZES = [
@@ -1407,6 +1472,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const needsRemuxSeekRef = useRef(false);
   // Base remux URL (no ss) used to build seek URLs; set alongside needsRemuxSeek.
   const remuxSeekBaseUrlRef = useRef<string | null>(null);
+  // TRUE only when the underlying /stream bytes are real MPEG-TS (timed_id3):
+  // gates BYTE-FORWARD (start_byte) remux seeks. MKV/MP4 sources leave this
+  // false and always seek via ffmpeg -ss (mid-file Matroska/ISOBMFF bytes fed
+  // to ffmpeg stdin die with "Invalid data found" — execution-proven).
+  const remuxSourceIsTsRef = useRef(false);
+  // Set synchronously when onMP4BoxReady reroutes an MP4-HEVC file to /remux.
+  // The MP4 init callers (fetchMoovFromTail / forward scan / faststart path)
+  // check `state.current.initialized` after appendBuffer and fall back to
+  // NATIVE when it's false — this flag tells them the pipeline was handed to
+  // mpegts.js instead, so they must not touch anything.
+  const reroutedToRemuxRef = useRef(false);
   const mpegtsRecreationGenRef = useRef(0);
   // Ref to store fMP4 config for thumbnail pipeline — set during initTsFmp4Pipeline
   const fmp4ConfigRef = useRef<{
@@ -1417,6 +1493,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     mimeType: string; // e.g. 'video/mp4; codecs="avc1.64001f,mp4a.40.2"'
     duration: number;
     fileSize: number;
+  } | null>(null);
+  // Server-side hover thumbnail config for the MP4-HEVC→/remux reroute tier.
+  // When set, useThumbnailExtractor fetches JPEGs from the backend /thumb
+  // endpoint (ffmpeg single-frame grab) instead of decoding client-side —
+  // stock WebView2 has no HEVC decode (same reason the reroute exists).
+  const remuxThumbConfigRef = useRef<{
+    baseUrl: string;
+    folderId: string;
+    messageId: string;
+    token: string;
+    duration: number;
   } | null>(null);
   // Current byte offset for the fMP4 download loop — stored as a ref so the
   // seek handler can update it and restart the loop from the new position.
@@ -1770,6 +1857,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       fmp4CurrentTimeRef.current = 0;
       fmp4ExpectedStartTimeRef.current = 0;
       fmp4ConfigRef.current = null;
+      remuxThumbConfigRef.current = null;
       setIsTransmuxerActive(false);
       clearDownloadedRanges();
       seekOffsetRef.current = 0;
@@ -1849,6 +1937,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     mpegtsVideoOnlyRef.current = false;
     needsRemuxSeekRef.current = false;
     remuxSeekBaseUrlRef.current = null;
+    remuxSourceIsTsRef.current = false;
+    reroutedToRemuxRef.current = false;
     mpegtsRecreationGenRef.current++; // invalidate any in-flight recreations
     byteTimeSamplesRef.current = [];
     seekOffsetRef.current = 0;
@@ -1869,6 +1959,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     fmp4CurrentTimeRef.current = 0;
     fmp4ExpectedStartTimeRef.current = 0;
     fmp4ConfigRef.current = null;
+    remuxThumbConfigRef.current = null;
     setIsTransmuxerActive(false);
     clearDownloadedRanges();
     // ── Clear persistent window flags ──
@@ -2530,7 +2621,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const meta = await metaPromise;
           if (meta?.has_timed_id3 && parsed) {
             diagLog('[MSE] Backend reports timed_id3 metadata stream — using ffmpeg remux (mpegts output) via mpegts.js');
-            const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+            const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcMseSupported()}`;
             diagLog(`[MSE] Routing to remux: ${remuxUrl}`);
             remuxUrlRef.current = remuxUrl;
             // Route SEEKS through the /remux endpoint using BYTE-FORWARD seeking
@@ -2546,6 +2637,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // &start_byte= (see that fn + seek-issues-findings.md "Option 2").
             needsRemuxSeekRef.current = true;
             remuxSeekBaseUrlRef.current = remuxUrl;
+            // timed_id3 /stream IS real MPEG-TS → byte-forward seeks are valid.
+            remuxSourceIsTsRef.current = true;
             // Don't use native fallback — the /remux endpoint now outputs MPEG-TS
             // which mpegts.js can play directly with full features (seeking, progress bar).
             // Fall through to the mpegts.js init path below with the remux URL.
@@ -2642,7 +2735,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // transmuxer fallback → ffmpeg /remux endpoint (outputs MPEG-TS) played
         // with mpegts.js. Same pipeline as the timed_id3 TS path.
         if ((mkvCodec === 'hevc' || mkvCodec === 'avc') && parsed) {
-          const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`;
+          // hevc_ok tells the backend this runtime CAN decode HEVC via MSE
+          // (HEVC Video Extensions installed) → 8-bit HEVC gets -c:v copy
+          // instead of a transcode. Stock WebView2 sends false.
+          const hevcOk = hevcMseSupported();
+          const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
           diagLog(`[MSE] mkv (${mkvCodec}) — routing to ffmpeg remux → mpegts.js: ${remuxUrl}`);
           remuxUrlRef.current = remuxUrl;
           // MKV /stream/ is Matroska, NOT MPEG-TS — byte-seeking it feeds the TS
@@ -2650,6 +2747,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // (timed_id3 does NOT set this: its /stream/ is real TS, byte-seek works.)
           needsRemuxSeekRef.current = true;
           remuxSeekBaseUrlRef.current = remuxUrl;
+          remuxSourceIsTsRef.current = false; // Matroska: ss-only seeks
 
           if (!shadowCacheRef.current) {
             shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
@@ -2889,6 +2987,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // while the metadata endpoint is still downloading the tail for PTS.
     let knownDuration: number | undefined = file?.duration ? file.duration : undefined;
 
+    // MP4-HEVC reroute: the moov atom already gave the EXACT duration
+    // (state.current.duration, set in onMP4BoxReady BEFORE the codec check
+    // failed and rerouted here). Use it instead of the 4Mbps estimate — it
+    // also suppresses the /fmp4/metadata retry loop below (log 1-c: player
+    // created with 2926.0s estimate while moov said 6267.712s, UI flashed
+    // 6267 → 2926 → 6267).
+    const durationFromMoov = reroutedToRemuxRef.current && state.current.duration > 0;
+    if (!knownDuration && durationFromMoov) {
+      knownDuration = state.current.duration;
+      (window as any).__nobuf_ptsDuration = knownDuration;
+      (window as any).__nobuf_durationIsEstimate = false;
+      diagLog(`[MPEGTS] Using exact moov duration: ${knownDuration.toFixed(3)}s (MP4 reroute — skipping 4Mbps estimate)`);
+    }
+
     // Estimate duration from bitrate+filesize so the player can start immediately.
     // ~4Mbps is typical for Telegram video. This estimate is close enough for
     // lazyLoadMaxDuration and seek bar. The real duration from /fmp4/metadata
@@ -2948,13 +3060,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // Caches raw TS bytes in JS memory (no SourceBuffer quota limit).
     // When mpegts.js seeks back to already-fetched positions, the fetch
     // interceptor serves bytes from memory — 0ms HTTP round-trip.
-    const urlKey = `/stream/${activeFolderId}/${file?.id}`;
-    const fileLen = state.current.fileLength || knownFilesize || 0;
+    // urlKey MUST match the URL mpegts.js actually fetches:
+    //  - remux tiers (timed_id3 / MKV-HEVC / MP4-HEVC reroute): the calling
+    //    branch already reset the cache to the /remux pathname with
+    //    fileLength=0 (remux output length is unknown — the interceptor
+    //    stays inert). Do NOT stomp it here with a /stream key + the
+    //    SOURCE file's length (log 1-c:42: urlKey=/stream/null/84 while
+    //    the player fetched /remux/home/84).
+    //  - plain TS: key on parsed.folderId — activeFolderId is null for
+    //    named folders ("home"), which built "/stream/null/84" and silently
+    //    disabled the cache for every named-folder TS play.
+    const isRemuxSource = new URL(streamUrl).pathname.startsWith('/remux/');
     if (!shadowCacheRef.current) {
       shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024); // 300MB budget
     }
-    shadowCacheRef.current.reset(urlKey, fileLen);
-    diagLog(`[MPEGTS] Shadow cache initialized: urlKey=${urlKey}, fileLength=${fileLen}`);
+    const fileLen = state.current.fileLength || knownFilesize || 0;
+    if (!isRemuxSource) {
+      const urlKey = `/stream/${parsed.folderId}/${parsed.messageId}`;
+      shadowCacheRef.current.reset(urlKey, fileLen);
+      diagLog(`[MPEGTS] Shadow cache initialized: urlKey=${urlKey}, fileLength=${fileLen}`);
+    } else {
+      diagLog(`[MPEGTS] Shadow cache: keeping remux key ${shadowCacheRef.current.urlKey} (interceptor inert — remux length unknown)`);
+    }
 
     // Seed byteToTimeTableRef with baseline anchors (0,0) and (fileLength, duration)
     // so byteToTime() uses monotonic interpolation instead of raw linear mapping.
@@ -3140,7 +3267,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // When the real duration arrives, we update mediaSource.duration.
       // With Semaphore(1), the tail download naturally alternates with
       // /stream and PROACTIVE — no FLOOD_PREMIUM_WAIT, no defer needed.
-      if (!file?.duration) {
+      // Skip when the moov atom already provided the exact duration (MP4
+      // reroute) — the estimate/probe dance is pointless and its "estimate →
+      // probed" updates would overwrite the exact value with ffprobe's less
+      // precise one, flashing the seek bar.
+      if (!file?.duration && !durationFromMoov) {
         const metaUrl = `${parsed.baseUrl}/fmp4/metadata/${parsed.folderId}/${parsed.messageId}?token=${parsed.token}&file_size=${state.current.fileLength}`;
         // The backend derives duration from the /remux ffprobe pass, which finishes
         // ~2s AFTER this first fetch — so the first response is often a bitrate
@@ -3287,6 +3418,24 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         if (formatRef.current === 'mkv') {
           diagLog('[MPEGTS] MKV — activating client-side transmuxer thumbnail pipeline (mediabunny)');
           setIsTransmuxerActive(true);
+          setThumbnailDataReady(true);
+        } else if (reroutedToRemuxRef.current) {
+          // MP4-HEVC reroute: the /fmp4 thumbnail endpoints parse the /stream
+          // cache as MPEG-TS, but this file's cache is ISOBMFF → guaranteed
+          // 500 ("Failed to extract stream info", log 1-t:145). And hover
+          // thumbnails would need WebCodecs HEVC decode, which stock WebView2
+          // lacks — same reason we rerouted. Instead, use the backend /thumb
+          // endpoint: ffmpeg decodes ONE frame server-side (`-ss t` over the
+          // Range-seekable /stream input — works on unbuffered regions, exact
+          // frame, VBR-proof) and returns a JPEG. See remux_hover_thumb.
+          remuxThumbConfigRef.current = {
+            baseUrl: parsed.baseUrl,
+            folderId: parsed.folderId,
+            messageId: parsed.messageId,
+            token: parsed.token,
+            duration: knownDuration || estimatedDurationS,
+          };
+          diagLog('[MPEGTS] MP4 reroute — server-side /thumb hover thumbnails activated');
           setThumbnailDataReady(true);
         } else {
           fmp4ConfigRef.current = {
@@ -3699,9 +3848,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // of the playhead. is_player_downloading is set based on whether the
       // IOController is actively fetching (buffer not full).
       const _fileIdForProactive = file?.id;
-      const _folderIdForProactive = activeFolderId;
+      const _folderIdForProactive = activeFolderId; // null = "home" (Saved Messages) — backend accepts Option
       const _fileSizeForProactive = state.current.fileLength;
-      if (_fileIdForProactive && _folderIdForProactive && _fileSizeForProactive && !isPausedRef.current) {
+      if (_fileIdForProactive && _fileSizeForProactive && !isPausedRef.current) {
         proactivePrebufferMsgIdRef.current = _fileIdForProactive;
         const proactiveInterval = setInterval(async () => {
           const v = videoRef.current;
@@ -4556,9 +4705,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       //    The prebuffer uses try_acquire + player_actively_downloading to yield
       //    to /stream, so it won't compete for the rate limiter budget.
       const _fileId = file?.id;
-      const _folderId = activeFolderId;
+      const _folderId = activeFolderId; // null = "home" — backend accepts Option
       const _fileSize = state.current.fileLength;
-      if (_fileId && _folderId && _fileSize && mpegtsDurationRef.current > 0) {
+      if (_fileId && _fileSize && mpegtsDurationRef.current > 0) {
         invoke('cmd_report_playback_position', {
           messageId: _fileId,
           folderId: _folderId,
@@ -5013,19 +5162,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const gen = ++mpegtsRecreationGenRef.current;
     const wasPaused = isPausedRef.current || video.paused;
 
-    // Build the seek URL. Prefer BYTE-FORWARD (start_byte) so the backend feeds
-    // ffmpeg via stdin instead of `-ss` — the latter fails to seek uncached
-    // Telegram /stream data (empty output → infinite load; logs 4-t/5-t). The
-    // byte offset uses the same linear time→byte estimate the proactive reporter
-    // uses below (Math.round(t/dur * fileSize)); the backend TS-aligns it and
-    // ffmpeg resyncs to the first keyframe. Falls back to ss= if we lack a valid
-    // fileLength/duration (e.g. cached file / MKV where -ss works).
+    // Build the seek URL. BYTE-FORWARD (start_byte) is used ONLY when the
+    // underlying /stream bytes are real MPEG-TS (timed_id3) — the backend
+    // feeds ffmpeg [init_prefix + /stream bytes] via stdin, which avoids the
+    // `-ss`-over-uncached-HTTP failure (logs 4-t/5-t). For MKV/MP4 sources the
+    // /stream bytes are Matroska/ISOBMFF and a mid-file slice on stdin dies
+    // with "Invalid data found" (execution-proven), so those ALWAYS seek with
+    // ffmpeg -ss over the seekable HTTP input. The byte offset uses the same
+    // linear time→byte estimate the proactive reporter uses below; the backend
+    // TS-aligns it and ffmpeg resyncs to the first keyframe.
     const _seekDur = mpegtsDurationRef.current || state.current.duration || 0;
     const _seekFileSize = state.current.fileLength;
-    const startByteEstimate =
-      _seekFileSize > 0 && _seekDur > 0
-        ? Math.round((timeSeconds / _seekDur) * _seekFileSize)
-        : undefined;
+    const startByteEstimate = computeRemuxSeekStartByte(
+      remuxSourceIsTsRef.current, timeSeconds, _seekDur, _seekFileSize);
     const seekUrl = buildRemuxSeekUrl(baseUrl, timeSeconds, startByteEstimate);
     if (!seekUrl) {
       diagLog('[MPEGTS] Remux seek: could not build seek URL — bailing');
@@ -5375,10 +5524,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // it's close enough to steer the downloader to the right region.
       if (!isPausedRef.current) {
         const _fileId = file?.id;
-        const _folderId = activeFolderId;
+        const _folderId = activeFolderId; // null = "home" — backend accepts Option
         const _fileSize = state.current.fileLength;
         const _dur = mpegtsDurationRef.current || state.current.duration || 0;
-        if (_fileId && _folderId !== null && _fileSize > 0 && _dur > 0) {
+        if (_fileId && _fileSize > 0 && _dur > 0) {
           proactivePrebufferMsgIdRef.current = _fileId;
           const seekByte = Math.round((timeSeconds / _dur) * _fileSize);
           invoke('cmd_report_playback_position', {
@@ -6230,9 +6379,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       console.log('[MSE] Moov append result: nextFileStart=' + moovResult);
 
       // If onReady hasn't fired yet, try forward scan as fallback.
+      // (Skip everything if onReady DID fire but rerouted to /remux — the
+      // MP4 pipeline is dead and mpegts.js owns the video element now.)
+      if (reroutedToRemuxRef.current) return;
       if (!state.current.initialized && !cancelledRef.current) {
         console.log('[MSE] onReady did not fire after first chunk + moov, trying forward scan');
         await fetchMoreDataForwardScan(url, mp4box);
+        if (reroutedToRemuxRef.current) return;
       }
 
       // 3. CRITICAL: Re-append the first chunk clone. After Step 1,
@@ -6251,7 +6404,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         mp4box.flush();
       }
 
-      if (!state.current.initialized && !cancelledRef.current) {
+      if (!state.current.initialized && !cancelledRef.current && !reroutedToRemuxRef.current) {
         console.error('[MSE] onReady did not fire after moov-from-tail — falling back to native playback');
         setUseNative(true);
       }
@@ -6312,6 +6465,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const MAX_PREFETCH = 10 * 1024 * 1024;
 
     while (!cancelledRef.current && !state.current.initialized &&
+           !reroutedToRemuxRef.current &&
            state.current.currentOffset < state.current.fileLength &&
            state.current.currentOffset < MAX_PREFETCH) {
 
@@ -6342,7 +6496,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
     }
 
-    if (!state.current.initialized && !cancelledRef.current) {
+    if (!state.current.initialized && !cancelledRef.current && !reroutedToRemuxRef.current) {
       console.error('[MSE] moov not found after forward scan — falling back to native playback');
       setUseNative(true);
     }
@@ -6425,6 +6579,74 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
 
     console.log('[MSE] Audio prefetch complete — fetched up to offset=' + offset);
+  };
+
+  /** Reroute an MP4 whose video codec MSE can't decode (HEVC family on stock
+   *  WebView2) to the ffmpeg /remux → mpegts.js tier — the same battle-tested
+   *  pipeline MKV-HEVC uses. Called from onMP4BoxReady AFTER MP4Box/MediaSource
+   *  are live, so it must quiesce the whole MP4 pipeline first:
+   *  streaming chain → mp4box → SourceBuffers → progress counters → blob URL.
+   *  The /stream bytes for MP4 are ISOBMFF (NOT MPEG-TS), so seeks use
+   *  ffmpeg `-ss` only (remuxSourceIsTs=false) — never byte-forward. */
+  const rerouteMp4ToRemux = async (url: string, mediaSource: MediaSource, mp4box: MP4BoxFile, videoCodec: string) => {
+    const parsed = parseStreamUrl(streamUrlRef.current ?? url);
+    if (!parsed) {
+      diagLog('[MSE] MP4-HEVC reroute: could not parse stream URL — cannot reroute');
+      return false;
+    }
+    // Mark the reroute SYNCHRONOUSLY so the MP4 init callers (fetchMoovFromTail
+    // / forward scan) that resume after onMP4BoxReady returns see it and skip
+    // their "onReady did not fire → native fallback" paths.
+    reroutedToRemuxRef.current = true;
+
+    // ── Quiesce the MP4 pipeline ──
+    stopStreamingChain();
+    try { mp4box.stop(); } catch { /* not started yet — fine */ }
+    try { (mp4box as any).onSegment = null; (mp4box as any).onReady = null; (mp4box as any).onError = null; } catch { /* defensive */ }
+    state.current.mp4box = null;
+    state.current.videoSourceBuffer?.destroy();
+    state.current.audioSourceBuffer?.destroy();
+    state.current.videoSourceBuffer = null;
+    state.current.audioSourceBuffer = null;
+    // Reset progress/prefetch counters seeded by the MP4 path (first chunk +
+    // moov tail fetch) so the green bar starts clean on the remux timeline.
+    clearDownloadedRanges();
+    setPrefetchedBytes(0);
+    state.current.currentOffset = 0;
+
+    const hevcOk = hevcMseSupported();
+    const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
+    diagLog(`[MSE] mp4 (${videoCodec}) — MSE can't decode, rerouting to ffmpeg remux → mpegts.js: ${remuxUrl}`);
+    remuxUrlRef.current = remuxUrl;
+    // MP4 /stream/ is ISOBMFF, NOT MPEG-TS — byte-forward would feed ffmpeg
+    // stdin mid-file MP4 bytes ("Invalid data found", execution-proven).
+    needsRemuxSeekRef.current = true;
+    remuxSeekBaseUrlRef.current = remuxUrl;
+    remuxSourceIsTsRef.current = false; // ISOBMFF: ss-only seeks
+
+    if (!shadowCacheRef.current) {
+      shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
+    }
+    shadowCacheRef.current.reset(new URL(remuxUrl).pathname, 0);
+
+    // Extend the MSE init timeout — remux needs download + ffprobe + ffmpeg startup.
+    transmuxerInitInProgressRef.current = true;
+
+    // Clear mseUrl BEFORE mpegts.js init — mpegts.js sets video.src to its own
+    // MediaSource blob; leaving mseUrl set would make FastStreamPlayer overwrite
+    // video.src back to our (now dead) blob on the next render.
+    setMseUrl(null);
+
+    // Cold-start overlay stays up through remux startup; MEDIA_INFO resolves it.
+    let coldResolve: () => void = () => {};
+    const coldPromise = new Promise<void>((resolve) => { coldResolve = resolve; });
+    coldStartDeferredRef.current = { resolve: coldResolve, promise: coldPromise };
+    setIsColdStartBuffering(true);
+    setColdStartPhase('initializing_player');
+    setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for remux
+
+    await _initMpegtsPlayer(remuxUrl, mediaSource, '', parsed);
+    return true;
   };
 
   const onMP4BoxReady = (info: MP4BoxInfo, url: string, mediaSource: MediaSource, mp4box: MP4BoxFile, _blobUrl: string) => {
@@ -6518,25 +6740,37 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           state.current.videoSourceBuffer = new SourceBufferWrapper(sb);
           console.log(`[MSE] Video SourceBuffer created, sourceBuffers.length=${mediaSource.sourceBuffers.length}`);
         } else {
-          // MSE doesn't support this codec. Check if native <video> can play it.
+          // MSE doesn't support this codec. HEVC family (incl. Dolby Vision
+          // dvh1/dvhe) → reroute to the ffmpeg /remux → mpegts.js tier, the
+          // same pipeline MKV-HEVC already uses. ffmpeg transcodes to H.264
+          // (HW-accelerated when available) so playback is free for everyone.
           const canPlay = videoRef.current?.canPlayType(mimeType) ?? '';
           console.warn(`[MSE] Video codec NOT supported by MSE: ${mimeType}`);
           console.log(`[MSE] Native canPlayType("${mimeType}") = "${canPlay}"`);
+          if (isHevcFamilyCodec(videoCodec)) {
+            // onMP4BoxReady is sync (called from mp4box.appendBuffer) — fire
+            // the async reroute and let it own the pipeline from here. Bail
+            // out of the MP4 path entirely: initialized stays false, and
+            // reroutedToRemuxRef stops the callers' native fallback.
+            rerouteMp4ToRemux(url, mediaSource, mp4box, videoCodec).catch((e: any) => {
+              console.error('[MSE] MP4-HEVC reroute failed:', e);
+              if (!cancelledRef.current) {
+                const msg = 'This HEVC video could not be played. You can download it and use an external player.';
+                setUnsupportedCodec(msg);
+                setError(msg);
+              }
+            });
+            return;
+          }
           if (canPlay === 'probably' || canPlay === 'maybe') {
             // Native <video> can handle this codec — fall back to native playback.
             // Native <video> handles moov-at-end files via Range requests naturally.
             console.log(`[MSE] Falling back to native playback — codec "${videoCodec}" is natively supported (${canPlay})`);
             setUseNative(true);
           } else {
-            // Neither MSE nor native <video> supports this codec.
-            const codecName = videoCodec.startsWith('hvc1') || videoCodec.startsWith('hev1')
-              ? 'HEVC (H.265)'
-              : videoCodec.startsWith('av01')
-                ? 'AV1'
-                : videoCodec;
-            const isHevc = videoCodec.startsWith('hvc1') || videoCodec.startsWith('hev1');
+            // Neither MSE, /remux, nor native <video> supports this codec.
+            const codecName = videoCodec.startsWith('av01') ? 'AV1' : videoCodec;
             const msg = `This video uses ${codecName} codec which is not supported by the built-in player.` +
-              (isHevc ? ' On Windows, install "HEVC Video Extensions" from the Microsoft Store ($0.99) for in-app playback.' : '') +
               ' You can download the video and play it with your preferred video player.';
             console.error(`[MSE] Codec completely unsupported: ${videoCodec}`);
             setUnsupportedCodec(msg);
@@ -6987,10 +7221,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    */
   const startMp4ProactiveReporter = () => {
     const fileId = file?.id;
-    const folderId = activeFolderId;
+    const folderId = activeFolderId; // null = "home" (Saved Messages) — backend accepts Option
     const fileSize = state.current.fileLength;
     // Only MP4 (mp4box) playback; never TS (mpegts) or MKV (transmuxer).
-    if (!fileId || folderId === null || !fileSize || fileSize <= 0) return;
+    if (!fileId || !fileSize || fileSize <= 0) return;
     if (isPausedRef.current) return;
     // Don't stack intervals — one reporter per file.
     if (proactiveIntervalRef.current) return;
@@ -7542,8 +7776,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // linear byte estimate for the target time; the backend refines from its
         // own reads. MKV-only — TS uses its periodic reporter + byte-offset index.
         {
-          const _fid = file?.id, _folder = activeFolderId, _fsz = state.current.fileLength;
-          if (_fid && _folder !== null && _fsz > 0 && state.current.duration > 0) {
+          const _fid = file?.id, _folder = activeFolderId, _fsz = state.current.fileLength; // _folder null = "home"
+          if (_fid && _fsz > 0 && state.current.duration > 0) {
             // Prefer the REAL VBR cluster byte from mediabunny's parsed Cues; fall
             // back to the linear estimate only if the cue index is unavailable.
             const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(clampedTime) ?? -1;
@@ -8011,10 +8245,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // never silently un-pauses a user-paused prebuffer ("paused means paused").
       if (!isPausedRef.current) {
         const fileId = file?.id;
-        const folderId = activeFolderId;
+        const folderId = activeFolderId; // null = "home" — backend accepts Option
         const fileSize = state.current.fileLength;
         const dur = state.current.duration || 0;
-        if (fileId && folderId !== null && fileSize > 0 && dur > 0) {
+        if (fileId && fileSize > 0 && dur > 0) {
           proactivePrebufferMsgIdRef.current = fileId;
           invoke('cmd_report_playback_position', {
             messageId: fileId,
@@ -8121,9 +8355,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
       // Restart proactive prebuffer reporting interval
       const _fileId = file?.id;
-      const _folderId = activeFolderId;
+      const _folderId = activeFolderId; // null = "home" — backend accepts Option
       const _fileSize = state.current.fileLength;
-      if (_fileId && _folderId && _fileSize && !proactiveIntervalRef.current) {
+      if (_fileId && _fileSize && !proactiveIntervalRef.current) {
         proactivePrebufferMsgIdRef.current = _fileId;
         const proactiveInterval = setInterval(async () => {
           const v = videoRef.current;
@@ -8219,6 +8453,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const getFormatCb = useCallback(() => formatRef.current, []);
   const isFmp4StreamCb = useCallback(() => fmp4PipelineActiveRef.current, []);
   const getFmp4ConfigCb = useCallback(() => fmp4ConfigRef.current, []);
+  const getRemuxThumbConfigCb = useCallback(() => remuxThumbConfigRef.current, []);
 
   // Fetch the backend's TS keyframe index so resume/seek/trim use authoritative
   // byte-time positions instead of noisy frontend samples.
@@ -8352,6 +8587,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     getTransmuxerSourceConfig: () => transmuxerRef.current?.getSourceConfig() ?? null,
     isFmp4Stream: isFmp4StreamCb,
     getFmp4Config: getFmp4ConfigCb,
+    getRemuxThumbConfig: getRemuxThumbConfigCb,
     isColdStartBuffering,
     coldStartProgress,
     coldStartPhase,
