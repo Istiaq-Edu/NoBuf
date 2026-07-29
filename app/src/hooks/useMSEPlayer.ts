@@ -185,6 +185,75 @@ export function shouldSkipRemuxPositionReport(
 }
 
 /**
+ * Was this player already fetching from the /remux tier? Used as the loop
+ * guard for the TS-HEVC fatal-error recovery: a failure ON the /remux tier
+ * itself must never re-recover to /remux (would loop forever) — it falls to
+ * the native last resort instead. Pure + exported for testing.
+ */
+export function isAlreadyRemuxUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  try {
+    return new URL(url).pathname.startsWith('/remux/');
+  } catch {
+    return url.includes('/remux/');
+  }
+}
+
+/**
+ * Classify an mpegts.js MediaMSEError info object: is it a FATAL SourceBuffer
+ * CREATION failure (MediaSource.addSourceBuffer threw — e.g. HEVC codec string
+ * on a stock WebView2 without HEVC Video Extensions), as opposed to a
+ * recoverable appendBuffer/quota error?
+ *
+ * WHY MESSAGE MATCHING: WebView2 DOMException `code` is unreliable — the quota
+ * case is PROVEN to arrive as code=0/name=undefined (see the MediaMSEError
+ * handler), so the legacy numeric code alone cannot discriminate. Chromium's
+ * message shapes are stable:
+ *   - addSourceBuffer: "Failed to execute 'addSourceBuffer' on 'MediaSource':
+ *     The type provided ('video/mp4;codecs=hvc1…') is unsupported."
+ *   - quota: "…'appendBuffer' on 'SourceBuffer': The SourceBuffer is full…"
+ * Quota shapes MUST return false. Pure + exported for testing.
+ */
+export function isFatalSourceBufferCreationError(info: any): boolean {
+  const msg = String(info?.msg ?? info?.message ?? '');
+  // Recoverable quota shapes — never fatal.
+  if (/quota|appendBuffer|is full/i.test(msg)) return false;
+  if (info?.code === 9) return true; // DOMException.NOT_SUPPORTED_ERR (when reported)
+  return /addSourceBuffer|NotSupportedError|is unsupported|not supported/i.test(msg);
+}
+
+/**
+ * Decide how (whether) to recover a failed TS playback to the /remux →
+ * mpegts.js tier (the battle-tested timed_id3 pipeline: ffmpeg transcodes
+ * HEVC→H.264 when the runtime can't decode it, full seek/prebuffer support).
+ *
+ *  - 'skip': recovery must not run — the failing player was ALREADY on /remux
+ *    (loop guard) or a recovery was already attempted for this file load
+ *    (one-shot guard). Caller falls to the native last resort.
+ *  - 'seek': playback had progressed (≥8s decoded) and the byte-forward
+ *    machinery has what it needs (duration + fileLength) — resume near the
+ *    playhead via the remux-seek recreate path.
+ *  - 'init': cold start from 0 via the timed_id3 init pattern.
+ * Pure + exported for testing.
+ */
+export function planRemuxRecovery(args: {
+  failedUrl: string | null | undefined;
+  alreadyAttempted: boolean;
+  currentTime: number;
+  duration: number;
+  fileLength: number;
+}): { action: 'skip' | 'init' | 'seek'; time?: number } {
+  if (args.alreadyAttempted || isAlreadyRemuxUrl(args.failedUrl)) return { action: 'skip' };
+  if (
+    Number.isFinite(args.currentTime) && args.currentTime >= 8 &&
+    args.duration > 0 && args.fileLength > 0
+  ) {
+    return { action: 'seek', time: args.currentTime };
+  }
+  return { action: 'init' };
+}
+
+/**
  * Decide how to dispatch an unbuffered transmuxer seek: run it now ('execute')
  * or hold it for the debounce timer ('defer').
  *
@@ -1483,6 +1552,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // NATIVE when it's false — this flag tells them the pipeline was handed to
   // mpegts.js instead, so they must not touch anything.
   const reroutedToRemuxRef = useRef(false);
+  // TS-HEVC fatal-error recovery guards. attempted = one-shot per file load
+  // (a second fatal falls to the native last resort); active = the current
+  // mpegts player IS the recovered /remux tier (routes hover thumbnails to
+  // the server-side /thumb endpoint, same as the MP4-HEVC reroute).
+  const remuxRecoveryAttemptedRef = useRef(false);
+  const remuxRecoveryActiveRef = useRef(false);
   const mpegtsRecreationGenRef = useRef(0);
   // Ref to store fMP4 config for thumbnail pipeline — set during initTsFmp4Pipeline
   const fmp4ConfigRef = useRef<{
@@ -1939,6 +2014,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     remuxSeekBaseUrlRef.current = null;
     remuxSourceIsTsRef.current = false;
     reroutedToRemuxRef.current = false;
+    remuxRecoveryAttemptedRef.current = false;
+    remuxRecoveryActiveRef.current = false;
     mpegtsRecreationGenRef.current++; // invalidate any in-flight recreations
     byteTimeSamplesRef.current = [];
     seekOffsetRef.current = 0;
@@ -3056,6 +3133,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     (window as any).__nobuf_mpegtsFatalAbort = false;
     mpegtsFailedRef.current = false;
 
+    // While the MEDIA_INFO wait below is pending, this rejects it immediately
+    // on a fatal error (CodecUnsupported / addSourceBuffer failure) instead of
+    // dead-waiting the full 60s timeout. Nulled once MEDIA_INFO resolves, so
+    // the ERROR handler can tell pending-init failures (reject → caller runs
+    // the remux recovery) from post-init failures (recover inline).
+    let initFailReject: ((e: Error) => void) | null = null;
+
     // ── Shadow cache: JS-side byte cache for instant seeks ──
     // Caches raw TS bytes in JS memory (no SourceBuffer quota limit).
     // When mpegts.js seeks back to already-fetched positions, the fetch
@@ -3121,11 +3205,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             return;
           }
 
-          // Check if video.error is already set — if so, this is a FATAL decode
-          // error, NOT a SourceBuffer quota issue. appendBuffer fails because
-          // the media element is in an error state. Recovery is impossible.
-          if (video.error) {
-            diagLog(`[MPEGTS] FATAL: video.error is set (code=${video.error.code}), aborting — not a quota issue`);
+          // FATAL detection, two shapes:
+          //  (a) video.error set — decode error; appendBuffer fails because the
+          //      media element is in an error state. Recovery is impossible.
+          //  (b) SourceBuffer CREATION failure — MediaSource.addSourceBuffer
+          //      threw (e.g. codecs="hvc1…" on stock WebView2 without HEVC
+          //      Video Extensions). video.error is typically NOT set here; the
+          //      old quota treatment (suspend + wait for eviction) hung forever
+          //      because no SourceBuffer exists to evict.
+          const fatalSbCreation = isFatalSourceBufferCreationError(_errorInfo);
+          if (video.error || fatalSbCreation) {
+            diagLog(`[MPEGTS] FATAL: ${video.error
+              ? `video.error is set (code=${video.error.code})`
+              : `SourceBuffer creation failed (${_errorInfo?.msg ?? 'no msg'})`} — aborting, not a quota issue`);
             (window as any).__nobuf_bufferFullDetected = false;
             mpegtsFailedRef.current = true;
             mpegtsPlayerRef.current = null;
@@ -3161,10 +3253,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               (window as any).__nobuf_mpegtsFatalAbort = false;
               diagLog('[MPEGTS] FATAL cleanup complete — player destroyed');
 
-              // Fall back to /remux/ (ffmpeg TS→MP4) since mpegts.js can't handle
-              // this file (e.g., AAC-LATM/LOAS parser bugs produce corrupted audio).
-              // The /remux/ endpoint uses ffmpeg which handles all audio formats correctly.
+              // If the MEDIA_INFO wait is still pending, reject it — the
+              // caller (initTransmuxerPlayer) sees init fail and runs the
+              // remux recovery / native fallback chain itself. Recovering
+              // HERE too would double-init.
+              if (initFailReject) {
+                const rej = initFailReject;
+                initFailReject = null;
+                rej(new Error(`mpegts.js fatal media error${fatalSbCreation ? ' (SourceBuffer creation failed)' : ''}`));
+                return;
+              }
+
+              // Post-init fatal. FIRST try recovering to the /remux →
+              // mpegts.js tier (ffmpeg transcodes what MSE can't decode;
+              // keeps seeking/prebuffer/thumbnails — the timed_id3 pipeline).
+              // Falls through to native only when recovery is not possible
+              // (already on /remux, already attempted, or URL unparseable).
               const video2 = videoRef.current;
+              // Capture the playhead BEFORE the reset (src='' zeroes it) so
+              // the recovery can resume near the position instead of from 0.
+              const resumeT = video2?.currentTime ?? 0;
               if (video2) {
                 try {
                   video2.src = '';
@@ -3172,20 +3280,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   video2.load();
                 } catch (_) {}
               }
-              // Defence-in-depth: prefer the live streamUrlRef over the
-              // closure-captured `parsed` if the user has switched files since
-              // this FATAL handler was registered. Falls back to `parsed` if
-              // streamUrlRef is somehow null or unparseable.
-              const liveUrl = streamUrlRef.current;
-              const liveParsed = liveUrl ? parseStreamUrl(liveUrl) : null;
-              const useParsed = liveParsed ?? parsed;
-              const remuxUrl = `${useParsed.baseUrl}/remux/${useParsed.folderId}/${useParsed.messageId}?token=${encodeURIComponent(useParsed.token)}`;
-              if (liveParsed && liveParsed.messageId !== parsed.messageId) {
-                diagLog(`[MPEGTS] FATAL: file switched mid-handler — using live URL (msg ${liveParsed.messageId}, not stale msg ${parsed.messageId})`);
-              }
-              diagLog(`[MPEGTS] FATAL: falling back to ffmpeg remux: ${remuxUrl}`);
-              remuxUrlRef.current = remuxUrl;
-              setUseNative(true);
+              void (async () => {
+                if (await _recoverToRemuxTier(streamUrl, 'fatal media error', resumeT)) return;
+                // Defence-in-depth: prefer the live streamUrlRef over the
+                // closure-captured `parsed` if the user has switched files since
+                // this FATAL handler was registered. Falls back to `parsed` if
+                // streamUrlRef is somehow null or unparseable.
+                const liveUrl = streamUrlRef.current;
+                const liveParsed = liveUrl ? parseStreamUrl(liveUrl) : null;
+                const useParsed = liveParsed ?? parsed;
+                const remuxUrl = `${useParsed.baseUrl}/remux/${useParsed.folderId}/${useParsed.messageId}?token=${encodeURIComponent(useParsed.token)}&hevc_ok=${hevcMseSupported()}`;
+                if (liveParsed && liveParsed.messageId !== parsed.messageId) {
+                  diagLog(`[MPEGTS] FATAL: file switched mid-handler — using live URL (msg ${liveParsed.messageId}, not stale msg ${parsed.messageId})`);
+                }
+                diagLog(`[MPEGTS] FATAL: falling back to ffmpeg remux (native): ${remuxUrl}`);
+                remuxUrlRef.current = remuxUrl;
+                setUseNative(true);
+              })();
             }, 0);
             return;
           }
@@ -3208,6 +3319,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         diagLog(`[MPEGTS] Error: type=${errorType}, detail=${errorDetail}`);
         // Codec unsupported or other media errors ARE fatal — fall back
         if (errorDetail === 'CodecUnsupported') {
+          if (mpegtsFailedRef.current) return; // re-entry guard (double emission)
           diagLog('[MPEGTS] Codec unsupported — detaching and falling back');
           try {
             player.detachMediaElement();
@@ -3216,6 +3328,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           } catch (_) {}
           mpegtsPlayerRef.current = null;
           mpegtsFailedRef.current = true;
+          if (initFailReject) {
+            // Init still pending: reject the MEDIA_INFO wait NOW instead of
+            // dead-waiting the 60s timeout. The caller (initTransmuxerPlayer)
+            // then runs the remux recovery / native fallback chain.
+            const rej = initFailReject;
+            initFailReject = null;
+            rej(new Error('mpegts.js codec unsupported'));
+          } else {
+            // Post-init: recover to the /remux tier directly (ffmpeg
+            // transcodes what this runtime can't decode). setTimeout(0) lets
+            // mpegts.js's pending promise chains drain post-destroy. Playhead
+            // captured now — the recovery resets the video element.
+            const resumeT = video.currentTime || 0;
+            setTimeout(() => {
+              void _recoverToRemuxTier(streamUrl, 'codec unsupported', resumeT);
+            }, 0);
+          }
         }
       });
 
@@ -3389,11 +3518,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // The outer MSE init timeout extends up to 120s; this inner timeout
         // must be long enough to not fire before the remux pipeline starts.
         const timeout = setTimeout(() => {
+          initFailReject = null;
           reject(new Error('mpegts.js initialization timeout (60s)'));
         }, 60000);
 
+        // Fatal errors (CodecUnsupported / addSourceBuffer failure) reject
+        // immediately via this hook instead of dead-waiting the 60s timeout.
+        initFailReject = (e: Error) => {
+          clearTimeout(timeout);
+          reject(e);
+        };
+
         player.on(MpegtsPlayer.Events.MEDIA_INFO, (info: any) => {
           clearTimeout(timeout);
+          initFailReject = null;
           mediaInfo = info;
           diagLog(`[MPEGTS] Media info: duration=${info.duration}s, codec=${info.videoCodec},${info.audioCodec}`);
           resolve();
@@ -3419,15 +3557,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           diagLog('[MPEGTS] MKV — activating client-side transmuxer thumbnail pipeline (mediabunny)');
           setIsTransmuxerActive(true);
           setThumbnailDataReady(true);
-        } else if (reroutedToRemuxRef.current) {
-          // MP4-HEVC reroute: the /fmp4 thumbnail endpoints parse the /stream
-          // cache as MPEG-TS, but this file's cache is ISOBMFF → guaranteed
-          // 500 ("Failed to extract stream info", log 1-t:145). And hover
-          // thumbnails would need WebCodecs HEVC decode, which stock WebView2
-          // lacks — same reason we rerouted. Instead, use the backend /thumb
-          // endpoint: ffmpeg decodes ONE frame server-side (`-ss t` over the
-          // Range-seekable /stream input — works on unbuffered regions, exact
-          // frame, VBR-proof) and returns a JPEG. See remux_hover_thumb.
+        } else if (reroutedToRemuxRef.current || remuxRecoveryActiveRef.current) {
+          // MP4-HEVC reroute AND TS-HEVC fatal recovery: hover thumbnails
+          // can't be decoded client-side (WebCodecs/MSE lack HEVC — the very
+          // reason we're on this tier), and for the MP4 case the /fmp4
+          // endpoints parse the /stream cache as MPEG-TS but the cache is
+          // ISOBMFF → guaranteed 500 ("Failed to extract stream info",
+          // log 1-t:145). Instead, use the backend /thumb endpoint: ffmpeg
+          // decodes ONE frame server-side (`-ss t` over the Range-seekable
+          // /stream input — works on unbuffered regions, exact frame,
+          // VBR-proof) and returns a JPEG. See remux_hover_thumb.
           remuxThumbConfigRef.current = {
             baseUrl: parsed.baseUrl,
             folderId: parsed.folderId,
@@ -3896,6 +4035,113 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       transmuxerInitInProgressRef.current = false;
       return false;
     }
+  };
+
+  /**
+   * TS-HEVC fatal-error recovery: recreate playback on the /remux → mpegts.js
+   * tier (the battle-tested timed_id3 pipeline). ffmpeg transcodes what this
+   * runtime's MSE can't decode (HEVC without the Extensions → H.264) or
+   * copies when it can (hevc_ok=true), and the raw /stream bytes of a TS file
+   * ARE real MPEG-TS — so byte-forward seeks, proactive prebuffer, duration
+   * override and the quota guard all work exactly as on timed_id3 (e2e-proven).
+   *
+   * Returns true when recovery was started; false when the caller must fall
+   * back to the native last resort (already on /remux → loop guard; second
+   * attempt this load → one-shot guard; unparseable URL).
+   *
+   * `resumeTime` must be captured BEFORE the video element is reset (src=''
+   * zeroes currentTime).
+   */
+  const _recoverToRemuxTier = async (
+    failedUrl: string,
+    reason: string,
+    resumeTime?: number,
+  ): Promise<boolean> => {
+    const plan = planRemuxRecovery({
+      failedUrl,
+      alreadyAttempted: remuxRecoveryAttemptedRef.current,
+      currentTime: resumeTime ?? 0,
+      duration: mpegtsDurationRef.current || state.current.duration || 0,
+      fileLength: state.current.fileLength || 0,
+    });
+    if (plan.action === 'skip') {
+      diagLog(`[MPEGTS] Remux recovery SKIPPED (${reason}): ${
+        remuxRecoveryAttemptedRef.current ? 'already attempted this load' : 'failure was on the /remux tier itself'} — native last resort`);
+      return false;
+    }
+    // Live URL re-parse (file-switch defence — same pattern as the FATAL handler).
+    const liveUrl = streamUrlRef.current ?? failedUrl;
+    const parsed = parseStreamUrl(liveUrl);
+    if (!parsed) {
+      diagLog(`[MPEGTS] Remux recovery (${reason}): could not parse stream URL — native last resort`);
+      return false;
+    }
+    remuxRecoveryAttemptedRef.current = true;
+    remuxRecoveryActiveRef.current = true;
+
+    // Reset the video element — clears video.error (a dead media element
+    // rejects all future appendBuffer calls) and detaches any stale src.
+    // Idempotent when the caller already reset it.
+    const video = videoRef.current;
+    if (video) {
+      try {
+        video.src = '';
+        video.removeAttribute('src');
+        video.load();
+      } catch (_) {}
+    }
+
+    const hevcOk = hevcMseSupported();
+    const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
+    diagLog(`[MPEGTS] Remux recovery (${reason}): ${plan.action === 'seek'
+      ? `resuming near ${plan.time!.toFixed(1)}s` : 'cold start'} via ${remuxUrl}`);
+    remuxUrlRef.current = remuxUrl;
+    needsRemuxSeekRef.current = true;
+    remuxSeekBaseUrlRef.current = remuxUrl;
+    // The raw /stream bytes of a TS file ARE real MPEG-TS → byte-forward
+    // (start_byte) seeks are valid, exactly like timed_id3 (NOT like MKV/MP4).
+    remuxSourceIsTsRef.current = true;
+
+    if (plan.action === 'seek') {
+      // Resume near the playhead via the proven remux-seek recreate path
+      // (gen counter, pause preservation, align poll all built in).
+      const dur = mpegtsDurationRef.current || state.current.duration || 0;
+      _mpegtsRecreatePlayerForRemuxSeek(clampSeekTime(plan.time!, dur), dur);
+      return true;
+    }
+
+    // Cold start from 0 — mirror the timed_id3 init pattern.
+    if (!shadowCacheRef.current) {
+      shadowCacheRef.current = new StreamShadowCache(300 * 1024 * 1024);
+    }
+    // Remux output length is unknown → interceptor stays inert (len 0).
+    shadowCacheRef.current.reset(new URL(remuxUrl).pathname, 0);
+    // Extend the MSE init timeout — remux needs download + ffprobe + ffmpeg startup.
+    transmuxerInitInProgressRef.current = true;
+    // Clear mseUrl so FastStreamPlayer can't stomp video.src back to a dead blob.
+    setMseUrl(null);
+    // Cold-start overlay through remux startup; MEDIA_INFO resolves it.
+    let coldResolve: () => void = () => {};
+    const coldPromise = new Promise<void>((resolve) => { coldResolve = resolve; });
+    coldStartDeferredRef.current = { resolve: coldResolve, promise: coldPromise };
+    setIsColdStartBuffering(true);
+    setColdStartPhase('initializing_player');
+    setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for remux
+
+    const ok = await _initMpegtsPlayer(remuxUrl, undefined as unknown as MediaSource, '', parsed);
+    if (!ok) {
+      diagLog(`[MPEGTS] Remux recovery (${reason}): recovered init FAILED — native last resort`);
+      remuxRecoveryActiveRef.current = false;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+      return false;
+    }
+    // Paused means paused: if the user had paused before the fatal error,
+    // don't let the recovered player's autoplay unpause them.
+    if (isPausedRef.current) {
+      try { videoRef.current?.pause(); } catch (_) {}
+    }
+    return true;
   };
 
   /** Unbuffered seek for mpegts.js TS files.
@@ -6003,6 +6249,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Revoke the now-closed original blob URL so it doesn't leak.
       try { URL.revokeObjectURL(blobUrl); } catch (_) {}
 
+      // FIRST: try recovering to the /remux → mpegts.js tier (ffmpeg
+      // transcodes what MSE can't decode — HEVC-in-TS on stock WebView2;
+      // full seek/prebuffer/thumbnails, the proven timed_id3 pipeline).
+      // Only when that's not possible (init failed ON /remux already,
+      // recovery already attempted, unparseable URL) fall to native below —
+      // which CANNOT play the TS /remux output and exists purely as a
+      // last-resort for non-codec failures.
+      if (await _recoverToRemuxTier(url, 'mpegts init failed')) return;
+
       // BUGFIX: was `parseStreamUrl(url)` — `url` is closure-captured from
       // when this callback was originally registered, which can be a prior
       // file when the user switches mid-init. Use streamUrlRef for the live
@@ -6010,7 +6265,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const fallbackUrl = streamUrlRef.current ?? url;
       const parsedFallback = parseStreamUrl(fallbackUrl);
       if (parsedFallback) {
-        const remuxUrl = `${parsedFallback.baseUrl}/remux/${parsedFallback.folderId}/${parsedFallback.messageId}?token=${encodeURIComponent(parsedFallback.token)}`;
+        const remuxUrl = `${parsedFallback.baseUrl}/remux/${parsedFallback.folderId}/${parsedFallback.messageId}?token=${encodeURIComponent(parsedFallback.token)}&hevc_ok=${hevcMseSupported()}`;
         if (fallbackUrl !== url) {
           diagLog(`[MSE] fallback: file switched mid-init — using live URL for /remux (was ${url}, now ${fallbackUrl})`);
         }
