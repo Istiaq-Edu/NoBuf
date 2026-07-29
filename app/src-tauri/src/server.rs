@@ -2216,31 +2216,48 @@ async fn fmp4_keyframe_at(
 // M2TS prefix stripping moved to ts_demux (shared with the download loops).
 use crate::ts_demux::strip_m2ts_prefix;
 
-/// One-shot cached probe: does this machine's ffmpeg support the h264_qsv
-/// encoder AND can it actually open an encode session? (Presence in
-/// `-encoders` is not enough — driver/session init can still fail with
-/// texture error 80070057.) Spawns a tiny 1-frame encode of a lavfi source
-/// and checks exit 0. Computed once; reused for every /remux decision because
-/// the piped path streams bytes immediately and cannot fall back mid-stream.
-fn qsv_h264_available() -> bool {
-    static QSV_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *QSV_OK.get_or_init(|| {
+/// Probe whether a specific ffmpeg h264 hardware encoder can actually
+/// initialize on this machine (drivers + GPU present). Same one-shot pattern
+/// as the original QSV-only probe: encode 1 black frame to null.
+/// IMPORTANT: production args must stay a superset of these probe args plus
+/// only format conversion — unprobed tuning flags could fail on some drivers.
+fn h264_encoder_probe(ffmpeg_path: &std::path::Path, encoder: &str) -> bool {
+    let output = std::process::Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=black:s=64x64:d=1",
+            "-frames:v", "1",
+            "-c:v", encoder,
+            "-f", "null", "-",
+        ])
+        .output();
+    matches!(output, Ok(o) if o.status.success())
+}
+
+/// Pure encoder ladder selection — separated from the probe so it can be
+/// unit-tested. Order: QSV (Intel iGPU, most common) → NVENC → AMF → libx264.
+fn select_h264_encoder(probe: impl Fn(&str) -> bool) -> &'static str {
+    for enc in ["h264_qsv", "h264_nvenc", "h264_amf"] {
+        if probe(enc) {
+            return enc;
+        }
+    }
+    "libx264"
+}
+
+/// One-shot cached: the best available h264 encoder on this machine.
+/// QSV → NVENC → AMF → libx264 (universal software floor, ~6-8x realtime
+/// 1080p on a modern laptop CPU at veryfast).
+fn best_h264_encoder() -> &'static str {
+    static BEST: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    *BEST.get_or_init(|| {
         let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
             Ok(p) => p,
-            Err(_) => return false,
+            Err(_) => return "libx264",
         };
-        let output = std::process::Command::new(&ffmpeg_path)
-            .args([
-                "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "color=black:s=64x64:d=1",
-                "-frames:v", "1",
-                "-c:v", "h264_qsv",
-                "-f", "null", "-",
-            ])
-            .output();
-        let ok = matches!(output, Ok(o) if o.status.success());
-        log::info!("[REMUX-CAP] h264_qsv available: {}", ok);
-        ok
+        let enc = select_h264_encoder(|e| h264_encoder_probe(&ffmpeg_path, e));
+        log::info!("[REMUX-CAP] best h264 encoder: {}", enc);
+        enc
     })
 }
 
@@ -2359,11 +2376,61 @@ fn build_remux_audio_filter(is_seek: bool) -> String {
     }
 }
 
-fn build_video_encoder_args(needs_transcode: bool, qsv_ok: bool, video_codec: &str) -> (Vec<String>, Vec<String>) {
+/// Per-encoder codec args + the pixel format each encoder wants fed to it.
+/// Rate-control flags kept minimal/universal per encoder family so the probe
+/// (default args) stays representative of production.
+fn h264_encoder_output_args(encoder: &str) -> (Vec<String>, &'static str) {
+    match encoder {
+        "h264_qsv" => (
+            vec!["-c:v".into(), "h264_qsv".into(), "-global_quality".into(), "23".into()],
+            "nv12",
+        ),
+        "h264_nvenc" => (
+            vec!["-c:v".into(), "h264_nvenc".into(), "-cq".into(), "23".into(), "-b:v".into(), "0".into()],
+            "nv12",
+        ),
+        "h264_amf" => (
+            vec!["-c:v".into(), "h264_amf".into()],
+            "nv12",
+        ),
+        _ => (
+            vec!["-c:v".into(), "libx264".into(), "-preset".into(), "veryfast".into()],
+            "yuv420p",
+        ),
+    }
+}
+
+/// HDR→SDR tonemap chain (VERIFIED by execution on a real HDR10 clip:
+/// smpte2084 + bt2020 → hable → bt709, 2.55x realtime with SW decode +
+/// h264_qsv encode). zscale/tonemap need system-memory frames, so HDR always
+/// uses SOFTWARE decode regardless of the encoder (no tonemap_qsv in the
+/// bundled ffmpeg build — verified).
+fn build_hdr_tonemap_vf(pix_fmt: &str) -> String {
+    format!(
+        "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format={}",
+        pix_fmt
+    )
+}
+
+fn build_video_encoder_args(
+    needs_transcode: bool,
+    encoder: &str,
+    video_codec: &str,
+    is_hdr: bool,
+) -> (Vec<String>, Vec<String>) {
     if !needs_transcode {
         return (vec![], vec!["-c:v".into(), "copy".into()]);
     }
-    if qsv_ok && (video_codec == "hevc" || video_codec == "h265") {
+    let (enc_args, pix_fmt) = h264_encoder_output_args(encoder);
+    if is_hdr {
+        // HDR (VERIFIED): SW decode → linearize → hable tonemap → bt709 → encode.
+        // Without this, HDR10/HLG output washes out gray (is_hdr was previously
+        // detected but never consumed).
+        let mut out = vec!["-vf".into(), build_hdr_tonemap_vf(pix_fmt)];
+        out.extend(enc_args);
+        return (vec![], out);
+    }
+    if encoder == "h264_qsv" && (video_codec == "hevc" || video_codec == "h265") {
         // Variant A (VERIFIED): full-HW HEVC decode → VPP nv12 → h264_qsv encode.
         (
             vec![
@@ -2377,28 +2444,14 @@ fn build_video_encoder_args(needs_transcode: bool, qsv_ok: bool, video_codec: &s
                 "-global_quality".into(), "23".into(),
             ],
         )
-    } else if qsv_ok {
-        // Variant B (VERIFIED): software decode → nv12 → h264_qsv GPU encode.
-        // No -hwaccel: the input decoder stays software (we only verified the
-        // hevc_qsv HW decoder), but the encode still runs on the QSV block.
-        (
-            vec![],
-            vec![
-                "-vf".into(), "format=nv12".into(),
-                "-c:v".into(), "h264_qsv".into(),
-                "-global_quality".into(), "23".into(),
-            ],
-        )
     } else {
-        // Software fallback (VERIFIED): 5.87x realtime on the i9-13900H.
-        (
-            vec![],
-            vec![
-                "-c:v".into(), "libx264".into(),
-                "-preset".into(), "veryfast".into(),
-                "-pix_fmt".into(), "yuv420p".into(),
-            ],
-        )
+        // Variant B (VERIFIED for QSV; NVENC/AMF use the same shape): software
+        // decode → format convert → HW/SW encode. No -hwaccel: only the QSV HW
+        // decoder was execution-verified; SW decode is ~8x realtime for 1080p10
+        // and the encoder is the bottleneck anyway.
+        let mut out = vec!["-vf".into(), format!("format={}", pix_fmt)];
+        out.extend(enc_args);
+        (vec![], out)
     }
 }
 
@@ -2764,6 +2817,12 @@ async fn remux_ts_to_mp4(
     log::info!("[REMUX-PROBE] msg {}: needs_transcode={} is_hdr={} vcodec={} pix_fmt={} hevc_ok={}",
         message_id, needs_transcode, is_hdr, video_codec_name, video_pix_fmt, hevc_ok);
 
+    // Stash is_hdr for the /thumb endpoint (single-frame hover grabs need the
+    // tonemap decision but must not pay for their own ffprobe HDR probe).
+    if let Ok(mut m) = thumb_hdr_map().lock() {
+        m.insert(message_id, is_hdr);
+    }
+
     // ── Phase 2b: Choose strategy based on cache availability ──
 
     if cache_available {
@@ -2786,6 +2845,11 @@ async fn remux_ts_to_mp4(
             }
         };
         let mut cmd = TokioCommand::new(&ffmpeg_path);
+        // Same capability gate as Strategy B: copy what the player can decode,
+        // transcode what it can't (HEVC on stock WebView2). Without this, a
+        // fully-cached HEVC file would remux to an HEVC TS that MSE rejects.
+        let (a_pre_input_args, a_video_enc_args) =
+            build_video_encoder_args(needs_transcode, best_h264_encoder(), &video_codec_name, is_hdr);
         cmd.args([
             "-hide_banner",
             "-loglevel", "warning",
@@ -2795,13 +2859,18 @@ async fn remux_ts_to_mp4(
             // Shift all timestamps to start at zero — prevents negative DTS that
             // the MPEG-TS muxer rejects with EINVAL.
             "-avoid_negative_ts", "make_zero",
+        ]);
+        cmd.args(&a_pre_input_args);
+        cmd.args([
             "-i", &input_source,
             // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
             // Files with timed_id3 metadata may have the id3 stream as the first
             // audio stream; 0:a:0 would map the wrong stream → AAC muxing error.
             "-map", &format!("0:{}", video_stream_idx),
             "-map", &format!("0:{}", audio_stream_idx),
-            "-c:v", "copy",
+        ]);
+        cmd.args(&a_video_enc_args);
+        cmd.args([
             "-c:a", "aac", "-b:a", "192k",
             // Remap non-standard layouts (e.g. 5.1(side)) so AAC avoids a PCE
             // that Chromium MSE can't parse. See AAC_LAYOUT_FILTER.
@@ -2903,10 +2972,10 @@ async fn remux_ts_to_mp4(
                     .body(format!("ffmpeg not found: {}", e));
             }
         };
-        // Capability-based encoder selection (Option B). Decide QSV/libx264/copy
-        // BEFORE spawning — the piped stream can't fall back mid-flight.
+        // Capability-based encoder selection: ladder QSV→NVENC→AMF→libx264,
+        // decided BEFORE spawning — the piped stream can't fall back mid-flight.
         let (pre_input_args, video_enc_args) =
-            build_video_encoder_args(needs_transcode, qsv_h264_available(), &video_codec_name);
+            build_video_encoder_args(needs_transcode, best_h264_encoder(), &video_codec_name, is_hdr);
         log::info!("[REMUX] msg {}: piped stream — needs_transcode={} video_enc={:?}",
             message_id, needs_transcode, video_enc_args);
 
@@ -5298,6 +5367,179 @@ async fn fmp4_keyframes(
         .body(body)
 }
 
+/// Shared HDR flags for the hover-thumbnail endpoint, keyed by message_id.
+/// Populated by the /remux probe (which already ffprobes color metadata);
+/// read by /thumb so single-frame grabs know whether to tonemap without
+/// paying for their own HDR probe. Missing entry = assume SDR (worst case:
+/// washed-out 228px preview, never a failure).
+fn thumb_hdr_map() -> &'static StdMutex<HashMap<i32, bool>> {
+    static MAP: std::sync::OnceLock<StdMutex<HashMap<i32, bool>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Per-message hover-thumbnail serialization + in-flight time markers.
+/// One ffmpeg per message at a time; a second hover while one is running
+/// returns 429 so the frontend retry loop (which polls desiredHoverTimeRef)
+/// naturally coalesces to the LATEST hover position.
+fn thumb_inflight() -> &'static StdMutex<std::collections::HashSet<i32>> {
+    static SET: std::sync::OnceLock<StdMutex<std::collections::HashSet<i32>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+}
+
+/// Server-side hover thumbnail for /remux-tier files (HEVC and anything else
+/// the client can't decode: no WebCodecs/MSE HEVC in stock WebView2).
+///
+/// `GET /thumb/{folder}/{message}?token=..&t=SECONDS[&w=228]`
+///
+/// Decodes exactly ONE frame with ffmpeg `-ss T` BEFORE `-i`:
+///   - Input is the local cache file when the byte region for T is already
+///     cached (fast path, no network), otherwise the local /stream HTTP
+///     endpoint — ffmpeg Range-requests only the moov + the GOP around T,
+///     so UNBUFFERED parts of the video work without downloading the file.
+///   - `-ss` before `-i` uses the demuxer index (verified 9-14x realtime over
+///     HTTP tail-moov during research) and decodes from the previous keyframe,
+///     so the frame is exact, VBR-proof, and needs no byte↔time mapping.
+///   - HDR sources get the same verified tonemap chain as /remux (is_hdr is
+///     stashed by the /remux probe; missing = SDR).
+///
+/// Edge cases handled: concurrent hovers (429 + per-message serialization),
+/// t clamped to [0, duration), zero-size/unprobed files (400), ffmpeg failure
+/// or empty output (502 with stderr tail logged), 15s hard timeout (504),
+/// dead-client cleanup via kill_on_drop.
+#[get("/thumb/{folder_id}/{message_id}")]
+async fn remux_hover_thumb(
+    path: web::Path<(String, i32)>,
+    query: web::Query<Fmp4Query>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id) = path.into_inner();
+
+    // Token check + media resolve (also gives us total_size).
+    let sq = StreamQuery {
+        token: query.token.clone(), cached_only: None, duration: None,
+        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+    };
+    let (_media, total_size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if total_size == 0 {
+        return HttpResponse::BadRequest().body("Unknown file size");
+    }
+
+    let t = query.time.unwrap_or(0.0).max(0.0);
+    // Clamp to just inside the known duration (if the frontend sent one) so a
+    // hover at the very end doesn't make ffmpeg seek past EOF and emit nothing.
+    let t = match query.duration {
+        Some(d) if d > 1.0 => t.min(d - 0.5),
+        _ => t,
+    };
+
+    // Per-message serialization: one decode at a time. The hover loop retries,
+    // so dropping this request loses nothing.
+    {
+        let mut set = match thumb_inflight().lock() {
+            Ok(s) => s,
+            Err(_) => return HttpResponse::InternalServerError().body("lock poisoned"),
+        };
+        if !set.insert(message_id) {
+            return HttpResponse::TooManyRequests()
+                .insert_header(("Retry-After", "1"))
+                .body("Thumbnail extraction already in progress");
+        }
+    }
+    // Remove the in-flight marker on every exit path.
+    struct InflightGuard(i32);
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            if let Ok(mut s) = thumb_inflight().lock() { s.remove(&self.0); }
+        }
+    }
+    let _guard = InflightGuard(message_id);
+
+    // Input: local cache file when the whole file is cached (cheapest),
+    // otherwise our own /stream endpoint (Range-seekable; ffmpeg fetches only
+    // moov + the GOP around t — works on completely unbuffered regions).
+    let mut input_source = format!(
+        "http://127.0.0.1:{}/stream/{}/{}?token={}&source_id=thumbnail",
+        crate::STREAM_PORT, folder_id_str, message_id,
+        query.token.as_deref().unwrap_or("")
+    );
+    if let Some(ref cache_mgr) = **cache {
+        if let Some(meta) = cache_mgr.load_meta(message_id) {
+            if meta.is_complete() {
+                input_source = cache_mgr.data_path(message_id).to_string_lossy().to_string();
+            }
+        }
+    }
+
+    let is_hdr = thumb_hdr_map().lock().ok()
+        .and_then(|m| m.get(&message_id).copied())
+        .unwrap_or(false);
+
+    let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("ffmpeg unavailable: {}", e)),
+    };
+
+    let width = 228u32; // matches THUMBNAIL_WIDTH in useThumbnailExtractor.ts
+    let vf = if is_hdr {
+        // Same verified chain as /remux transcode, then scale for the preview.
+        format!("{},scale={}:-2", build_hdr_tonemap_vf("yuv420p"), width)
+    } else {
+        format!("scale={}:-2", width)
+    };
+
+    let mut cmd = TokioCommand::new(&ffmpeg_path);
+    cmd.args([
+        "-hide_banner", "-loglevel", "error",
+        "-ss", &format!("{:.3}", t),
+        "-i", &input_source,
+        "-frames:v", "1",
+        "-vf", &vf,
+        "-f", "mjpeg", "-q:v", "6",
+        "-",
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    let started = std::time::Instant::now();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        cmd.output().await
+    }).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            log::error!("[THUMB] msg {}: ffmpeg spawn failed: {}", message_id, e);
+            return HttpResponse::InternalServerError().body(format!("ffmpeg spawn failed: {}", e));
+        }
+        Err(_) => {
+            log::warn!("[THUMB] msg {} t={:.1}: ffmpeg timed out after 15s (uncached region on slow network)", message_id, t);
+            return HttpResponse::GatewayTimeout().body("Thumbnail extraction timed out");
+        }
+    };
+
+    if !output.status.success() || output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr.chars().rev().take(300).collect::<String>().chars().rev().collect();
+        log::warn!("[THUMB] msg {} t={:.1}: ffmpeg produced no frame (status={:?}): {}",
+            message_id, t, output.status.code(), tail.trim());
+        return HttpResponse::BadGateway().body("Failed to extract frame");
+    }
+
+    log::info!("[THUMB] msg {} t={:.1}: {}B JPEG in {:.1}s (hdr={} src={})",
+        message_id, t, output.stdout.len(), started.elapsed().as_secs_f32(), is_hdr,
+        if input_source.starts_with("http") { "stream" } else { "cache" });
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "image/jpeg"))
+        .insert_header(("Cache-Control", "max-age=3600"))
+        .body(output.stdout)
+}
+
 fn configure_fmp4(
     cfg: &mut web::ServiceConfig,
     fmp4_cache: web::Data<Fmp4InitCacheData>,
@@ -5373,6 +5615,7 @@ pub async fn start_streaming_server(
             .service(stream_media)
             .service(stream_media_head)
             .service(remux_ts_to_mp4)
+            .service(remux_hover_thumb)
             .configure(hls::configure_hls)
             .configure(crate::faststart::configure_faststart)
             .configure(|cfg| {
@@ -6073,6 +6316,107 @@ mod tests {
         let r = super::parse_probe_json(json);
         assert_eq!(r.video_stream_idx, 3, "must skip the index=-1 stream and pick idx 3");
         assert_eq!(r.audio_stream_idx, 4);
+    }
+
+    // ── Encoder ladder (Phase 2: QSV → NVENC → AMF → libx264) ──
+
+    #[test]
+    fn encoder_ladder_prefers_qsv_when_available() {
+        assert_eq!(super::select_h264_encoder(|_| true), "h264_qsv");
+    }
+
+    #[test]
+    fn encoder_ladder_falls_to_nvenc_then_amf() {
+        assert_eq!(super::select_h264_encoder(|e| e == "h264_nvenc"), "h264_nvenc");
+        assert_eq!(super::select_h264_encoder(|e| e == "h264_amf"), "h264_amf");
+        // NVIDIA machine where QSV probe fails but NVENC works:
+        assert_eq!(super::select_h264_encoder(|e| e != "h264_qsv"), "h264_nvenc");
+    }
+
+    #[test]
+    fn encoder_ladder_floor_is_libx264() {
+        // No hardware encoder at all → universal software floor. NEVER panics,
+        // NEVER returns an empty encoder (graceful-degradation guarantee).
+        assert_eq!(super::select_h264_encoder(|_| false), "libx264");
+    }
+
+    #[test]
+    fn encoder_output_args_carry_rate_control() {
+        let (qsv, pf) = super::h264_encoder_output_args("h264_qsv");
+        assert!(qsv.iter().any(|a| a == "h264_qsv"));
+        assert!(qsv.iter().any(|a| a == "-global_quality"), "QSV needs -global_quality (verified flags)");
+        assert_eq!(pf, "nv12");
+
+        let (nv, _) = super::h264_encoder_output_args("h264_nvenc");
+        assert!(nv.iter().any(|a| a == "-cq"), "NVENC constant-quality mode");
+
+        let (x264, pf) = super::h264_encoder_output_args("libx264");
+        assert!(x264.iter().any(|a| a == "veryfast"), "libx264 must use veryfast (8x realtime verified)");
+        assert_eq!(pf, "yuv420p");
+    }
+
+    // ── build_video_encoder_args: copy vs transcode vs HDR (Phase 3) ──
+
+    #[test]
+    fn no_transcode_is_pure_copy() {
+        let (pre, out) = super::build_video_encoder_args(false, "h264_qsv", "h264", false);
+        assert!(pre.is_empty(), "copy path must not add pre-input args");
+        assert_eq!(out, vec!["-c:v".to_string(), "copy".to_string()]);
+        // Even if is_hdr is true: no transcode → no tonemap (we never touch the stream).
+        let (_, out) = super::build_video_encoder_args(false, "h264_qsv", "hevc", true);
+        assert_eq!(out, vec!["-c:v".to_string(), "copy".to_string()]);
+    }
+
+    #[test]
+    fn hevc_qsv_sdr_uses_full_hw_variant_a() {
+        let (pre, out) = super::build_video_encoder_args(true, "h264_qsv", "hevc", false);
+        // Pre-input: HW decode session (verified: 12-14x realtime).
+        assert!(pre.iter().any(|a| a == "-hwaccel"), "variant A needs -hwaccel qsv before -i");
+        assert!(pre.iter().any(|a| a == "hevc_qsv"), "variant A uses the QSV HEVC decoder");
+        assert!(out.iter().any(|a| a == "vpp_qsv=format=nv12"), "GPU-side format convert (NOT hwupload)");
+        assert!(out.iter().any(|a| a == "h264_qsv"));
+    }
+
+    #[test]
+    fn hdr_always_software_decodes_and_tonemaps() {
+        // HDR10 → hable tonemap chain (execution-verified). zscale needs
+        // system-memory frames, so NO -hwaccel even on a QSV machine.
+        let (pre, out) = super::build_video_encoder_args(true, "h264_qsv", "hevc", true);
+        assert!(pre.is_empty(), "HDR must NOT use HW decode (zscale needs SW frames)");
+        let vf = out.iter().position(|a| a == "-vf").map(|i| out[i + 1].clone()).unwrap();
+        assert!(vf.contains("zscale=t=linear:npl=100"), "linearize before tonemap");
+        assert!(vf.contains("tonemap=hable"), "hable operator (verified chain)");
+        assert!(vf.contains("p=bt709:t=bt709:m=bt709"), "must land in bt709 SDR");
+        assert!(vf.ends_with("format=nv12"), "QSV encoder wants nv12, got: {}", vf);
+        assert!(out.iter().any(|a| a == "h264_qsv"), "still HW ENCODE (only decode is SW)");
+    }
+
+    #[test]
+    fn hdr_tonemap_matches_encoder_pix_fmt() {
+        // libx264 floor takes yuv420p, not nv12.
+        let (_, out) = super::build_video_encoder_args(true, "libx264", "hevc", true);
+        let vf = out.iter().position(|a| a == "-vf").map(|i| out[i + 1].clone()).unwrap();
+        assert!(vf.ends_with("format=yuv420p"));
+        assert!(out.iter().any(|a| a == "libx264"));
+    }
+
+    #[test]
+    fn non_qsv_transcode_uses_sw_decode_variant_b() {
+        // NVENC/AMF/libx264 machines: SW decode → format convert → encode.
+        for enc in ["h264_nvenc", "h264_amf", "libx264"] {
+            let (pre, out) = super::build_video_encoder_args(true, enc, "hevc", false);
+            assert!(pre.is_empty(), "{}: no pre-input hwaccel (only QSV decode verified)", enc);
+            assert!(out.iter().any(|a| a == enc), "{}: encoder present", enc);
+            assert!(out.iter().any(|a| a.starts_with("format=") || a == "-vf"), "{}: format convert present", enc);
+        }
+    }
+
+    #[test]
+    fn av1_and_unknown_codecs_transcode_but_via_variant_b() {
+        // AV1 in an MKV routed to /remux must not try hevc_qsv decode.
+        let (pre, out) = super::build_video_encoder_args(true, "h264_qsv", "av1", false);
+        assert!(pre.is_empty(), "non-HEVC input must not use the hevc_qsv decoder");
+        assert!(out.iter().any(|a| a == "h264_qsv"));
     }
 }
 

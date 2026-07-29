@@ -721,7 +721,11 @@ pub async fn cmd_get_cache_total_size(
 #[tauri::command]
 pub async fn cmd_report_playback_position(
     message_id: i32,
-    folder_id: i64,
+    // Option: None = Saved Messages / "home" (activeFolderId is null in the
+    // frontend for home files — resolve_peer maps None → get_me()). A non-Option
+    // i64 here silently disabled the proactive prebuffer for every home file:
+    // the frontend gated the call on folderId !== null and never reported.
+    folder_id: Option<i64>,
     current_time_s: f64,
     duration_s: f64,
     file_size: u64,
@@ -883,7 +887,7 @@ pub async fn cmd_stop_proactive_prebuffer(
 /// byte position (not the beginning of the file).
 async fn proactive_prebuffer_download(
     message_id: i32,
-    folder_id: i64,
+    folder_id: Option<i64>,
     start_byte: u64,
     max_ahead_byte: u64,
     client: grammers_client::Client,
@@ -899,7 +903,7 @@ async fn proactive_prebuffer_download(
         const MAX_SETUP_RETRIES: u32 = 3;
         loop {
             match (async {
-                let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
+                let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
                 let messages = client
                     .get_messages_by_id(&peer, &[message_id])
                     .await
@@ -1319,7 +1323,7 @@ async fn proactive_prebuffer_download(
                             let _lock = cache_mgr.lock_meta(message_id).await;
                             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,
-                                folder_id,
+                                folder_id: folder_id.unwrap_or(0), // 0 = home/Saved Messages sentinel
                                 total_size,
                                 filename: filename.clone(),
                                 cached_ranges: Vec::new(),
