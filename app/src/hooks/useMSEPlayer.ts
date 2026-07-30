@@ -253,6 +253,169 @@ export function planRemuxRecovery(args: {
   return { action: 'init' };
 }
 
+// ══════════════════ Audio track selection (pure helpers) ══════════════════
+
+/** One selectable audio track, normalized across tiers.
+ *  `id` is tier-native: ffprobe stream index (/remux), mediabunny track.id
+ *  (MKV), or mp4box track.id (MP4). */
+export interface AudioTrackInfo {
+  id: number;
+  label: string;
+  language: string;   // ISO 639-2 or '' / 'und' when untagged
+  codec: string;
+  channels: number;
+  isDefault: boolean;
+  /** False when this runtime's MSE can't play the codec in-place (H3):
+   *  the switch must reroute via /remux (ffmpeg→AAC) instead. */
+  playable: boolean;
+}
+
+/** ISO 639-2 → human name for the common cases; anything unknown passes
+ *  through uppercased ("POL") which is still meaningful in a menu. */
+const LANG_NAMES: Record<string, string> = {
+  eng: 'English', jpn: 'Japanese', chi: 'Chinese', zho: 'Chinese',
+  kor: 'Korean', spa: 'Spanish', por: 'Portuguese', fre: 'French',
+  fra: 'French', ger: 'German', deu: 'German', ita: 'Italian',
+  rus: 'Russian', hin: 'Hindi', ara: 'Arabic', tur: 'Turkish',
+  vie: 'Vietnamese', tha: 'Thai', ind: 'Indonesian', nld: 'Dutch',
+  dut: 'Dutch', pol: 'Polish', ukr: 'Ukrainian', ben: 'Bengali',
+};
+
+/** Channel count → familiar layout name. */
+function channelsLabel(channels: number): string {
+  switch (channels) {
+    case 1: return 'Mono';
+    case 2: return 'Stereo';
+    case 6: return '5.1';
+    case 8: return '7.1';
+    default: return channels > 0 ? `${channels}ch` : '';
+  }
+}
+
+/**
+ * Build the menu label for an audio track: "Japanese — AAC 5.1" style.
+ * Priority: explicit title/name > language name > "Track N".
+ * The codec/channel suffix is ALWAYS appended when known so duplicate
+ * languages (e.g. two "English" tracks) stay distinguishable (E9).
+ * Pure + exported for testing.
+ */
+export function buildAudioTrackLabel(args: {
+  title?: string;
+  language?: string;
+  codec?: string;
+  channels?: number;
+  /** 1-based position among audio tracks — fallback naming. */
+  position: number;
+}): string {
+  const lang = (args.language ?? '').toLowerCase();
+  const base =
+    (args.title && args.title.trim()) ||
+    (lang && lang !== 'und' ? (LANG_NAMES[lang] ?? lang.toUpperCase()) : '') ||
+    `Track ${args.position}`;
+  const codec = (args.codec ?? '').toUpperCase().replace(/^MP4A.*/, 'AAC');
+  const ch = channelsLabel(args.channels ?? 0);
+  const suffix = [codec, ch].filter(Boolean).join(' ');
+  return suffix ? `${base} — ${suffix}` : base;
+}
+
+/**
+ * Pick the initially-active audio track: persisted per-file choice (when it
+ * still exists AND is playable) > disposition default > first playable >
+ * first. Returns null for empty lists. Pure + exported for testing (E10).
+ */
+export function pickDefaultAudioTrack(
+  tracks: AudioTrackInfo[],
+  persistedId?: number | null,
+): AudioTrackInfo | null {
+  if (tracks.length === 0) return null;
+  if (persistedId != null) {
+    const p = tracks.find((t) => t.id === persistedId && t.playable);
+    if (p) return p;
+  }
+  return (
+    tracks.find((t) => t.isDefault && t.playable) ??
+    tracks.find((t) => t.playable) ??
+    tracks[0]
+  );
+}
+
+/**
+ * Decide the switch mechanism for a tier + target track (H1/H3, E7):
+ *  - 'rebuild'            — rebuild from playhead, SB type unchanged.
+ *  - 'rebuild-changetype' — rebuild + SourceBuffer.changeType(newMime) first
+ *                           (combined-SB tier whose audio codec changes).
+ *  - 'reroute-remux'      — target codec can't play in this runtime's MSE;
+ *                           switch by rerouting the file to /remux?audio_idx=N.
+ *  - 'reject'             — no valid path (e.g. track unknown).
+ * Pure + exported for testing.
+ */
+export function planAudioSwitch(args: {
+  tier: 'remux' | 'mkv' | 'mp4' | 'ts';
+  targetPlayable: boolean;
+  /** Combined-SB tiers only: current SB mime and the mime the new track needs. */
+  currentMime?: string | null;
+  newMime?: string | null;
+  isTypeSupportedFn?: (mime: string) => boolean;
+}): 'rebuild' | 'rebuild-changetype' | 'reroute-remux' | 'reject' {
+  if (args.tier === 'ts') return 'reject'; // mpegts.js: no selection (scope cut)
+  if (args.tier === 'remux') return 'rebuild'; // ffmpeg re-encodes → always AAC
+  if (!args.targetPlayable) return 'reroute-remux';
+  if (args.currentMime && args.newMime && args.currentMime !== args.newMime) {
+    const supported = args.isTypeSupportedFn
+      ? args.isTypeSupportedFn(args.newMime)
+      : (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(args.newMime));
+    return supported ? 'rebuild-changetype' : 'reroute-remux';
+  }
+  return 'rebuild';
+}
+
+/**
+ * Return `url` with `audio_idx` set to `idx` (or removed when idx is null) —
+ * idempotent, preserves every other query param. Applied at EVERY /remux URL
+ * construction site so seeks/recovery/reroute can never silently revert the
+ * user's chosen track (E11). Pure + exported for testing.
+ */
+export function withAudioIdx(url: string, idx: number | null | undefined): string {
+  try {
+    const u = new URL(url);
+    if (idx == null) u.searchParams.delete('audio_idx');
+    else u.searchParams.set('audio_idx', String(idx));
+    return u.toString();
+  } catch {
+    // Relative/unparseable — string fallback (test-covered).
+    const stripped = url.replace(/([?&])audio_idx=-?\d+&?/g, (_, sep) => sep)
+      .replace(/[?&]$/, '');
+    if (idx == null) return stripped;
+    return stripped + (stripped.includes('?') ? '&' : '?') + `audio_idx=${idx}`;
+  }
+}
+
+/** localStorage key + LRU-map helpers for the per-file audio choice (U2). */
+export const AUDIO_TRACK_STORE_KEY = 'nobuf-audio-track';
+const AUDIO_TRACK_STORE_CAP = 200;
+
+export function readPersistedAudioTrack(fileKey: string): number | null {
+  try {
+    const map = JSON.parse(localStorage.getItem(AUDIO_TRACK_STORE_KEY) ?? '{}');
+    const v = map[fileKey];
+    return typeof v === 'number' ? v : null;
+  } catch { return null; }
+}
+
+export function persistAudioTrack(fileKey: string, trackId: number): void {
+  try {
+    let map: Record<string, number>;
+    try { map = JSON.parse(localStorage.getItem(AUDIO_TRACK_STORE_KEY) ?? '{}') ?? {}; }
+    catch { map = {}; }
+    delete map[fileKey]; // re-insert → newest position
+    map[fileKey] = trackId;
+    const keys = Object.keys(map);
+    // Plain-object insertion order = LRU order (oldest first) — trim overflow.
+    for (let i = 0; i < keys.length - AUDIO_TRACK_STORE_CAP; i++) delete map[keys[i]];
+    localStorage.setItem(AUDIO_TRACK_STORE_KEY, JSON.stringify(map));
+  } catch { /* storage full/unavailable — non-fatal */ }
+}
+
 /**
  * Decide how to dispatch an unbuffered transmuxer seek: run it now ('execute')
  * or hold it for the debounce timer ('defer').
@@ -891,6 +1054,12 @@ interface MP4BoxTrack {
   height?: number;
   duration: number;
   timescale: number;
+  /** ISO-639 language from elng/mdhd (mp4box getInfo) — audio menu labels. */
+  language?: string;
+  /** hdlr name (often "SoundHandler" — filtered for labels). */
+  name?: string;
+  /** Audio sample-entry facts (mp4box getInfo track.audio). */
+  audio?: { sample_rate?: number; channel_count?: number; sample_size?: number };
 }
 
 /** mp4box.js instance interface (minimal typing) */
@@ -1264,6 +1433,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // the shadow cache. Playback now waits until the first 5MB are cached (or a
   // timeout fires), and the overlay is hidden exactly when playback begins.
   const [isColdStartBuffering, setIsColdStartBuffering] = useState(false);
+  // ── Audio track selection state ──
+  // Normalized track list for the UI menu (empty/1-elem → menu hidden), the
+  // active selection, and a single-flight guard so rapid switches can't race
+  // two rebuilds (plan E3/E4). Populated per tier: /remux via /audio_tracks,
+  // MKV via mediabunny getAudioTracks, MP4 via mp4box info.audioTracks.
+  const [audioTracks, setAudioTracks] = useState<AudioTrackInfo[]>([]);
+  const [activeAudioTrackId, setActiveAudioTrackId] = useState<number | null>(null);
+  const audioSwitchInFlightRef = useRef(false);
+  // MP4 tier switch = full teardown + fresh MP4Box re-init (plan §3 MP4, L3:
+  // mp4box seek() is global — in-place track swap rewinds the video cursor).
+  // Bumping this nonce re-runs the main init effect on the SAME streamUrl;
+  // mp4ResumeTimeRef carries the playhead across the rebuild.
+  const [mp4ReinitNonce, setMp4ReinitNonce] = useState(0);
+  const mp4ResumeTimeRef = useRef(0);
+  // Detects REAL file changes inside the main effect (vs nonce-driven re-init
+  // of the same file) so per-file audio prefs reset exactly once per file.
+  const lastEffectStreamUrlRef = useRef<string | null>(null);
   const [coldStartProgress, setColdStartProgress] = useState<{ bytes: number; targetBytes: number }>({
     bytes: 0,
     targetBytes: minColdStartBytes,
@@ -1558,6 +1744,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // the server-side /thumb endpoint, same as the MP4-HEVC reroute).
   const remuxRecoveryAttemptedRef = useRef(false);
   const remuxRecoveryActiveRef = useRef(false);
+  // User-selected audio track for the /remux tier (ffprobe stream index).
+  // null = backend primary. Read by EVERY /remux URL construction site (via
+  // withAudioIdx) so seek recreation, reroute, and fatal recovery can never
+  // silently revert the user's chosen track (plan E11).
+  const remuxAudioIdxRef = useRef<number | null>(null);
+  // MP4 tier: preferred mp4box audio track id. Overrides the audioTracks[0]
+  // pick in onMP4BoxReady; a switch = teardown + re-init with this set, then
+  // seek back to the captured playhead (plan §3 MP4 — fresh instance, L3).
+  const preferredAudioTrackIdRef = useRef<number | null>(null);
   const mpegtsRecreationGenRef = useRef(0);
   // Ref to store fMP4 config for thumbnail pipeline — set during initTsFmp4Pipeline
   const fmp4ConfigRef = useRef<{
@@ -1696,6 +1891,30 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     effectGenerationRef.current += 1;
     streamUrlRef.current = streamUrl;
     const currentGeneration = effectGenerationRef.current;
+
+    // Per-FILE audio-selection reset (not on nonce-driven same-file re-inits:
+    // the MP4 track switch bumps mp4ReinitNonce and must KEEP its refs).
+    if (lastEffectStreamUrlRef.current !== streamUrl) {
+      lastEffectStreamUrlRef.current = streamUrl;
+      setAudioTracks([]);
+      setActiveAudioTrackId(null);
+      preferredAudioTrackIdRef.current = null;
+      mp4ResumeTimeRef.current = 0;
+      // Seed from per-file persistence (E10). Applied by each tier when its
+      // track list materializes; invalid ids fall back to defaults there.
+      const parsed = parseStreamUrl(streamUrl);
+      if (parsed) {
+        const persisted = readPersistedAudioTrack(`${parsed.folderId}:${parsed.messageId}`);
+        preferredAudioTrackIdRef.current = persisted;
+        // Remux tier reads this at every URL construction site — seeding here
+        // applies the persisted track from the FIRST request. A file's tier is
+        // stable, so the persisted id is in that tier's namespace; if it ever
+        // reaches the backend from another tier, validation falls back to
+        // primary (never breaks playback).
+        remuxAudioIdxRef.current = persisted;
+        if (persisted != null) diagLog(`[AUDIO] per-file persisted track id=${persisted} seeded`);
+      }
+    }
 
     // Swallow the known-benign promise rejections that mediabunny's source
     // worker (source.js _runWorker) surfaces as "Uncaught (in promise)" when a
@@ -1969,7 +2188,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
       blobUrlRef.current = null;
     };
-  }, [streamUrl]);
+  // mp4ReinitNonce: bumped by the MP4 audio-track switch to rebuild the whole
+  // pipeline (fresh MP4Box) on the SAME streamUrl. Per-file state is guarded
+  // by lastEffectStreamUrlRef above.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamUrl, mp4ReinitNonce]);
 
   const cleanup = () => {
     abortRef.current?.abort();
@@ -2016,6 +2239,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     reroutedToRemuxRef.current = false;
     remuxRecoveryAttemptedRef.current = false;
     remuxRecoveryActiveRef.current = false;
+    remuxAudioIdxRef.current = null; // audio choice is per-file (re-seeded from persistence on init)
     mpegtsRecreationGenRef.current++; // invalidate any in-flight recreations
     byteTimeSamplesRef.current = [];
     seekOffsetRef.current = 0;
@@ -2698,7 +2922,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const meta = await metaPromise;
           if (meta?.has_timed_id3 && parsed) {
             diagLog('[MSE] Backend reports timed_id3 metadata stream — using ffmpeg remux (mpegts output) via mpegts.js');
-            const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcMseSupported()}`;
+            const remuxUrl = withAudioIdx(`${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcMseSupported()}`, remuxAudioIdxRef.current);
             diagLog(`[MSE] Routing to remux: ${remuxUrl}`);
             remuxUrlRef.current = remuxUrl;
             // Route SEEKS through the /remux endpoint using BYTE-FORWARD seeking
@@ -2816,7 +3040,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           // (HEVC Video Extensions installed) → 8-bit HEVC gets -c:v copy
           // instead of a transcode. Stock WebView2 sends false.
           const hevcOk = hevcMseSupported();
-          const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
+          const remuxUrl = withAudioIdx(`${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`, remuxAudioIdxRef.current);
           diagLog(`[MSE] mkv (${mkvCodec}) — routing to ffmpeg remux → mpegts.js: ${remuxUrl}`);
           remuxUrlRef.current = remuxUrl;
           // MKV /stream/ is Matroska, NOT MPEG-TS — byte-seeking it feeds the TS
@@ -3289,7 +3513,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                 const liveUrl = streamUrlRef.current;
                 const liveParsed = liveUrl ? parseStreamUrl(liveUrl) : null;
                 const useParsed = liveParsed ?? parsed;
-                const remuxUrl = `${useParsed.baseUrl}/remux/${useParsed.folderId}/${useParsed.messageId}?token=${encodeURIComponent(useParsed.token)}&hevc_ok=${hevcMseSupported()}`;
+                const remuxUrl = withAudioIdx(`${useParsed.baseUrl}/remux/${useParsed.folderId}/${useParsed.messageId}?token=${encodeURIComponent(useParsed.token)}&hevc_ok=${hevcMseSupported()}`, remuxAudioIdxRef.current);
                 if (liveParsed && liveParsed.messageId !== parsed.messageId) {
                   diagLog(`[MPEGTS] FATAL: file switched mid-handler — using live URL (msg ${liveParsed.messageId}, not stale msg ${parsed.messageId})`);
                 }
@@ -3553,6 +3777,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       //    via mediabunny + WebCodecs (independent of the mpegts.js player).
       //    It is triggered by isTransmuxerActive (see useThumbnailExtractor.ts).
       if (mediaInfo && mediaInfo.videoCodec) {
+        // Audio-track menu: mpegts.js tiers playing a /remux URL can switch
+        // tracks server-side (audio_idx). Fire-and-forget; menu stays hidden
+        // on failure. Plain TS (raw /stream through mpegts.js) is excluded —
+        // mpegts.js binds the first PMT audio PID (plan: TS scope cut).
+        if (isRemuxSource || reroutedToRemuxRef.current || remuxRecoveryActiveRef.current) {
+          void _loadRemuxAudioTracks();
+        }
         if (formatRef.current === 'mkv') {
           diagLog('[MPEGTS] MKV — activating client-side transmuxer thumbnail pipeline (mediabunny)');
           setIsTransmuxerActive(true);
@@ -4092,7 +4323,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
 
     const hevcOk = hevcMseSupported();
-    const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
+    const remuxUrl = withAudioIdx(`${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`, remuxAudioIdxRef.current);
     diagLog(`[MPEGTS] Remux recovery (${reason}): ${plan.action === 'seek'
       ? `resuming near ${plan.time!.toFixed(1)}s` : 'cold start'} via ${remuxUrl}`);
     remuxUrlRef.current = remuxUrl;
@@ -5378,6 +5609,281 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
   };
 
+  // ══════════════════ Audio track selection (tier machinery) ══════════════════
+
+  /** File key for per-file audio-choice persistence: "<folderId>:<messageId>". */
+  const _audioFileKey = (): string | null => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    return parsed ? `${parsed.folderId}:${parsed.messageId}` : null;
+  };
+
+  /**
+   * Load the audio track list for the ACTIVE /remux-tier file from the backend
+   * /audio_tracks endpoint (memoized server-side). Stale-response-guarded by
+   * messageId (plan E12). Only used on the mpegts.js-/remux tiers; the MKV and
+   * MP4 tiers populate audioTracks from their own demuxers.
+   */
+  const _loadRemuxAudioTracks = async (): Promise<void> => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    if (!parsed) return;
+    const msgAtRequest = parsed.messageId;
+    try {
+      const resp = await fetch(
+        `${parsed.baseUrl}/audio_tracks/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`
+      );
+      if (!resp.ok) {
+        diagLog(`[AUDIO] /audio_tracks failed (HTTP ${resp.status}) — menu stays hidden`);
+        return;
+      }
+      const json = await resp.json();
+      // Stale guard: user may have switched files while the probe ran.
+      const live = streamUrlRef.current ? parseStreamUrl(streamUrlRef.current) : null;
+      if (!live || live.messageId !== msgAtRequest) {
+        diagLog('[AUDIO] /audio_tracks response is for a previous file — discarded');
+        return;
+      }
+      const raw: any[] = Array.isArray(json?.tracks) ? json.tracks : [];
+      const tracks: AudioTrackInfo[] = raw.map((s: any, i: number) => ({
+        id: s.index,
+        label: buildAudioTrackLabel({
+          title: s.title, language: s.language, codec: s.codec,
+          channels: s.channels, position: i + 1,
+        }),
+        language: s.language ?? '',
+        codec: s.codec ?? '',
+        channels: s.channels ?? 0,
+        isDefault: !!s.is_default,
+        playable: true, // /remux tier: ffmpeg re-encodes to AAC — every track is playable
+      }));
+      setAudioTracks(tracks);
+      const active = remuxAudioIdxRef.current;
+      setActiveAudioTrackId(
+        active != null && tracks.some(t => t.id === active)
+          ? active
+          : (typeof json?.primary_idx === 'number' && json.primary_idx >= 0 ? json.primary_idx : (tracks[0]?.id ?? null))
+      );
+      diagLog(`[AUDIO] /remux tier: ${tracks.length} audio track(s) available`);
+    } catch (e: any) {
+      diagLog(`[AUDIO] /audio_tracks fetch error: ${e?.message} — menu stays hidden`);
+    }
+  };
+
+  /**
+   * Switch the audio track on the /remux → mpegts.js tier: point the base URL
+   * at the new audio_idx and recreate the player at the current playhead via
+   * the proven remux-seek machinery (gen guard, pause preservation, align poll).
+   * Returns true when the rebuild was dispatched.
+   */
+  const _switchRemuxAudioTrack = async (trackId: number): Promise<boolean> => {
+    const video = videoRef.current;
+    const baseUrl = remuxSeekBaseUrlRef.current;
+    if (!video || !baseUrl) {
+      diagLog('[AUDIO] remux switch: no video/base URL — cannot switch');
+      return false;
+    }
+    const t = video.currentTime || 0;
+    remuxAudioIdxRef.current = trackId;
+    // Re-key the base URL so THIS recreation and every future seek carry the track.
+    remuxSeekBaseUrlRef.current = withAudioIdx(baseUrl, trackId);
+    if (remuxUrlRef.current) {
+      remuxUrlRef.current = withAudioIdx(remuxUrlRef.current, trackId);
+    }
+    diagLog(`[AUDIO] remux switch → audio_idx=${trackId} at t=${t.toFixed(1)}s (paused=${isPausedRef.current})`);
+    const dur = mpegtsDurationRef.current || state.current.duration || 0;
+    await _mpegtsRecreatePlayerForRemuxSeek(clampSeekTime(t, dur), dur);
+    return true;
+  };
+
+  /**
+   * Switch the audio track on the MKV mediabunny-transmuxer tier: select the
+   * track on the transmuxer (re-derives codec/mime), changeType the combined
+   * SourceBuffer when the audio codec changed (H1), then rebuild from the
+   * playhead via the SAME flush + seekTo + timestampOffset + refill chain the
+   * user-seek path runs. A buffered-range instant seek is NOT allowed here —
+   * buffered data carries the OLD track's audio, so we always hard-rebuild.
+   */
+  const _switchMkvAudioTrack = async (trackId: number, track: AudioTrackInfo): Promise<boolean> => {
+    const video = videoRef.current;
+    const transmuxer = transmuxerRef.current as any;
+    const sbVideo = state.current.videoSourceBuffer; // MKV: single COMBINED SB (K7)
+    if (!video || !transmuxer?.setDesiredAudioTrack || !sbVideo) {
+      diagLog('[AUDIO] mkv switch: missing video/transmuxer/SB');
+      return false;
+    }
+    const t = video.currentTime || 0;
+    const currentMime = transmuxer.getMimeType?.() ?? null;
+
+    // 1. Select on the transmuxer → new combined mime (null = resolve failure).
+    const newMime: string | null = await transmuxer.setDesiredAudioTrack(trackId);
+    if (!newMime) {
+      diagLog('[AUDIO] mkv switch: setDesiredAudioTrack failed');
+      return false;
+    }
+    const plan = planAudioSwitch({
+      tier: 'mkv',
+      targetPlayable: track.playable,
+      currentMime,
+      newMime,
+    });
+    if (plan === 'reroute-remux' || plan === 'reject') {
+      // MSE can't play the new codec in-place. Revert the transmuxer selection;
+      // the reroute path (playing this file via /remux?audio_idx) is a phase-2
+      // enhancement — for now surface failure so the UI reverts (E7/E8).
+      diagLog(`[AUDIO] mkv switch: plan=${plan} (mime ${newMime} unsupported) — reverting`);
+      await transmuxer.setDesiredAudioTrack(null);
+      return false;
+    }
+
+    // 2. Hard rebuild from playhead — mirrors the user-seek chain (§K).
+    const seekGen = ++transmuxerSeekGenRef.current;
+    stopStreamingChain();
+    refillInProgressRef.current = false;
+    burstBufferRef.current = [];
+    bufferingForSeekRef.current = true;
+    seekBufferRef.current = [];
+    await sbVideo.resetForSeek();
+    if (plan === 'rebuild-changetype') {
+      try {
+        await sbVideo.changeType(newMime);
+        diagLog(`[AUDIO] mkv switch: SourceBuffer.changeType(${newMime}) applied (H1)`);
+      } catch (e: any) {
+        diagLog(`[AUDIO] mkv switch: changeType failed (${e?.message}) — reverting`);
+        bufferingForSeekRef.current = false;
+        await transmuxer.setDesiredAudioTrack(null);
+        return false;
+      }
+    }
+
+    // skipInitSegment:false — the new track needs a fresh ftyp+moov (its codec
+    // config differs even when the codec string doesn't).
+    const stopTime = transmuxer.nextKeyframeAtOrAfter?.(t + SEEK_START_DURATION) ?? undefined;
+    const keyframeTimestamp = await transmuxer.seekTo(t, SEEK_START_DURATION, {
+      skipInitSegment: false,
+      ...(stopTime !== undefined ? { stopTime } : {}),
+    });
+    bufferingForSeekRef.current = false;
+    if (isSeekSuperseded(seekGen, transmuxerSeekGenRef.current)) {
+      seekBufferRef.current = [];
+      diagLog('[AUDIO] mkv switch superseded by a newer seek — discarding');
+      return false;
+    }
+    if (keyframeTimestamp === null) {
+      diagLog('[AUDIO] mkv switch: seekTo returned null — reverting selection');
+      await transmuxer.setDesiredAudioTrack(null);
+      return false;
+    }
+
+    seekOffsetRef.current = keyframeTimestamp;
+    await sbVideo.setTimestampOffset(keyframeTimestamp);
+    const buffered = seekBufferRef.current;
+    seekBufferRef.current = [];
+    for (const item of buffered) {
+      sbVideo.appendBuffer(item.data);
+    }
+    // Refill chain tops the buffer up from here (same as post-seek).
+    startStreamingChain();
+    diagLog(`[AUDIO] mkv switch → track ${trackId} complete at kf=${keyframeTimestamp.toFixed(2)}s (paused=${isPausedRef.current})`);
+    return true;
+  };
+
+  /**
+   * Switch the audio track on the MP4 mp4box tier: FRESH MP4Box instance
+   * (plan §3 MP4 — in-place re-segmentation is fragile: mp4box's seek() is
+   * global and rewinds the playing video track, L3). We set the preferred
+   * track, bump mp4ReinitNonce (re-runs the main init effect on the same
+   * streamUrl; per-file state is preserved by lastEffectStreamUrlRef), wait
+   * for the rebuilt pipeline, then seek back to the captured playhead.
+   */
+  const _switchMp4AudioTrack = async (trackId: number): Promise<boolean> => {
+    const video = videoRef.current;
+    if (!video) return false;
+    const t = video.currentTime || 0;
+    const wasPaused = isPausedRef.current || video.paused;
+    preferredAudioTrackIdRef.current = trackId;
+    mp4ResumeTimeRef.current = t;
+    const genBefore = effectGenerationRef.current;
+    diagLog(`[AUDIO] mp4 switch → track ${trackId}: fresh re-init from t=${t.toFixed(1)}s (paused=${wasPaused})`);
+    setMp4ReinitNonce(n => n + 1);
+
+    // Wait for the re-init effect to tear down + bring the new instance up.
+    const deadline = performance.now() + 45000;
+    while (performance.now() < deadline) {
+      await new Promise(r => setTimeout(r, 250));
+      if (effectGenerationRef.current !== genBefore && state.current.initialized) break;
+      // File switched away mid-rebuild → abandon silently (new file owns state).
+      if (streamUrlRef.current !== lastEffectStreamUrlRef.current) return false;
+    }
+    if (!state.current.initialized) {
+      diagLog('[AUDIO] mp4 switch: re-init did not complete in time — selection persists for next load');
+      return false;
+    }
+    // Resume position through the normal seek machinery, preserving pause.
+    if (t > 1) {
+      try { await seekTo(t); } catch (_) {}
+    }
+    if (wasPaused) {
+      try { video.pause(); } catch (_) {}
+    }
+    diagLog(`[AUDIO] mp4 switch → track ${trackId} complete (resumed at ${t.toFixed(1)}s)`);
+    return true;
+  };
+
+  /**
+   * Public switch entry point (exposed on the hook return object).
+   * Single-flight + cold-start/seek guards (plan E3/E4); persists the choice
+   * and reverts the UI selection on failure (E8). Never unpauses (K6: the
+   * rebuild paths only READ isPausedRef).
+   */
+  const switchAudioTrack = async (trackId: number): Promise<boolean> => {
+    if (audioSwitchInFlightRef.current) {
+      diagLog('[AUDIO] switch rejected: another switch is in flight (E4)');
+      return false;
+    }
+    if (isColdStartBuffering || bufferingForSeekRef.current) {
+      diagLog('[AUDIO] switch rejected: cold start / seek in progress (E3)');
+      return false;
+    }
+    if (trackId === activeAudioTrackId) return true; // no-op
+    const track = audioTracks.find(t => t.id === trackId);
+    if (!track) {
+      diagLog(`[AUDIO] switch rejected: unknown track id ${trackId}`);
+      return false;
+    }
+    const prevActive = activeAudioTrackId;
+    audioSwitchInFlightRef.current = true;
+    setActiveAudioTrackId(trackId); // optimistic — reverted on failure
+    try {
+      let ok = false;
+      // Tier dispatch: mpegts.js player on a /remux URL (timed_id3 / reroute /
+      // recovery / MKV-HEVC) → backend switch. MKV transmuxer / MP4 mp4box
+      // tiers are wired in their own sections below.
+      if (mpegtsPlayerRef.current && remuxSeekBaseUrlRef.current) {
+        ok = await _switchRemuxAudioTrack(trackId);
+      } else if (transmuxerRef.current && formatRef.current === 'mkv') {
+        ok = await _switchMkvAudioTrack(trackId, track);
+      } else if (state.current.mp4box && formatRef.current === 'mp4') {
+        ok = await _switchMp4AudioTrack(trackId);
+      } else {
+        diagLog('[AUDIO] switch rejected: active tier does not support switching');
+      }
+      if (ok) {
+        const key = _audioFileKey();
+        if (key) persistAudioTrack(key, trackId);
+      } else {
+        setActiveAudioTrackId(prevActive ?? null); // revert (E8)
+      }
+      return ok;
+    } catch (e: any) {
+      diagLog(`[AUDIO] switch failed: ${e?.message} — reverting selection (E8)`);
+      setActiveAudioTrackId(prevActive ?? null);
+      return false;
+    } finally {
+      audioSwitchInFlightRef.current = false;
+    }
+  };
+
   /**
    * Recreate the mpegts.js player for a seek on a REMUX-transcoded source
    * (HEVC MKV etc. — see needsRemuxSeekRef). Unlike _mpegtsRecreatePlayerForSeek,
@@ -6113,6 +6619,45 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     setIsTransmuxerActive(true);
     void blobUrl; // blob URL already set as video.src by the caller
 
+    // Audio-track menu for MKV: enumerate via mediabunny (cheap on the
+    // persistent Input — metadata already parsed, plan I1). If a persisted
+    // per-file choice exists, apply it BEFORE the initial prime below so the
+    // first buffered window already carries the chosen track (E10).
+    void (async () => {
+      try {
+        const raw = await (transmuxer as any).getAudioTracks?.() ?? [];
+        const list: AudioTrackInfo[] = raw.map((t: any, i: number) => ({
+          id: t.id,
+          label: buildAudioTrackLabel({
+            title: t.name ?? undefined,
+            language: t.language,
+            codec: t.codec,
+            channels: t.channels,
+            position: i + 1,
+          }),
+          language: t.language ?? '',
+          codec: t.codec ?? '',
+          channels: t.channels ?? 0,
+          isDefault: !!t.isDefault,
+          // Combined-SB tier: playable = MSE accepts a mime with this codec
+          // param. Unknown codec strings default to playable=false (H3).
+          playable: !!t.codecParameterString && typeof MediaSource !== 'undefined'
+            && MediaSource.isTypeSupported(`audio/mp4; codecs="${t.codecParameterString}"`),
+        }));
+        setAudioTracks(list);
+        const persisted = preferredAudioTrackIdRef.current;
+        const chosen = pickDefaultAudioTrack(list, persisted);
+        setActiveAudioTrackId(chosen?.id ?? null);
+        if (persisted != null && chosen && chosen.id === persisted && list.length > 1) {
+          // Apply the persisted non-primary selection at init (before prime).
+          const mime = await (transmuxer as any).setDesiredAudioTrack?.(persisted);
+          if (!mime) diagLog('[AUDIO] mkv: persisted track failed to apply — primary used');
+        }
+      } catch (e: any) {
+        diagLog(`[AUDIO] mkv track enumeration failed: ${e?.message}`);
+      }
+    })();
+
     setIsPrefetching(true);
 
     // Prime the initial buffer with a BOUNDED window, then hand off to the
@@ -6265,7 +6810,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const fallbackUrl = streamUrlRef.current ?? url;
       const parsedFallback = parseStreamUrl(fallbackUrl);
       if (parsedFallback) {
-        const remuxUrl = `${parsedFallback.baseUrl}/remux/${parsedFallback.folderId}/${parsedFallback.messageId}?token=${encodeURIComponent(parsedFallback.token)}&hevc_ok=${hevcMseSupported()}`;
+        const remuxUrl = withAudioIdx(`${parsedFallback.baseUrl}/remux/${parsedFallback.folderId}/${parsedFallback.messageId}?token=${encodeURIComponent(parsedFallback.token)}&hevc_ok=${hevcMseSupported()}`, remuxAudioIdxRef.current);
         if (fallbackUrl !== url) {
           diagLog(`[MSE] fallback: file switched mid-init — using live URL for /remux (was ${url}, now ${fallbackUrl})`);
         }
@@ -6870,7 +7415,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     state.current.currentOffset = 0;
 
     const hevcOk = hevcMseSupported();
-    const remuxUrl = `${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`;
+    const remuxUrl = withAudioIdx(`${parsed.baseUrl}/remux/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}&hevc_ok=${hevcOk}`, remuxAudioIdxRef.current);
     diagLog(`[MSE] mp4 (${videoCodec}) — MSE can't decode, rerouting to ffmpeg remux → mpegts.js: ${remuxUrl}`);
     remuxUrlRef.current = remuxUrl;
     // MP4 /stream/ is ISOBMFF, NOT MPEG-TS — byte-forward would feed ffmpeg
@@ -6941,7 +7486,32 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         codec: track.codec,
         duration: track.duration,
         timescale: track.timescale,
+        language: (track as any).language,
+        name: (track as any).name,
+        audio: (track as any).audio,
       });
+    }
+
+    // Populate the audio-track menu (M3: language/name/channel_count are in
+    // mp4box's info at zero extra cost). playable = MSE accepts the codec.
+    {
+      const list: AudioTrackInfo[] = (info.audioTracks ?? []).map((t: any, i: number) => ({
+        id: t.id,
+        label: buildAudioTrackLabel({
+          title: typeof t.name === 'string' && t.name && t.name !== 'SoundHandler' ? t.name : undefined,
+          language: t.language,
+          codec: t.codec,
+          channels: t.audio?.channel_count ?? 0,
+          position: i + 1,
+        }),
+        language: t.language ?? '',
+        codec: t.codec ?? '',
+        channels: t.audio?.channel_count ?? 0,
+        isDefault: i === 0, // mp4box exposes no disposition; first = default
+        playable: typeof MediaSource !== 'undefined'
+          && MediaSource.isTypeSupported(`audio/mp4; codecs="${t.codec}"`),
+      }));
+      setAudioTracks(list);
     }
 
     // Calculate bitrate
@@ -6979,12 +7549,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     try {
       // Track IDs for mapping segments
       const videoTrackId = state.current.videoTracks.length > 0 ? state.current.videoTracks[0].id : -1;
-      const audioTrackId = state.current.audioTracks.length > 0 ? state.current.audioTracks[0].id : -1;
+      // Preferred track (audio switch / persisted per-file choice) overrides
+      // the historical [0] pick; falls back to [0] when it doesn't resolve.
+      const _preferredAudio = preferredAudioTrackIdRef.current != null
+        ? state.current.audioTracks.find(a => a.id === preferredAudioTrackIdRef.current)
+        : undefined;
+      const _audioPick = _preferredAudio ?? (state.current.audioTracks.length > 0 ? state.current.audioTracks[0] : undefined);
+      const audioTrackId = _audioPick?.id ?? -1;
       state.current.videoTrackId = videoTrackId;
       state.current.audioTrackId = audioTrackId;
+      setActiveAudioTrackId(audioTrackId >= 0 ? audioTrackId : null);
 
       const videoCodec = state.current.videoTracks.length > 0 ? state.current.videoTracks[0].codec : null;
-      const audioCodec = state.current.audioTracks.length > 0 ? state.current.audioTracks[0].codec : null;
+      const audioCodec = _audioPick?.codec ?? null;
 
       // Create video SourceBuffer
       if (videoCodec) {
@@ -8800,6 +9377,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     remuxUrl: remuxUrlRef.current,
     error: useNative ? null : error,
     useNative,
+
+    // ── Audio track selection ──
+    audioTracks,
+    activeAudioTrackId,
+    switchAudioTrack,
 
     unsupportedCodec,
     prefetchedBytes,
