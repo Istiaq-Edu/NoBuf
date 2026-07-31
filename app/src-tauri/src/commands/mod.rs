@@ -86,6 +86,11 @@ pub struct TelegramState {
     /// ffprobe pass over the (possibly uncached, rate-limited) stream — memoize
     /// so menu re-opens and player re-inits don't re-probe.
     pub audio_tracks_json: Arc<tokio::sync::RwLock<HashMap<i32, String>>>,
+    /// Memoized /subtitles list probe result (serialized JSON) keyed by
+    /// message_id. Same rationale as `audio_tracks_json`: stream layout is
+    /// immutable per file and each probe costs an ffprobe pass over the
+    /// (possibly uncached, rate-limited) stream.
+    pub sub_tracks_json: Arc<tokio::sync::RwLock<HashMap<i32, String>>>,
     /// PTS-tail-derived duration (seconds) keyed by message_id. Computing this
     /// requires downloading the last 512KB of the file from Telegram to read the
     /// final video PTS. That value never changes for a given file, but the

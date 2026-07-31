@@ -56,9 +56,13 @@ interface Props {
   activeTracks: SubtitleTrack[];
   /** Video currentTime, driven by the player's timeupdate (seconds). */
   currentTime: number;
+  /** Font URLs for embedded ASS tracks (MKV attachments served by the
+   *  backend). Passed to jassub's `fonts` option; absent = unchanged
+   *  behavior for sidecar ASS. */
+  assFonts?: string[];
 }
 
-export function SubtitleOverlay({ vidRef, activeTracks, currentTime }: Props) {
+export function SubtitleOverlay({ vidRef, activeTracks, currentTime, assFonts }: Props) {
   const vttTracks = useMemo(() => activeTracks.filter((t) => !t.isASS), [activeTracks]);
   const assTrack = useMemo(() => activeTracks.find((t) => t.isASS) ?? null, [activeTracks]);
 
@@ -76,13 +80,17 @@ export function SubtitleOverlay({ vidRef, activeTracks, currentTime }: Props) {
       workerUrl: jassubWorkerUrl,
       wasmUrl: jassubWasmUrl,
       modernWasmUrl: jassubModernWasmUrl,
+      // Embedded MKV font attachments (eager, non-blocking fetch by jassub).
+      // Missing/unused fonts degrade to the bundled default font gracefully.
+      ...(assFonts && assFonts.length > 0 ? { fonts: assFonts } : {}),
     });
     jassubRef.current = instance;
     return () => {
       instance.destroy();
       if (jassubRef.current === instance) jassubRef.current = null;
     };
-  }, [assTrack?.assContent, vidRef]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assTrack?.assContent, vidRef, assFonts?.join(',')]);
 
   // ---- VTT/SRT DOM path --------------------------------------------------
   const lines = useMemo(() => {

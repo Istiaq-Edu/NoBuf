@@ -416,6 +416,134 @@ export function persistAudioTrack(fileKey: string, trackId: number): void {
   } catch { /* storage full/unavailable — non-fatal */ }
 }
 
+// ══════════════════ Embedded subtitle tracks (pure helpers) ══════════════════
+
+/** One embedded subtitle track, from the backend /subtitles list endpoint.
+ *  `idx` is the ABSOLUTE ffprobe stream index (tier-independent — extraction
+ *  is container-level, unlike audio's tier-native ids). */
+export interface EmbeddedSubTrack {
+  idx: number;
+  label: string;
+  language: string; // ISO 639-2 or '' when untagged
+  codec: string;    // subrip | ass | ssa | webvtt | mov_text | hdmv_pgs_subtitle | ...
+  /** 'text' = extractable; 'bitmap' = listed but greyed out (PGS/VobSub);
+   *  'unsupported' = rare XML-ish codecs, also greyed. */
+  kind: 'text' | 'bitmap' | 'unsupported';
+  isDefault: boolean;
+  forced: boolean;
+  sdh: boolean;
+}
+
+/** One font attachment (MKV) served by /subtitles/.../font/{idx} for jassub. */
+export interface EmbeddedSubFont {
+  idx: number;
+  filename: string;
+  mimetype: string;
+}
+
+/**
+ * Build the menu label for an embedded subtitle track:
+ * "English", "Japanese — Signs & Songs", "Track 3 — SRT" style.
+ * Priority: explicit title > language name > "Track N". Badges (forced/SDH)
+ * are appended so dual-language files stay distinguishable.
+ * Pure + exported for testing.
+ */
+export function buildSubTrackLabel(args: {
+  title?: string;
+  language?: string;
+  codec?: string;
+  forced?: boolean;
+  sdh?: boolean;
+  /** 1-based position among subtitle tracks — fallback naming. */
+  position: number;
+}): string {
+  const lang = (args.language ?? '').toLowerCase();
+  const langName = lang && lang !== 'und' ? (LANG_NAMES[lang] ?? lang.toUpperCase()) : '';
+  const title = (args.title ?? '').trim();
+  // Title alone can be cryptic ("Signs"); prefix the language when it adds info.
+  let base: string;
+  if (title && langName && !title.toLowerCase().includes(langName.toLowerCase())) {
+    base = `${langName} — ${title}`;
+  } else {
+    base = title || langName || `Track ${args.position}`;
+  }
+  const badges: string[] = [];
+  if (args.forced) badges.push('Forced');
+  if (args.sdh) badges.push('SDH');
+  return badges.length ? `${base} (${badges.join(', ')})` : base;
+}
+
+/**
+ * Strip C0 control bytes (except newline, tab and CR) from extracted subtitle
+ * text. ffmpeg mangles literal `{\anN}` tags inside SRT sources into a 0x07
+ * (BEL) byte + "nN" (verified E8 in subs-ffmpeg-extraction); any such control
+ * byte would confuse the VTT parser. Pure + exported for testing.
+ */
+export function stripControlChars(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+}
+
+/** localStorage key + LRU-map helpers for the per-file subtitle choice.
+ *  Value: stream idx of the chosen embedded track, or -1 for explicit "off"
+ *  (distinguishes "user turned subs off" from "no stored choice"). */
+export const SUB_TRACK_STORE_KEY = 'nobuf-sub-track';
+const SUB_TRACK_STORE_CAP = 200;
+
+export function readPersistedSubTrack(fileKey: string): number | null {
+  try {
+    const map = JSON.parse(localStorage.getItem(SUB_TRACK_STORE_KEY) ?? '{}');
+    const v = map[fileKey];
+    return typeof v === 'number' ? v : null;
+  } catch { return null; }
+}
+
+export function persistSubTrack(fileKey: string, streamIdx: number): void {
+  try {
+    let map: Record<string, number>;
+    try { map = JSON.parse(localStorage.getItem(SUB_TRACK_STORE_KEY) ?? '{}') ?? {}; }
+    catch { map = {}; }
+    delete map[fileKey]; // re-insert → newest position
+    map[fileKey] = streamIdx;
+    const keys = Object.keys(map);
+    for (let i = 0; i < keys.length - SUB_TRACK_STORE_CAP; i++) delete map[keys[i]];
+    localStorage.setItem(SUB_TRACK_STORE_KEY, JSON.stringify(map));
+  } catch { /* storage full/unavailable — non-fatal */ }
+}
+
+/**
+ * Normalize the backend /subtitles list JSON into EmbeddedSubTrack[] +
+ * EmbeddedSubFont[]. Defensive against missing fields (backend contract is
+ * new). Pure + exported for testing.
+ */
+export function normalizeSubList(json: any): { tracks: EmbeddedSubTrack[]; fonts: EmbeddedSubFont[] } {
+  const rawTracks: any[] = Array.isArray(json?.tracks) ? json.tracks : [];
+  const rawFonts: any[] = Array.isArray(json?.fonts) ? json.fonts : [];
+  const tracks: EmbeddedSubTrack[] = rawTracks.map((s: any, i: number) => ({
+    idx: typeof s.index === 'number' ? s.index : -1,
+    label: buildSubTrackLabel({
+      title: s.title, language: s.language, codec: s.codec,
+      forced: !!s.forced, sdh: !!s.hearing_impaired, position: i + 1,
+    }),
+    language: s.language ?? '',
+    codec: s.codec ?? '',
+    kind: s.kind === 'text' || s.kind === 'bitmap' ? s.kind : 'unsupported',
+    isDefault: !!s.is_default,
+    forced: !!s.forced,
+    sdh: !!s.hearing_impaired,
+  })).filter((t) => t.idx >= 0);
+  // Menu ordering (formats doc §8): default-disposition tracks first, file
+  // order otherwise. Array.prototype.sort is stable, so relative order within
+  // each group is preserved.
+  tracks.sort((a, b) => Number(b.isDefault) - Number(a.isDefault));
+  const fonts: EmbeddedSubFont[] = rawFonts.map((f: any) => ({
+    idx: typeof f.index === 'number' ? f.index : -1,
+    filename: f.filename ?? '',
+    mimetype: f.mimetype ?? '',
+  })).filter((f) => f.idx >= 0);
+  return { tracks, fonts };
+}
+
 /**
  * Decide how to dispatch an unbuffered transmuxer seek: run it now ('execute')
  * or hold it for the debounce timer ('defer').
@@ -1450,6 +1578,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Detects REAL file changes inside the main effect (vs nonce-driven re-init
   // of the same file) so per-file audio prefs reset exactly once per file.
   const lastEffectStreamUrlRef = useRef<string | null>(null);
+  // ── Embedded subtitle track state (plan §2.1) ──
+  // Container-level inventory from /subtitles/.../list — tier-INDEPENDENT
+  // (cues are absolute-time on every tier, C14), so one fetch per file from
+  // the per-file block below. Fonts feed jassub for embedded ASS tracks.
+  const [embeddedSubTracks, setEmbeddedSubTracks] = useState<EmbeddedSubTrack[]>([]);
+  const [embeddedSubFonts, setEmbeddedSubFonts] = useState<EmbeddedSubFont[]>([]);
+  const [embeddedSubsLoading, setEmbeddedSubsLoading] = useState(false);
+  // Single-flight + per-file guard: the list fetch fires once per file.
+  const embeddedSubsFetchedForRef = useRef<string | null>(null);
   const [coldStartProgress, setColdStartProgress] = useState<{ bytes: number; targetBytes: number }>({
     bytes: 0,
     targetBytes: minColdStartBytes,
@@ -1914,6 +2051,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         remuxAudioIdxRef.current = persisted;
         if (persisted != null) diagLog(`[AUDIO] per-file persisted track id=${persisted} seeded`);
       }
+      // Embedded subtitle inventory is per-FILE too (container-level, tier-
+      // independent). Reset + refetch happens here; the fetch itself is
+      // deferred a tick so it never competes with cold-start init I/O.
+      setEmbeddedSubTracks([]);
+      setEmbeddedSubFonts([]);
+      setEmbeddedSubsLoading(false);
+      embeddedSubsFetchedForRef.current = null;
     }
 
     // Swallow the known-benign promise rejections that mediabunny's source
@@ -5617,6 +5761,112 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const parsed = url ? parseStreamUrl(url) : null;
     return parsed ? `${parsed.folderId}:${parsed.messageId}` : null;
   };
+
+  /**
+   * Load the embedded subtitle inventory for the CURRENT file from the backend
+   * /subtitles list endpoint (memoized server-side, container-level →
+   * tier-independent, plan §2.1). Stale-response-guarded by messageId (E17).
+   * Single-flight per file via embeddedSubsFetchedForRef.
+   */
+  const loadEmbeddedSubTracks = useCallback(async (): Promise<void> => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    if (!parsed) return;
+    const fileKey = `${parsed.folderId}:${parsed.messageId}`;
+    if (embeddedSubsFetchedForRef.current === fileKey) return; // already fetched/fetching
+    embeddedSubsFetchedForRef.current = fileKey;
+    setEmbeddedSubsLoading(true);
+    const msgAtRequest = parsed.messageId;
+    try {
+      const resp = await fetch(
+        `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/list?token=${encodeURIComponent(parsed.token)}`
+      );
+      // Stale guard: user may have switched files while the probe ran.
+      const live = streamUrlRef.current ? parseStreamUrl(streamUrlRef.current) : null;
+      if (!live || live.messageId !== msgAtRequest) {
+        diagLog('[SUBS] /subtitles list response is for a previous file — discarded');
+        return;
+      }
+      if (!resp.ok) {
+        diagLog(`[SUBS] /subtitles list failed (HTTP ${resp.status}) — embedded section stays hidden`);
+        // Clear the single-flight marker so a later trigger (e.g. re-opening
+        // the menu after the backend recovers) can retry — otherwise one
+        // transient 5xx hides embedded subs for this file all session.
+        if (embeddedSubsFetchedForRef.current === fileKey) embeddedSubsFetchedForRef.current = null;
+        return;
+      }
+      const { tracks, fonts } = normalizeSubList(await resp.json());
+      setEmbeddedSubTracks(tracks);
+      setEmbeddedSubFonts(fonts);
+      diagLog(`[SUBS] ${tracks.length} embedded subtitle track(s), ${fonts.length} font(s)`);
+    } catch (e: any) {
+      diagLog(`[SUBS] /subtitles list fetch error: ${e?.message} — embedded section stays hidden`);
+      if (embeddedSubsFetchedForRef.current === fileKey) embeddedSubsFetchedForRef.current = null;
+    } finally {
+      // Only clear the spinner if this response is still current (a newer
+      // file's fetch owns the state otherwise).
+      const live = streamUrlRef.current ? parseStreamUrl(streamUrlRef.current) : null;
+      if (live && live.messageId === msgAtRequest) setEmbeddedSubsLoading(false);
+    }
+  }, []);
+
+  /**
+   * Fetch the extracted text of ONE embedded subtitle track (plan §2.2).
+   * Returns { text, format } on success, null on any failure (caller toasts).
+   * Handles: 204 zero-cue tracks (null + 'empty' reason), 429 extraction
+   * in-flight (single retry after Retry-After), C0-byte mangling (E8 strip).
+   */
+  const fetchEmbeddedSubText = useCallback(async (
+    streamIdx: number,
+  ): Promise<{ text: string; format: 'ass' | 'srt' } | { error: 'empty' | 'failed' }> => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    if (!parsed) return { error: 'failed' };
+    const endpoint = `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/track/${streamIdx}?token=${encodeURIComponent(parsed.token)}`;
+    try {
+      let resp = await fetch(endpoint);
+      if (resp.status === 429) {
+        // Another extraction for this file is running — wait once and retry.
+        const after = parseInt(resp.headers.get('Retry-After') ?? '2', 10);
+        await new Promise((r) => setTimeout(r, Math.min(after, 5) * 1000));
+        resp = await fetch(endpoint);
+      }
+      if (resp.status === 204) return { error: 'empty' };
+      if (!resp.ok) {
+        diagLog(`[SUBS] track ${streamIdx} extraction failed (HTTP ${resp.status})`);
+        return { error: 'failed' };
+      }
+      const format = resp.headers.get('X-Subs-Format') === 'ass' ? 'ass' as const : 'srt' as const;
+      const raw = await resp.text();
+      const text = stripControlChars(raw);
+      if (!text.trim()) return { error: 'empty' };
+      diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${resp.headers.get('X-Subs-Partial') ? ', partial' : ''})`);
+      return { text, format };
+    } catch (e: any) {
+      diagLog(`[SUBS] track ${streamIdx} fetch error: ${e?.message}`);
+      return { error: 'failed' };
+    }
+  }, []);
+
+  /** Build the /subtitles font URLs for the current file (jassub `fonts` opt). */
+  const getEmbeddedSubFontUrls = useCallback((): string[] => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    if (!parsed) return [];
+    return embeddedSubFonts.map((f) =>
+      `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/font/${f.idx}?token=${encodeURIComponent(parsed.token)}`
+    );
+  }, [embeddedSubFonts]);
+
+  // Fire the per-file embedded-subtitle inventory fetch. Deferred 1.5s so the
+  // header probe never competes with cold-start init for the Telegram pipe —
+  // by then the container header is in the disk cache and the probe is a
+  // near-free local read (P11); the backend memoizes per message anyway.
+  useEffect(() => {
+    if (!streamUrl) return;
+    const t = window.setTimeout(() => { void loadEmbeddedSubTracks(); }, 1500);
+    return () => window.clearTimeout(t);
+  }, [streamUrl, mp4ReinitNonce, loadEmbeddedSubTracks]);
 
   /**
    * Load the audio track list for the ACTIVE /remux-tier file from the backend
@@ -9382,6 +9632,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     audioTracks,
     activeAudioTrackId,
     switchAudioTrack,
+
+    // ── Embedded subtitle tracks ──
+    embeddedSubTracks,
+    embeddedSubsLoading,
+    fetchEmbeddedSubText,
+    getEmbeddedSubFontUrls,
 
     unsupportedCodec,
     prefetchedBytes,

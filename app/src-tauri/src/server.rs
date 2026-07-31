@@ -2536,11 +2536,222 @@ fn validate_audio_idx_override(
     audio_streams: &[AudioStreamInfo],
 ) -> Option<i32> {
     let req = requested?;
+
     if audio_streams.iter().any(|s| s.index == req) {
         Some(req)
     } else {
         None
     }
+}
+
+// ══════════════════ Embedded subtitle extraction (pure helpers) ══════════════════
+
+/// One subtitle stream from an ffprobe pass (for the embedded-subtitle menu).
+/// `kind` decides extractability: "text" → extractable; "bitmap" → listed but
+/// never extractable (OCR out of scope); "unsupported" → rare XML-ish formats.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SubTrackInfo {
+    /// Absolute ffprobe stream index (usable directly in `-map 0:<index>`).
+    index: i32,
+    codec: String,
+    kind: String,
+    /// ISO 639-2 language tag ("" when untagged).
+    language: String,
+    /// Human title ("" when absent). MKV stores it in tags.title, MP4 mov_text
+    /// in tags.name — both are read (verified: E2 in subs-ffmpeg-extraction).
+    title: String,
+    is_default: bool,
+    forced: bool,
+    hearing_impaired: bool,
+}
+
+/// One font attachment stream (MKV) usable by the ASS renderer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct FontAttachmentInfo {
+    index: i32,
+    filename: String,
+    mimetype: String,
+}
+
+/// Parsed subtitle/font inventory of one media file.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SubProbeResult {
+    tracks: Vec<SubTrackInfo>,
+    fonts: Vec<FontAttachmentInfo>,
+}
+
+/// Classify an ffprobe subtitle codec_name for extractability.
+/// Text→text conversion is verified for every "text" codec here; bitmap→text
+/// is impossible in ffmpeg ("Subtitle encoding currently only possible from
+/// text to text or bitmap to bitmap").
+fn subtitle_kind(codec_name: &str) -> &'static str {
+    match codec_name {
+        "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "mov_text" | "text" => "text",
+        "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => "bitmap",
+        _ => "unsupported",
+    }
+}
+
+/// True when an MKV attachment stream is a usable font (by mimetype, with a
+/// filename-extension fallback for sloppily tagged files).
+fn is_font_attachment(filename: &str, mimetype: &str) -> bool {
+    let mt = mimetype.to_ascii_lowercase();
+    if mt.contains("font") || mt.contains("truetype") || mt.contains("opentype") {
+        return true;
+    }
+    let fl = filename.to_ascii_lowercase();
+    [".ttf", ".otf", ".ttc", ".woff", ".woff2"]
+        .iter()
+        .any(|e| fl.ends_with(e))
+}
+
+/// Parse ffprobe JSON (`-show_streams -print_format json`) into the subtitle/
+/// font inventory. Separate from [`parse_probe_json`] on purpose: zero blast
+/// radius on the /remux probe path. Returns an empty inventory on malformed
+/// JSON (the caller distinguishes probe FAILURE from a real empty result).
+fn parse_subtitle_probe_json(json_str: &str) -> SubProbeResult {
+    let mut result = SubProbeResult::default();
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    if let Some(streams) = val.get("streams").and_then(|s| s.as_array()) {
+        for stream in streams {
+            let idx = stream.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+            if idx < 0 {
+                continue;
+            }
+            let codec_type = stream.get("codec_type").and_then(|t| t.as_str()).unwrap_or("");
+            let codec_name = stream.get("codec_name").and_then(|n| n.as_str()).unwrap_or("");
+            let tags = stream.get("tags");
+            let get_tag = |key: &str| -> String {
+                tags.and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let get_disp = |key: &str| -> bool {
+                stream
+                    .get("disposition")
+                    .and_then(|d| d.get(key))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    == 1
+            };
+            if codec_type == "subtitle" {
+                // MKV: tags.title; MP4 mov_text: tags.name (E2).
+                let mut title = get_tag("title");
+                if title.is_empty() {
+                    title = get_tag("name");
+                }
+                result.tracks.push(SubTrackInfo {
+                    index: idx as i32,
+                    codec: codec_name.to_string(),
+                    kind: subtitle_kind(codec_name).to_string(),
+                    language: get_tag("language"),
+                    title,
+                    is_default: get_disp("default"),
+                    forced: get_disp("forced"),
+                    hearing_impaired: get_disp("hearing_impaired"),
+                });
+            } else if codec_type == "attachment" {
+                let filename = get_tag("filename");
+                let mimetype = get_tag("mimetype");
+                if is_font_attachment(&filename, &mimetype) {
+                    result.fonts.push(FontAttachmentInfo {
+                        index: idx as i32,
+                        filename,
+                        mimetype,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Subtitle extraction disk-cache filename (under `{remux_dir}/subs/`).
+/// Keyed by stream index; the extension IS the served format, so the handler
+/// can infer X-Subs-Format from a cache hit alone.
+fn sub_cache_filename(folder_id: &str, message_id: i32, stream_idx: i32, ass: bool) -> String {
+    format!(
+        "{}_{}_s{}.{}",
+        folder_id,
+        message_id,
+        stream_idx,
+        if ass { "ass" } else { "srt" }
+    )
+}
+
+/// Font attachment disk-cache filename (under `{remux_dir}/subs/`).
+fn sub_font_cache_filename(folder_id: &str, message_id: i32, att_idx: i32) -> String {
+    format!("{}_{}_f{}.bin", folder_id, message_id, att_idx)
+}
+
+/// ffmpeg args for extracting ONE text subtitle track to a file.
+/// ASS/SSA sources are codec-copied to .ass (byte-faithful header + styles);
+/// every other text codec transcodes to SRT. `latin1_retry` inserts
+/// `-sub_charenc latin1` BEFORE `-i` (input option) for the mislabeled-charset
+/// retry (verified E9b/E9c). The `-map` uses the ABSOLUTE stream index —
+/// never `0:s:N` relative maps and never trailing-`?` maps (F1/C11: a `?` map
+/// was observed emitting the WRONG track's cues).
+fn build_sub_extract_args(
+    input: &str,
+    stream_idx: i32,
+    ass: bool,
+    latin1_retry: bool,
+    out_path: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+    ];
+    if latin1_retry {
+        args.push("-sub_charenc".into());
+        args.push("latin1".into());
+    }
+    args.push("-i".into());
+    args.push(input.into());
+    args.push("-map".into());
+    args.push(format!("0:{}", stream_idx));
+    if ass {
+        args.push("-c:s".into());
+        args.push("copy".into());
+        args.push("-f".into());
+        args.push("ass".into());
+    } else {
+        args.push("-f".into());
+        args.push("srt".into());
+    }
+    args.push(out_path.into());
+    args
+}
+
+/// ffmpeg args for dumping ONE font attachment to `out_path`.
+/// `-dump_attachment` is an INPUT option that writes the file at input-open
+/// time (attachments live in the MKV header); `-t 0.01 -f null -` bounds the
+/// rest of the run and satisfies "at least one output" with a clean exit 0
+/// (verified X4/X5/F1 in subs research).
+fn build_font_dump_args(input: &str, att_idx: i32, out_path: &str) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        format!("-dump_attachment:{}", att_idx),
+        out_path.into(),
+        "-i".into(),
+        input.into(),
+        "-t".into(),
+        "0.01".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]
 }
 
 /// Parse ffprobe JSON (`-show_streams -show_format -print_format json`) into a
@@ -5626,6 +5837,467 @@ async fn audio_tracks_list(
     HttpResponse::Ok().content_type("application/json").body(body)
 }
 
+// ══════════════════ Embedded subtitle endpoints ══════════════════
+
+/// Per-message subtitle-extraction serialization. One ffmpeg per message at a
+/// time (two tracks extracting concurrently would each pull the whole file
+/// over /stream); a duplicate request gets 429 + Retry-After and the client
+/// retries briefly.
+fn subs_inflight() -> &'static StdMutex<std::collections::HashSet<i32>> {
+    static SET: std::sync::OnceLock<StdMutex<std::collections::HashSet<i32>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+}
+
+/// Resolve the ffmpeg/ffprobe input for a subtitle operation: the local cache
+/// file when the WHOLE file is cached (fastest: no HTTP, no Telegram), else
+/// our own /stream endpoint with `source_id=subs` so the download coordinator
+/// never confuses subtitle reads with the player's stream.
+fn subs_input_source(
+    folder_id: &str,
+    message_id: i32,
+    token: &str,
+    cache: &Option<StreamCacheManager>,
+) -> String {
+    if let Some(ref cache_mgr) = *cache {
+        if let Some(meta) = cache_mgr.load_meta(message_id) {
+            if meta.is_complete() {
+                return cache_mgr.data_path(message_id).to_string_lossy().to_string();
+            }
+        }
+    }
+    format!(
+        "http://127.0.0.1:{}/stream/{}/{}?token={}&source_id=subs",
+        crate::STREAM_PORT, folder_id, message_id, token
+    )
+}
+
+/// Subtitle disk-cache dir (`{remux_dir}/subs`), created on demand.
+fn subs_cache_dir(cache: &Option<StreamCacheManager>) -> std::path::PathBuf {
+    let base = if let Some(ref cache_mgr) = *cache {
+        cache_mgr.cache_dir().join("remux")
+    } else {
+        std::path::PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "/tmp".into()))
+            .join("nobuf_remux")
+    };
+    let dir = base.join("subs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Run the memoized subtitle/font inventory probe for one file.
+/// Returns the parsed inventory (memo hit skips the ffprobe entirely).
+async fn probe_sub_tracks(
+    folder_id: &str,
+    message_id: i32,
+    token: &str,
+    data: &web::Data<Arc<TelegramState>>,
+    cache: &web::Data<Option<StreamCacheManager>>,
+) -> Result<SubProbeResult, HttpResponse> {
+    if let Some(json) = data.sub_tracks_json.read().await.get(&message_id) {
+        // Memo stores the serialized SubProbeResult verbatim.
+        if let Ok(parsed) = serde_json::from_str::<SubProbeResult>(json) {
+            return Ok(parsed);
+        }
+    }
+
+    let ffprobe_path = match crate::ffmpeg_util::ensure_ffprobe() {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(HttpResponse::InternalServerError().body(format!("ffprobe not found: {}", e)))
+        }
+    };
+    let input_source = subs_input_source(folder_id, message_id, token, cache);
+
+    // Header-only probe: stream declarations (incl. subs + attachments) live in
+    // the MKV Track header / MP4 moov — 5MB budget is enough even on partially
+    // cached files (verified P11 in subs-execution-bytecost).
+    let probe_output = TokioCommand::new(&ffprobe_path)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-print_format", "json",
+            "-show_streams",
+            "-probesize", "5000000", "-analyzeduration", "5000000",
+            &input_source,
+        ])
+        .output()
+        .await;
+
+    let result = match probe_output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Reviewer advisory: distinguish "ffprobe genuinely saw zero
+            // subtitle streams" from "exit 0 but unusable output" — memoizing
+            // the latter would hide subtitles for the whole app session.
+            let has_streams = serde_json::from_str::<serde_json::Value>(&stdout)
+                .ok()
+                .map(|v| v.get("streams").and_then(|s| s.as_array()).map(|a| !a.is_empty()).unwrap_or(false))
+                .unwrap_or(false);
+            if !has_streams {
+                log::warn!("[SUBS] msg {}: ffprobe exit 0 but no parseable streams — not memoizing", message_id);
+                return Err(HttpResponse::BadGateway().body("subtitle probe returned no streams"));
+            }
+            parse_subtitle_probe_json(&stdout)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "[SUBS] msg {}: ffprobe failed: {}",
+                message_id, stderr.trim()
+            );
+            return Err(HttpResponse::BadGateway().body("subtitle probe failed"));
+        }
+        Err(e) => {
+            log::warn!("[SUBS] msg {}: ffprobe spawn failed: {}", message_id, e);
+            return Err(HttpResponse::InternalServerError().body(format!("ffprobe spawn failed: {}", e)));
+        }
+    };
+
+    // Memoize (including empty inventories: "no subs" is the common permanent
+    // case, and the header probe sees stream declarations even on partially
+    // cached files — unlike the audio partial-probe race).
+    if let Ok(json) = serde_json::to_string(&result) {
+        data.sub_tracks_json.write().await.insert(message_id, json);
+    }
+    Ok(result)
+}
+
+/// List the embedded subtitle tracks + font attachments of a media file.
+///
+/// `GET /subtitles/{folder}/{message}/list?token=..`
+/// → `{ "tracks": [SubTrackInfo...], "fonts": [FontAttachmentInfo...] }`
+///
+/// One header-only ffprobe per file (memoized on TelegramState like
+/// /audio_tracks). Bitmap tracks (PGS/VobSub/DVB) are listed with
+/// kind="bitmap" so the UI can grey them out; only kind="text" tracks are
+/// extractable via the /track endpoint.
+#[get("/subtitles/{folder_id}/{message_id}/list")]
+async fn subtitles_list(
+    path: web::Path<(String, i32)>,
+    query: web::Query<StreamQuery>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id) = path.into_inner();
+    if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
+        return resp;
+    }
+    let token = query.token.as_deref().unwrap_or("");
+    match probe_sub_tracks(&folder_id_str, message_id, token, &data, &cache).await {
+        Ok(inv) => match serde_json::to_string(&inv) {
+            Ok(body) => HttpResponse::Ok().content_type("application/json").body(body),
+            Err(e) => HttpResponse::InternalServerError().body(format!("serialize failed: {}", e)),
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// Extract ONE embedded text subtitle track as SRT (or byte-faithful ASS).
+///
+/// `GET /subtitles/{folder}/{message}/track/{stream_idx}?token=..`
+/// → 200 `text/plain; charset=utf-8` + `X-Subs-Format: ass|srt`
+///   (+ `X-Subs-Partial: 1` when extracted from a partially-cached file)
+/// → 204 when the track legitimately has zero cues
+/// → 404 for a non-text/absent stream_idx; 429 while another extraction for
+///   the same message runs; 502/504 on ffmpeg failure/timeout.
+///
+/// Edge cases handled (subs research): absolute-index -map (never `?` maps —
+/// F1: a trailing-? map emitted the WRONG track), one `-sub_charenc latin1`
+/// retry on the mislabeled-UTF8 signature (E9c), whole-track policy (mid-file
+/// -ss over HTTP is pathological — P6: 2.16x file size), partial-cache
+/// extraction serves-but-doesn't-cache (P8), deterministic disk cache under
+/// {remux_dir}/subs keyed by stream index.
+#[get("/subtitles/{folder_id}/{message_id}/track/{stream_idx}")]
+async fn subtitles_extract_track(
+    path: web::Path<(String, i32, i32)>,
+    query: web::Query<StreamQuery>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id, stream_idx) = path.into_inner();
+    let sq = StreamQuery {
+        token: query.token.clone(), cached_only: None, duration: None,
+        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        audio_idx: None,
+    };
+    if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
+        return resp;
+    }
+    let token = query.token.as_deref().unwrap_or("");
+
+    // Validate against the (memoized) probe: must be a TEXT subtitle stream.
+    let inv = match probe_sub_tracks(&folder_id_str, message_id, token, &data, &cache).await {
+        Ok(inv) => inv,
+        Err(resp) => return resp,
+    };
+    let track = match inv.tracks.iter().find(|t| t.index == stream_idx) {
+        Some(t) if t.kind == "text" => t.clone(),
+        Some(_) => {
+            return HttpResponse::NotFound()
+                .content_type("application/json")
+                .body(r#"{"error":"not a text subtitle stream"}"#)
+        }
+        None => {
+            return HttpResponse::NotFound()
+                .content_type("application/json")
+                .body(r#"{"error":"no such subtitle stream"}"#)
+        }
+    };
+    let ass = track.codec == "ass" || track.codec == "ssa";
+    let format_hdr = if ass { "ass" } else { "srt" };
+
+    // Disk cache hit → serve immediately (extraction is deterministic).
+    let subs_dir = subs_cache_dir(&cache);
+    let cache_path = subs_dir.join(sub_cache_filename(&folder_id_str, message_id, stream_idx, ass));
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        if !bytes.is_empty() {
+            return HttpResponse::Ok()
+                .content_type("text/plain; charset=utf-8")
+                .insert_header(("X-Subs-Format", format_hdr))
+                .insert_header(("Cache-Control", "max-age=86400"))
+                .body(bytes);
+        }
+    }
+
+    // Per-message serialization (thumb_inflight pattern).
+    {
+        let mut set = match subs_inflight().lock() {
+            Ok(s) => s,
+            Err(_) => return HttpResponse::InternalServerError().body("lock poisoned"),
+        };
+        if !set.insert(message_id) {
+            return HttpResponse::TooManyRequests()
+                .insert_header(("Retry-After", "2"))
+                .body("Subtitle extraction already in progress");
+        }
+    }
+    struct SubsInflightGuard(i32);
+    impl Drop for SubsInflightGuard {
+        fn drop(&mut self) {
+            if let Ok(mut s) = subs_inflight().lock() {
+                s.remove(&self.0);
+            }
+        }
+    }
+    let _guard = SubsInflightGuard(message_id);
+
+    let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("ffmpeg unavailable: {}", e)),
+    };
+
+    // Whether the file is fully cached decides input AND cacheability of the
+    // result: a partial extraction must NOT be cached (more cues may appear
+    // as the cache fills).
+    let fully_cached = cache
+        .as_ref()
+        .as_ref()
+        .and_then(|m| m.load_meta(message_id))
+        .map(|m| m.is_complete())
+        .unwrap_or(false);
+    let input_source = subs_input_source(&folder_id_str, message_id, token, &cache);
+    let tmp_path = subs_dir.join(format!(
+        "{}.tmp",
+        sub_cache_filename(&folder_id_str, message_id, stream_idx, ass)
+    ));
+    let tmp_str = tmp_path.to_string_lossy().to_string();
+
+    // Extraction with one latin1 retry on the mislabeled-charset signature.
+    let started = std::time::Instant::now();
+    let mut attempt_latin1 = false;
+    let output = loop {
+        let args = build_sub_extract_args(&input_source, stream_idx, ass, attempt_latin1, &tmp_str);
+        let mut cmd = TokioCommand::new(&ffmpeg_path);
+        cmd.args(args.iter().map(|s| s.as_str()));
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                log::error!("[SUBS] msg {} s{}: ffmpeg spawn failed: {}", message_id, stream_idx, e);
+                return HttpResponse::InternalServerError().body(format!("ffmpeg spawn failed: {}", e));
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                log::warn!("[SUBS] msg {} s{}: extraction timed out after 120s", message_id, stream_idx);
+                return HttpResponse::GatewayTimeout().body("Subtitle extraction timed out");
+            }
+        };
+        if out.status.success() {
+            break out;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !attempt_latin1 && stderr.contains("Invalid UTF-8") {
+            // Mislabeled legacy charset (E9b) — retry once with -sub_charenc.
+            log::info!("[SUBS] msg {} s{}: invalid UTF-8, retrying with latin1", message_id, stream_idx);
+            attempt_latin1 = true;
+            continue;
+        }
+        let tail: String = stderr.chars().rev().take(300).collect::<String>().chars().rev().collect();
+        log::warn!(
+            "[SUBS] msg {} s{}: ffmpeg failed (status={:?}): {}",
+            message_id, stream_idx, out.status.code(), tail.trim()
+        );
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return HttpResponse::BadGateway().body("Subtitle extraction failed");
+    };
+
+    let text = match tokio::fs::read(&tmp_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("[SUBS] msg {} s{}: output read failed: {}", message_id, stream_idx, e);
+            return HttpResponse::BadGateway().body("Subtitle extraction produced no output");
+        }
+    };
+
+    // exit 0 + empty output = legitimate zero-cue track (E14-redo): 204, and
+    // do NOT cache (a partially-cached file may yield cues later).
+    if text.is_empty() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        log::info!("[SUBS] msg {} s{}: track has no cues (204)", message_id, stream_idx);
+        return HttpResponse::NoContent().finish();
+    }
+
+    // "File ended prematurely" with cues present = partial extraction (P8):
+    // serve but don't promote to the deterministic cache.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let partial = !fully_cached || stderr.contains("ended prematurely");
+    if partial {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    } else if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path).await {
+        log::warn!("[SUBS] msg {} s{}: cache rename failed: {}", message_id, stream_idx, e);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+
+    log::info!(
+        "[SUBS] msg {} s{} ({}): {}B in {:.1}s (src={}, cached={})",
+        message_id, stream_idx, format_hdr, text.len(), started.elapsed().as_secs_f32(),
+        if input_source.starts_with("http") { "stream" } else { "cache" },
+        !partial
+    );
+
+    let mut resp = HttpResponse::Ok();
+    resp.content_type("text/plain; charset=utf-8")
+        .insert_header(("X-Subs-Format", format_hdr));
+    if partial {
+        resp.insert_header(("X-Subs-Partial", "1"));
+    } else {
+        resp.insert_header(("Cache-Control", "max-age=86400"));
+    }
+    resp.body(text)
+}
+
+/// Serve ONE font attachment (for jassub) from an MKV.
+///
+/// `GET /subtitles/{folder}/{message}/font/{att_idx}?token=..`
+/// → 200 with the font bytes (probed mimetype, font/ttf fallback)
+/// → 404 when att_idx is not a known font attachment.
+#[get("/subtitles/{folder_id}/{message_id}/font/{att_idx}")]
+async fn subtitles_font(
+    path: web::Path<(String, i32, i32)>,
+    query: web::Query<StreamQuery>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id, att_idx) = path.into_inner();
+    let sq = StreamQuery {
+        token: query.token.clone(), cached_only: None, duration: None,
+        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        audio_idx: None,
+    };
+    if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
+        return resp;
+    }
+    let token = query.token.as_deref().unwrap_or("");
+
+    let inv = match probe_sub_tracks(&folder_id_str, message_id, token, &data, &cache).await {
+        Ok(inv) => inv,
+        Err(resp) => return resp,
+    };
+    let font = match inv.fonts.iter().find(|f| f.index == att_idx) {
+        Some(f) => f.clone(),
+        None => {
+            return HttpResponse::NotFound()
+                .content_type("application/json")
+                .body(r#"{"error":"no such font attachment"}"#)
+        }
+    };
+    let mime = if font.mimetype.is_empty() { "font/ttf".to_string() } else { font.mimetype.clone() };
+
+    let subs_dir = subs_cache_dir(&cache);
+    let cache_path = subs_dir.join(sub_font_cache_filename(&folder_id_str, message_id, att_idx));
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        if !bytes.is_empty() {
+            return HttpResponse::Ok()
+                .content_type(mime)
+                .insert_header(("Cache-Control", "max-age=86400"))
+                .body(bytes);
+        }
+    }
+
+    let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("ffmpeg unavailable: {}", e)),
+    };
+    let input_source = subs_input_source(&folder_id_str, message_id, token, &cache);
+    let tmp_path = subs_dir.join(format!(
+        "{}.tmp",
+        sub_font_cache_filename(&folder_id_str, message_id, att_idx)
+    ));
+    let tmp_str = tmp_path.to_string_lossy().to_string();
+
+    // Attachments live in the MKV header — this is a cheap header read even
+    // over /stream (verified E12/X5). 60s cap covers slow uncached headers.
+    let args = build_font_dump_args(&input_source, att_idx, &tmp_str);
+    let mut cmd = TokioCommand::new(&ffmpeg_path);
+    cmd.args(args.iter().map(|s| s.as_str()));
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return HttpResponse::InternalServerError().body(format!("ffmpeg spawn failed: {}", e));
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return HttpResponse::GatewayTimeout().body("Font extraction timed out");
+        }
+    };
+
+    let bytes = match tokio::fs::read(&tmp_path).await {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "[SUBS] msg {} font f{}: dump failed (status={:?}): {}",
+                message_id, att_idx, output.status.code(), stderr.trim()
+            );
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return HttpResponse::BadGateway().body("Font extraction failed");
+        }
+    };
+    if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path).await {
+        log::warn!("[SUBS] msg {} font f{}: cache rename failed: {}", message_id, att_idx, e);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+
+    log::info!("[SUBS] msg {} font f{} ({}): {}B served", message_id, att_idx, font.filename, bytes.len());
+    HttpResponse::Ok()
+        .content_type(mime)
+        .insert_header(("Cache-Control", "max-age=86400"))
+        .body(bytes)
+}
+
 #[get("/thumb/{folder_id}/{message_id}")]
 async fn remux_hover_thumb(
     path: web::Path<(String, i32)>,
@@ -5825,7 +6497,7 @@ pub async fn start_streaming_server(
             .allowed_origin("http://nobuf-stream.localhost")
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial"])
             .max_age(3600);
 
         App::new()
@@ -5838,6 +6510,9 @@ pub async fn start_streaming_server(
             .service(remux_ts_to_mp4)
             .service(remux_hover_thumb)
             .service(audio_tracks_list)
+            .service(subtitles_list)
+            .service(subtitles_extract_track)
+            .service(subtitles_font)
             .configure(hls::configure_hls)
             .configure(crate::faststart::configure_faststart)
             .configure(|cfg| {
@@ -6544,6 +7219,173 @@ mod tests {
             super::remux_cache_filename("home", 84, Some(1)),
             super::remux_cache_filename("home", 84, None),
         );
+    }
+
+    // ══════════════ Embedded subtitle extraction (plan §1.4) ══════════════
+
+    /// Probe JSON → track/font classification: text vs bitmap vs unsupported,
+    /// tags, dispositions, and the MP4 mov_text `tags.name` title fallback (E2).
+    #[test]
+    fn subtitle_probe_classifies_tracks_and_fonts() {
+        let json = r#"{
+            "streams": [
+                {"index":0,"codec_type":"video","codec_name":"h264"},
+                {"index":1,"codec_type":"audio","codec_name":"aac","channels":2},
+                {"index":2,"codec_type":"subtitle","codec_name":"subrip",
+                 "tags":{"language":"eng","title":"English"},
+                 "disposition":{"default":1,"forced":0,"hearing_impaired":0}},
+                {"index":3,"codec_type":"subtitle","codec_name":"ass",
+                 "tags":{"language":"jpn"},
+                 "disposition":{"default":0,"forced":1,"hearing_impaired":0}},
+                {"index":4,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle",
+                 "tags":{"language":"ger"},
+                 "disposition":{"default":0,"forced":0,"hearing_impaired":1}},
+                {"index":5,"codec_type":"subtitle","codec_name":"mov_text",
+                 "tags":{"language":"eng","name":"English (from name tag)"},
+                 "disposition":{"default":0,"forced":0,"hearing_impaired":0}},
+                {"index":6,"codec_type":"attachment","codec_name":"ttf",
+                 "tags":{"filename":"font.ttf","mimetype":"application/x-truetype-font"}},
+                {"index":7,"codec_type":"attachment","codec_name":"bin",
+                 "tags":{"filename":"cover.jpg","mimetype":"image/jpeg"}}
+            ]
+        }"#;
+        let inv = super::parse_subtitle_probe_json(json);
+
+        assert_eq!(inv.tracks.len(), 4, "video/audio/non-font attachments excluded");
+        let t2 = &inv.tracks[0];
+        assert_eq!((t2.index, t2.codec.as_str(), t2.kind.as_str()), (2, "subrip", "text"));
+        assert_eq!((t2.language.as_str(), t2.title.as_str()), ("eng", "English"));
+        assert!(t2.is_default && !t2.forced && !t2.hearing_impaired);
+
+        let t3 = &inv.tracks[1];
+        assert_eq!((t3.index, t3.kind.as_str()), (3, "text"));
+        assert!(t3.forced, "forced disposition must survive");
+        assert_eq!(t3.title, "", "absent title stays empty");
+
+        let t4 = &inv.tracks[2];
+        assert_eq!(t4.kind, "bitmap", "PGS is listed but marked bitmap");
+        assert!(t4.hearing_impaired);
+
+        let t5 = &inv.tracks[3];
+        assert_eq!(t5.title, "English (from name tag)", "mov_text falls back to tags.name");
+
+        assert_eq!(inv.fonts.len(), 1, "jpeg attachment is NOT a font");
+        assert_eq!(inv.fonts[0].index, 6);
+        assert_eq!(inv.fonts[0].filename, "font.ttf");
+    }
+
+    /// Malformed / empty probe JSON → empty inventory (never a panic).
+    #[test]
+    fn subtitle_probe_handles_malformed_json() {
+        assert_eq!(super::parse_subtitle_probe_json("not json").tracks.len(), 0);
+        assert_eq!(super::parse_subtitle_probe_json("{}").tracks.len(), 0);
+        let no_subs = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}"#;
+        let inv = super::parse_subtitle_probe_json(no_subs);
+        assert!(inv.tracks.is_empty() && inv.fonts.is_empty());
+    }
+
+    /// Kind classification table (E2/E15): every verified text codec extracts,
+    /// every bitmap codec is refused, unknown codecs are "unsupported".
+    #[test]
+    fn subtitle_kind_classification() {
+        for c in ["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"] {
+            assert_eq!(super::subtitle_kind(c), "text", "{c}");
+        }
+        for c in ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"] {
+            assert_eq!(super::subtitle_kind(c), "bitmap", "{c}");
+        }
+        assert_eq!(super::subtitle_kind("kate"), "unsupported");
+        assert_eq!(super::subtitle_kind(""), "unsupported");
+    }
+
+    /// Font attachment detection: mimetype first, extension fallback for
+    /// sloppily tagged files, and non-fonts rejected.
+    #[test]
+    fn font_attachment_detection() {
+        assert!(super::is_font_attachment("a.ttf", "application/x-truetype-font"));
+        assert!(super::is_font_attachment("a.otf", "application/vnd.ms-opentype"));
+        assert!(super::is_font_attachment("a.ttf", "font/ttf"));
+        assert!(super::is_font_attachment("weird.TTF", ""), "extension fallback, case-insensitive");
+        assert!(super::is_font_attachment("x.woff2", "application/octet-stream"));
+        assert!(!super::is_font_attachment("cover.jpg", "image/jpeg"));
+        assert!(!super::is_font_attachment("notes.txt", "text/plain"));
+    }
+
+    /// Subtitle cache filenames: keyed by stream index, extension = format,
+    /// fonts keyed separately — no cross-track/cross-kind collisions.
+    #[test]
+    fn sub_cache_filenames_keyed_by_stream() {
+        assert_eq!(super::sub_cache_filename("home", 84, 2, false), "home_84_s2.srt");
+        assert_eq!(super::sub_cache_filename("home", 84, 3, true), "home_84_s3.ass");
+        assert_eq!(super::sub_font_cache_filename("home", 84, 6), "home_84_f6.bin");
+        assert_ne!(
+            super::sub_cache_filename("home", 84, 2, false),
+            super::sub_cache_filename("home", 84, 3, false),
+        );
+        assert_ne!(
+            super::sub_cache_filename("home", 84, 2, true),
+            super::sub_cache_filename("home", 84, 2, false),
+            "ass vs srt of the same stream never collide"
+        );
+    }
+
+    /// Extraction arg builder: ABSOLUTE-index -map (never 0:s:N, never `?` —
+    /// F1: a trailing-? map emitted the WRONG track), ass=copy vs srt
+    /// transcode, and -sub_charenc BEFORE -i on the latin1 retry (E9c).
+    #[test]
+    fn sub_extract_args_shape() {
+        let srt = super::build_sub_extract_args("http://in", 2, false, false, "out.tmp");
+        let m = srt.iter().position(|s| s == "-map").unwrap();
+        assert_eq!(srt[m + 1], "0:2", "absolute stream index");
+        assert!(!srt[m + 1].contains('?'), "no ? maps ever");
+        assert!(srt.windows(2).any(|w| w[0] == "-f" && w[1] == "srt"));
+        assert!(!srt.iter().any(|s| s == "copy"), "srt path transcodes");
+        assert!(!srt.iter().any(|s| s == "-sub_charenc"));
+        assert_eq!(srt.last().unwrap(), "out.tmp");
+
+        let ass = super::build_sub_extract_args("C:\\cache\\file.mkv", 3, true, false, "out.tmp");
+        assert!(ass.windows(2).any(|w| w[0] == "-c:s" && w[1] == "copy"), "ass is codec-copied");
+        assert!(ass.windows(2).any(|w| w[0] == "-f" && w[1] == "ass"));
+
+        let retry = super::build_sub_extract_args("http://in", 2, false, true, "out.tmp");
+        let enc = retry.iter().position(|s| s == "-sub_charenc").unwrap();
+        let inp = retry.iter().position(|s| s == "-i").unwrap();
+        assert!(enc < inp, "-sub_charenc must be an INPUT option (before -i)");
+        assert_eq!(retry[enc + 1], "latin1");
+    }
+
+    /// Font dump arg builder: -dump_attachment:<idx> BEFORE -i (input option),
+    /// endpoint-controlled output path, and the `-t 0.01 -f null -` bound that
+    /// makes ffmpeg exit 0 without reading the whole file (X4/X5/F1).
+    #[test]
+    fn font_dump_args_shape() {
+        let args = super::build_font_dump_args("http://in", 6, "font.tmp");
+        let dump = args.iter().position(|s| s == "-dump_attachment:6").unwrap();
+        assert_eq!(args[dump + 1], "font.tmp", "endpoint-controlled filename");
+        let inp = args.iter().position(|s| s == "-i").unwrap();
+        assert!(dump < inp, "-dump_attachment is an INPUT option");
+        assert!(args.windows(2).any(|w| w[0] == "-f" && w[1] == "null"));
+        assert_eq!(args.last().unwrap(), "-", "null muxer needs a sink arg");
+    }
+
+    /// SubProbeResult memo round-trip: what the endpoint memoizes is exactly
+    /// what a later validation call deserializes (serde stability guard).
+    #[test]
+    fn sub_probe_result_serde_round_trip() {
+        let inv = super::SubProbeResult {
+            tracks: vec![super::SubTrackInfo {
+                index: 2, codec: "ass".into(), kind: "text".into(),
+                language: "jpn".into(), title: "Signs".into(),
+                is_default: false, forced: true, hearing_impaired: false,
+            }],
+            fonts: vec![super::FontAttachmentInfo {
+                index: 6, filename: "f.ttf".into(),
+                mimetype: "font/ttf".into(),
+            }],
+        };
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: super::SubProbeResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, inv);
     }
 
     /// Arg builders must map the OVERRIDDEN audio index (regression guard for
