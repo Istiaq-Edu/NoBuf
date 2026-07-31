@@ -5,7 +5,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
-import { useMSEPlayer } from '../../hooks/useMSEPlayer';
+import { useMSEPlayer, readPersistedSubTrack, persistSubTrack } from '../../hooks/useMSEPlayer';
 import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
@@ -132,6 +132,16 @@ interface FastStreamPlayerProps {
   const { settings, updateSetting } = useSettings();
   const cacheSession = useCacheSession();
   const subs = useSubtitles();
+  // Embedded subtitle bookkeeping: stream idx → loaded SubtitleTrack (so a
+  // re-click toggles instead of re-fetching, E18), which idx is mid-fetch
+  // (spinner row + double-click guard), and the busy idx as state for renders.
+  const embeddedSubTracksRef = useRef<Map<number, SubtitleTrack>>(new Map());
+  const embeddedSubLoadingIdxRef = useRef<number | null>(null);
+  const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
+  // Generation counter bumped on every file switch: an extraction that started
+  // on file A must NOT activate/persist/clear state after the player moved to
+  // file B (review finding: stale cues crossing a mid-extraction file switch).
+  const embeddedSubFileGenRef = useRef(0);
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -149,6 +159,10 @@ interface FastStreamPlayerProps {
   // Drop any loaded subtitle tracks when the source file changes.
   useEffect(() => {
     subs.clearTracks();
+    embeddedSubTracksRef.current.clear();
+    embeddedSubLoadingIdxRef.current = null;
+    setEmbeddedSubBusyIdx(null);
+    embeddedSubFileGenRef.current++; // invalidate any in-flight extraction
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.id]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
@@ -1494,6 +1508,67 @@ interface FastStreamPlayerProps {
     }
   }, [subs]);
 
+  // Toggle an EMBEDDED subtitle track (captions menu → Embedded section).
+  // First click extracts via the backend (spinner row while running) and
+  // activates; later clicks toggle the already-loaded track without refetch.
+  // The choice is persisted per file (-1 = explicitly off) and re-applied on
+  // the next open of the same file.
+  const toggleEmbeddedSub = useCallback(async (idx: number, label: string, language: string) => {
+    const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+    // Already loaded → plain toggle.
+    const existing = embeddedSubTracksRef.current.get(idx);
+    if (existing) {
+      const wasActive = subs.activeTracks.includes(existing);
+      subs.toggleTrack(existing);
+      persistSubTrack(fileKey, wasActive ? -1 : idx);
+      return;
+    }
+    // Fetch in flight for this idx → ignore the click (spinner shows).
+    if (embeddedSubLoadingIdxRef.current != null) return;
+    embeddedSubLoadingIdxRef.current = idx;
+    setEmbeddedSubBusyIdx(idx);
+    const genAtStart = embeddedSubFileGenRef.current;
+    try {
+      const res = await msePlayer.fetchEmbeddedSubText(idx);
+      // File switched while extracting: the reset effect already cleared the
+      // bookkeeping — drop this result entirely (activating would attach file
+      // A's cues to file B; the finally must not clobber B's state either).
+      if (embeddedSubFileGenRef.current !== genAtStart) return;
+      if ('error' in res) {
+        if (res.error === 'empty') toast.info('This subtitle track has no cues');
+        else toast.error('Subtitle extraction failed');
+        return;
+      }
+      const track = new SubtitleTrack(label, language || null);
+      track.loadText(res.text);
+      embeddedSubTracksRef.current.set(idx, track);
+      subs.activateTrack(subs.addTrack(track));
+      persistSubTrack(fileKey, idx);
+    } finally {
+      if (embeddedSubFileGenRef.current === genAtStart) {
+        embeddedSubLoadingIdxRef.current = null;
+        setEmbeddedSubBusyIdx(null);
+      }
+    }
+  }, [subs, msePlayer, activeFolderId, file.id]);
+
+  // Re-apply the persisted embedded-subtitle choice when the track list for
+  // this file materializes (plan §2.4: never auto-enable without a persisted
+  // choice; -1 = explicit off, absent = no stored preference).
+  const embeddedSubAutoAppliedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+    if (embeddedSubAutoAppliedRef.current === fileKey) return; // once per file
+    if (msePlayer.embeddedSubTracks.length === 0) return;
+    embeddedSubAutoAppliedRef.current = fileKey;
+    const persisted = readPersistedSubTrack(fileKey);
+    if (persisted == null || persisted < 0) return; // off / no choice
+    const t = msePlayer.embeddedSubTracks.find((s) => s.idx === persisted && s.kind === 'text');
+    if (!t) return;
+    void toggleEmbeddedSub(t.idx, t.label, t.language);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msePlayer.embeddedSubTracks, file.id, activeFolderId]);
+
   // Settings panel resize: drag the left edge. Width is clamped to the player box
   // and persisted so it's remembered across sessions. Panel grows leftward, so a
   // drag to the LEFT (smaller clientX) = wider panel.
@@ -1750,12 +1825,43 @@ interface FastStreamPlayerProps {
           </button>
           {subMenu && (
             <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
-              <button onClick={() => { subs.activeTracks.forEach(subs.deactivateTrack); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
+              <button onClick={() => { subs.activeTracks.forEach(subs.deactivateTrack); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
               {subs.tracks.map((t, i) => (
                 <button key={i} onClick={() => subs.toggleTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
                   {t.label || t.language || `Track ${i + 1}`}{t.isASS ? ' (ASS)' : ''}
                 </button>
               ))}
+              {(msePlayer.embeddedSubTracks.length > 0 || msePlayer.embeddedSubsLoading) && (
+                <div className="border-t border-white/10 mt-1 pt-1">
+                  <div className="px-3 py-1 text-[11px] uppercase tracking-wider text-white/40 select-none">Embedded</div>
+                  {msePlayer.embeddedSubsLoading && msePlayer.embeddedSubTracks.length === 0 && (
+                    <div className="px-3 py-1.5 text-sm text-white/50">Scanning tracks…</div>
+                  )}
+                  {msePlayer.embeddedSubTracks.map((t) => {
+                    const loaded = embeddedSubTracksRef.current.get(t.idx);
+                    const active = !!loaded && subs.activeTracks.includes(loaded);
+                    const busy = embeddedSubBusyIdx === t.idx;
+                    const disabled = t.kind !== 'text' || busy;
+                    return (
+                      <button
+                        key={t.idx}
+                        disabled={disabled}
+                        title={t.kind !== 'text' ? 'Image-based subtitles — not supported' : t.label}
+                        onClick={() => { void toggleEmbeddedSub(t.idx, t.label, t.language); }}
+                        className={`block w-full text-left px-3 py-1.5 text-sm truncate ${
+                          t.kind !== 'text'
+                            ? 'text-white/30 cursor-not-allowed'
+                            : active
+                              ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold hover:bg-white/10'
+                              : 'text-white hover:bg-white/10'
+                        }`}
+                      >
+                        {busy ? `${t.label} — extracting…` : `${t.label}${t.kind !== 'text' ? ' (image-based)' : ''}`}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <div className="border-t border-white/10 mt-1 pt-1">
                 <button onClick={() => { setSubMenu(false); subFileInputRef.current?.click(); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Load subtitle file…</button>
               </div>
@@ -2000,7 +2106,7 @@ interface FastStreamPlayerProps {
           />
         )}
         {!err && (
-          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} />
+          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} assFonts={msePlayer.getEmbeddedSubFontUrls()} />
         )}
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
