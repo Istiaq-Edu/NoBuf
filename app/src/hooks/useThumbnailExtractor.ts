@@ -194,6 +194,158 @@ export function readMkvCuePointCount(videoTrack: unknown): number | null {
   } catch { return null; }
 }
 
+// ─── Round-3 Fix C: cue-less MKV far-hover bisection helpers ─────────────────
+// A cue-less MKV forces mediabunny's getKeyPacket into a LINEAR cluster walk
+// from its last known position (observed round-2: 184MB/103s for ONE hover).
+// The demuxer's own walk-start structure — InternalTrack.clusterPositionCache:
+// {elementStartPos, startTimestamp}[] (sorted, sparse-ok, binary-searched by
+// performClusterLookup) — is injectable: byte-bisect the file for the cluster
+// at-or-before the hover time, insert a synthetic entry, and the walk becomes
+// ≤1-2 clusters. Verified against vendored mediabunny 1.45.4
+// (reports/research/round3-verify-c-bisect.md). All three helpers are pure /
+// guarded reach-ins (readMkvCuePointCount precedent): shape drift ⇒ null/false
+// ⇒ callers degrade to the round-2 skip behavior.
+
+const MKV_CLUSTER_ID = 0x1f43b675;
+/** EBML IDs legal as Cluster children (vendored demuxer's handled set):
+ *  Timestamp, CRC-32, SilentTracks, Position, PrevSize, SimpleBlock, BlockGroup. */
+const MKV_CLUSTER_CHILD_IDS = new Set([0xe7, 0xbf, 0x5854, 0xa7, 0xab, 0xa3, 0xa0]);
+
+/** Parse an EBML vint at `pos`: returns value + width, or null. `keepMarker`
+ *  keeps the length-descriptor bit (element IDs are stored WITH the marker). */
+function readVint(buf: Uint8Array, pos: number, keepMarker: boolean): { value: number; width: number } | null {
+  if (pos >= buf.length) return null;
+  const first = buf[pos];
+  if (first === 0) return null;
+  let width = 1;
+  for (let mask = 0x80; !(first & mask); mask >>= 1) width++;
+  if (width > 8 || pos + width > buf.length) return null;
+  let value = keepMarker ? first : first & (0xff >> width);
+  for (let i = 1; i < width; i++) value = value * 256 + buf[pos + i];
+  return { value, width };
+}
+
+/** True when the size vint at `pos` is the EBML unknown-size marker (all
+ *  value bits set, any width — e.g. 0xFF, 0x01FF..FF). */
+function isUnknownSize(buf: Uint8Array, pos: number): boolean {
+  const v = readVint(buf, pos, false);
+  if (!v) return false;
+  const first = buf[pos];
+  const valueBitsFirst = first & (0xff >> v.width);
+  if (valueBitsFirst !== (0xff >> v.width)) return false;
+  for (let i = 1; i < v.width; i++) if (buf[pos + i] !== 0xff) return false;
+  return true;
+}
+
+/** Sync-scan a fetched window for a VALIDATED MKV Cluster and read its 0xE7
+ *  Timestamp. Validation (verify-c H-C1e): plausible size vint (or unknown-size
+ *  marker), child-walk with only legal Cluster-child IDs until 0xE7 (CRC-32 is
+ *  commonly first — R11), ticks within [loTicks-slack, hiTicks+slack]. False
+ *  positives continue the scan. Returns ABSOLUTE file position of the ID's
+ *  first byte (the demuxer parses the header at exactly that byte). */
+export function scanForMkvClusterInWindow(
+  buf: Uint8Array,
+  windowFileOffset: number,
+  loTicks: number,
+  hiTicks: number,
+  slackTicks: number,
+): { elementStartPos: number; timestampTicks: number } | null {
+  const MAX_DEFINED_SIZE = 256 * 1024 * 1024; // clusters beyond 256MB are implausible
+  outer:
+  for (let i = 0; i + 4 <= buf.length; i++) {
+    if (((buf[i] << 24) | (buf[i + 1] << 16) | (buf[i + 2] << 8) | buf[i + 3]) >>> 0 !== MKV_CLUSTER_ID) continue;
+    const sizePos = i + 4;
+    const size = readVint(buf, sizePos, false);
+    if (!size) continue;
+    if (!isUnknownSize(buf, sizePos) && size.value > MAX_DEFINED_SIZE) continue;
+    // Child-walk from data start until we hit Timestamp (0xE7) or run out.
+    let p = sizePos + size.width;
+    for (let child = 0; child < 8 && p < buf.length; child++) {
+      const id = readVint(buf, p, true);
+      if (!id || !MKV_CLUSTER_CHILD_IDS.has(id.value)) continue outer;
+      const childSize = readVint(buf, p + id.width, false);
+      if (!childSize) continue outer;
+      const dataPos = p + id.width + childSize.width;
+      if (id.value === 0xe7) {
+        if (dataPos + childSize.value > buf.length || childSize.value === 0 || childSize.value > 8) continue outer;
+        let ticks = 0;
+        for (let b = 0; b < childSize.value; b++) ticks = ticks * 256 + buf[dataPos + b];
+        if (ticks < loTicks - slackTicks || ticks > hiTicks + slackTicks) continue outer;
+        return { elementStartPos: windowFileOffset + i, timestampTicks: ticks };
+      }
+      p = dataPos + childSize.value; // skip this child (CRC-32 etc.)
+    }
+  }
+  return null;
+}
+
+/** timestampFactor (ticks per second) from the segment — guarded reach-in. */
+export function readMkvTimestampFactor(videoTrack: unknown): number | null {
+  try {
+    const f = (videoTrack as any)?._backing?.internalTrack?.segment?.timestampFactor;
+    return typeof f === 'number' && Number.isFinite(f) && f > 0 ? f : null;
+  } catch { return null; }
+}
+
+/** First-cluster byte (bisection lo-bound; skips the header region and pins
+ *  segment membership — verify-c residual 7). Guarded reach-in. */
+export function readMkvClusterSeekStart(videoTrack: unknown): number | null {
+  try {
+    const seg = (videoTrack as any)?._backing?.internalTrack?.segment;
+    const v = seg?.clusterSeekStartPos ?? seg?.dataStartPos;
+    return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+  } catch { return null; }
+}
+
+/** Insert a synthetic entry into the demuxer's clusterPositionCache — sorted
+ *  splice by startTimestamp + neighbor dedup by elementStartPos, mirroring the
+ *  vendored organic insert (matroska-demuxer readCluster). false = shape drift
+ *  (caller degrades to skip). */
+export function injectMkvClusterPosition(
+  videoTrack: unknown,
+  entry: { elementStartPos: number; startTimestamp: number },
+): boolean {
+  try {
+    const cache = (videoTrack as any)?._backing?.internalTrack?.clusterPositionCache;
+    if (!Array.isArray(cache)) return false;
+    // binarySearchLessOrEqual by startTimestamp (last index with value <= key).
+    let lo = 0, hi = cache.length - 1, idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (cache[mid].startTimestamp <= entry.startTimestamp) { idx = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (idx >= 0 && cache[idx].elementStartPos === entry.elementStartPos) return true; // dup
+    cache.splice(idx + 1, 0, { elementStartPos: entry.elementStartPos, startTimestamp: entry.startTimestamp });
+    return true;
+  } catch { return false; }
+}
+
+/** R10 consult-before-bisect: an existing cache entry (organic OR injected)
+ *  with startTimestamp ∈ [targetTicks - windowTicks, targetTicks] already
+ *  bounds getKeyPacket's walk — skip the bisection entirely. */
+export function findClusterCacheEntryNear(
+  videoTrack: unknown,
+  targetTicks: number,
+  windowTicks: number,
+): { elementStartPos: number; startTimestamp: number } | null {
+  try {
+    const cache = (videoTrack as any)?._backing?.internalTrack?.clusterPositionCache;
+    if (!Array.isArray(cache) || cache.length === 0) return null;
+    let lo = 0, hi = cache.length - 1, idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (cache[mid].startTimestamp <= targetTicks) { idx = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (idx < 0) return null;
+    const e = cache[idx];
+    return targetTicks - e.startTimestamp <= windowTicks
+      ? { elementStartPos: e.elementStartPos, startTimestamp: e.startTimestamp }
+      : null;
+  } catch { return null; }
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
