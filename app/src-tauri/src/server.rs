@@ -326,6 +326,14 @@ pub(crate) struct StreamQuery {
     /// Used by the TS keyframe scanner to avoid triggering scattered
     /// targeted downloads at far-ahead byte offsets.
     pub(crate) cached_only: Option<bool>,
+    /// Round-3 subs fix: serve ONLY the already-cached prefix of the range, then
+    /// END the body cleanly at the cache frontier — no poll-wait, no Telegram
+    /// fallback, no coordinator subscribe/spawn. Unlike `cached_only` this never
+    /// 503s a partially-cached range (that check is pre-body and whole-request —
+    /// review R1). ffmpeg salvages every cue parsed before the close (exit 0,
+    /// fixture-verified). Used exclusively by subtitles_extract_track for
+    /// not-fully-cached files.
+    pub(crate) cached_prefix: Option<bool>,
     /// Expected duration in seconds (for remux endpoint).
     /// Passed to ffmpeg via -t so the fMP4 moov box contains the correct
     /// total duration — without this, the browser can't show the video length.
@@ -764,6 +772,18 @@ async fn stream_media(
             .body("Range not cached — cached_only mode");
     }
 
+    // === cached_prefix (round-3 subs fix): bounded prefix read ===
+    // Serve whatever contiguous prefix of the range is on disk, then END the
+    // body at the cache frontier. Never subscribe to or spawn a Telegram
+    // download (the whole point: a subs extraction must not compete for
+    // bandwidth or run for minutes). The stream body's CACHE-PREFIX + poll
+    // loop handle the serving; the gates inside the body (see
+    // cached_prefix_mode) handle the ending. NOTE deliberately NOT the
+    // cached_only 503 above: that check is whole-request (fires for any
+    // not-fully-cached range — review R1) and would kill ffmpeg's 0-EOF
+    // request instantly.
+    let cached_prefix_mode = query.cached_prefix.unwrap_or(false);
+
     // === COORDINATOR: Check if an active SEQUENTIAL download already covers our range ===
     // Bug #6 fix: overlapping range requests subscribe to existing downloads instead of
     // spawning duplicates.
@@ -775,7 +795,14 @@ async fn stream_media(
     //    browser to retry later (by then the data should be cached or closer to our offset).
     //    This eliminates the "proceed unregistered" cascade that wastes bandwidth.
     if let Some(ref cache_mgr) = **cache {
-        let dl_info = cache_mgr.find_best_covering_download(message_id, start_byte, end_byte).await;
+        // cached_prefix (round-3): never subscribe — a subscriber stream rides an
+        // ACTIVE Telegram download and delivers at Telegram speed (unbounded time).
+        // Prefix reads must serve disk bytes and end. Fall through to the poll path.
+        let dl_info = if cached_prefix_mode {
+            None
+        } else {
+            cache_mgr.find_best_covering_download(message_id, start_byte, end_byte).await
+        };
         if let Some(dl) = dl_info {
             let current_progress = *dl.progress_rx.borrow();
             let distance = start_byte.saturating_sub(current_progress.max(dl.start_byte));
@@ -1007,6 +1034,9 @@ async fn stream_media(
     let client_clone = client.clone();
     let media_clone = media.clone();
     let semaphore_clone = data.download_semaphore.clone();
+    // cached_prefix (round-3): moved into the stream body; gates the frontier
+    // poll-wait and the Telegram fallback so the body ENDS at the cache frontier.
+    let cached_prefix_stream = cached_prefix_mode;
 
     let stream = async_stream::stream! {
         // ── CACHE PREFIX: Serve already-cached bytes instantly from disk ──
@@ -1190,6 +1220,14 @@ async fn stream_media(
             }
 
             // Data not cached yet — wait for proactive prebuffer to download it
+            // cached_prefix (round-3): NO waiting — the prefix is exhausted, end
+            // the body cleanly at the frontier. ffmpeg finalizes the cues parsed
+            // so far (exit 0; CUT shape, fixture-verified).
+            if cached_prefix_stream {
+                log::info!("[STREAM-PREFIX-END] msg {} ended at cache frontier offset {} ({}B of {} sent — cached_prefix mode)",
+                    message_id, read_offset, bytes_sent, content_length);
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
             wait_elapsed_ms += POLL_INTERVAL_MS;
 
@@ -1217,8 +1255,8 @@ async fn stream_media(
 
             // Safety timeout: if data doesn't appear in 30s, fall back to Telegram
             if wait_elapsed_ms >= FALLBACK_TIMEOUT_MS {
-                log::warn!("[STREAM-CACHE-WAIT] msg {}: 10s timeout waiting for cache at offset {}, falling back to Telegram",
-                    message_id, read_offset);
+                log::warn!("[STREAM-CACHE-WAIT] msg {}: {}ms timeout waiting for cache at offset {}, falling back to Telegram",
+                    message_id, FALLBACK_TIMEOUT_MS, read_offset);
                 break; // Exit poll loop, enter Telegram fallback below
             }
         }
@@ -1228,7 +1266,14 @@ async fn stream_media(
         // cache manager at all, download remaining data directly from Telegram.
         // This is a safety net for when the proactive prebuffer fails or
         // isn't running — prevents the player from hanging forever.
-        if bytes_sent < content_length {
+        // cached_prefix (round-3): NEVER fall back to Telegram — this arm is the
+        // normal exit when the cached run at start_byte was too small for the
+        // poll loop (skip_poll bootstrap heuristic) or absent entirely (e.g.
+        // ffmpeg's EOF SeekHead probe on an uncached tail): end the body short.
+        if cached_prefix_stream && bytes_sent < content_length {
+            log::info!("[STREAM-PREFIX-END] msg {} ended at cache frontier offset {} ({}B of {} sent — cached_prefix mode, no fallback)",
+                message_id, read_offset, bytes_sent, content_length);
+        } else if bytes_sent < content_length {
             let fallback_start = read_offset;
             let fallback_remaining = content_length - bytes_sent;
             log::debug!("[STREAM-FALLBACK] msg {} falling back to Telegram download from offset {}, {} bytes remaining",
@@ -2110,7 +2155,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2726,6 +2771,11 @@ fn build_sub_extract_args(
         args.push("-f".into());
         args.push("srt".into());
     }
+    // Round-3: flush each muxed cue to disk immediately — the output survives
+    // even a kill_on_drop mid-extraction (120s timeout), enabling salvage
+    // (fixture: 90 cues on disk at SIGKILL t=25s vs 0 without).
+    args.push("-flush_packets".into());
+    args.push("1".into());
     args.push(out_path.into());
     args
 }
@@ -4315,7 +4365,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -6017,7 +6067,7 @@ async fn subtitles_extract_track(
 ) -> impl Responder {
     let (folder_id_str, message_id, stream_idx) = path.into_inner();
     let sq = StreamQuery {
-        token: query.token.clone(), cached_only: None, duration: None,
+        token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None,
     };
@@ -6096,7 +6146,19 @@ async fn subtitles_extract_track(
         .and_then(|m| m.load_meta(message_id))
         .map(|m| m.is_complete())
         .unwrap_or(false);
-    let input_source = subs_input_source(&folder_id_str, message_id, token, &cache);
+    let input_source = {
+        let mut src = subs_input_source(&folder_id_str, message_id, token, &cache);
+        // Round-3 (review R1): bound the extraction input to the cached prefix.
+        // The body serves disk bytes and ENDS at the frontier — ffmpeg finalizes
+        // every cue parsed so far (exit 0) and the response rides the existing
+        // X-Subs-Partial path below. Only the extract call site gets this param:
+        // probe (EOF SeekHead) and font reads share subs_input_source and must
+        // stay unbounded.
+        if !fully_cached && src.starts_with("http") {
+            src.push_str("&cached_prefix=1");
+        }
+        src
+    };
     let tmp_path = subs_dir.join(format!(
         "{}.tmp",
         sub_cache_filename(&folder_id_str, message_id, stream_idx, ass)
@@ -6156,11 +6218,18 @@ async fn subtitles_extract_track(
     };
 
     // exit 0 + empty output = legitimate zero-cue track (E14-redo): 204, and
-    // do NOT cache (a partially-cached file may yield cues later).
+    // do NOT cache (a partially-cached file may yield cues later). Round-3:
+    // when the input was prefix-bounded, tag the 204 as partial so the frontend
+    // can say "no cues in the downloaded portion YET" and allow a later retry.
     if text.is_empty() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        log::info!("[SUBS] msg {} s{}: track has no cues (204)", message_id, stream_idx);
-        return HttpResponse::NoContent().finish();
+        log::info!("[SUBS] msg {} s{}: track has no cues (204{})", message_id, stream_idx,
+            if fully_cached { "" } else { ", partial input" });
+        let mut resp = HttpResponse::NoContent();
+        if !fully_cached {
+            resp.insert_header(("X-Subs-Partial", "1"));
+        }
+        return resp.finish();
     }
 
     // "File ended prematurely" with cues present = partial extraction (P8):
@@ -6207,7 +6276,7 @@ async fn subtitles_font(
 ) -> impl Responder {
     let (folder_id_str, message_id, att_idx) = path.into_inner();
     let sq = StreamQuery {
-        token: query.token.clone(), cached_only: None, duration: None,
+        token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None,
     };
@@ -6310,7 +6379,7 @@ async fn remux_hover_thumb(
 
     // Token check + media resolve (also gives us total_size).
     let sq = StreamQuery {
-        token: query.token.clone(), cached_only: None, duration: None,
+        token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None,
     };
@@ -7296,6 +7365,19 @@ mod tests {
         }
         assert_eq!(super::subtitle_kind("kate"), "unsupported");
         assert_eq!(super::subtitle_kind(""), "unsupported");
+    }
+
+    /// Round-3 subs fix: every extraction flushes cues to disk per-packet so the
+    /// output survives a kill_on_drop mid-extraction (timeout salvage belt).
+    #[test]
+    fn sub_extract_args_include_flush_packets() {
+        let args = super::build_sub_extract_args(
+            "http://x/stream/home/1?token=t&source_id=subs", 2, false, false, "out.srt",
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-flush_packets 1"), "srt args: {}", joined);
+        let args_ass = super::build_sub_extract_args("in.mkv", 3, true, false, "out.ass");
+        assert!(args_ass.join(" ").contains("-flush_packets 1"), "ass path too");
     }
 
     /// Font attachment detection: mimetype first, extension fallback for
