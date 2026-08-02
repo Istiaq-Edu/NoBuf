@@ -6139,13 +6139,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
   /**
    * Fetch the extracted text of ONE embedded subtitle track (plan §2.2).
-   * Returns { text, format } on success, null on any failure (caller toasts).
-   * Handles: 204 zero-cue tracks (null + 'empty' reason), 429 extraction
-   * in-flight (single retry after Retry-After), C0-byte mangling (E8 strip).
+   * Returns { text, format, partial } on success (partial = extracted from the
+   * cached PREFIX only — round-3 bounded extraction; more cues appear as the
+   * cache grows and the caller may re-extract). null-ish failures: 204 zero-cue
+   * tracks ('empty', or 'empty-partial' when the prefix just doesn't hold cues
+   * YET), 429 extraction in-flight (single retry after Retry-After), C0-byte
+   * mangling (E8 strip).
    */
   const fetchEmbeddedSubText = useCallback(async (
     streamIdx: number,
-  ): Promise<{ text: string; format: 'ass' | 'srt' } | { error: 'empty' | 'failed' }> => {
+  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean } | { error: 'empty' | 'empty-partial' | 'failed' }> => {
     const url = streamUrlRef.current;
     const parsed = url ? parseStreamUrl(url) : null;
     if (!parsed) return { error: 'failed' };
@@ -6158,17 +6161,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         await new Promise((r) => setTimeout(r, Math.min(after, 5) * 1000));
         resp = await fetch(endpoint);
       }
-      if (resp.status === 204) return { error: 'empty' };
+      if (resp.status === 204) {
+        return { error: resp.headers.get('X-Subs-Partial') === '1' ? 'empty-partial' : 'empty' };
+      }
       if (!resp.ok) {
         diagLog(`[SUBS] track ${streamIdx} extraction failed (HTTP ${resp.status})`);
         return { error: 'failed' };
       }
       const format = resp.headers.get('X-Subs-Format') === 'ass' ? 'ass' as const : 'srt' as const;
+      const partial = resp.headers.get('X-Subs-Partial') === '1';
       const raw = await resp.text();
       const text = stripControlChars(raw);
-      if (!text.trim()) return { error: 'empty' };
-      diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${resp.headers.get('X-Subs-Partial') ? ', partial' : ''})`);
-      return { text, format };
+      if (!text.trim()) return { error: partial ? 'empty-partial' : 'empty' };
+      diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${partial ? ', partial' : ''})`);
+      return { text, format, partial };
     } catch (e: any) {
       diagLog(`[SUBS] track ${streamIdx} fetch error: ${e?.message}`);
       return { error: 'failed' };
