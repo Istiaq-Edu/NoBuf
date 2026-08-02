@@ -43,6 +43,14 @@ function diagLog(msg: string) {
   invoke('cmd_log', { message: msg }).catch(() => {});
 }
 
+// Layer-1 audio-start fallback window (reports/mkv-audioskip-solution.md §Layer 1).
+// getFirstKeyPacket scans from segment start by DESIGN (bypasses cues) — cheap only
+// when the window itself is near the head (bytes already in the seed/cold-start
+// prefetch, and the subsequent audio iteration covers ≤ this many seconds). For
+// mid-file windows the fallback must NOT run: iterating audio from the file's first
+// packet to a far window would stream every cluster in between over HTTP (edge-A D9).
+const NEAR_START_AUDIO_FALLBACK_S = 10;
+
 export interface TransmuxerConfig {
   format: DetectedFormat;
   sourceConfig: TauriStreamSourceConfig;
@@ -94,6 +102,16 @@ function combineUint8Arrays(...arrays: Uint8Array[]): ArrayBuffer {
   return result.buffer;
 }
 
+/** Fix A2 (round-2): post-resolve abandon predicate. True ⇒ this seek was condemned while its
+ *  getKeyPacket walk ran (interrupt set seekAbortFlag / dispose / a newer seek bumped the
+ *  generation) and must do ZERO further work — see the belt call in seekTo. Pure + exported
+ *  for unit testing (house pattern: shouldInterruptInflightSeek et al.). */
+export function shouldAbandonResolvedSeek(
+  seekAbortFlag: boolean, disposed: boolean, capturedGen: number, liveGen: number,
+): boolean {
+  return seekAbortFlag || disposed || capturedGen !== liveGen;
+}
+
 export class MediabunnyTransmuxer {
   private config: TransmuxerConfig;
   private input: Input | null = null;
@@ -119,6 +137,12 @@ export class MediabunnyTransmuxer {
   // Consumed by resolveAudioTrack() at init and in the seekTo() hot path, so a
   // switch = set this + rebuild from playhead (audio-track-selection plan §3).
   private desiredAudioTrackId: number | null = null;
+  // Layer 3 support (audio-skip fix): audio packets actually emitted by the
+  // current seekTo window. A 2-track window that emits ZERO audio packets
+  // starves the SourceBuffer's buffered intersection (stall with no error
+  // event) — the refill chain watches this via wasLastWindowAudioStarved().
+  private windowAudioPacketsAdded = 0;
+  private lastWindowAudioStarved = false;
   private ebmlHeaderData: Uint8Array | null = null;
   private lastProcessedTime: number = 0;
   private seekAbortFlag = false;
@@ -161,6 +185,13 @@ export class MediabunnyTransmuxer {
   // cluster fetch hits warm cache instead of a wrong-region miss. Empty when the
   // MKV has no Cues or mediabunny's internal layout changed (guarded extraction).
   private mkvCueIndex: { time: number; byteOffset: number }[] = [];
+
+  // Cue-less MKV harvest watermark (fix A, reports/refill-stall-solution.md):
+  // ONE contiguous span [start, end] of fully-iterated packet timestamps.
+  // Inside it, every keyframe is guaranteed present in keyframeTimestamps, so
+  // findNearestKeyframe may trust the index at any distance. -1 = empty.
+  private harvestSpanStart = -1;
+  private harvestSpanEnd = -1;
 
   constructor(config: TransmuxerConfig) {
     this.config = config;
@@ -428,8 +459,28 @@ export class MediabunnyTransmuxer {
 
       const t3 = performance.now();
       diagLog(`[Transmuxer] init: calling resolveAudioTrack()`);
-      const audioTrack = await this.resolveAudioTrack(this.input);
+      let audioTrack = await this.resolveAudioTrack(this.input);
       diagLog(`[Transmuxer] init: resolveAudioTrack()=${audioTrack ? 'found' : 'null'} took ${((performance.now() - t3)/1000).toFixed(1)}s`);
+
+      // Layer 2 (audio-skip fix): probe the audio START before declaring the
+      // mime. The SourceBuffer is created from init()'s track inventory, but
+      // whether audio can actually be EMITTED is only known after a start
+      // lookup — for a cue-less MKV whose audio starts >0s the legacy lookup
+      // returned null, audio was silently skipped, and the init segment
+      // omitted the promised aac trak → Chromium code-4 fatal. Probe with the
+      // same Layer-1 chain the windows use (head bytes are seed-cached, so
+      // this costs one in-memory cluster read); if even the chain fails,
+      // declare video-only NOW — every downstream site keys off audioCodec,
+      // so the mime, setupOutput's addAudioTrack, and the window pumps all
+      // stay consistent automatically.
+      if (audioTrack) {
+        const probeSink = new EncodedPacketSink(audioTrack);
+        const probe = await this.resolveAudioStartPacket(probeSink, 0, this.seekGeneration);
+        if (!probe) {
+          diagLog('[Transmuxer] init: audio start UNRESOLVABLE (even via fallback chain) — declaring VIDEO-ONLY output');
+          audioTrack = null;
+        }
+      }
 
       this.videoCodec = videoTrack ? await videoTrack.getCodec() : null;
       this.audioCodec = audioTrack ? await audioTrack.getCodec() : null;
@@ -748,8 +799,6 @@ export class MediabunnyTransmuxer {
     if (this.keyframeIndexBuilt) return; // Full index already available — no need for incremental
 
     const ts = this.keyframeTimestamps;
-    // Skip if already present (within 0.01s tolerance)
-    if (ts.some(t => Math.abs(t - timestamp) < 0.01)) return;
 
     // Binary search for insertion position
     let lo = 0, hi = ts.length;
@@ -761,8 +810,35 @@ export class MediabunnyTransmuxer {
         hi = mid;
       }
     }
+    // Dedup via neighbor check — O(log n) total, replacing the old O(n)
+    // ts.some() scan (the harvest path calls this per keyframe; ~3k keyframes
+    // on a 9h file would make the linear scan ~5M compares over the file).
+    if ((lo < ts.length && Math.abs(ts[lo] - timestamp) < 0.01)
+     || (lo > 0 && Math.abs(ts[lo - 1] - timestamp) < 0.01)) return;
     ts.splice(lo, 0, timestamp);
     this.keyframeIndexPartial = true;
+  }
+
+  /** Watermark update (cue-less MKV harvest). Consecutive refill windows
+   *  OVERLAP by construction on cue-less files (the next window re-resolves
+   *  the PRIOR keyframe behind the mid-GOP maxDuration cut), so the merge
+   *  branch runs with negative gap; the 0.25s tolerance additionally bridges
+   *  float jitter on exact-abut geometries. A disjoint HIGHER window (far
+   *  forward seek) RESETS the span (single-span model — the refill chain only
+   *  queries the current playback region; GOP>12s coverage behind a far seek
+   *  degrades to the G1/B guards, disclosed in the design). A disjoint LOWER
+   *  window merges without extending — the span can under-claim, NEVER
+   *  over-claim (span facts are monotone: once fully iterated, always true). */
+  private noteIterated(ts: number): void {
+    if (this.harvestSpanEnd >= 0 && ts <= this.harvestSpanEnd + 0.25) {
+      if (ts > this.harvestSpanEnd) this.harvestSpanEnd = ts;
+    } else if (ts > this.harvestSpanEnd) {
+      // First-ever window or disjoint-higher reset. (`ts > end` is always
+      // true here for non-negative timestamps; the guard only rejects
+      // degenerate negatives.)
+      this.harvestSpanStart = ts;
+      this.harvestSpanEnd = ts;
+    }
   }
 
   /** Find the nearest keyframe timestamp at or before the given time.
@@ -800,7 +876,13 @@ export class MediabunnyTransmuxer {
       // trust a partial-index hit within ONE GOP (~12s); beyond that, return null
       // so the caller falls back to native getKeyPacket(seekTime), which finds the
       // true keyframe at the requested position (fast for MKV — cluster-based).
-      if (!this.keyframeIndexBuilt && seekTime - ts[lo] > 12) {
+      // Inside the harvest watermark the index provably contains EVERY
+      // keyframe of the span, so the nearest indexed keyframe IS the true
+      // nearest — trust it at any distance (a GOP>12s cue-less file would
+      // otherwise still null). Outside the span the 12s rule is unchanged.
+      const inWatermark = this.harvestSpanEnd >= 0
+        && seekTime >= this.harvestSpanStart && seekTime <= this.harvestSpanEnd + 0.25;
+      if (!this.keyframeIndexBuilt && !inWatermark && seekTime - ts[lo] > 12) {
         return null; // Sparse coverage — don't seek to a distant stale keyframe
       }
       return ts[lo];
@@ -915,7 +997,7 @@ export class MediabunnyTransmuxer {
     let audioSkipped = false;
     if (audioTrack && audioSource) {
       audioSink = new EncodedPacketSink(audioTrack);
-      audioStartPacket = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
+      audioStartPacket = await this.resolveAudioStartPacket(audioSink, keyframeTimestamp, generation);
       if (!audioStartPacket) {
         audioSource.close();
         audioSink = null;
@@ -1025,10 +1107,10 @@ export class MediabunnyTransmuxer {
     let audioSkipped = false;
     if (audioTrack && audioSource) {
       audioSink = new EncodedPacketSink(audioTrack);
-      diagLog(`[Transmuxer] seqContinue: calling audioSink.getKeyPacket at t=${performance.now().toFixed(0)}ms`);
+      diagLog(`[Transmuxer] seqContinue: resolving audio start at t=${performance.now().toFixed(0)}ms`);
       const t7 = performance.now();
-      audioStartPacket = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
-      diagLog(`[Transmuxer] seqContinue: audioSink.getKeyPacket took ${((performance.now() - t7)/1000).toFixed(2)}s`);
+      audioStartPacket = await this.resolveAudioStartPacket(audioSink, keyframeTimestamp, generation);
+      diagLog(`[Transmuxer] seqContinue: audio start resolve took ${((performance.now() - t7)/1000).toFixed(2)}s`);
       if (!audioStartPacket) {
         audioSource.close();
         audioSink = null;
@@ -1232,6 +1314,8 @@ export class MediabunnyTransmuxer {
 
     // Increment generation to discard stale callback data
     this.seekGeneration++;
+    // Layer-3 starvation watchdog: reset the per-window audio emission counter.
+    this.windowAudioPacketsAdded = 0;
 
     // Cancel current conversion and dispose input
     if (this.conversion) {
@@ -1446,29 +1530,27 @@ export class MediabunnyTransmuxer {
         ? { decoderConfig: (await audioTrack.getDecoderConfig()) as AudioDecoderConfig | undefined }
         : undefined;
 
-      // Find audio starting point nearest to keyframeTimestamp
-      // If getKeyPacket fails (audio track has no Cue points), close audioSource
-      // immediately — the Output treats closed tracks as "done" (keyFrameQueuedEverywhere
-      // returns true for closed tracks), so segments can be produced with video-only data.
-      // The init segment still includes the audio track definition (start() ran before
-      // closing audioSource). Audio will be added via refill segments later.
+      // Find the audio starting point for this window via the Layer-1 fallback
+      // chain (getKeyPacket ?? near-start getFirstKeyPacket — see
+      // resolveAudioStartPacket). When the chain still returns null (mid-file
+      // zero-audio window, or a truly broken track), close the audio source so
+      // the Output can produce video-only MEDIA segments — the Output treats
+      // closed tracks as "done" (keyFrameQueuedEverywhere returns true for
+      // closed tracks). NOTE: a zero-packet closed track is OMITTED from the
+      // moov (mediabunny lazy-creates trackDatas on first sample) — a full
+      // (non-skipInitSegment) window that skips audio under a 2-codec
+      // SourceBuffer mime is a Chromium code-4 fatal. Layer 2 (probe-at-init)
+      // prevents that for the init window; Layer 3 reroutes if it ever fires.
       let audioStartPacket: EncodedPacket | null = null;
       let audioSink: EncodedPacketSink | null = null;
       let audioSkipped = false;
       if (audioTrack && audioSource) {
         const audioKeyStart = performance.now();
         audioSink = new EncodedPacketSink(audioTrack);
-        // Use verifyKeyPackets: false when keyframe index is available —
-        // same optimization as video getKeyPacket. Audio keyframes are less
-        // critical than video (all audio packets are independently decodable
-        // for AAC/Opus), so verification is even less necessary.
-        audioStartPacket = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
-        console.log(`[Transmuxer] seekTo: audio getKeyPacket took ${performance.now() - audioKeyStart}ms, result=${audioStartPacket ? 'found' : 'null (will skip audio)'}`);
+        audioStartPacket = await this.resolveAudioStartPacket(audioSink, keyframeTimestamp, currentGeneration);
+        console.log(`[Transmuxer] seekTo: audio start resolve took ${performance.now() - audioKeyStart}ms, result=${audioStartPacket ? 'found' : 'null (will skip audio)'}`);
 
         if (!audioStartPacket) {
-          // No audio keyframe found near seek position — close audio source immediately.
-          // This allows the Output to produce video-only segments without waiting for
-          // audio data that would require iterating from file start (extremely slow).
           audioSource.close();
           audioSink = null;
           audioSkipped = true;
@@ -1489,6 +1571,18 @@ export class MediabunnyTransmuxer {
       const iterStartTime = performance.now();
       await Promise.all([videoPromise, audioPromise]);
       console.log(`[Transmuxer] seekTo: iteration took ${performance.now() - iterStartTime}ms (audioSkipped=${audioSkipped})`);
+
+      // Zero-audio window signal (edge-A F5): a 2-track window is "starved"
+      // when the output intended audio but ZERO audio packets were emitted —
+      // either the start packet was null (audioSkipped) OR the resolved start
+      // was already >= stopTime and the loop cut on iteration 1. The refill
+      // chain converts consecutive starved windows into a Layer-3 reroute.
+      // Generation-gated like finalize below: a superseded seek's write is
+      // garbage (its reader bails on the chain-generation check anyway).
+      if (currentGeneration === this.seekGeneration) {
+        this.lastWindowAudioStarved =
+          audioTrack !== null && this.audioCodec !== null && this.windowAudioPacketsAdded === 0;
+      }
 
       // Close sources and finalize output
       videoSource.close();
@@ -1546,11 +1640,29 @@ export class MediabunnyTransmuxer {
     verifyKeyPackets: boolean = true,
     stopTime: number = Infinity,
   ): Promise<void> {
+    // Cue-less MKV keyframe harvest (fix A — reports/refill-stall-solution.md):
+    // mediabunny's getKeyPacket walk starts at the highest position-cache entry
+    // ≤ target and only moves FORWARD (vendored matroska-demuxer.ts:2233-2260;
+    // the cache path lacks the cue path's lied-to-us retry), so once a GOP's
+    // keyframe cluster falls behind the read frontier, every mid-GOP lookup in
+    // the played span returns null — permanently. Harvest every keyframe the
+    // pump observes (ORIGINAL pre-clone timestamps) so findNearestKeyframe
+    // resolves refills from memory instead of re-searching. Gated: cue-INDEXED
+    // files keep a byte-identical index (their seekTo never reaches
+    // findNearestKeyframe), and a completed full scan needs no increments.
+    const harvest = this.config.format === 'mkv'
+      && !this.keyframeIndexBuilt
+      && this.mkvCueIndex.length === 0;
     let isFirst = true;
     for await (const packet of videoSink.packets(keyPacket, undefined, { verifyKeyPackets })) {
       if (this.seekAbortFlag || this.disposed || generation !== this.seekGeneration) {
         videoSource.close();
         return;
+      }
+
+      if (harvest) {
+        if (packet.type === 'key') this.addKeyframeTimestamp(packet.timestamp);
+        this.noteIterated(packet.timestamp);
       }
 
       // Clamp to non-negative: audio key packet timestamp can be slightly
@@ -1584,6 +1696,40 @@ export class MediabunnyTransmuxer {
 
       this.lastProcessedTime = packet.timestamp;
     }
+  }
+
+  /**
+   * Resolve the audio packet a transmux window starts from (Layer 1 of the
+   * audio-skip fix — reports/mkv-audioskip-solution.md).
+   *
+   * Chain: getKeyPacket(kf) ?? (near-start ? getFirstKeyPacket() : null).
+   *  - getKeyPacket(t) returns the last packet with ts <= t → NULL when the
+   *    audio track starts after t (e.g. default track starting at 0.029s with
+   *    kf=0 — the Inception repro). All audio packets are typed 'key' on both
+   *    MKV and TS, so a getPacket() link would return the identical result
+   *    (crossvalidation #8) — omitted.
+   *  - getFirstKeyPacket() bypasses cues and scans from segment start — the
+   *    library's own fallback idiom (media-sink.ts:526-527). Gated to
+   *    near-start windows; a mid-file null is surfaced as a zero-audio window
+   *    (Layer 2/3 handle it) instead of an unbounded from-start iteration.
+   *  - Generation/disposal checked between links: a superseding seek must not
+   *    pay for a fallback scan it will discard (edge-A F6).
+   */
+  private async resolveAudioStartPacket(
+    audioSink: EncodedPacketSink,
+    keyframeTimestamp: number,
+    generation: number,
+  ): Promise<EncodedPacket | null> {
+    const direct = await audioSink.getKeyPacket(keyframeTimestamp, { verifyKeyPackets: false });
+    if (direct) return direct;
+    if (this.disposed || generation !== this.seekGeneration) return null;
+    if (keyframeTimestamp > NEAR_START_AUDIO_FALLBACK_S) return null;
+    const first = await audioSink.getFirstKeyPacket();
+    if (this.disposed || generation !== this.seekGeneration) return null;
+    if (first) {
+      diagLog(`[Transmuxer] audio start: fallback getFirstKeyPacket → ${first.timestamp.toFixed(3)}s (kf=${keyframeTimestamp.toFixed(3)}s)`);
+    }
+    return first;
   }
 
   /**
@@ -1634,14 +1780,20 @@ export class MediabunnyTransmuxer {
       } else {
         await audioSource.add(adjusted);
       }
+      // NOTE (reviewer advisory): a superseded window's in-flight add() can
+      // complete after a new seekTo reset this counter, leaking ≤1 stale
+      // increment into the new window — delays the watchdog by one window at
+      // worst, never a false fire (the flag write in seekTo is generation-gated).
+      this.windowAudioPacketsAdded++;
     }
   }
 
-  /**
-   * Iterate audio packets from the beginning (no key packet found near keyframe).
-   * Skips packets before keyframeTimestamp and clamps adjusted timestamps
-   * to non-negative for the same reason as iterateAudioPackets.
-   */
+  /** True when the LAST seekTo window intended audio but emitted zero audio
+   *  packets (zero-audio window — buffered-intersection starvation risk). */
+  wasLastWindowAudioStarved(): boolean {
+    return this.lastWindowAudioStarved;
+  }
+
   getMseDecision(): MseCodecDecision {
     return this.mseDecision;
   }
@@ -1792,6 +1944,8 @@ export class MediabunnyTransmuxer {
     this.keyframeTimestamps = [];
     this.keyframeIndexBuilt = false;
     this.keyframeIndexPartial = false;
+    this.harvestSpanStart = -1;
+    this.harvestSpanEnd = -1;
     this.keyframeByteOffsets = [];
     this.tsHeaderData = null;
     this.initInputRef = null;
