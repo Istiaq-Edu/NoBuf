@@ -356,9 +356,16 @@ export function planAudioSwitch(args: {
   currentMime?: string | null;
   newMime?: string | null;
   isTypeSupportedFn?: (mime: string) => boolean;
+  /** Combined-SB tiers: false when the SourceBuffer was created WITHOUT an audio
+   *  track (Layer-2 video-only birth). MSE pins the track set at the first init
+   *  segment — adding audio later is illegal in every engine (B4), so any switch
+   *  on such a SB must reroute via /remux?audio_idx. Omit on tiers with separate
+   *  per-track SourceBuffers (mp4) or server-side switching (remux). */
+  sbHasAudio?: boolean;
 }): 'rebuild' | 'rebuild-changetype' | 'reroute-remux' | 'reject' {
   if (args.tier === 'ts') return 'reject'; // mpegts.js: no selection (scope cut)
   if (args.tier === 'remux') return 'rebuild'; // ffmpeg re-encodes → always AAC
+  if (args.sbHasAudio === false) return 'reroute-remux'; // B4: track set is pinned
   if (!args.targetPlayable) return 'reroute-remux';
   if (args.currentMime && args.newMime && args.currentMime !== args.newMime) {
     const supported = args.isTypeSupportedFn
@@ -388,6 +395,24 @@ export function withAudioIdx(url: string, idx: number | null | undefined): strin
     if (idx == null) return stripped;
     return stripped + (stripped.includes('?') ? '&' : '?') + `audio_idx=${idx}`;
   }
+}
+
+/**
+ * Bridge the MKV tier's track-id namespace to the /remux tier's (§5 of the
+ * reroute edge doc): MKV menu ids are Matroska TrackNumbers (mediabunny
+ * track.id); /remux?audio_idx expects the ffprobe ABSOLUTE stream index.
+ * Both lists enumerate audio tracks in container order, so map by POSITION.
+ * Returns null when the mapping is unknowable — the server then falls back to
+ * the default track (validated, never breaks playback). Pure + exported.
+ */
+export function mapAudioTrackToRemuxIdx(
+  mkvTracks: AudioTrackInfo[],
+  mkvTrackId: number,
+  ffprobeTracks: { id: number }[],
+): number | null {
+  const pos = mkvTracks.findIndex(t => t.id === mkvTrackId);
+  if (pos < 0) return null;
+  return ffprobeTracks[pos]?.id ?? null;
 }
 
 /** localStorage key + LRU-map helpers for the per-file audio choice (U2). */
@@ -587,6 +612,66 @@ export function decideSeekDispatch(
  */
 export function isSeekSuperseded(capturedGen: number, liveGen: number): boolean {
   return capturedGen !== liveGen;
+}
+
+/**
+ * Zero-audio starvation watchdog rule (Layer 3 of the MKV audio-skip fix).
+ * `consecutiveStarvedWindows` counts refill windows that intended audio but
+ * emitted zero audio packets (transmuxer.wasLastWindowAudioStarved). On a
+ * SourceBuffer that declared audio, 3 in a row means buffered (the per-track
+ * intersection) has stopped growing — an invisible stall; reroute to /remux.
+ * Pure + exported for testing.
+ */
+export function shouldTriggerZeroAudioReroute(
+  consecutiveStarvedWindows: number,
+  sbHasAudio: boolean,
+): boolean {
+  return sbHasAudio && consecutiveStarvedWindows >= 3;
+}
+
+/**
+ * Refill chain-continue delay (fix C of the cue-less MKV refill-stall stack —
+ * reports/refill-stall-solution.md). A null refill (seekTo could not resolve a
+ * keyframe) retries at a flat 1000ms: on cue-less MKV the null is DETERMINISTIC
+ * (mediabunny's position-cache walk is a pure function of frozen state — 3,413
+ * observed 130Hz retries changed nothing), so fast retries are pointless; 1s
+ * keeps the breaker's time-to-verdict ~4s while killing the spin. Healthy
+ * refills keep the original expression byte-for-byte (cue-indexed/TS unchanged).
+ * Pure + exported for testing.
+ */
+export function computeRefillChainDelay(
+  lastRefillWasNull: boolean,
+  ahead: number,
+  threshold: number,
+): number {
+  if (lastRefillWasNull) return 1000;
+  return ahead < threshold ? 0 : Math.min(5000, Math.max(2000, Math.floor((ahead - threshold) * 200)));
+}
+
+/**
+ * Null-refill circuit breaker verdict (fix B of the cue-less MKV refill-stall
+ * stack). A cue-less getKeyPacket(bufEnd) null is deterministic (frozen
+ * position cache — vendored matroska-demuxer.ts:2233-2260 lacks the cue path's
+ * lied-to-us retry), so counting is evidence-gathering for transients only.
+ * Near duration end (within nearEofThresholdS = max(estimated GOP, 5), passed
+ * by the caller) the last keyframe is behind us and fully transmuxed → 'eof'
+ * at 2 observations (mirrors the indexed nearEOF+noProgress≥1 precedent).
+ * Mid-file → 'reroute' to the ffmpeg /remux tier at 5. Unknown duration can
+ * never declare eof (a guessed endOfStream would truncate mid-file playback).
+ * Pure + exported for testing.
+ */
+export function classifyNullRefill(
+  consecutiveNullRefills: number,
+  refillPosition: number,
+  duration: number,
+  isMkv: boolean,
+  nearEofThresholdS: number,
+): 'continue' | 'eof' | 'reroute' {
+  if (!isMkv) return 'continue';
+  const nearEof = duration > 0 && Number.isFinite(duration)
+    && refillPosition >= duration - nearEofThresholdS;
+  if (nearEof) return consecutiveNullRefills >= 2 ? 'eof' : 'continue';
+  return consecutiveNullRefills >= 5 ? 'reroute' : 'continue';
 }
 
 /**
@@ -1752,6 +1837,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Generation ref lets an in-flight warmer bail when a new file/teardown starts.
   const mkvWarmerGenRef = useRef(0);
   const mkvWarmerActiveRef = useRef(false);
+  // ── Layer-3 MKV fatal reroute state ──
+  // Re-entrancy latch: a reroute is in flight (R1 — double-fatal from the same
+  // dying pipeline must not start two recoveries).
+  const mkvRerouteInFlightRef = useRef(false);
+  // Whether the MKV combined SB was created WITH an audio track (Layer-2 birth
+  // decision). Gates the starvation watchdog and the B4 switch guard.
+  const mkvSbHasAudioRef = useRef(true);
+  // Consecutive refill windows that intended audio but emitted zero packets.
+  const zeroAudioWindowsRef = useRef(0);
+  // Latest-instance mirror of _recoverMkvToRemuxTier: the video-error listener
+  // is registered ONCE with [] deps (its closure is frozen at mount), so it —
+  // and every other long-lived closure — must call through this ref.
+  const recoverMkvRerouteRef = useRef<((reason: string) => Promise<boolean>) | null>(null);
   // Tracks the keyframe timestamp of the last refill seekTo. When a refill
   // finds the same keyframe as the previous refill (no new data progress),
   // it means we've reached EOF — the chain should stop and call endOfStream.
@@ -1763,6 +1861,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // at 2066.66s but duration is 2073.2s — one noProgress is normal, two
   // means we're truly stuck at the last keyframe).
   const consecutiveNoProgressRef = useRef(0);
+  // Cue-less MKV refill-stall stack (reports/refill-stall-solution.md):
+  // breaker counter (fix B) + last-refill-was-null flag (backoff, fix C).
+  // Both written ONLY in the refill null branch downstream of the chain-
+  // generation stale check, so dead chains can never count; flag cleared at
+  // every refill entry, counter reset at sites 1-8 (see plan).
+  const nullRefillCountRef = useRef(0);
+  const lastRefillNullRef = useRef(false);
   // Detected file format (stored for MSEGetters — thumbnail pipeline needs it)
   const formatRef = useRef<DetectedFormat>('unknown');
   // Cached init segments (codec config) — re-appended after each SourceBuffer clear
@@ -2297,6 +2402,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       fmp4ConfigRef.current = null;
       remuxThumbConfigRef.current = null;
       setIsTransmuxerActive(false);
+      mkvRerouteInFlightRef.current = false;
+      mkvSbHasAudioRef.current = true;
+      zeroAudioWindowsRef.current = 0;
+      nullRefillCountRef.current = 0;
+      lastRefillNullRef.current = false;
+      // Pre-existing latent bug (review L6): hasEverCompletedRef was NEVER
+      // reset per-file — a completed previous file leaks its 'ended' state
+      // into the near-end seek guard of the NEXT file. Load-bearing now that
+      // the null-refill 'eof' verdict writes it.
+      hasEverCompletedRef.current = false;
       clearDownloadedRanges();
       seekOffsetRef.current = 0;
       bufferingForSeekRef.current = false;
@@ -2406,6 +2521,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     fmp4ConfigRef.current = null;
     remuxThumbConfigRef.current = null;
     setIsTransmuxerActive(false);
+    mkvRerouteInFlightRef.current = false;
+    mkvSbHasAudioRef.current = true;
+    zeroAudioWindowsRef.current = 0;
+    nullRefillCountRef.current = 0;
+    lastRefillNullRef.current = false;
     clearDownloadedRanges();
     // ── Clear persistent window flags ──
     // These survive React unmount/remount and can block future evictions
@@ -2550,6 +2670,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // Reset EOF tracking — new chain starts fresh
     lastRefillKeyframeRef.current = null;
     consecutiveNoProgressRef.current = 0;
+    // Breaker/backoff reset (canonical site — every chain (re)start begins
+    // with a clean slate; the other reset sites are belts):
+    nullRefillCountRef.current = 0;
+    lastRefillNullRef.current = false;
     console.log('[MSE] Starting streaming chain for transmuxer playback');
     // Trigger first refill immediately — no timer delay
     executeStreamingRefill();
@@ -2582,10 +2706,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const chainGeneration = streamingChainGenRef.current;
 
     try {
+      // Backoff flag reflects THIS refill only; cleared before the entry
+      // guards so guard-skipped cycles (buffer full etc.) take normal delays.
+      lastRefillNullRef.current = false;
       const video = videoRef.current;
       const transmuxer = transmuxerRef.current;
       const sb = state.current.videoSourceBuffer;
-      if (!video || !transmuxer || !sb || video.ended || sb.hasFatalError) {
+      if (!video || !transmuxer || !sb || video.ended) {
+        refillInProgressRef.current = false;
+        return;
+      }
+      if (sb.hasFatalError) {
+        // Layer-3 D3 (audio-skip fix): silent SourceBuffer fatal — some fatal
+        // sequences (InvalidStateError on append, remove-during-eviction races)
+        // kill the SB WITHOUT a video error event; today this returned silently
+        // and playback stalled forever. Reroute MKV to /remux.
+        if (formatRef.current === 'mkv' && transmuxerRef.current && !mkvRerouteInFlightRef.current) {
+          diagLog('[MSE] SourceBuffer fatal detected in refill chain — rerouting MKV to /remux');
+          void recoverMkvRerouteRef.current?.('silent SourceBuffer fatal');
+        }
         refillInProgressRef.current = false;
         return;
       }
@@ -2676,6 +2815,36 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Disable buffering mode
       bufferingForSeekRef.current = false;
 
+      // Layer-3 zero-audio starvation watchdog (B3/F5): count consecutive
+      // windows that intended audio but emitted none; 3 in a row on an
+      // audio-declaring SB = buffered intersection frozen → invisible stall.
+      // ORDER IS LOAD-BEARING: starved=3 and noProgress=2 can land on the SAME
+      // refill — this block must run BEFORE the isConfirmedEOF check below so
+      // the reroute wins over endOfStream for a mid-file hole. Do not reorder.
+      // NEAR-EOF SUPPRESSION: audio tracks commonly end slightly before video;
+      // windows inside the last 30s legitimately emit zero audio and the
+      // existing noProgress→endOfStream machinery below must win there —
+      // a reroute at true EOF would restart the file on tier 2 pointlessly.
+      const durForHoleGuard = state.current.duration;
+      const nearEofHole = durForHoleGuard > 0 && Number.isFinite(durForHoleGuard)
+        && refillPosition >= durForHoleGuard - 30;
+      if (keyframeTimestamp !== null && !nearEofHole
+          && formatRef.current === 'mkv' && mkvSbHasAudioRef.current) {
+        if ((transmuxer as MediabunnyTransmuxer).wasLastWindowAudioStarved()) {
+          zeroAudioWindowsRef.current++;
+          diagLog(`[MSE] MKV refill window emitted ZERO audio packets (${zeroAudioWindowsRef.current} consecutive)`);
+        } else {
+          zeroAudioWindowsRef.current = 0;
+        }
+        if (shouldTriggerZeroAudioReroute(zeroAudioWindowsRef.current, mkvSbHasAudioRef.current)
+            && !mkvRerouteInFlightRef.current) {
+          diagLog('[MSE] MKV zero-audio starvation confirmed — rerouting to /remux');
+          void recoverMkvRerouteRef.current?.('zero-audio starvation');
+          refillInProgressRef.current = false;
+          return;
+        }
+      }
+
       // EOF detection: when a refill finds the same keyframe as the previous
       // refill (no new data progress), or when refillPosition is close to the
       // end of the file, we've reached EOF. Stop the chain and signal
@@ -2756,6 +2925,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // Update last refill keyframe for progress tracking
       if (keyframeTimestamp !== null) {
         lastRefillKeyframeRef.current = keyframeTimestamp;
+        nullRefillCountRef.current = 0; // breaker: a healthy refill ends the null streak
       }
 
       if (keyframeTimestamp !== null) {
@@ -2800,6 +2970,53 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Refill failed — discard buffered segments
         seekBufferRef.current = [];
         console.warn('[MSE] Streaming refill failed');
+        lastRefillNullRef.current = true;
+
+        // Null-refill circuit breaker (fix B, reports/refill-stall-solution.md).
+        // Runs ONLY downstream of the chain-generation stale check above — a
+        // dead chain's late null can never count. `duration`,
+        // `estimatedKeyframeInterval` and `refillPosition` are the same values
+        // the indexed EOF machinery above uses (one clock).
+        if (formatRef.current === 'mkv') {
+          nullRefillCountRef.current++;
+          const verdict = classifyNullRefill(
+            nullRefillCountRef.current,
+            refillPosition,
+            duration,
+            true,
+            Math.max(estimatedKeyframeInterval, 5),
+          );
+          if (verdict === 'eof') {
+            // Cue-less EOF: the indexed EOF path above is unreachable on null
+            // (it requires a resolved keyframe — a null even resets its
+            // counter), so without this branch the chain null-loops at file
+            // end forever: video.ended never fires, no replay overlay.
+            // Reduced completion — NO segment flush (seekBuffer was just
+            // discarded; the failed seekTo produced nothing).
+            console.log(`[MSE] EOF via null-refill classification: pos=${refillPosition.toFixed(1)}s dur=${duration.toFixed(1)}s (${nullRefillCountRef.current} consecutive nulls)`);
+            hasEverCompletedRef.current = true; // near-end seek guard parity with the indexed path
+            const msEof = state.current.mediaSource;
+            if (msEof && msEof.readyState === 'open') {
+              try { msEof.endOfStream(); console.log('[MSE] endOfStream called at EOF (null-refill)'); } catch (e2) { console.warn('[MSE] endOfStream failed:', e2); }
+            }
+            setIsComplete(true);
+            isCompleteRef.current = true; // finally's rechain is gated on this
+            refillInProgressRef.current = false;
+            return;
+          }
+          if (verdict === 'reroute' && !mkvRerouteInFlightRef.current) {
+            // Deterministic mid-file null → the ffmpeg /remux tier (reads
+            // linearly, cue-less-proof). The reroute latches
+            // mkvRerouteInFlightRef AND bumps the chain generation
+            // synchronously before its first await, so the finally block's
+            // stale-gen check kills the rechain — no double-fire, no orphan
+            // setTimeout (verified, review Adj 6).
+            diagLog(`[MSE] MKV refill cannot advance (${nullRefillCountRef.current} consecutive null keyframes at ${refillPosition.toFixed(1)}s) — rerouting to /remux`);
+            void recoverMkvRerouteRef.current?.('refill cannot advance (null keyframe)');
+            refillInProgressRef.current = false;
+            return;
+          }
+        }
       }
     } catch (e) {
       // Only clear bufferingForSeekRef if this refill's generation is still
@@ -2830,7 +3047,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const video = videoRef.current;
       const transmuxer = transmuxerRef.current;
       const sb = state.current.videoSourceBuffer;
-      if (video && transmuxer && sb && !video.ended && !sb.hasFatalError && !isCompleteRef.current) {
+      const sbFatal = !!sb?.hasFatalError;
+      if (sbFatal && formatRef.current === 'mkv' && transmuxer && !mkvRerouteInFlightRef.current) {
+        // Layer-3 D3: fatal discovered at chain-continue — without this the
+        // chain stops rescheduling and the entry-check reroute never runs.
+        diagLog('[MSE] SourceBuffer fatal at refill chain-continue — rerouting MKV to /remux');
+        void recoverMkvRerouteRef.current?.('silent SourceBuffer fatal');
+      }
+      if (video && transmuxer && sb && !video.ended && !sbFatal && !isCompleteRef.current) {
         const ahead = getBufferedAheadSeconds();
         // Hard cap on buffer ahead: skip refills entirely when > cap seconds ahead.
         // Prevents buffer from growing excessively (e.g., 62.9s ahead for TS)
@@ -2847,7 +3071,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             }
           }, 2000);
         } else {
-          const delay = ahead < REFILL_THRESHOLD_SECONDS ? 0 : Math.min(5000, Math.max(2000, Math.floor((ahead - REFILL_THRESHOLD_SECONDS) * 200)));
+          // Fix C: null refills back off to 1000ms (see computeRefillChainDelay).
+          // MUST stay inside this generation-gated setTimeout wrapper (G5) —
+          // do not relocate the reschedule outside the gen check below.
+          const delay = computeRefillChainDelay(lastRefillNullRef.current, ahead, REFILL_THRESHOLD_SECONDS);
           if (delay === 0) {
             console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s below threshold ${REFILL_THRESHOLD_SECONDS}s — chaining next refill immediately`);
           } else {
@@ -4431,6 +4658,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     failedUrl: string,
     reason: string,
     resumeTime?: number,
+    /** Whether the FILE's raw /stream bytes are real MPEG-TS (byte-forward
+     *  start_byte remux seeks valid — TS tier). MKV/MP4 callers MUST pass
+     *  false: their /stream bytes are Matroska/ISOBMFF, so post-recovery seeks
+     *  must stay on ss-only /remux recreation (D0 in the regression doc). */
+    sourceIsTs: boolean = true,
   ): Promise<boolean> => {
     const plan = planRemuxRecovery({
       failedUrl,
@@ -4473,9 +4705,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     remuxUrlRef.current = remuxUrl;
     needsRemuxSeekRef.current = true;
     remuxSeekBaseUrlRef.current = remuxUrl;
-    // The raw /stream bytes of a TS file ARE real MPEG-TS → byte-forward
-    // (start_byte) seeks are valid, exactly like timed_id3 (NOT like MKV/MP4).
-    remuxSourceIsTsRef.current = true;
+    // TS sources: raw /stream bytes ARE real MPEG-TS → byte-forward
+    // (start_byte) seeks are valid, exactly like timed_id3. MKV/MP4 sources
+    // pass sourceIsTs=false: Matroska/ISOBMFF bytes would feed the TS demuxer
+    // garbage, so seeks stay on the ss-only /remux recreate path (D0).
+    remuxSourceIsTsRef.current = sourceIsTs;
 
     if (plan.action === 'seek') {
       // Resume near the playhead via the proven remux-seek recreate path
@@ -4507,6 +4741,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (!ok) {
       diagLog(`[MPEGTS] Remux recovery (${reason}): recovered init FAILED — native last resort`);
       remuxRecoveryActiveRef.current = false;
+      // Defensive: _initMpegtsPlayer clears this on its own failure paths
+      // (success / catch), but if it ever returns false without clearing, a
+      // stale true would swallow ALL future fatal video errors (the error
+      // listener ignores errors while "init in progress").
+      transmuxerInitInProgressRef.current = false;
       setIsColdStartBuffering(false);
       setColdStartPhase('none');
       return false;
@@ -4518,6 +4757,94 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
     return true;
   };
+
+  /**
+   * Layer-3 reroute for the MKV MediabunnyTransmuxer tier (audio-skip fix):
+   * on a post-init fatal (video error 3/4, silent SB fatal, transmuxer
+   * onError, zero-audio starvation, audio-switch onto a video-only SB), tear
+   * down the dying transmuxer pipeline and hand the file to the PROVEN
+   * /remux → mpegts.js tier (ffmpeg: video copy + AAC re-encode — cue-less
+   * proof, reads linearly), resuming near the playhead. Replaces the old dead
+   * end (useNative on raw MKV = black screen — WebView2 has no MKV demuxer).
+   *
+   * Teardown ORDER matters (§3 of the reroute edge doc): stop producers →
+   * dispose transmuxer → detach OUR MediaSource blob (FastStreamPlayer
+   * re-applies v.src = mseUrl on every render while it is non-null) → then
+   * _recoverToRemuxTier (shared one-shot guard, G3 — a remux-tier fatal after
+   * this reroute lands on 'skip' → native, never a loop).
+   */
+  const _recoverMkvToRemuxTier = async (reason: string): Promise<boolean> => {
+    if (mkvRerouteInFlightRef.current) return false; // R1 re-entrancy latch
+    if (cancelledRef.current) return false;
+    const transmuxer = transmuxerRef.current;
+    if (!transmuxer || formatRef.current !== 'mkv') return false;
+    mkvRerouteInFlightRef.current = true;
+    try {
+      // 1. Capture the resume position BEFORE any teardown — video.error does
+      //    NOT zero currentTime, but src='' does (§4).
+      const video = videoRef.current;
+      const resumeT = video?.currentTime ?? 0;
+      // 'Paused means paused' (L3): capture BEFORE teardown — src='' and the
+      // teardown pause make video.paused read true unconditionally later. The
+      // cold recovery plan (<8s) force-plays at MEDIA_INFO and its re-pause
+      // check reads only the PREFETCH pause ref (isPausedRef is written solely
+      // by pausePrefetch/resumePrefetch), so a user who paused the VIDEO
+      // ELEMENT would be force-unpaused by the reroute without this.
+      const wasPausedAtReroute = (video?.paused ?? false) || isPausedRef.current;
+      diagLog(`[MSE] MKV fatal (${reason}) — rerouting to /remux tier from t=${resumeT.toFixed(1)}s`);
+
+      // 2. Stop the dying pipeline (idioms from the per-file cleanup and the
+      //    audio-switch rebuild).
+      stopStreamingChain();
+      refillInProgressRef.current = false;
+      burstBufferRef.current = [];
+      seekBufferRef.current = [];
+      bufferingForSeekRef.current = false;
+      zeroAudioWindowsRef.current = 0;
+      nullRefillCountRef.current = 0;
+      mkvWarmerGenRef.current++;          // in-flight warmer loop bails at next gen check
+      mkvWarmerActiveRef.current = false;
+      try { transmuxer.dispose(); } catch (_) {} // aborts in-flight seekTo (expected-error filtered)
+      transmuxerRef.current = null;
+      setIsTransmuxerActive(false);
+      state.current.videoSourceBuffer?.destroy();
+      state.current.audioSourceBuffer?.destroy();
+      state.current.videoSourceBuffer = null;
+      state.current.audioSourceBuffer = null;
+      state.current.initialized = false;  // also blocks the MKV seek path (R2)
+
+      // 3. Detach OUR MediaSource blob BEFORE mpegts.js takes the element:
+      //    clear mseUrl first (stops FastStreamPlayer re-applying it), then
+      //    revoke.
+      const staleBlob = blobUrlRef.current;
+      setMseUrl(null);
+      if (staleBlob) {
+        try { URL.revokeObjectURL(staleBlob); } catch (_) {}
+        blobUrlRef.current = null;
+      }
+
+      // 4. Shared recovery: one-shot guard + element reset + cold-vs-seek
+      //    decision (planRemuxRecovery: <8s → cold 'init' — the repro fatal
+      //    fires at t≈0; ≥8s → 'seek' resume). sourceIsTs=false — Matroska
+      //    bytes are NOT MPEG-TS (D0).
+      const ok = await _recoverToRemuxTier(streamUrlRef.current ?? '', reason, resumeT, false);
+      if (ok && wasPausedAtReroute) {
+        // Do NOT widen the tier-shared re-pause check inside the recovery
+        // path itself — this guard is MKV-reroute-scoped by design (L3).
+        try { videoRef.current?.pause(); } catch { /* detached element */ }
+      }
+      if (!ok) {
+        diagLog(`[MSE] MKV reroute failed (${reason}) — native last resort`);
+        setUseNative(true);
+      }
+      return ok;
+    } finally {
+      mkvRerouteInFlightRef.current = false;
+    }
+  };
+  // Latest-instance mirror for frozen closures (video-error listener, refill
+  // chain callbacks registered in earlier renders).
+  recoverMkvRerouteRef.current = _recoverMkvToRemuxTier;
 
   /** Unbuffered seek for mpegts.js TS files.
    *  Since the FetchStreamLoader.abort() patch is now in place, IOController.seek()
@@ -5971,17 +6298,53 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       diagLog('[AUDIO] mkv switch: setDesiredAudioTrack failed');
       return false;
     }
+    // Map the Matroska TrackNumber (trackId) to the ffprobe stream index —
+    // remuxAudioIdxRef feeds withAudioIdx → the server's audio_idx override,
+    // which speaks FFPROBE indices. A naive trackId assignment selects the
+    // WRONG stream on tier 2 (review Adj 4). null (mapping unavailable)
+    // degrades to the server default track.
+    const mapTrackToFfprobeIdx = async (): Promise<number | null> => {
+      const parsed = streamUrlRef.current ? parseStreamUrl(streamUrlRef.current) : null;
+      if (!parsed) return null;
+      try {
+        const resp = await fetch(`${parsed.baseUrl}/audio_tracks/${parsed.folderId}/${parsed.messageId}?token=${encodeURIComponent(parsed.token)}`);
+        if (!resp.ok) return null;
+        const json = await resp.json();
+        const ff = (Array.isArray(json?.tracks) ? json.tracks : []).map((s: any) => ({ id: s.index }));
+        return mapAudioTrackToRemuxIdx(audioTracks, trackId, ff);
+      } catch (_) { return null; /* mapping fetch failed — server default track */ }
+    };
+
     const plan = planAudioSwitch({
       tier: 'mkv',
       targetPlayable: track.playable,
       currentMime,
       newMime,
+      sbHasAudio: mkvSbHasAudioRef.current,
     });
-    if (plan === 'reroute-remux' || plan === 'reject') {
-      // MSE can't play the new codec in-place. Revert the transmuxer selection;
-      // the reroute path (playing this file via /remux?audio_idx) is a phase-2
-      // enhancement — for now surface failure so the UI reverts (E7/E8).
-      diagLog(`[AUDIO] mkv switch: plan=${plan} (mime ${newMime} unsupported) — reverting`);
+    if (plan === 'reroute-remux') {
+      // The combined SB cannot reach this track in-place — unsupported codec,
+      // or the SB was born video-only (a 1→2-trak change is illegal in MSE,
+      // B4). Reroute the WHOLE file to /remux?audio_idx=N: ffmpeg re-encodes
+      // any track to AAC, so the user gets working audio on tier 2. Map the
+      // MKV track id (Matroska TrackNumber) to the ffprobe stream index by
+      // position; null (mapping unknown) degrades to the server default track.
+      diagLog(`[AUDIO] mkv switch: plan=reroute-remux → switching via /remux tier (track ${trackId})`);
+      remuxAudioIdxRef.current = await mapTrackToFfprobeIdx();
+      const ok = (await recoverMkvRerouteRef.current?.(`audio switch to track ${trackId}`)) ?? false;
+      if (!ok) {
+        // Revert the transmuxer's desired-track selection. LATENT (reviewer
+        // advisory): on a video-only-birth SB this re-derives audioCodec to the
+        // primary track (non-null) — harmless today because every reroute
+        // failure ends in teardown + setUseNative, but if reroute-failure ever
+        // becomes recoverable in-place, skip this revert when
+        // mkvSbHasAudioRef.current === false.
+        await transmuxer.setDesiredAudioTrack(null);
+      }
+      return ok;
+    }
+    if (plan === 'reject') {
+      diagLog(`[AUDIO] mkv switch: plan=reject — reverting`);
       await transmuxer.setDesiredAudioTrack(null);
       return false;
     }
@@ -5990,6 +6353,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const seekGen = ++transmuxerSeekGenRef.current;
     stopStreamingChain();
     refillInProgressRef.current = false;
+    nullRefillCountRef.current = 0; // breaker: rebuild = fresh chain
     burstBufferRef.current = [];
     bufferingForSeekRef.current = true;
     seekBufferRef.current = [];
@@ -6020,9 +6384,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       return false;
     }
     if (keyframeTimestamp === null) {
-      diagLog('[AUDIO] mkv switch: seekTo returned null — reverting selection');
-      await transmuxer.setDesiredAudioTrack(null);
-      return false;
+      // G2 (cue-less MKV): the rebuild seekTo nulls for the same reason
+      // refills do (mid-GOP playhead, keyframe cluster behind the position-
+      // cache walk start). A bare revert leaves a DEAD player: the SB was
+      // flushed (resetForSeek above) and the chain stopped — nothing restarts
+      // either, and re-seeking would null again. Escalate to the ffmpeg tier
+      // carrying the user's chosen track. No setDesiredAudioTrack(null)
+      // revert — the reroute disposes the transmuxer anyway.
+      diagLog(`[AUDIO] mkv switch: seekTo returned null — escalating to /remux tier (track ${trackId})`);
+      remuxAudioIdxRef.current = await mapTrackToFfprobeIdx();
+      return (await recoverMkvRerouteRef.current?.(`audio switch keyframe unresolvable (track ${trackId})`)) ?? false;
     }
 
     seekOffsetRef.current = keyframeTimestamp;
@@ -6770,6 +7141,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       onError: (error: Error) => {
         if (cancelledRef.current) return;
         diagLog(`[MSE] MKV transmuxer ERROR: ${error.message}`);
+        // Layer-3 D4 (audio-skip fix): post-init transmuxer fatal (non-superseded
+        // seekTo failure) fires while the video element may still be healthy —
+        // reroute to /remux instead of the dead native path. During init
+        // (initialized=false) keep the old behavior: init failure has its own
+        // fall-through to the /remux branch in the format dispatcher.
+        if (state.current.initialized && transmuxerRef.current
+            && formatRef.current === 'mkv' && !mkvRerouteInFlightRef.current) {
+          void recoverMkvRerouteRef.current?.(`transmuxer error: ${error.message}`);
+          return;
+        }
         setError(error.message);
         setUseNative(true);
       },
@@ -6866,6 +7247,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       initTimeoutRef.current = null;
     }
     transmuxerRef.current = transmuxer;
+    // Layer 2: remember whether the SB was born WITH audio — gates the
+    // starvation watchdog (video-only SB expects zero audio) and the B4
+    // audio-switch guard (1→2-trak changes are illegal; must reroute).
+    mkvSbHasAudioRef.current = !!result.audioTrack;
+    zeroAudioWindowsRef.current = 0;
+    nullRefillCountRef.current = 0;
     setIsTransmuxerActive(true);
     void blobUrl; // blob URL already set as video.src by the caller
 
@@ -6898,10 +7285,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const persisted = preferredAudioTrackIdRef.current;
         const chosen = pickDefaultAudioTrack(list, persisted);
         setActiveAudioTrackId(chosen?.id ?? null);
-        if (persisted != null && chosen && chosen.id === persisted && list.length > 1) {
-          // Apply the persisted non-primary selection at init (before prime).
+        // Layer-2 guards: (a) never resurrect audio on a SB born video-only —
+        // selecting a track later goes through the switch path → B4 → reroute;
+        // (b) if the persisted track's codec differs from the SB's declared
+        // mime, changeType BEFORE the prime emits its init segment (legal
+        // pre-first-append) or the init would contradict the declaration
+        // (same fatal class this fix removes).
+        if (persisted != null && chosen && chosen.id === persisted && list.length > 1
+            && result.audioTrack) {
           const mime = await (transmuxer as any).setDesiredAudioTrack?.(persisted);
-          if (!mime) diagLog('[AUDIO] mkv: persisted track failed to apply — primary used');
+          if (!mime) {
+            diagLog('[AUDIO] mkv: persisted track failed to apply — primary used');
+          } else if (mime !== result.mimeType) {
+            try {
+              await state.current.videoSourceBuffer?.changeType(mime);
+              diagLog(`[AUDIO] mkv: pre-prime changeType(${mime}) applied (persisted track codec differs)`);
+            } catch (e: any) {
+              diagLog(`[AUDIO] mkv: pre-prime changeType failed (${e?.message}) — reverting to primary track`);
+              await (transmuxer as any).setDesiredAudioTrack?.(null);
+            }
+          }
         }
       } catch (e: any) {
         diagLog(`[AUDIO] mkv track enumeration failed: ${e?.message}`);
@@ -8898,6 +9301,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Stop streaming chain — new seek will start its own chain after completion
         stopStreamingChain();
         refillInProgressRef.current = false;
+        zeroAudioWindowsRef.current = 0; // starvation watchdog: new position, fresh count
+        nullRefillCountRef.current = 0; // breaker: new position, fresh count
         // Clear burst buffer on seek
         burstBufferRef.current = [];
 
@@ -9062,6 +9467,19 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // Seek failed — discard buffered segments
               seekBufferRef.current = [];
               transmuxerSeekInProgressRef.current = false; // Seek failed — allow new seeks
+              // G1 (cue-less MKV): a user-seek null STRANDS the player today —
+              // the chain was stopped at seek entry, only the success branch
+              // restarts it, and video.currentTime already sits at the
+              // unbuffered target → spinner forever. The null is deterministic
+              // (same frozen-cache geometry as the refill bug; post-harvest
+              // it is near-unreachable), so retrying converges on the same
+              // null: reroute to the ffmpeg tier immediately. resumeT inside
+              // the reroute reads video.currentTime = the user's target, so
+              // the rerouted session resumes exactly where they clicked.
+              if (formatRef.current === 'mkv' && !mkvRerouteInFlightRef.current) {
+                diagLog('[MSE] MKV user seek keyframe unresolvable — rerouting to /remux');
+                void recoverMkvRerouteRef.current?.('user seek keyframe unresolvable');
+              }
             }
           }).catch((e: Error) => {
             bufferingForSeekRef.current = false;
@@ -9511,6 +9929,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // mpegts.js player still active — the FATAL handler hasn't run yet.
               // This is a non-fatal error during mpegts.js playback (e.g., quota).
               // Let mpegts.js handle it internally (suspend/resume).
+            } else if (transmuxerRef.current && formatRef.current === 'mkv'
+                       && !mkvRerouteInFlightRef.current) {
+              // Layer-3 D1/D2 (audio-skip fix): post-init decode(3)/src(4) fatal
+              // on the MKV transmuxer tier — e.g. CHUNK_DEMUXER_ERROR_APPEND_FAILED
+              // "Initialization segment misses expected aac track". useNative on a
+              // raw MKV is a dead player (WebView2 has no MKV demuxer); reroute to
+              // /remux instead. This closure is frozen at mount ([] deps — `useNative`
+              // above is the stale initial false forever), so ALL decisions here read
+              // refs and the call goes through the latest-instance ref.
+              console.warn('[MSE] Fatal video error (code', err.code, ') on MKV transmuxer tier — rerouting to /remux');
+              void recoverMkvRerouteRef.current?.(`video error code ${err.code}`);
+            } else if (mkvRerouteInFlightRef.current) {
+              // R1: a reroute is ALREADY tearing this element down — the dying
+              // pipeline can fire a second error (code 3 then 4) after
+              // transmuxerRef was nulled. Falling through to setUseNative here
+              // would stomp the in-flight recovery. Swallow it.
+              console.warn('[MSE] Video error (code', err.code, ') during MKV reroute — ignoring (recovery owns the element)');
             } else {
               console.warn('[MSE] Fatal video error (code', err.code, ') — falling back to native playback');
               setUseNative(true);
