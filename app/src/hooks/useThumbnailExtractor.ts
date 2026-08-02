@@ -860,6 +860,17 @@ class TransmuxerThumbnailPipeline {
   // become index-or-skip. Detected in init() from mediabunny's already-parsed metadata.
   isCuelessMkv = false;
   private warnedCuelessSkip = false;
+  // Round-3 Fix C: per-bucket bisection memo — processLoop retries every ~250ms,
+  // so an inflight/failed bucket must not re-dispatch (round-3 logs: 36 hammered
+  // retries on one skipped bucket). 'done' buckets carry the injected entry so a
+  // capture throw can evict it (verify-c risk 4). Failed buckets retry after a
+  // cooldown. Adjacent buckets are served without re-bisecting via the R10
+  // clusterPositionCache consult (organic AND injected entries qualify).
+  private bisectMemo = new Map<number, {
+    state: 'inflight' | 'done' | 'failed';
+    at: number;
+    entry?: { elementStartPos: number; startTimestamp: number };
+  }>();
 
   constructor(
     streamUrl: string,
@@ -1044,12 +1055,43 @@ class TransmuxerThumbnailPipeline {
     const mkvDecision = decideMkvCaptureStrategy(
       this.keyframeTimestamps, time, THUMB_INDEX_MAX_GAP, this.isCuelessMkv,
     );
+    // Round-3 Fix C: 'skip' becomes bisect-inject-capture. A synthetic
+    // clusterPositionCache entry at-or-before the hover time bounds mediabunny's
+    // getKeyPacket walk to ≤1-2 clusters — real frames at far positions with
+    // ~11 bounded ranged reads instead of an unbounded linear scan.
+    let bisectedTicks: number | null = null;
     if (mkvDecision.strategy === 'skip') {
-      if (!this.warnedCuelessSkip) {
-        this.warnedCuelessSkip = true;
-        console.warn(`[TransmuxerThumbnailPipeline] Cue-less MKV: hover ${time.toFixed(1)}s outside harvested index — capture skipped (tooltip degrades to time-only; TS-precedent)`);
+      const factor = readMkvTimestampFactor(this.videoTrack);
+      if (factor === null) {
+        // Shape drift / no factor — round-2 behavior (skip, warn once).
+        if (!this.warnedCuelessSkip) {
+          this.warnedCuelessSkip = true;
+          console.warn(`[TransmuxerThumbnailPipeline] Cue-less MKV: hover ${time.toFixed(1)}s outside harvested index and bisection unavailable — capture skipped`);
+        }
+        return false;
       }
-      return false;
+      const targetTicks = Math.round(time * factor);
+      const windowTicks = Math.round(35 * factor); // ≥ max cluster span (32.767s overflow bound)
+      const bucketKey = bucket;
+      const memo = this.bisectMemo.get(bucketKey);
+      // R10: an existing cache entry (organic or injected) near the target
+      // already bounds the walk — capture directly, no bisection.
+      const nearEntry = findClusterCacheEntryNear(this.videoTrack, targetTicks, windowTicks);
+      if (nearEntry) {
+        bisectedTicks = targetTicks;
+      } else if (memo?.state === 'done') {
+        bisectedTicks = targetTicks;
+      } else if (memo?.state === 'inflight') {
+        return false; // busy NOT taken — near hovers stay serviceable
+      } else if (memo?.state === 'failed' && performance.now() - memo.at < 60_000) {
+        return false; // cooldown — don't hammer a failing region
+      } else {
+        // Fire-and-forget: bisect in the background; processLoop's next retry
+        // for this bucket falls into 'done'/'failed'/nearEntry above.
+        this.bisectMemo.set(bucketKey, { state: 'inflight', at: performance.now() });
+        void this._bisectAndInject(time, targetTicks, bucketKey);
+        return false;
+      }
     }
 
     this.busy = true;
@@ -1064,6 +1106,37 @@ class TransmuxerThumbnailPipeline {
         // cluster byte with a hard in-demuxer stop, warms after the first capture, and is
         // typically disk-speed (on cue-less files playback already walked ≤ this byte).
         keyPacket = await this.videoSink!.getKeyPacket(mkvDecision.timestamp, { verifyKeyPackets: false });
+      } else if (bisectedTicks !== null) {
+        // Round-3 Fix C: cue-less far hover with an injected/organic cache entry
+        // bounding the walk. On a throw, evict the injected entry (verify-c risk
+        // 4: a false-positive cluster byte makes readCluster assert) and mark the
+        // bucket failed so the memo cooldown applies.
+        try {
+          keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
+        } catch (e) {
+          const memo = this.bisectMemo.get(bucket);
+          if (memo?.entry) {
+            const cache = (this.videoTrack as any)?._backing?.internalTrack?.clusterPositionCache;
+            if (Array.isArray(cache)) {
+              const i = cache.findIndex((c: any) => c.elementStartPos === memo.entry!.elementStartPos);
+              if (i >= 0) cache.splice(i, 1);
+            }
+          }
+          this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
+          console.warn('[TransmuxerThumbnailPipeline] Bisected capture threw — injected entry evicted:', e);
+          return false;
+        }
+        if (!keyPacket) {
+          // Keyframe may live in an EARLIER cluster than the bisected one
+          // (verify-c risk 3): back off one probe step once, then cooldown.
+          this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
+          console.warn(`[TransmuxerThumbnailPipeline] Bisected getKeyPacket(${time.toFixed(1)}) found no keyframe — backing off`);
+          const factor = readMkvTimestampFactor(this.videoTrack);
+          if (factor !== null && time > 35) {
+            void this._bisectAndInject(time - 35, Math.round((time - 35) * factor), bucket);
+          }
+          return false;
+        }
       } else {
         // 'native' — cue-indexed MKV: the sparse playback-built index misses this hover (or is
         // empty pre-harvest); mediabunny's full Cues find the real keyframe at `time`. This
@@ -1150,6 +1223,82 @@ class TransmuxerThumbnailPipeline {
       return false;
     } finally {
       this.busy = false;
+    }
+  }
+
+  /** Round-3 Fix C driver: byte-bisect for the cluster at-or-before
+   *  `targetSeconds` and inject it into the demuxer's clusterPositionCache.
+   *  ~11 probes on a 1.5GB file; each probe fetches a bounded window (1MB,
+   *  geometric grow to 8MB when a window holds no cluster ID). Plain fetch with
+   *  explicit source_id=thumbnail (R11: this.streamUrl carries none; the param
+   *  keeps the backend coordinator from cross-cancelling playback downloads).
+   *  Updates bisectMemo[bucketKey] to 'done' (with the injected entry) or
+   *  'failed'. Never throws. */
+  private async _bisectAndInject(
+    targetSeconds: number,
+    targetTicks: number,
+    bucketKey: number,
+  ): Promise<void> {
+    const started = performance.now();
+    try {
+      let lo = readMkvClusterSeekStart(this.videoTrack) ?? 0;
+      let hi = this.sourceConfig.fileSize;
+      if (!(hi > lo)) {
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+        return;
+      }
+      const baseUrl = this.sourceConfig.url;
+      const sep = baseUrl.includes('?') ? '&' : '?';
+      const probeUrl = `${baseUrl}${sep}source_id=thumbnail`;
+      let best: { elementStartPos: number; timestampTicks: number } | null = null;
+      let window = 1024 * 1024; // 1MB start, geometric grow on no-find (cap 8MB)
+      let bytesFetched = 0;
+
+      for (let iter = 0; iter < 18 && hi - lo > 64 * 1024 && this.active; iter++) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        const fetchEnd = Math.min(mid + window - 1, this.sourceConfig.fileSize - 1);
+        const resp = await fetch(probeUrl, { headers: { Range: `bytes=${mid}-${fetchEnd}` } });
+        if (!resp.ok && resp.status !== 206) {
+          this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+          return;
+        }
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        bytesFetched += buf.length;
+        // Bracket [0, targetTicks] with ZERO high-side slack: the injected entry
+        // must satisfy startTimestamp ≤ target or binarySearchLessOrEqual will
+        // never select it (verify-c risk 2) and the walk falls back to byte 0.
+        const hit = scanForMkvClusterInWindow(buf, mid, 0, targetTicks, 0);
+        if (!hit) {
+          // Distinguish "window held a cluster but ABOVE target" from "no
+          // cluster at all": rescan with an unbounded upper bracket.
+          const any = scanForMkvClusterInWindow(buf, mid, 0, Number.MAX_SAFE_INTEGER, 0);
+          if (!any) {
+            if (window < 8 * 1024 * 1024) { window *= 2; continue; } // grow, re-probe same bracket
+            this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+            return;
+          }
+          hi = mid; // cluster found but past the target → search lower half
+          continue;
+        }
+        best = hit;
+        if (hit.elementStartPos + 1 >= hi) break;
+        lo = hit.elementStartPos + 1; // search higher for a later at-or-before cluster
+      }
+
+      if (!best || !this.active) {
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+        return;
+      }
+      const entry = { elementStartPos: best.elementStartPos, startTimestamp: best.timestampTicks };
+      if (!injectMkvClusterPosition(this.videoTrack, entry)) {
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+        return;
+      }
+      this.bisectMemo.set(bucketKey, { state: 'done', at: performance.now(), entry });
+      console.log(`[TransmuxerThumbnailPipeline] Bisected cluster for ${targetSeconds.toFixed(1)}s: byte=${entry.elementStartPos}, ticks=${entry.startTimestamp} (${(bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
+    } catch (e) {
+      this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+      console.warn('[TransmuxerThumbnailPipeline] Bisection failed:', e);
     }
   }
 
