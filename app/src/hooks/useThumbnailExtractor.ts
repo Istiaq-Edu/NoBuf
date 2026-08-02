@@ -157,6 +157,33 @@ export function computeThumbnailSeekTarget(
   return Math.min(nudged, (first.start + first.end) / 2);
 }
 
+/** Fix B (round-2): MKV thumbnail capture strategy. 'index' = harvested-keyframe hit within
+ *  maxGap (timestamp is the FOUND ts[lo], never the hover time) → cheap indexed capture.
+ *  Miss/empty: cue-indexed MKV keeps today's 'native' getKeyPacket; cue-less MKV → 'skip'
+ *  (native getKeyPacket on a 0-cue file is an unbounded linear cluster walk — observed 103s+,
+ *  184MB for ONE hover, busy-locking every later hover; the TS path already skips when it has
+ *  no index). Pure + exported for unit testing, like the helpers above. */
+export type MkvCaptureDecision =
+  | { strategy: 'index'; timestamp: number }
+  | { strategy: 'native' }
+  | { strategy: 'skip' };
+
+export function decideMkvCaptureStrategy(
+  timestamps: number[], time: number, maxGap: number, cueless: boolean,
+): MkvCaptureDecision {
+  if (timestamps.length > 0) {
+    let lo = 0, hi = timestamps.length - 1;
+    while (lo < hi) {
+      const mid = lo + ((hi - lo + 1) >> 1);
+      if (timestamps[mid] <= time) lo = mid; else hi = mid - 1;
+    }
+    if (timestamps[lo] <= time && time - timestamps[lo] <= maxGap) {
+      return { strategy: 'index', timestamp: timestamps[lo] };
+    }
+  }
+  return cueless ? { strategy: 'skip' } : { strategy: 'native' };
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
