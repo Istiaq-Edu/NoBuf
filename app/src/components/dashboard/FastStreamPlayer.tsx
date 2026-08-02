@@ -135,7 +135,7 @@ interface FastStreamPlayerProps {
   // Embedded subtitle bookkeeping: stream idx → loaded SubtitleTrack (so a
   // re-click toggles instead of re-fetching, E18), which idx is mid-fetch
   // (spinner row + double-click guard), and the busy idx as state for renders.
-  const embeddedSubTracksRef = useRef<Map<number, SubtitleTrack>>(new Map());
+  const embeddedSubTracksRef = useRef<Map<number, { track: SubtitleTrack; partial: boolean }>>(new Map());
   const embeddedSubLoadingIdxRef = useRef<number | null>(null);
   const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
   // Generation counter bumped on every file switch: an extraction that started
@@ -1515,11 +1515,14 @@ interface FastStreamPlayerProps {
   // the next open of the same file.
   const toggleEmbeddedSub = useCallback(async (idx: number, label: string, language: string) => {
     const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
-    // Already loaded → plain toggle.
+    // Already loaded → plain toggle; EXCEPT a partial track being re-ENABLED:
+    // re-extract against the (larger) cached prefix and swap the cues in place
+    // (round-3 B-4; the server never disk-caches partials, so each re-request
+    // re-runs and self-improves until fully_cached flips it final).
     const existing = embeddedSubTracksRef.current.get(idx);
-    if (existing) {
-      const wasActive = subs.activeTracks.includes(existing);
-      subs.toggleTrack(existing);
+    if (existing && !(existing.partial && !subs.activeTracks.includes(existing.track))) {
+      const wasActive = subs.activeTracks.includes(existing.track);
+      subs.toggleTrack(existing.track);
       persistSubTrack(fileKey, wasActive ? -1 : idx);
       return;
     }
@@ -1528,6 +1531,11 @@ interface FastStreamPlayerProps {
     embeddedSubLoadingIdxRef.current = idx;
     setEmbeddedSubBusyIdx(idx);
     const genAtStart = embeddedSubFileGenRef.current;
+    // Partial re-select: show the old cues IMMEDIATELY while the re-extract runs.
+    if (existing) {
+      subs.activateTrack(existing.track);
+      persistSubTrack(fileKey, idx);
+    }
     try {
       const res = await msePlayer.fetchEmbeddedSubText(idx);
       // File switched while extracting: the reset effect already cleared the
@@ -1536,12 +1544,25 @@ interface FastStreamPlayerProps {
       if (embeddedSubFileGenRef.current !== genAtStart) return;
       if ('error' in res) {
         if (res.error === 'empty') toast.info('This subtitle track has no cues');
-        else toast.error('Subtitle extraction failed');
+        else if (res.error === 'empty-partial') toast.info('No cues in the downloaded portion yet — try again as more downloads');
+        else if (!existing) toast.error('Subtitle extraction failed');
+        // Partial re-extract failure: old cues stay active — nothing to undo.
+        return;
+      }
+      if (existing) {
+        // Refresh in place: loadText REPLACES state for ASS (assContent) but
+        // APPENDS cues for SRT/VTT (parser.oncue pushes) — reset first.
+        existing.track.cues = [];
+        existing.track.loadText(res.text);
+        existing.partial = res.partial;
+        // Re-activate to force the renderer to re-read the cue list.
+        subs.deactivateTrack(existing.track);
+        subs.activateTrack(existing.track);
         return;
       }
       const track = new SubtitleTrack(label, language || null);
       track.loadText(res.text);
-      embeddedSubTracksRef.current.set(idx, track);
+      embeddedSubTracksRef.current.set(idx, { track, partial: res.partial });
       subs.activateTrack(subs.addTrack(track));
       persistSubTrack(fileKey, idx);
     } finally {
@@ -1839,7 +1860,7 @@ interface FastStreamPlayerProps {
                   )}
                   {msePlayer.embeddedSubTracks.map((t) => {
                     const loaded = embeddedSubTracksRef.current.get(t.idx);
-                    const active = !!loaded && subs.activeTracks.includes(loaded);
+                    const active = !!loaded && subs.activeTracks.includes(loaded.track);
                     const busy = embeddedSubBusyIdx === t.idx;
                     const disabled = t.kind !== 'text' || busy;
                     return (
