@@ -51,6 +51,12 @@ function diagLog(msg: string) {
 // packet to a far window would stream every cluster in between over HTTP (edge-A D9).
 const NEAR_START_AUDIO_FALLBACK_S = 10;
 
+// Round-3 Fix A-2: cap for the harvested-boundary fallback in nextKeyframeAtOrAfter.
+// Mirrors REFILL_MAX_DURATION_CAP (useMSEPlayer). The harvest can be gappy across
+// far-seek discontinuities, and a stopTime BYPASSES maxDuration in the video
+// iteration — an unclamped cross-gap boundary would transmux minutes in one refill.
+const HARVEST_BOUNDARY_CLAMP_S = 25;
+
 export interface TransmuxerConfig {
   format: DetectedFormat;
   sourceConfig: TauriStreamSourceConfig;
@@ -255,8 +261,29 @@ export class MediabunnyTransmuxer {
    *  cue index is unavailable (TS / pre-parse), so callers fall back to the
    *  original maxDuration behavior unchanged. */
   nextKeyframeAtOrAfter(time: number): number | null {
+    if (!Number.isFinite(time)) return null;
     const idx = this.mkvCueIndex;
-    if (idx.length === 0 || !Number.isFinite(time)) return null;
+    if (idx.length === 0) {
+      // Round-3 Fix A-2: cue-less MKV — fall back to the harvested keyframe index
+      // (sorted+deduped by addKeyframeTimestamp). Without this, every cue-less
+      // refill/switch stopTime is Infinity → the switch seekTo stops mid-GOP → the
+      // first post-switch refill re-resolves the SAME keyframe behind the playhead
+      // and replaces coded frames right at it (round-3 logs: 4/4 switches). Gated
+      // on mkv: the class is format-agnostic and the TS scanner also populates
+      // keyframeTimestamps (review R7). CLAMP: harvest can be gappy across far-seek
+      // discontinuities, and stopTime BYPASSES maxDuration in iterateVideoPackets —
+      // an unclamped cross-gap boundary would transmux minutes (review R8).
+      if (this.config.format !== 'mkv') return null;
+      const ts = this.keyframeTimestamps;
+      if (ts.length === 0) return null;
+      let lo = 0, hi = ts.length; // find first ts[i] > time
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ts[mid] > time) hi = mid; else lo = mid + 1;
+      }
+      if (lo >= ts.length) return null;
+      return ts[lo] - time <= HARVEST_BOUNDARY_CLAMP_S ? ts[lo] : null;
+    }
     let lo = 0, hi = idx.length; // find first idx[i].time > time
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
@@ -300,8 +327,28 @@ export class MediabunnyTransmuxer {
    *  mis-snap across a keyframe. No-op (returns `time`) when the cue index is
    *  unavailable (TS / pre-parse), preserving that path unchanged. */
   snapToCueKeyframe(time: number, tolerance: number = 0.25): number {
+    if (!Number.isFinite(time)) return time;
     const idx = this.mkvCueIndex;
-    if (idx.length === 0 || !Number.isFinite(time)) return time;
+    if (idx.length === 0) {
+      // Round-3 Fix A-2: harvested fallback (same rationale as nextKeyframeAtOrAfter;
+      // no clamp needed — a snap is bounded by `tolerance` by construction).
+      if (this.config.format !== 'mkv') return time;
+      const ts = this.keyframeTimestamps;
+      if (ts.length === 0) return time;
+      let lo = 0, hi = ts.length; // first ts[i] >= time
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ts[mid] < time) lo = mid + 1; else hi = mid;
+      }
+      let best = time;
+      let bestDelta = tolerance;
+      for (const i of [lo - 1, lo]) {
+        if (i < 0 || i >= ts.length) continue;
+        const delta = Math.abs(ts[i] - time);
+        if (delta <= bestDelta) { bestDelta = delta; best = ts[i]; }
+      }
+      return best;
+    }
     // Binary search for the insertion point, then compare the neighbours on
     // either side — the nearest cue may be just above or just below `time`.
     let lo = 0, hi = idx.length; // first idx[i].time >= time
