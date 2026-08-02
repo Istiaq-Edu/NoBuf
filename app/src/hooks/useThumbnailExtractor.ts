@@ -184,6 +184,16 @@ export function decideMkvCaptureStrategy(
   return cueless ? { strategy: 'skip' } : { strategy: 'native' };
 }
 
+/** Cue-point count from mediabunny's already-parsed MKV metadata (pure in-memory read — zero
+ *  I/O; getPrimaryVideoTrack already ran readMetadata). Reaches vendored internals by the same
+ *  convention as MediabunnyTransmuxer.extractMkvCueIndex; null = layout drift. */
+export function readMkvCuePointCount(videoTrack: unknown): number | null {
+  try {
+    const cues = (videoTrack as any)?._backing?.internalTrack?.cuePoints;
+    return Array.isArray(cues) ? cues.length : null;
+  } catch { return null; }
+}
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
@@ -694,6 +704,10 @@ class TransmuxerThumbnailPipeline {
   active = true;
   busy = false;
   _initInProgress = false;
+  // Fix B (round-2): cue-less MKV ⇒ native getKeyPacket is an unbounded linear walk — captures
+  // become index-or-skip. Detected in init() from mediabunny's already-parsed metadata.
+  isCuelessMkv = false;
+  private warnedCuelessSkip = false;
 
   constructor(
     streamUrl: string,
@@ -795,6 +809,16 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
+      // Fix B (round-2): cue-lessness from already-parsed metadata (zero I/O). null (vendored
+      // layout drift) ⇒ treated cue-less: extractMkvCueIndex degrades to [] the same way, so
+      // playback is ALSO cue-less on drift; a skipped thumbnail beats a 103s busy-locked walk.
+      // Cold branch on pinned mediabunny 1.45.4 (shape proven in prod by the transmuxer).
+      if (this.format === 'mkv') {
+        const cueCount = readMkvCuePointCount(this.videoTrack);
+        this.isCuelessMkv = (cueCount ?? 0) === 0;
+        if (this.isCuelessMkv) console.warn('[TransmuxerThumbnailPipeline] MKV has no Cues — native-scan captures disabled (index-or-skip)');
+      }
+
       // Get video codec
       this.videoCodec = await this.videoTrack.getCodec();
 
@@ -862,42 +886,36 @@ class TransmuxerThumbnailPipeline {
       return false;
     }
 
+    // Fix B (round-2): pick the MKV strategy BEFORE locking busy — a cue-less 'skip' must never
+    // block later hovers (the 103s walk also busy-locked every subsequent capture). This region
+    // is await-free, so two hovers cannot interleave between decision and busy=true.
+    const mkvDecision = decideMkvCaptureStrategy(
+      this.keyframeTimestamps, time, THUMB_INDEX_MAX_GAP, this.isCuelessMkv,
+    );
+    if (mkvDecision.strategy === 'skip') {
+      if (!this.warnedCuelessSkip) {
+        this.warnedCuelessSkip = true;
+        console.warn(`[TransmuxerThumbnailPipeline] Cue-less MKV: hover ${time.toFixed(1)}s outside harvested index — capture skipped (tooltip degrades to time-only; TS-precedent)`);
+      }
+      return false;
+    }
+
     this.busy = true;
 
     try {
-      // 1. Find nearest keyframe — use cached keyframe index when available
-      //    for instant binary search (O(log n)) instead of slow getKeyPacket
-      //    for TS format (8-12s linear scan per call).
+      // 1. Find nearest keyframe — strategy decided above (fix B).
       let keyPacket: EncodedPacket | null;
-      let keyframeTimestampFromIndex: number | null = null;
 
-      if (this.keyframeTimestamps.length > 0) {
-        // Binary search for nearest keyframe ≤ time
-        const ts = this.keyframeTimestamps;
-        let lo = 0, hi = ts.length - 1;
-        while (lo < hi) {
-          const mid = lo + ((hi - lo + 1) >> 1);
-          if (ts[mid] <= time) {
-            lo = mid;
-          } else {
-            hi = mid - 1;
-          }
-        }
-        if (ts[lo] <= time && time - ts[lo] <= THUMB_INDEX_MAX_GAP) {
-          keyframeTimestampFromIndex = ts[lo];
-          // Use the known timestamp with verifyKeyPackets: false — our index
-          // already confirmed this is a keyframe during the metadataOnly scan.
-          keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
-        } else {
-          // The sparse playback-built index doesn't cover the hover time (it only
-          // holds keyframes seen during playback, e.g. 2 entries near the start).
-          // Binary-searching it for a far hover returns a keyframe hundreds of
-          // seconds away → wrong thumbnail frame. Fall back to native getKeyPacket,
-          // which uses mediabunny's full Cues to find the real keyframe at `time`.
-          keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
-        }
+      if (mkvDecision.strategy === 'index') {
+        // Harvested-index hit — known keyframe timestamp, verifyKeyPackets:false (the index
+        // only ever holds confirmed keyframes). Cold-Input cost is bounded by this timestamp's
+        // cluster byte with a hard in-demuxer stop, warms after the first capture, and is
+        // typically disk-speed (on cue-less files playback already walked ≤ this byte).
+        keyPacket = await this.videoSink!.getKeyPacket(mkvDecision.timestamp, { verifyKeyPackets: false });
       } else {
-        // No keyframe index — fall back to standard getKeyPacket with verification
+        // 'native' — cue-indexed MKV: the sparse playback-built index misses this hover (or is
+        // empty pre-harvest); mediabunny's full Cues find the real keyframe at `time`. This
+        // tier is byte-identical to pre-fix behavior. Cue-less never reaches here ('skip').
         keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
       }
 
