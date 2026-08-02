@@ -6350,6 +6350,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     }
 
     // 2. Hard rebuild from playhead — mirrors the user-seek chain (§K).
+    // Round-3 Fix A-1: transmux FIRST (old buffer keeps playing — segments land in
+    // seekBufferRef because bufferingForSeekRef is set), THEN changeType → flush →
+    // append. The playhead's no-data window shrinks from flush+transmux+append to
+    // flush+append (~ms). Superseded/failed switches now bail with the old buffer
+    // INTACT and still playing. Ordering invariants (verify-a H-A1c, review R6):
+    // seekGen capture + stopStreamingChain MUST precede seekTo (abortSeek condemns
+    // in-flight work; seekTo clears the flag on entry); bufferingForSeek+seekBuffer
+    // MUST be set before seekTo (segment callbacks route on the flag); the
+    // supersession check sits immediately after the await; setTimestampOffset MUST
+    // precede the append loop (wrapper applies offset on queue drain).
     const seekGen = ++transmuxerSeekGenRef.current;
     stopStreamingChain();
     refillInProgressRef.current = false;
@@ -6357,18 +6367,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     burstBufferRef.current = [];
     bufferingForSeekRef.current = true;
     seekBufferRef.current = [];
-    await sbVideo.resetForSeek();
-    if (plan === 'rebuild-changetype') {
-      try {
-        await sbVideo.changeType(newMime);
-        diagLog(`[AUDIO] mkv switch: SourceBuffer.changeType(${newMime}) applied (H1)`);
-      } catch (e: any) {
-        diagLog(`[AUDIO] mkv switch: changeType failed (${e?.message}) — reverting`);
-        bufferingForSeekRef.current = false;
-        await transmuxer.setDesiredAudioTrack(null);
-        return false;
-      }
-    }
 
     // skipInitSegment:false — the new track needs a fresh ftyp+moov (its codec
     // config differs even when the codec string doesn't).
@@ -6380,22 +6378,44 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     bufferingForSeekRef.current = false;
     if (isSeekSuperseded(seekGen, transmuxerSeekGenRef.current)) {
       seekBufferRef.current = [];
-      diagLog('[AUDIO] mkv switch superseded by a newer seek — discarding');
+      diagLog('[AUDIO] mkv switch superseded by a newer seek — discarding (buffer intact)');
       return false;
     }
     if (keyframeTimestamp === null) {
-      // G2 (cue-less MKV): the rebuild seekTo nulls for the same reason
-      // refills do (mid-GOP playhead, keyframe cluster behind the position-
-      // cache walk start). A bare revert leaves a DEAD player: the SB was
-      // flushed (resetForSeek above) and the chain stopped — nothing restarts
-      // either, and re-seeking would null again. Escalate to the ffmpeg tier
-      // carrying the user's chosen track. No setDesiredAudioTrack(null)
-      // revert — the reroute disposes the transmuxer anyway.
+      // G2 (cue-less MKV): the rebuild seekTo nulls for the same reason refills
+      // do (mid-GOP playhead, keyframe cluster behind the position-cache walk
+      // start). Escalate to the ffmpeg tier carrying the user's chosen track.
+      // Round-3: the SB was NOT flushed yet — the reroute captures currentTime
+      // on live data (strictly better than the old post-flush escalation). No
+      // setDesiredAudioTrack(null) revert — the reroute disposes the transmuxer.
+      seekBufferRef.current = [];
       diagLog(`[AUDIO] mkv switch: seekTo returned null — escalating to /remux tier (track ${trackId})`);
       remuxAudioIdxRef.current = await mapTrackToFfprobeIdx();
       return (await recoverMkvRerouteRef.current?.(`audio switch keyframe unresolvable (track ${trackId})`)) ?? false;
     }
 
+    // changeType BEFORE the flush (review R6): on failure, revert IN PLACE — the
+    // old buffer is still there and still playing; restart the chain and walk away
+    // (the old code dead-ended here on a flushed SB with a stopped chain).
+    if (plan === 'rebuild-changetype') {
+      try {
+        await sbVideo.changeType(newMime);
+        diagLog(`[AUDIO] mkv switch: SourceBuffer.changeType(${newMime}) applied (H1)`);
+      } catch (e: any) {
+        diagLog(`[AUDIO] mkv switch: changeType failed (${e?.message}) — reverting in place`);
+        seekBufferRef.current = [];
+        const revertMime = await transmuxer.setDesiredAudioTrack(null);
+        if (!revertMime) {
+          // Revert itself failed — same terminal shape as the null-keyframe path.
+          remuxAudioIdxRef.current = await mapTrackToFfprobeIdx();
+          return (await recoverMkvRerouteRef.current?.(`audio switch changeType+revert failed (track ${trackId})`)) ?? false;
+        }
+        startStreamingChain();
+        return false;
+      }
+    }
+
+    await sbVideo.resetForSeek();
     seekOffsetRef.current = keyframeTimestamp;
     await sbVideo.setTimestampOffset(keyframeTimestamp);
     const buffered = seekBufferRef.current;
