@@ -94,18 +94,6 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
   let clusterByteOfLastSeek = -1;
   let captureNextReadStart = false;
 
-  // PROBE (trace-27): byte-accounting to split a cold seek's cost into SEARCH
-  // (bytes getKeyPacket reads walking from the cue cluster to the target
-  // keyframe) vs PLAYBACK (bytes the forward fMP4 iteration reads after the
-  // keyframe resolves). markSeekStart() arms the counter at seekTo entry;
-  // fetchRange adds every network byte while armed; markSeekResolved() logs the
-  // SEARCH total. Only THIS source's own fetches are counted, so interleaved
-  // warmer / stale-playback streams don't pollute the number. Remove once the
-  // search-vs-playback split is confirmed and the fix lever is chosen.
-  let seekSearchActive = false;
-  let seekSearchBytes = 0;    // bytes FETCHED over the network (8MB readahead units)
-  let seekSearchConsumed = 0; // bytes mediabunny actually REQUESTED (the real need)
-
   async function fetchRange(start: number, end: number): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let totalLen = 0;
@@ -185,7 +173,6 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
       totalLen += chunk.length;
       pos += chunk.length;
       emptyRetries = 0;
-      if (seekSearchActive) seekSearchBytes += chunk.length; // PROBE: count search bytes
 
       if (chunk.length < requestedSize) {
         await new Promise(r => setTimeout(r, PARTIAL_RETRY_DELAY_MS));
@@ -251,12 +238,6 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
     getSize: async () => fileSize,
     read: async (start: number, end: number) => {
       const totalRequested = end - start;
-      // PROBE (trace-28): count bytes mediabunny actually REQUESTS during the
-      // seek search (vs the 8MB readahead we fetch). If consumed << 8MB, the
-      // search is reducible: a smaller readahead for scattered reads (or
-      // metadataOnly) would cut it. If consumed ≈ 8MB, the search genuinely
-      // needs the data and the only lever is bandwidth (kill stale streams).
-      if (seekSearchActive) seekSearchConsumed += totalRequested;
       const result = new Uint8Array(totalRequested);
       let filled = 0;
 
@@ -375,18 +356,10 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
     for (const abort of inFlightAborts) abort.abort();
     inFlightAborts.clear();
   };
-  // PROBE (trace-27): arm search byte-accounting at seekTo entry.
-  (source as any).markSeekStart = () => { seekSearchActive = true; seekSearchBytes = 0; seekSearchConsumed = 0; };
   // Arm cluster-byte capture: call right after getKeyPacket resolves so the
   // next read (the forward fMP4 iteration) records the real cluster byte.
-  // PROBE: also stop + log the SEARCH byte total (bytes read from cue cluster
-  // to the resolved keyframe) — the reducible portion, vs playback bytes after.
   (source as any).markSeekResolved = () => {
     captureNextReadStart = true;
-    if (seekSearchActive) {
-      console.log(`[TauriStreamSource] SEEK SEARCH fetched=${(seekSearchBytes / 1048576).toFixed(2)}MB consumed=${(seekSearchConsumed / 1048576).toFixed(2)}MB (${seekSearchConsumed}B) — consumed<<fetched ⇒ reducible; consumed≈fetched ⇒ bandwidth-bound`);
-      seekSearchActive = false;
-    }
   };
   // Real cluster byte of the last resolved seek — pair with the seek's keyframe
   // time to add a VBR byte↔time anchor. -1 if not captured yet.

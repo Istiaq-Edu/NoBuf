@@ -1451,9 +1451,6 @@ export class MediabunnyTransmuxer {
         ? byteOffsetKeyframe.timestamp // Use byte-offset index timestamp (most accurate)
         : cachedKeyframeTs ?? seekTime;
 
-      // PROBE (trace-27): arm search byte-accounting so markSeekResolved can log
-      // how many bytes THIS getKeyPacket read from the cue cluster to the keyframe.
-      (this.streamSource as any)?.markSeekStart?.();
       if (useCachedIndex || byteOffsetKeyframe !== null) {
         keyPacket = await videoSink.getKeyPacket(seekTargetTs, { verifyKeyPackets: false });
         console.log(`[Transmuxer] seekTo: using keyframe index — seekTargetTs=${seekTargetTs.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s, byteOffset=${byteOffsetKeyframe?.byteOffset ?? 'N/A'}`);
