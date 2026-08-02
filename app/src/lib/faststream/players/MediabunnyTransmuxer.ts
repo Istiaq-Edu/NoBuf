@@ -1311,6 +1311,12 @@ export class MediabunnyTransmuxer {
     // in the coordinator's zombie-cancel logic (both source_id=None) so neither
     // ever completes and the seek hangs. Aborting frees the slot immediately.
     (this.streamSource as any)?.abortInFlight?.();
+    // Fix A1 (round-2): clear the sticky condemnation set by interruptSeek()/a prior entry —
+    // THIS seek's reads must pass. Entry is synchronous from here through seekGeneration++,
+    // so nothing this seek issues can be condemned. Scope: protects the user-drain supersede
+    // path; a user seek superseding an in-flight REFILL self-clears in ~µs (accepted residual,
+    // see reports/seek-interrupt-solution.md).
+    (this.streamSource as any)?.resetSupersession?.();
 
     // Increment generation to discard stale callback data
     this.seekGeneration++;
@@ -1486,6 +1492,16 @@ export class MediabunnyTransmuxer {
       const keyframeTimestamp = keyPacket.timestamp;
       console.log(`[Transmuxer] Seek to ${seekTime}s: keyframe at ${keyframeTimestamp}s`);
 
+      // Fix A2 (round-2): post-resolve belt. The walk may resolve AFTER condemnation (warm
+      // cache, or the interrupt raced the last fetch). Bail BEFORE any corpse work: arming
+      // markSeekResolved here would pair the SUPERSEDING seek's first cluster byte with THIS
+      // corpse's keyframe time (corrupt VBR anchor); also skips lastSeekKeyframeTime, harvest,
+      // Output creation, audio resolve, and the init-segment emit.
+      if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
+        console.log(`[Transmuxer] Seek abandoned post-resolve (condemned while walking): target=${seekTime.toFixed(2)}s resolved=${keyframeTimestamp.toFixed(3)}s`);
+        return null;
+      }
+
       // Arm the source to capture the cluster byte of the upcoming forward fMP4
       // iteration (the read that actually contains this keyframe's data), so the
       // caller can add a REAL (clusterByte, keyframeTimestamp) VBR anchor — not
@@ -1606,6 +1622,7 @@ export class MediabunnyTransmuxer {
       const isAborted = this.seekAbortFlag;
       const isDisposed = this.disposed;
       const isExpectedError = e instanceof Error && (
+        e.message.includes('read aborted (superseded by seek)') ||
         e.message.includes('has been canceled') ||
         e.name === 'ConversionCanceledError' ||
         e.message.includes('Input has been disposed') ||
@@ -1840,7 +1857,9 @@ export class MediabunnyTransmuxer {
   }
 
   /** Enumerate audio tracks with menu metadata. Cheap on the persistent MKV
-   *  Input (metadata/Cues already parsed — plan I1; timing logged to verify). */
+   *  Input (metadata/Cues already parsed — plan I1; timing logged to verify).
+   *  Round-2 note: during the ~120ms condemned window (interrupt → next seekTo) reads here
+   *  can throw the superseded error — caught below, degrades to [], self-heals at next seekTo. */
   async getAudioTracks(): Promise<Array<{
     id: number; language: string; name: string | null; codec: string;
     channels: number; isDefault: boolean; codecParameterString: string | null;

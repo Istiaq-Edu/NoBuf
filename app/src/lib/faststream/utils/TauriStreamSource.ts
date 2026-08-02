@@ -94,6 +94,15 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
   let clusterByteOfLastSeek = -1;
   let captureNextReadStart = false;
 
+  // Fix A1 (round-2): sticky supersession. abortInFlight() aborts only the controllers alive
+  // AT THAT INSTANT — but a cue-less getKeyPacket walk is a LOOP of sequential fetches, each
+  // with a fresh controller, so an abort landing BETWEEN two fetches was silently lost and the
+  // condemned walk ran to completion (observed: 35.7s / 48MB zombie, round-2 forensics).
+  // Sticky: every fetch attempt after condemnation dies until the next seekTo entry calls
+  // resetSupersession(). Per-closure-instance — thumbnail/scan/TS-offset sources are separate
+  // instances and are never condemned.
+  let superseded = false;
+
   async function fetchRange(start: number, end: number): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     let totalLen = 0;
@@ -102,6 +111,7 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
 
     while (pos <= end) {
       if (disposed) throw new Error('[TauriStreamSource] disposed during fetch');
+      if (superseded) throw new Error('[TauriStreamSource] read aborted (superseded by seek)');
 
       const rangeEnd = Math.min(end, fileSize - 1);
       if (pos > rangeEnd) break;
@@ -111,6 +121,7 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
 
       for (let attempt = 0; attempt <= MAX_503_RETRIES; attempt++) {
         if (disposed) throw new Error('[TauriStreamSource] disposed during fetch');
+        if (superseded) throw new Error('[TauriStreamSource] read aborted (superseded by seek)');
 
         const abort = new AbortController();
         inFlightAborts.add(abort);
@@ -349,6 +360,7 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
   // download slot immediately (see inFlightAbort comment). Attached to the
   // instance because CustomSource's options don't include a control channel.
   (source as any).abortInFlight = () => {
+    superseded = true; // sticky — survives until the next seekTo entry (resetSupersession)
     // Abort EVERY live fetch (read + prefetch), not just the last one, so no
     // stale request survives to keep its backend slot. Each fetch's finally
     // removes itself from the set; abort() on an already-settled controller is
@@ -356,6 +368,9 @@ export function createTauriStreamSource(config: TauriStreamSourceConfig): Custom
     for (const abort of inFlightAborts) abort.abort();
     inFlightAborts.clear();
   };
+  // Fix A1: clear the sticky condemnation for a NEW seek. Called at seekTo entry immediately
+  // after abortInFlight() — the new seek's own reads must pass. NOWHERE else.
+  (source as any).resetSupersession = () => { superseded = false; };
   // Arm cluster-byte capture: call right after getKeyPacket resolves so the
   // next read (the forward fMP4 iteration) records the real cluster byte.
   (source as any).markSeekResolved = () => {
