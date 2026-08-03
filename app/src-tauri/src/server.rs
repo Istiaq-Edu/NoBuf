@@ -6155,7 +6155,9 @@ async fn subtitles_extract_track(
         // probe (EOF SeekHead) and font reads share subs_input_source and must
         // stay unbounded.
         if !fully_cached && src.starts_with("http") {
-            src.push_str("&cached_prefix=1");
+            // serde Option<bool> parses "true"/"false" ONLY — "=1" 400s the whole
+            // query (round-4 regression, 4-t.md:239).
+            src.push_str("&cached_prefix=true");
         }
         src
     };
@@ -7378,6 +7380,23 @@ mod tests {
         assert!(joined.contains("-flush_packets 1"), "srt args: {}", joined);
         let args_ass = super::build_sub_extract_args("in.mkv", 3, true, false, "out.ass");
         assert!(args_ass.join(" ").contains("-flush_packets 1"), "ass path too");
+    }
+
+    /// Round-4 regression (4-t.md:239-241): serde bools in query strings parse
+    /// from "true"/"false" ONLY — `cached_prefix=1` made actix 400 the ENTIRE
+    /// StreamQuery, killing every bounded extraction at ffmpeg's first request.
+    /// Pins the contract for both bool params and the exact literal the extract
+    /// call site appends.
+    #[test]
+    fn stream_query_bool_params_parse_from_true_literal() {
+        use actix_web::web::Query;
+        let q = Query::<super::StreamQuery>::from_query("cached_prefix=true").unwrap();
+        assert_eq!(q.cached_prefix, Some(true));
+        let q = Query::<super::StreamQuery>::from_query("cached_only=true&cached_prefix=true").unwrap();
+        assert_eq!(q.cached_only, Some(true));
+        assert_eq!(q.cached_prefix, Some(true));
+        // Numeric shorthand must keep failing loudly, not silently coerce.
+        assert!(Query::<super::StreamQuery>::from_query("cached_prefix=1").is_err());
     }
 
     /// Font attachment detection: mimetype first, extension fallback for
