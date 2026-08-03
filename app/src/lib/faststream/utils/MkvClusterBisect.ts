@@ -21,6 +21,15 @@ const MKV_CLUSTER_ID = 0x1f43b675;
  *  one cluster's interior; the subsequent walk reads those bytes anyway
  *  (5-t: 16 probes wasted on a 12.58MB monster-cluster interior). */
 const BISECT_WALKABLE_GAP_BYTES = 16 * 1024 * 1024;
+
+/** Round-7 keyframe shadow: getKeyPacket's forward-only walk fails when the
+ *  closest cache entry ≤ target sits AFTER the last keyframe before the target
+ *  (up to one GOP wide). Bisect for target − shadow so the injected entry lands
+ *  behind that keyframe. Clamps: floor 12s (partial-index GOP bound used across
+ *  the player), cap 35s (max cluster span; keeps the residual walk bounded). */
+export const SEEK_SHADOW_DEFAULT_S = 15;
+export const SEEK_SHADOW_MIN_S = 12;
+export const SEEK_SHADOW_MAX_S = 35;
 /** EBML IDs legal as Cluster children (vendored demuxer's handled set):
  *  Timestamp, CRC-32, SilentTracks, Position, PrevSize, SimpleBlock, BlockGroup. */
 const MKV_CLUSTER_CHILD_IDS = new Set([0xe7, 0xbf, 0x5854, 0xa7, 0xab, 0xa3, 0xa0]);
@@ -267,6 +276,46 @@ export function readMkvClusterPositions(
     }
     return out;
   } catch { return null; }
+}
+
+/** Round-7: adaptive keyframe-shadow width from the harvested keyframe index —
+ *  2 × the max consecutive gap (the shadow can't exceed one GOP; 2× absorbs
+ *  harvest sparsity), clamped [SEEK_SHADOW_MIN_S, SEEK_SHADOW_MAX_S]. Fewer
+ *  than 2 keyframes → SEEK_SHADOW_DEFAULT_S. `keyframeTimestamps` sorted asc. */
+export function computeKeyframeShadowSeconds(keyframeTimestamps: number[]): number {
+  if (keyframeTimestamps.length < 2) return SEEK_SHADOW_DEFAULT_S;
+  let maxGap = 0;
+  for (let i = 1; i < keyframeTimestamps.length; i++) {
+    const gap = keyframeTimestamps[i] - keyframeTimestamps[i - 1];
+    if (gap > maxGap) maxGap = gap;
+  }
+  return Math.min(SEEK_SHADOW_MAX_S, Math.max(SEEK_SHADOW_MIN_S, 2 * maxGap));
+}
+
+/** Round-7 shadow purge: evict every clusterPositionCache entry with
+ *  startTimestamp in (fromTicks, toTicks]. A stale entry inside the keyframe
+ *  shadow wins performClusterLookup's closest-≤-target race no matter what we
+ *  inject behind it — and a FAILED walk's own organic inserts re-poison the
+ *  window, so the purge must cover the whole range, not just our entry.
+ *  Returns the number of entries removed; 0 on shape drift. */
+export function removeMkvClusterPositionsInRange(
+  videoTrack: unknown,
+  fromTicks: number,
+  toTicks: number,
+): number {
+  try {
+    const cache = (videoTrack as any)?._backing?.internalTrack?.clusterPositionCache;
+    if (!Array.isArray(cache)) return 0;
+    let removed = 0;
+    for (let i = cache.length - 1; i >= 0; i--) {
+      const t = cache[i]?.startTimestamp;
+      if (typeof t === 'number' && t > fromTicks && t <= toTicks) {
+        cache.splice(i, 1);
+        removed++;
+      }
+    }
+    return removed;
+  } catch { return 0; }
 }
 
 export interface MkvBisectSearchOpts {
