@@ -442,3 +442,25 @@ describe('removeMkvClusterPositionsInRange (round-7 shadow purge)', () => {
     expect(near?.startTimestamp).toBe(100_000);
   });
 });
+
+describe('computeKeyframeShadowSeconds — seek-jump gap filter (round-8)', () => {
+  it('ignores far-seek jump gaps: only gaps <= 60s are GOP evidence (8-x harvest)', () => {
+    // Real round-8 harvest after the 3318.1s seek: jump gap 155.572 -> 3317.94 (~3162s)
+    // must NOT be treated as a GOP. Surviving max gap = 20.812 -> 2x -> clamp 35.
+    expect(computeKeyframeShadowSeconds([0, 20.812, 31.24, 41.625, 155.572, 3317.94])).toBe(35);
+  });
+
+  it('does not saturate a short-GOP file after a far seek (the round-8 bug)', () => {
+    // 5s GOPs + one far-seek artifact: was 35 (saturated), must be 12 (2x5 clamped up).
+    expect(computeKeyframeShadowSeconds([0, 5, 10, 15, 3000])).toBe(12);
+  });
+
+  it('falls back to the default when no gap survives the filter', () => {
+    expect(computeKeyframeShadowSeconds([0, 3000])).toBe(15);
+  });
+
+  it('keeps large-but-plausible gaps at or below the evidence bound', () => {
+    // 50s <= 60s evidence bound: kept, 2x50 = 100 -> clamp 35.
+    expect(computeKeyframeShadowSeconds([0, 50])).toBe(35);
+  });
+});
