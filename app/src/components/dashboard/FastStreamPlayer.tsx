@@ -375,8 +375,8 @@ interface FastStreamPlayerProps {
   // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
   // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, getKnownDuration: msePlayer.getKnownDuration, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config, getRemuxThumbConfig: msePlayer.getRemuxThumbConfig,
-  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.getKnownDuration, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config, msePlayer.getRemuxThumbConfig]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, getKnownDuration: msePlayer.getKnownDuration, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, recordByteTimeAnchor: msePlayer.recordByteTimeAnchor, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config, getRemuxThumbConfig: msePlayer.getRemuxThumbConfig,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.getKnownDuration, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.recordByteTimeAnchor, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config, msePlayer.getRemuxThumbConfig]);
 
   const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -615,7 +615,18 @@ interface FastStreamPlayerProps {
             // (rawPlayhead removed with the GREEN-BAR diagnostic log; re-add
             //  `const rawPlayhead = vidRef.current?.currentTime ?? 0;` if re-enabling.)
             // (B) Capture a VBR anchor for the active seek before converting.
-            if (typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
+            // ROUND-5 GATE (user report: "seeked to 5min → instant 1-2min of
+            // green that isn't downloaded"): this heuristic pairs the nearest
+            // cached-range START with the seek time. That's sound ONLY on the
+            // linear /remux-tier where ffmpeg's reads for the seek create that
+            // range. On the MKV transmuxer tier it's poison: thumbnail-probe /
+            // old-seek islands get snapped to the playhead (island start ↔
+            // seekTarget) → the whole island instantly renders as phantom
+            // prebuffer AT the seek point, and the bogus anchor then blocks the
+            // transmuxer's real ground-truth anchor (getLastSeekAnchor,
+            // monotonicity guard rejects the later correct pair). The
+            // transmuxer records its own exact anchors — skip the guess there.
+            if (!isTransmuxer() && typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
               const linearByte = (seekTarget / durForBar) * status.total_bytes;
               // Nearest cached-range START to the linear estimate = ffmpeg's real
               // cluster read for this seek. Ignore the front (0) and tail ranges.

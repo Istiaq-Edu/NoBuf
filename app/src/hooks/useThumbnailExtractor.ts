@@ -207,6 +207,10 @@ export function readMkvCuePointCount(videoTrack: unknown): number | null {
 // ⇒ callers degrade to the round-2 skip behavior.
 
 const MKV_CLUSTER_ID = 0x1f43b675;
+/** Round-5: stop bisecting once best + next-above bracket ≤ this gap — the
+ *  residue is one cluster's interior; the capture walk reads those bytes anyway
+ *  (5-t: 16 probes wasted on a 12.58MB monster-cluster interior). */
+const BISECT_WALKABLE_GAP_BYTES = 16 * 1024 * 1024;
 /** EBML IDs legal as Cluster children (vendored demuxer's handled set):
  *  Timestamp, CRC-32, SilentTracks, Position, PrevSize, SimpleBlock, BlockGroup. */
 const MKV_CLUSTER_CHILD_IDS = new Set([0xe7, 0xbf, 0x5854, 0xa7, 0xab, 0xa3, 0xa0]);
@@ -321,6 +325,49 @@ export function pickBisectProbe(
   frac = Math.min(0.98, Math.max(0.02, frac));
   const probe = loByte + Math.floor((hiByte - loByte) * frac);
   return Math.min(hiByte - 1, Math.max(loByte + 1, probe));
+}
+
+export interface BisectBracket {
+  lo: number;
+  hi: number;
+  loTicks: number | null;
+  hiTicks: number | null;
+}
+
+/** Round-5 spin fix (5-t:301-330 — 16 identical re-fetches): pure bracket step.
+ *  'below' = the window's LAST ≤-target cluster (advance lo past it);
+ *  'above' = the window held clusters but all above target — the window proved
+ *  no ≤-target cluster exists in [mid, windowEnd], so hi shrinks to MID. The
+ *  round-4 code set hi = found-cluster byte, but that byte is ≥ mid by
+ *  construction (found inside the window), so the bracket never shrank and the
+ *  interpolated probe repeated forever. Ticks tighten the interpolation only. */
+export function stepBisectBracket(
+  br: BisectBracket,
+  mid: number,
+  outcome: { kind: 'below' | 'above'; byte: number; ticks: number },
+): void {
+  if (outcome.kind === 'below') {
+    br.lo = outcome.byte + 1;
+    br.loTicks = outcome.ticks;
+  } else {
+    br.hi = Math.max(br.lo + 1, mid);
+    br.hiTicks = outcome.ticks;
+  }
+}
+
+/** Round-5 terminal rule: when the best ≤-target cluster and the next
+ *  above-target cluster bracket a gap ≤ walkableGapBytes, the answer is FINAL
+ *  (the gap is one cluster's interior — no more cluster starts can exist in
+ *  it) and further probing only re-downloads bytes the capture walk will read
+ *  anyway. Round-5 numbers: best@703792419 next@716375330 → 12.58MB gap; the
+ *  16 extra probes bought nothing. */
+export function bisectShouldStop(
+  bestByte: number | null,
+  nextAboveByte: number | null,
+  walkableGapBytes: number,
+): boolean {
+  if (bestByte === null || nextAboveByte === null) return false;
+  return nextAboveByte - bestByte <= walkableGapBytes;
 }
 
 /** timestampFactor (ticks per second) from the segment — guarded reach-in. */
@@ -915,6 +962,10 @@ class TransmuxerThumbnailPipeline {
     at: number;
     entry?: { elementStartPos: number; startTimestamp: number };
   }>();
+  /** Round-5 (green bar D3): sink for exact (byte, timeSeconds) pairs from
+   *  validated bisection clusters — wired to the player's recordByteTimeAnchor
+   *  so cached islands render at true VBR positions. Optional; no-op when unset. */
+  onByteTimeAnchor: ((byteOffset: number, timeSeconds: number) => void) | null = null;
 
   constructor(
     streamUrl: string,
@@ -1285,9 +1336,8 @@ class TransmuxerThumbnailPipeline {
   ): Promise<void> {
     const started = performance.now();
     try {
-      let lo = readMkvClusterSeekStart(this.videoTrack) ?? 0;
-      let hi = this.sourceConfig.fileSize;
-      if (!(hi > lo)) {
+      const startLo = readMkvClusterSeekStart(this.videoTrack) ?? 0;
+      if (!(this.sourceConfig.fileSize > startLo)) {
         this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
         return;
       }
@@ -1295,19 +1345,33 @@ class TransmuxerThumbnailPipeline {
       const sep = baseUrl.includes('?') ? '&' : '?';
       const probeUrl = `${baseUrl}${sep}source_id=thumbnail`;
       let best: { elementStartPos: number; timestampTicks: number } | null = null;
+      let nextAbove: number | null = null; // earliest known above-target cluster byte
       let window = 2 * 1024 * 1024; // 2MB start, geometric grow on no-find (cap 8MB)
       let bytesFetched = 0;
-      // Round-4 (4-c:463 — 17 probes, 30MB, 33.9s): interpolation search over the
-      // near-linear byte↔time mapping + in-buffer last-cluster advance. Bracket
-      // tick endpoints start as (0 @ lo, duration @ EOF) and tighten with every
-      // validated cluster read, so probes home in ~2-4 fetches.
-      let loTicks: number | null = 0;
+      // Round-4 (4-c:463): interpolation search over the near-linear byte↔time
+      // mapping + in-buffer last-cluster advance. Round-5 (5-t:301-330 — 16
+      // identical re-fetches): bracket stepping extracted to stepBisectBracket
+      // ('above' shrinks hi to MID, the round-4 found-byte step never shrank)
+      // and a walkable-gap stop rule (bisectShouldStop) ends the search once
+      // best+nextAbove bracket ≤16MB — the residue is one cluster's interior
+      // that the capture walk reads anyway.
       const factor = readMkvTimestampFactor(this.videoTrack);
-      let hiTicks: number | null =
-        this.duration > 0 && factor !== null ? Math.round(this.duration * factor) : null;
+      const br: BisectBracket = {
+        lo: startLo,
+        hi: this.sourceConfig.fileSize,
+        loTicks: 0,
+        hiTicks: this.duration > 0 && factor !== null ? Math.round(this.duration * factor) : null,
+      };
+      // D3 (green bar): every VALIDATED cluster is an exact (byte, time) pair —
+      // feed them to the player's byte↔time table so cached islands render at
+      // their true positions instead of the file-average slope.
+      const feedAnchor = (byte: number, ticks: number) => {
+        if (factor !== null) this.onByteTimeAnchor?.(byte, ticks / factor);
+      };
 
-      for (let iter = 0; iter < 18 && hi - lo > 64 * 1024 && this.active; iter++) {
-        const mid = pickBisectProbe(lo, hi, loTicks, hiTicks, targetTicks);
+      for (let iter = 0; iter < 18 && br.hi - br.lo > 64 * 1024 && this.active; iter++) {
+        if (bisectShouldStop(best?.elementStartPos ?? null, nextAbove, BISECT_WALKABLE_GAP_BYTES)) break;
+        const mid = pickBisectProbe(br.lo, br.hi, br.loTicks, br.hiTicks, targetTicks);
         const fetchEnd = Math.min(mid + window - 1, this.sourceConfig.fileSize - 1);
         const resp = await fetch(probeUrl, { headers: { Range: `bytes=${mid}-${fetchEnd}` } });
         if (!resp.ok && resp.status !== 206) {
@@ -1316,10 +1380,9 @@ class TransmuxerThumbnailPipeline {
         }
         const buf = new Uint8Array(await resp.arrayBuffer());
         bytesFetched += buf.length;
-        // LAST validated cluster ≤ target in this window (in-buffer advance —
-        // replaces the round-4 terminal creep of overlapping re-fetches). Zero
-        // high-side slack: the injected entry must satisfy ts ≤ target or
-        // binarySearchLessOrEqual never selects it (verify-c risk 2).
+        // LAST validated cluster ≤ target in this window. Zero high-side slack:
+        // the injected entry must satisfy ts ≤ target or binarySearchLessOrEqual
+        // never selects it (verify-c risk 2).
         const hit = scanForLastMkvClusterAtOrBefore(buf, mid, targetTicks);
         if (!hit) {
           // Distinguish "cluster present but ABOVE target" from "no cluster at all".
@@ -1329,27 +1392,27 @@ class TransmuxerThumbnailPipeline {
             this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
             return;
           }
-          // Cluster found but past the target → its START is a hard upper bound
-          // (tighter than mid) and keeps hiTicks consistent with hi.
-          hi = Math.max(lo + 1, any.elementStartPos);
-          hiTicks = any.timestampTicks; // tighten the interpolation bracket
+          feedAnchor(any.elementStartPos, any.timestampTicks);
+          nextAbove = nextAbove === null ? any.elementStartPos : Math.min(nextAbove, any.elementStartPos);
+          stepBisectBracket(br, mid, { kind: 'above', byte: any.elementStartPos, ticks: any.timestampTicks });
           continue;
         }
         best = hit;
-        // The found cluster's END is a hard lower bound for a later at-or-before
-        // cluster; its ticks tighten the interpolation bracket.
-        const advance = hit.elementStartPos + 1;
-        if (advance >= hi) break;
-        // Terminal convergence: if the found cluster sits inside the fetched
-        // window and the window also holds a cluster ABOVE the target, the
-        // answer is bracketed within ONE window — best is final.
+        feedAnchor(hit.elementStartPos, hit.timestampTicks);
+        // If the same window also holds a cluster ABOVE the target, the answer
+        // is bracketed within ONE window — record it and let the stop rule end
+        // the search (best is final: no later ≤-target cluster can exist).
         const above = scanForMkvClusterInWindow(
           buf.subarray(hit.elementStartPos - mid + 1), hit.elementStartPos + 1,
           targetTicks + 1, Number.MAX_SAFE_INTEGER, 0,
         );
-        if (above) break;
-        lo = advance;
-        loTicks = hit.timestampTicks;
+        if (above) {
+          feedAnchor(above.elementStartPos, above.timestampTicks);
+          nextAbove = nextAbove === null ? above.elementStartPos : Math.min(nextAbove, above.elementStartPos);
+          break;
+        }
+        if (hit.elementStartPos + 1 >= br.hi) break;
+        stepBisectBracket(br, mid, { kind: 'below', byte: hit.elementStartPos, ticks: hit.timestampTicks });
       }
 
       if (!best || !this.active) {
@@ -2216,6 +2279,9 @@ export function useThumbnailExtractor(
       getters.getKeyframeTimestamps(), // Cached keyframe index for fast seek
       getters.getKnownDuration?.() ?? 0, // Probed duration — skips EOF-scanning computeDuration() for headerless MKV
     );
+    // Round-5 (green bar D3): bisection clusters are exact (byte,time) pairs —
+    // feed the player's byte↔time table so islands render at true positions.
+    pipeline.onByteTimeAnchor = getters.recordByteTimeAnchor ?? null;
 
     transmuxerPipelineRef.current = pipeline;
 
