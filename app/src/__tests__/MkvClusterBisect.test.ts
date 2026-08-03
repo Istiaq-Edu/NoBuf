@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   scanForMkvClusterInWindow,
+  scanForLastMkvClusterAtOrBefore,
+  pickBisectProbe,
   injectMkvClusterPosition,
   findClusterCacheEntryNear,
 } from '../hooks/useThumbnailExtractor';
@@ -128,5 +130,72 @@ describe('findClusterCacheEntryNear (R10 consult-before-bisect)', () => {
   it('null on empty/drifted cache', () => {
     expect(findClusterCacheEntryNear(fakeTrack([]), 100, 200)).toBeNull();
     expect(findClusterCacheEntryNear(fakeTrack(null), 100, 200)).toBeNull();
+  });
+});
+
+/**
+ * Round-4 (4-c.md:463 — 30MB/33.9s for one bisection): probe-count optimizations.
+ * pickBisectProbe: interpolation search — MKV byte↔time is near-linear (measured:
+ * hover 35.87% of duration lived at 35.06% of the file), so seeding probes from
+ * the (byte,ticks) bracket endpoints collapses 17 halving probes to ~2-4.
+ * scanForLastMkvClusterAtOrBefore: in-buffer forward advance — one fetched window
+ * often holds several clusters; take the LAST ≤ target instead of re-fetching
+ * overlapping windows to creep forward (the log's last 6 probes re-downloaded an
+ * already-fetched 1.5MB bracket).
+ */
+describe('pickBisectProbe (interpolation search)', () => {
+  it('interpolates linearly between bracket endpoints', () => {
+    // ticks 0..10000 over bytes 0..1_000_000, target 3500 → ~350_000
+    const p = pickBisectProbe(0, 1_000_000, 0, 10_000, 3_500);
+    expect(p).toBeGreaterThan(300_000);
+    expect(p).toBeLessThan(400_000);
+  });
+
+  it('clamps the interpolation fraction away from the endpoints', () => {
+    // target at 0.1% of the tick range must still probe ≥2% into the bracket
+    expect(pickBisectProbe(0, 1_000_000, 0, 10_000, 10)).toBeGreaterThanOrEqual(20_000);
+    // target at 99.9% must stay ≤98%
+    expect(pickBisectProbe(0, 1_000_000, 0, 10_000, 9_990)).toBeLessThanOrEqual(980_000);
+  });
+
+  it('falls back to the midpoint without tick endpoints', () => {
+    expect(pickBisectProbe(0, 1_000_000, null, null, 3_500)).toBe(500_000);
+    expect(pickBisectProbe(0, 1_000_000, 0, null, 3_500)).toBe(500_000);
+    expect(pickBisectProbe(0, 1_000_000, 5_000, 5_000, 5_500)).toBe(500_000); // degenerate
+  });
+
+  it('always lands strictly inside (lo, hi)', () => {
+    const p = pickBisectProbe(100, 200, 0, 1, 0);
+    expect(p).toBeGreaterThan(100);
+    expect(p).toBeLessThan(200);
+  });
+});
+
+describe('scanForLastMkvClusterAtOrBefore (in-buffer advance)', () => {
+  it('returns the LAST cluster ≤ target, not the first', () => {
+    const c1 = cluster([tsElement(1000)]);
+    const c2 = cluster([tsElement(2000)]);
+    const c3 = cluster([tsElement(3000)]);
+    const buf = new Uint8Array([...c1, ...c2, ...c3]);
+    const hit = scanForLastMkvClusterAtOrBefore(buf, 500, 2500);
+    expect(hit).toEqual({ elementStartPos: 500 + c1.length, timestampTicks: 2000 });
+  });
+
+  it('all clusters ≤ target → the final one wins', () => {
+    const c1 = cluster([tsElement(1000)]);
+    const c2 = cluster([tsElement(3000)]);
+    const buf = new Uint8Array([...c1, ...c2]);
+    expect(scanForLastMkvClusterAtOrBefore(buf, 0, 5000)).toEqual({
+      elementStartPos: c1.length, timestampTicks: 3000,
+    });
+  });
+
+  it('none ≤ target → null (clusters exist but are all above)', () => {
+    const buf = new Uint8Array(cluster([tsElement(9000)]));
+    expect(scanForLastMkvClusterAtOrBefore(buf, 0, 5000)).toBeNull();
+  });
+
+  it('empty/garbage buffer → null', () => {
+    expect(scanForLastMkvClusterAtOrBefore(new Uint8Array(1024).fill(0x42), 0, 5000)).toBeNull();
   });
 });

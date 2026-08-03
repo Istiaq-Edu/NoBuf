@@ -279,6 +279,50 @@ export function scanForMkvClusterInWindow(
   return null;
 }
 
+/** Round-4 (4-c:463 — 30MB/33.9s): LAST validated cluster ≤ targetTicks in the
+ *  window. One fetched window often spans several clusters — advancing to the
+ *  last one in-buffer replaces the terminal creep the round-4 log showed (6
+ *  overlapping 2MB re-fetches over an already-downloaded 1.5MB bracket). Same
+ *  validation as scanForMkvClusterInWindow ([0, target], zero slack). */
+export function scanForLastMkvClusterAtOrBefore(
+  buf: Uint8Array,
+  windowFileOffset: number,
+  targetTicks: number,
+): { elementStartPos: number; timestampTicks: number } | null {
+  let best: { elementStartPos: number; timestampTicks: number } | null = null;
+  let searchFrom = 0;
+  for (;;) {
+    const sub = searchFrom === 0 ? buf : buf.subarray(searchFrom);
+    const hit = scanForMkvClusterInWindow(sub, windowFileOffset + searchFrom, 0, targetTicks, 0);
+    if (!hit) return best;
+    best = hit;
+    const next = hit.elementStartPos - windowFileOffset + 1;
+    if (next <= searchFrom || next >= buf.length) return best;
+    searchFrom = next;
+  }
+}
+
+/** Round-4: interpolation probe picker. MKV byte↔time is near-linear (measured
+ *  35.87% duration ↔ 35.06% file byte in the round-4 log), so interpolating
+ *  inside the [lo,hi] bracket using its known tick endpoints collapses ~17
+ *  blind halvings into ~2-4 probes. Fraction clamped to [0.02, 0.98] so a bad
+ *  endpoint can never pin the probe to the bracket edge; falls back to the
+ *  midpoint when either endpoint tick is unknown or degenerate. */
+export function pickBisectProbe(
+  loByte: number,
+  hiByte: number,
+  loTicks: number | null,
+  hiTicks: number | null,
+  targetTicks: number,
+): number {
+  const mid = loByte + Math.floor((hiByte - loByte) / 2);
+  if (loTicks === null || hiTicks === null || !(hiTicks > loTicks)) return mid;
+  let frac = (targetTicks - loTicks) / (hiTicks - loTicks);
+  frac = Math.min(0.98, Math.max(0.02, frac));
+  const probe = loByte + Math.floor((hiByte - loByte) * frac);
+  return Math.min(hiByte - 1, Math.max(loByte + 1, probe));
+}
+
 /** timestampFactor (ticks per second) from the segment — guarded reach-in. */
 export function readMkvTimestampFactor(videoTrack: unknown): number | null {
   try {
@@ -1251,11 +1295,19 @@ class TransmuxerThumbnailPipeline {
       const sep = baseUrl.includes('?') ? '&' : '?';
       const probeUrl = `${baseUrl}${sep}source_id=thumbnail`;
       let best: { elementStartPos: number; timestampTicks: number } | null = null;
-      let window = 1024 * 1024; // 1MB start, geometric grow on no-find (cap 8MB)
+      let window = 2 * 1024 * 1024; // 2MB start, geometric grow on no-find (cap 8MB)
       let bytesFetched = 0;
+      // Round-4 (4-c:463 — 17 probes, 30MB, 33.9s): interpolation search over the
+      // near-linear byte↔time mapping + in-buffer last-cluster advance. Bracket
+      // tick endpoints start as (0 @ lo, duration @ EOF) and tighten with every
+      // validated cluster read, so probes home in ~2-4 fetches.
+      let loTicks: number | null = 0;
+      const factor = readMkvTimestampFactor(this.videoTrack);
+      let hiTicks: number | null =
+        this.duration > 0 && factor !== null ? Math.round(this.duration * factor) : null;
 
       for (let iter = 0; iter < 18 && hi - lo > 64 * 1024 && this.active; iter++) {
-        const mid = lo + Math.floor((hi - lo) / 2);
+        const mid = pickBisectProbe(lo, hi, loTicks, hiTicks, targetTicks);
         const fetchEnd = Math.min(mid + window - 1, this.sourceConfig.fileSize - 1);
         const resp = await fetch(probeUrl, { headers: { Range: `bytes=${mid}-${fetchEnd}` } });
         if (!resp.ok && resp.status !== 206) {
@@ -1264,25 +1316,40 @@ class TransmuxerThumbnailPipeline {
         }
         const buf = new Uint8Array(await resp.arrayBuffer());
         bytesFetched += buf.length;
-        // Bracket [0, targetTicks] with ZERO high-side slack: the injected entry
-        // must satisfy startTimestamp ≤ target or binarySearchLessOrEqual will
-        // never select it (verify-c risk 2) and the walk falls back to byte 0.
-        const hit = scanForMkvClusterInWindow(buf, mid, 0, targetTicks, 0);
+        // LAST validated cluster ≤ target in this window (in-buffer advance —
+        // replaces the round-4 terminal creep of overlapping re-fetches). Zero
+        // high-side slack: the injected entry must satisfy ts ≤ target or
+        // binarySearchLessOrEqual never selects it (verify-c risk 2).
+        const hit = scanForLastMkvClusterAtOrBefore(buf, mid, targetTicks);
         if (!hit) {
-          // Distinguish "window held a cluster but ABOVE target" from "no
-          // cluster at all": rescan with an unbounded upper bracket.
+          // Distinguish "cluster present but ABOVE target" from "no cluster at all".
           const any = scanForMkvClusterInWindow(buf, mid, 0, Number.MAX_SAFE_INTEGER, 0);
           if (!any) {
             if (window < 8 * 1024 * 1024) { window *= 2; continue; } // grow, re-probe same bracket
             this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
             return;
           }
-          hi = mid; // cluster found but past the target → search lower half
+          // Cluster found but past the target → its START is a hard upper bound
+          // (tighter than mid) and keeps hiTicks consistent with hi.
+          hi = Math.max(lo + 1, any.elementStartPos);
+          hiTicks = any.timestampTicks; // tighten the interpolation bracket
           continue;
         }
         best = hit;
-        if (hit.elementStartPos + 1 >= hi) break;
-        lo = hit.elementStartPos + 1; // search higher for a later at-or-before cluster
+        // The found cluster's END is a hard lower bound for a later at-or-before
+        // cluster; its ticks tighten the interpolation bracket.
+        const advance = hit.elementStartPos + 1;
+        if (advance >= hi) break;
+        // Terminal convergence: if the found cluster sits inside the fetched
+        // window and the window also holds a cluster ABOVE the target, the
+        // answer is bracketed within ONE window — best is final.
+        const above = scanForMkvClusterInWindow(
+          buf.subarray(hit.elementStartPos - mid + 1), hit.elementStartPos + 1,
+          targetTicks + 1, Number.MAX_SAFE_INTEGER, 0,
+        );
+        if (above) break;
+        lo = advance;
+        loTicks = hit.timestampTicks;
       }
 
       if (!best || !this.active) {
