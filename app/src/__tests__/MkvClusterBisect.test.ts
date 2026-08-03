@@ -8,7 +8,11 @@ import {
   injectMkvClusterPosition,
   findClusterCacheEntryNear,
 } from '../hooks/useThumbnailExtractor';
-import { bisectMkvClusterSearch } from '../lib/faststream/utils/MkvClusterBisect';
+import {
+  bisectMkvClusterSearch,
+  computeKeyframeShadowSeconds,
+  removeMkvClusterPositionsInRange,
+} from '../lib/faststream/utils/MkvClusterBisect';
 
 /**
  * Round-3 Fix C (reports/round3-solution.md): cue-less MKV far-hover bisection.
@@ -368,5 +372,73 @@ describe('bisectMkvClusterSearch (shared driver — round-6 player far-seek)', (
       fetchImpl: (async () => { throw new Error('must not fetch'); }) as unknown as typeof fetch,
     });
     expect(res).toBeNull();
+  });
+});
+
+describe('computeKeyframeShadowSeconds (round-7 keyframe shadow)', () => {
+  it('defaults to 15s with fewer than 2 harvested keyframes', () => {
+    expect(computeKeyframeShadowSeconds([])).toBe(15);
+    expect(computeKeyframeShadowSeconds([10])).toBe(15);
+  });
+
+  it('uses 2x the max consecutive gap, clamped to 35s (7-t harvest)', () => {
+    // Real round-7 harvest: 0, 20.812, 31.24, 41.625 → max gap 20.812 → 2x = 41.624 → clamp 35.
+    expect(computeKeyframeShadowSeconds([0, 20.812, 31.24, 41.625])).toBe(35);
+  });
+
+  it('clamps small GOPs up to the 12s floor', () => {
+    // 5s gaps → 2x = 10 → floor 12.
+    expect(computeKeyframeShadowSeconds([0, 5, 10, 15])).toBe(12);
+  });
+
+  it('returns 2x max gap when inside the clamps', () => {
+    // Gaps 10.4 → 2x = 20.8.
+    expect(computeKeyframeShadowSeconds([0, 10.4, 20.8])).toBeCloseTo(20.8, 5);
+  });
+});
+
+describe('removeMkvClusterPositionsInRange (round-7 shadow purge)', () => {
+  const mkTrack = (cache: { elementStartPos: number; startTimestamp: number }[] | null) =>
+    ({ _backing: { internalTrack: cache ? { clusterPositionCache: cache } : {} } });
+
+  it('removes entries in (fromTicks, toTicks] — from exclusive, to inclusive', () => {
+    const cache = [
+      { elementStartPos: 1000, startTimestamp: 100_000 },  // == from → kept
+      { elementStartPos: 2000, startTimestamp: 147_773 },  // inside → removed
+      { elementStartPos: 3000, startTimestamp: 149_464 },  // == to → removed
+      { elementStartPos: 4000, startTimestamp: 150_000 },  // above → kept
+    ];
+    const track = mkTrack(cache);
+    const removed = removeMkvClusterPositionsInRange(track, 100_000, 149_464);
+    expect(removed).toBe(2);
+    expect(cache.map(e => e.elementStartPos)).toEqual([1000, 4000]);
+  });
+
+  it('returns 0 and leaves the cache intact when nothing is in range', () => {
+    const cache = [{ elementStartPos: 1000, startTimestamp: 50_000 }];
+    expect(removeMkvClusterPositionsInRange(mkTrack(cache), 100_000, 149_464)).toBe(0);
+    expect(cache).toHaveLength(1);
+  });
+
+  it('returns 0 on missing or non-array cache (shape drift)', () => {
+    expect(removeMkvClusterPositionsInRange(mkTrack(null), 0, 10)).toBe(0);
+    expect(removeMkvClusterPositionsInRange(null, 0, 10)).toBe(0);
+    expect(removeMkvClusterPositionsInRange({}, 0, 10)).toBe(0);
+  });
+
+  it('purged shadow lets findClusterCacheEntryNear resolve the shadowed target (integration)', () => {
+    // Round-7 incident numbers: injected 147773 sat in the shadow of target 149464.
+    // After purging (114464, 149464], the closest-≤ entry for the SHADOWED target
+    // (149464 - 35000 = 114464) is the organic 100000 entry — behind the shadow.
+    const cache = [
+      { elementStartPos: 20_000_000, startTimestamp: 100_000 },
+      { elementStartPos: 31_859_439, startTimestamp: 147_773 },
+      { elementStartPos: 32_100_000, startTimestamp: 149_100 },
+    ];
+    const track = mkTrack(cache);
+    const removed = removeMkvClusterPositionsInRange(track, 114_464, 149_464);
+    expect(removed).toBe(2);
+    const near = findClusterCacheEntryNear(track, 114_464, 35_000);
+    expect(near?.startTimestamp).toBe(100_000);
   });
 });

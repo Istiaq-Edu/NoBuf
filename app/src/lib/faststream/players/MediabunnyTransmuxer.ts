@@ -36,11 +36,14 @@ import { createTauriStreamSource, type TauriStreamSourceConfig } from '../utils/
 import { scanTSFile, createOffsetTauriStreamSource, type TSKeyframeEntry, type TSScanResult } from '../utils/TSByteOffsetScanner';
 import {
   bisectMkvClusterSearch,
+  computeKeyframeShadowSeconds,
   findClusterCacheEntryNear,
   injectMkvClusterPosition,
   readMkvClusterPositions,
   readMkvClusterSeekStart,
   readMkvTimestampFactor,
+  removeMkvClusterPositionsInRange,
+  SEEK_SHADOW_MAX_S,
 } from '../utils/MkvClusterBisect';
 import type { DetectedFormat } from '../utils/FormatDetector';
 import { invoke } from '@tauri-apps/api/core';
@@ -1035,8 +1038,18 @@ export class MediabunnyTransmuxer {
    *  hovered). Byte-bisect the cluster at-or-before the target (shared
    *  engine, ~3-6 ranged probes) and inject it into the demuxer's position
    *  cache so getKeyPacket's walk is bounded to the ≤16MB residual gap.
-   *  Degrades silently to the raw walk on any failure. */
-  private async bisectSeekTarget(videoTrack: unknown, seekTime: number, generation: number): Promise<void> {
+   *  Degrades silently to the raw walk on any failure.
+   *
+   *  Round-7 "keyframe shadow" fix (7-c:185-204): getKeyPacket's forward-only
+   *  walk needs a keyframe ≤ target INSIDE a walked cluster, but the last such
+   *  keyframe can sit up to one GOP BEFORE the target. Round-6 injected the
+   *  cluster at-or-before the target itself (147.773s for target 149.464s,
+   *  GOP ~10.4s) — the walk started past the last keyframe (~145.6s), found
+   *  none, returned null → user-seek fatal → /remux reroute. Fix: bisect for
+   *  target − shadow (adaptive from the harvested keyframe gaps) and purge any
+   *  cache entries inside (shadowed, target] first — a stale entry there wins
+   *  performClusterLookup's closest-≤-target race no matter what we inject. */
+  private async bisectSeekTarget(videoTrack: unknown, seekTime: number, generation: number, forceShadowSeconds?: number): Promise<void> {
     try {
       const factor = readMkvTimestampFactor(videoTrack);
       if (factor === null) return; // shape drift — previous (walk) behavior
@@ -1047,9 +1060,20 @@ export class MediabunnyTransmuxer {
       // prime seeks to 0 through this path on every cue-less open) — probing
       // would only add latency. Matches the near-entry window below.
       if (targetTicks <= windowTicks) return;
-      // An entry near the target (organic from prior walks, injected by a
-      // hover bisect, or by a previous seek's bisect) already bounds the walk.
-      if (findClusterCacheEntryNear(videoTrack, targetTicks, windowTicks)) return;
+      // Round-7: shadow-offset the bisection target behind the last keyframe.
+      const shadowSeconds = forceShadowSeconds ?? computeKeyframeShadowSeconds(this.keyframeTimestamps);
+      const shadowedTicks = Math.max(0, targetTicks - Math.round(shadowSeconds * factor));
+      // Round-7: purge poisoned entries in the shadow (round-6 injections,
+      // organic inserts from failed walks) BEFORE the near-entry check — they
+      // would otherwise win the closest-≤-target race and re-null the walk.
+      const purged = removeMkvClusterPositionsInRange(videoTrack, shadowedTicks, targetTicks);
+      if (purged > 0) {
+        console.log(`[Transmuxer] seekTo bisect: purged ${purged} cluster cache entr${purged === 1 ? 'y' : 'ies'} in keyframe shadow (${(shadowedTicks / factor).toFixed(1)}s, ${seekTime.toFixed(1)}s]`);
+      }
+      // An entry near the SHADOWED target (organic from prior walks, injected
+      // by a hover bisect, or by a previous seek's bisect) already bounds the
+      // walk from behind the keyframe shadow.
+      if (findClusterCacheEntryNear(videoTrack, shadowedTicks, windowTicks)) return;
       const baseUrl = this.config.sourceConfig.url;
       const sep = baseUrl.includes('?') ? '&' : '?';
       const started = performance.now();
@@ -1060,7 +1084,7 @@ export class MediabunnyTransmuxer {
         probeUrl: `${baseUrl}${sep}source_id=seek-bisect`,
         fileSize: this.config.sourceConfig.fileSize,
         startLo: readMkvClusterSeekStart(videoTrack) ?? 0,
-        targetTicks,
+        targetTicks: shadowedTicks,
         hiTicks: this.duration > 0 && Number.isFinite(this.duration) ? Math.round(this.duration * factor) : null,
         shouldContinue: () => !shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, generation, this.seekGeneration),
         // Every validated probe cluster is an exact byte↔time pair — feed the
@@ -1069,7 +1093,7 @@ export class MediabunnyTransmuxer {
       });
       if (!result) return; // aborted/failed — degrade to the raw walk
       injectMkvClusterPosition(videoTrack, result.entry);
-      console.log(`[Transmuxer] seekTo bisect: cluster for ${seekTime.toFixed(1)}s at byte=${result.entry.elementStartPos}, ticks=${result.entry.startTimestamp} (${result.probes} probes, ${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
+      console.log(`[Transmuxer] seekTo bisect: cluster for ${seekTime.toFixed(1)}s at byte=${result.entry.elementStartPos}, ticks=${result.entry.startTimestamp} (shadow=${shadowSeconds.toFixed(1)}s, ${result.probes} probes, ${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
     } catch (e) {
       console.warn('[Transmuxer] seekTo bisect failed (falling back to linear walk):', e);
     }
@@ -1633,6 +1657,25 @@ export class MediabunnyTransmuxer {
       }
 
       console.log(`[Transmuxer] seekTo: video getKeyPacket took ${performance.now() - videoKeyStart}ms, skipInit=${skipInit}, usedIndex=${useCachedIndex}, byteOffsetSeek=${byteOffsetKeyframe !== null}`);
+
+      if (!keyPacket) {
+        // Round-7 belt: on the raw cue-less path a null can still be the
+        // keyframe shadow (adaptive shadow underestimated the true GOP, or a
+        // stale poisoned entry outside the purged window). Purge the FULL max
+        // shadow window and re-bisect for target − 35s, then re-ask ONCE.
+        // Skipped when the first attempt already used max shadow (deterministic
+        // re-run — a failed walk resolves no keyframe, harvest unchanged).
+        if (this.config.format === 'mkv' && this.mkvCueIndex.length === 0 && seekTime >= 1.0
+            && computeKeyframeShadowSeconds(this.keyframeTimestamps) < SEEK_SHADOW_MAX_S) {
+          console.log(`[Transmuxer] seekTo: keyframe-shadow retry with max shadow (${SEEK_SHADOW_MAX_S}s) for ${seekTime.toFixed(2)}s`);
+          await this.bisectSeekTarget(videoTrack, seekTime, currentGeneration, SEEK_SHADOW_MAX_S);
+          if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
+            console.log(`[Transmuxer] Seek abandoned during shadow retry: target=${seekTime.toFixed(2)}s`);
+            return null;
+          }
+          keyPacket = await videoSink.getKeyPacket(seekTime, { verifyKeyPackets: true });
+        }
+      }
 
       if (!keyPacket) {
         // No keyframe found — this is a seek failure, not a fatal transmuxer
