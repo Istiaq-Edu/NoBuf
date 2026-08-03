@@ -7103,6 +7103,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         seedData,                       // header bytes served from memory (zero-latency init)
         sourceId: 'playback',           // isolates player reads from the thumbnail pipeline in the backend coordinator (source_ids_match)
       },
+      // Round-6 Fix B: exact (byte, time) anchors — organic cluster positions
+      // harvested after every seek/refill + seek-bisect probe clusters. Densifies
+      // the green-bar byte↔time table (incident 1: 2-point seed → linear mapping
+      // overshot the buffered head ~2× on this dual-audio file).
+      onByteTimeAnchor: (byteOffset: number, time: number) => {
+        if (cancelledRef.current) return;
+        recordByteTimeAnchor(byteOffset, time);
+      },
       onInitSegment: (segData: ArrayBuffer) => {
         if (cancelledRef.current) return;
         diagLog(`[MSE] MKV transmuxer init segment: ${segData.byteLength} bytes`);

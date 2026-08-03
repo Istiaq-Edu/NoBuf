@@ -8,6 +8,7 @@ import {
   injectMkvClusterPosition,
   findClusterCacheEntryNear,
 } from '../hooks/useThumbnailExtractor';
+import { bisectMkvClusterSearch } from '../lib/faststream/utils/MkvClusterBisect';
 
 /**
  * Round-3 Fix C (reports/round3-solution.md): cue-less MKV far-hover bisection.
@@ -261,5 +262,111 @@ describe('bisectShouldStop (walkable-gap terminal rule)', () => {
   it('never stops without both endpoints', () => {
     expect(bisectShouldStop(null, 716375330, 16 * 1024 * 1024)).toBe(false);
     expect(bisectShouldStop(703792419, null, 16 * 1024 * 1024)).toBe(false);
+  });
+});
+
+describe('bisectMkvClusterSearch (shared driver — round-6 player far-seek)', () => {
+  /** Synthetic file: clusters every `spacing` bytes, ticks = index * tickStep.
+   *  Returns a fetchImpl serving ranged reads from it. */
+  function makeSyntheticFile(fileSize: number, spacing: number, tickStep: number, firstClusterAt: number) {
+    const file = new Uint8Array(fileSize);
+    const clusters: { byte: number; ticks: number }[] = [];
+    for (let byte = firstClusterAt, i = 0; byte + 64 < fileSize; byte += spacing, i++) {
+      const ticks = i * tickStep;
+      const clu = cluster([crcElement(), tsElement(ticks, 3), simpleBlock(8)]);
+      file.set(clu, byte);
+      clusters.push({ byte, ticks });
+    }
+    const calls: string[] = [];
+    const fetchImpl = (async (_url: any, init?: any) => {
+      const m = /bytes=(\d+)-(\d+)/.exec(init?.headers?.Range ?? '');
+      if (!m) throw new Error('no range');
+      const start = parseInt(m[1], 10), end = parseInt(m[2], 10);
+      calls.push(`${start}-${end}`);
+      return {
+        ok: true, status: 206,
+        arrayBuffer: async () => file.slice(start, end + 1).buffer,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { clusters, fetchImpl, calls };
+  }
+
+  it('finds the last cluster ≤ target on a synthetic file (bounded probes)', async () => {
+    // 64MB file, cluster every 1MB, 1000 ticks apart (tick=ms → 1s clusters).
+    const { clusters, fetchImpl, calls } = makeSyntheticFile(64 * 1024 * 1024, 1024 * 1024, 1000, 4096);
+    const targetTicks = 40_500; // between cluster 40 (40000) and 41 (41000)
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream?source_id=playback-bisect',
+      fileSize: 64 * 1024 * 1024,
+      startLo: 4096,
+      targetTicks,
+      hiTicks: 63_000,
+      fetchImpl,
+    });
+    expect(res).not.toBeNull();
+    const expected = clusters.filter(c => c.ticks <= targetTicks).pop()!;
+    expect(res!.entry.elementStartPos).toBe(expected.byte);
+    expect(res!.entry.startTimestamp).toBe(expected.ticks);
+    expect(calls.length).toBeLessThanOrEqual(6); // interpolation + walkable-gap stop
+  });
+
+  it('feeds every validated cluster through onClusterFound (exact anchors)', async () => {
+    const { fetchImpl } = makeSyntheticFile(32 * 1024 * 1024, 1024 * 1024, 1000, 4096);
+    const anchors: [number, number][] = [];
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream',
+      fileSize: 32 * 1024 * 1024,
+      startLo: 4096,
+      targetTicks: 20_500,
+      hiTicks: 31_000,
+      onClusterFound: (b, t) => anchors.push([b, t]),
+      fetchImpl,
+    });
+    expect(res).not.toBeNull();
+    expect(anchors.length).toBeGreaterThan(0);
+    // Every reported anchor must be a real synthetic cluster (byte = ticks/1000 MB + 4096).
+    for (const [b, t] of anchors) {
+      expect(b).toBe((t / 1000) * 1024 * 1024 + 4096);
+    }
+  });
+
+  it('aborts cleanly when shouldContinue goes false (returns null, no throw)', async () => {
+    const { fetchImpl } = makeSyntheticFile(32 * 1024 * 1024, 1024 * 1024, 1000, 4096);
+    let probes = 0;
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream',
+      fileSize: 32 * 1024 * 1024,
+      startLo: 4096,
+      targetTicks: 20_500,
+      hiTicks: 31_000,
+      shouldContinue: () => ++probes <= 1, // allow only the first probe
+      fetchImpl,
+    });
+    expect(res).toBeNull();
+  });
+
+  it('returns null on HTTP failure (degrade, never throw)', async () => {
+    const fetchImpl = (async () => ({ ok: false, status: 500 } as unknown as Response)) as unknown as typeof fetch;
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream',
+      fileSize: 32 * 1024 * 1024,
+      startLo: 4096,
+      targetTicks: 20_500,
+      hiTicks: 31_000,
+      fetchImpl,
+    });
+    expect(res).toBeNull();
+  });
+
+  it('returns null when fileSize ≤ startLo (degenerate)', async () => {
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream',
+      fileSize: 1000,
+      startLo: 1000,
+      targetTicks: 5000,
+      hiTicks: 10_000,
+      fetchImpl: (async () => { throw new Error('must not fetch'); }) as unknown as typeof fetch,
+    });
+    expect(res).toBeNull();
   });
 });

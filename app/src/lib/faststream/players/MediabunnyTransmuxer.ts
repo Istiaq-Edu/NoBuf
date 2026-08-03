@@ -34,6 +34,14 @@ import type { SourceRef } from 'mediabunny';
 
 import { createTauriStreamSource, type TauriStreamSourceConfig } from '../utils/TauriStreamSource';
 import { scanTSFile, createOffsetTauriStreamSource, type TSKeyframeEntry, type TSScanResult } from '../utils/TSByteOffsetScanner';
+import {
+  bisectMkvClusterSearch,
+  findClusterCacheEntryNear,
+  injectMkvClusterPosition,
+  readMkvClusterPositions,
+  readMkvClusterSeekStart,
+  readMkvTimestampFactor,
+} from '../utils/MkvClusterBisect';
 import type { DetectedFormat } from '../utils/FormatDetector';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -67,6 +75,10 @@ export interface TransmuxerConfig {
   onError: (error: Error) => void;
   onSpeedUpdate?: (speed: number) => void;
   onProgressUpdate?: (processedTime: number, estimatedBytes: number) => void;
+  /** Round-6 Fix B: exact (byte, timeSeconds) pairs from validated bisection
+   *  clusters during cue-less far seeks — feeds the player's byte↔time table
+   *  so the green bar renders at true VBR positions. Optional. */
+  onByteTimeAnchor?: (byteOffset: number, timeSeconds: number) => void;
 }
 
 export interface TransmuxerTrackInfo {
@@ -155,6 +167,9 @@ export class MediabunnyTransmuxer {
   // Keyframe time of the last resolved seek — paired with the source's captured
   // cluster byte to form a real VBR byte↔time calibration anchor.
   private lastSeekKeyframeTime = -1;
+  // Round-6 Fix B: byte offsets already emitted through onByteTimeAnchor (the
+  // cluster-cache harvest re-snapshots the whole cache every seek/refill).
+  private emittedAnchorBytes = new Set<number>();
   // Seek generation counter — incremented on each seek so stale callbacks are discarded
   private seekGeneration = 0;
   
@@ -982,6 +997,84 @@ export class MediabunnyTransmuxer {
     return { byteOffset, time: this.lastSeekKeyframeTime };
   }
 
+  /** Round-6 Fix B: emit an exact (byte, seconds) anchor to the config sink,
+   *  once per byte offset (harvest re-snapshots the whole cluster cache). */
+  private emitByteTimeAnchor(byteOffset: number, timeSeconds: number): void {
+    if (this.emittedAnchorBytes.has(byteOffset)) return;
+    this.emittedAnchorBytes.add(byteOffset);
+    this.config.onByteTimeAnchor?.(byteOffset, timeSeconds);
+  }
+
+  /** Round-6 Fix B: harvest the demuxer's ORGANIC clusterPositionCache into
+   *  byte↔time anchors. Every cluster the walk/iteration parsed is an exact
+   *  (byte, ticks) pair — refills call seekTo every ~10-20s of playback, so the
+   *  green-bar table densifies as playback progresses instead of mapping the
+   *  whole file at the (2× wrong, 6-c incident 1) file-average slope. NOTE:
+   *  getLastSeekAnchor is NOT usable for refills — refills resolve inside
+   *  mediabunny's 32MB Input cache, so the armed captureNextReadStart fires on
+   *  the first UNCACHED read, up to 32MB past the true cluster byte. */
+  private harvestClusterAnchors(videoTrack: unknown): void {
+    if (!this.config.onByteTimeAnchor) return;
+    try {
+      const factor = readMkvTimestampFactor(videoTrack);
+      if (factor === null) return;
+      const positions = readMkvClusterPositions(videoTrack);
+      if (!positions) return;
+      for (const p of positions) {
+        this.emitByteTimeAnchor(p.elementStartPos, p.startTimestamp / factor);
+      }
+    } catch { /* anchor harvest is best-effort — never break a seek */ }
+  }
+
+  /** Round-6 Fix A: bounded cluster location for cue-less MKV far seeks.
+   *  Without this, a seek outside the harvested keyframe index fell into
+   *  mediabunny's raw linear cluster walk from the last known position —
+   *  6-t measured 83.9MB in 43s (1.95MB/s) with ~800MB left for a 2819.9s
+   *  target ≈ 7 minutes of frozen player (the user killed the app; the hover
+   *  pipeline has had bisection since round-3, but this session never
+   *  hovered). Byte-bisect the cluster at-or-before the target (shared
+   *  engine, ~3-6 ranged probes) and inject it into the demuxer's position
+   *  cache so getKeyPacket's walk is bounded to the ≤16MB residual gap.
+   *  Degrades silently to the raw walk on any failure. */
+  private async bisectSeekTarget(videoTrack: unknown, seekTime: number, generation: number): Promise<void> {
+    try {
+      const factor = readMkvTimestampFactor(videoTrack);
+      if (factor === null) return; // shape drift — previous (walk) behavior
+      const targetTicks = Math.round(seekTime * factor);
+      const windowTicks = Math.round(35 * factor); // ≥ max cluster span (32.767s overflow bound)
+      // Near-start targets: the raw walk starts at clusterSeekStartPos and
+      // reaches ≤35s in a handful of sequential cluster reads (the initial
+      // prime seeks to 0 through this path on every cue-less open) — probing
+      // would only add latency. Matches the near-entry window below.
+      if (targetTicks <= windowTicks) return;
+      // An entry near the target (organic from prior walks, injected by a
+      // hover bisect, or by a previous seek's bisect) already bounds the walk.
+      if (findClusterCacheEntryNear(videoTrack, targetTicks, windowTicks)) return;
+      const baseUrl = this.config.sourceConfig.url;
+      const sep = baseUrl.includes('?') ? '&' : '?';
+      const started = performance.now();
+      const result = await bisectMkvClusterSearch({
+        // Dedicated source_id: probes jump far apart by design — sharing
+        // 'playback' would trip the coordinator's zombie-cancel against the
+        // real playback reads (source_ids_match), 'thumbnail' against hovers.
+        probeUrl: `${baseUrl}${sep}source_id=seek-bisect`,
+        fileSize: this.config.sourceConfig.fileSize,
+        startLo: readMkvClusterSeekStart(videoTrack) ?? 0,
+        targetTicks,
+        hiTicks: this.duration > 0 && Number.isFinite(this.duration) ? Math.round(this.duration * factor) : null,
+        shouldContinue: () => !shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, generation, this.seekGeneration),
+        // Every validated probe cluster is an exact byte↔time pair — feed the
+        // green-bar table (Fix B) even when the search is later superseded.
+        onClusterFound: (byte, ticks) => this.emitByteTimeAnchor(byte, ticks / factor),
+      });
+      if (!result) return; // aborted/failed — degrade to the raw walk
+      injectMkvClusterPosition(videoTrack, result.entry);
+      console.log(`[Transmuxer] seekTo bisect: cluster for ${seekTime.toFixed(1)}s at byte=${result.entry.elementStartPos}, ticks=${result.entry.startTimestamp} (${result.probes} probes, ${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
+    } catch (e) {
+      console.warn('[Transmuxer] seekTo bisect failed (falling back to linear walk):', e);
+    }
+  }
+
   /** Returns the keyframe timestamps array (for thumbnail pipeline). */
   getKeyframeTimestamps(): number[] {
     return this.keyframeTimestamps;
@@ -1508,6 +1601,19 @@ export class MediabunnyTransmuxer {
         keyPacket = await videoSink.getKeyPacket(seekTargetTs, { verifyKeyPackets: false });
         console.log(`[Transmuxer] seekTo: using keyframe index — seekTargetTs=${seekTargetTs.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s, byteOffset=${byteOffsetKeyframe?.byteOffset ?? 'N/A'}`);
       } else {
+        // Round-6 Fix A: cue-less MKV + harvest miss ⇒ getKeyPacket would do an
+        // unbounded LINEAR cluster walk (6-t: 83.9MB/43s, ~7min for a 47min
+        // seek). Bisect the target cluster first (~3-6 ranged probes) and
+        // inject it into the demuxer's position cache so the walk is bounded
+        // to the ≤16MB residual. No-ops fast when a near entry already exists;
+        // degrades to the raw walk on failure/supersession.
+        if (this.config.format === 'mkv' && this.mkvCueIndex.length === 0) {
+          await this.bisectSeekTarget(videoTrack, seekTime, currentGeneration);
+          if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
+            console.log(`[Transmuxer] Seek abandoned during bisect: target=${seekTime.toFixed(2)}s`);
+            return null;
+          }
+        }
         keyPacket = await videoSink.getKeyPacket(seekTime, { verifyKeyPackets: true });
       }
 
@@ -1631,6 +1737,11 @@ export class MediabunnyTransmuxer {
       const iterStartTime = performance.now();
       await Promise.all([videoPromise, audioPromise]);
       console.log(`[Transmuxer] seekTo: iteration took ${performance.now() - iterStartTime}ms (audioSkipped=${audioSkipped})`);
+
+      // Round-6 Fix B: harvest organic cluster positions (walk + iteration)
+      // into exact byte↔time anchors for the green bar. Refills land here every
+      // ~10-20s, so the table densifies as playback progresses. Best-effort.
+      if (this.config.format === 'mkv') this.harvestClusterAnchors(videoTrack);
 
       // Zero-audio window signal (edge-A F5): a 2-track window is "starved"
       // when the output intended audio but ZERO audio packets were emitted —
