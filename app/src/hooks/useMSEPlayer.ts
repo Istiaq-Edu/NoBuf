@@ -1307,6 +1307,10 @@ export interface MSEGetters {
   getKeyframeByteOffsets: () => TSKeyframeEntry[]; // Byte-offset index for OffsetCustomSource
   getTsHeaderData: () => Uint8Array | null; // TS header (PAT/PMT) for OffsetCustomSource
   getTransmuxerSourceConfig: () => { url: string; fileSize: number; headers?: Record<string, string> } | null;
+  /** Round-5 (green bar D3): exact (byte, timeSeconds) anchors from validated
+   *  bisection clusters feed the player's byte↔time table so cached islands
+   *  render at true VBR positions on the green bar. */
+  recordByteTimeAnchor?: (byteOffset: number, time: number) => void;
   // TS→fMP4 backend pipeline — when active, thumbnails use backend segment endpoints
   isFmp4Stream: () => boolean;
   getFmp4Config: () => {

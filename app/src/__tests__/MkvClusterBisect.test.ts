@@ -3,6 +3,8 @@ import {
   scanForMkvClusterInWindow,
   scanForLastMkvClusterAtOrBefore,
   pickBisectProbe,
+  stepBisectBracket,
+  bisectShouldStop,
   injectMkvClusterPosition,
   findClusterCacheEntryNear,
 } from '../hooks/useThumbnailExtractor';
@@ -197,5 +199,67 @@ describe('scanForLastMkvClusterAtOrBefore (in-buffer advance)', () => {
 
   it('empty/garbage buffer → null', () => {
     expect(scanForLastMkvClusterAtOrBefore(new Uint8Array(1024).fill(0x42), 0, 5000)).toBeNull();
+  });
+});
+
+/**
+ * Round-5 (5-t.md:301-330 — 16 IDENTICAL 2MB re-fetches of 715751078-717848229):
+ * the round-4 'above' branch set hi = max(lo+1, any.elementStartPos), but `any`
+ * is found INSIDE the window starting at mid, so any.elementStartPos ≥ mid ≥ hi's
+ * previous shrink floor — the bracket never moved and interpolation returned the
+ * same probe byte until the iteration cap. The pure bracket step must shrink hi
+ * to MID on an above-target outcome (the window proved no ≤-target cluster in
+ * [mid, windowEnd]). And once best + the next above-target cluster bracket a gap
+ * ≤ one acceptable walk, further probing is pure waste (the gap is one monster
+ * cluster's interior; the capture walk reads those bytes anyway) — stop.
+ */
+describe('stepBisectBracket (round-5 spin fix)', () => {
+  it('above outcome shrinks hi to MID, not to the found cluster byte', () => {
+    const br = { lo: 703792420, hi: 716375330, loTicks: 4018639, hiTicks: 4057383 };
+    const mid = pickBisectProbe(br.lo, br.hi, br.loTicks, br.hiTicks, 4055461);
+    expect(mid).toBeLessThan(br.hi); // sanity: probe strictly inside
+    stepBisectBracket(br, mid, { kind: 'above', byte: 716375330, ticks: 4057383 });
+    expect(br.hi).toBe(mid);          // shrunk to mid — NOT the old static 716375330
+    expect(br.hiTicks).toBe(4057383);
+  });
+
+  it('repeated above outcomes strictly shrink the bracket (no spin)', () => {
+    const br = { lo: 703792420, hi: 716375330, loTicks: 4018639, hiTicks: 4057383 };
+    let prevHi = br.hi;
+    for (let i = 0; i < 6; i++) {
+      const mid = pickBisectProbe(br.lo, br.hi, br.loTicks, br.hiTicks, 4055461);
+      stepBisectBracket(br, mid, { kind: 'above', byte: 716375330, ticks: 4057383 });
+      expect(br.hi).toBeLessThan(prevHi);
+      prevHi = br.hi;
+    }
+  });
+
+  it('below outcome advances lo past the found cluster', () => {
+    const br = { lo: 0, hi: 1_000_000, loTicks: 0, hiTicks: 10_000 };
+    stepBisectBracket(br, 500_000, { kind: 'below', byte: 600_000, ticks: 5_000 });
+    expect(br.lo).toBe(600_001);
+    expect(br.loTicks).toBe(5_000);
+  });
+
+  it('above outcome never collapses hi at/below lo', () => {
+    const br = { lo: 100, hi: 200, loTicks: 0, hiTicks: 10 };
+    stepBisectBracket(br, 100, { kind: 'above', byte: 150, ticks: 8 });
+    expect(br.hi).toBeGreaterThan(br.lo);
+  });
+});
+
+describe('bisectShouldStop (walkable-gap terminal rule)', () => {
+  it('stops when best and the next above-target cluster bracket a walkable gap', () => {
+    // Round-5 numbers: best@703792419, next@716375330 → 12.58MB ≤ 16MB cap.
+    expect(bisectShouldStop(703792419, 716375330, 16 * 1024 * 1024)).toBe(true);
+  });
+
+  it('keeps probing while the gap exceeds the cap', () => {
+    expect(bisectShouldStop(0, 32 * 1024 * 1024, 16 * 1024 * 1024)).toBe(false);
+  });
+
+  it('never stops without both endpoints', () => {
+    expect(bisectShouldStop(null, 716375330, 16 * 1024 * 1024)).toBe(false);
+    expect(bisectShouldStop(703792419, null, 16 * 1024 * 1024)).toBe(false);
   });
 });
