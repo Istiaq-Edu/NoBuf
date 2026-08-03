@@ -55,6 +55,35 @@ export function clampSeekTime(requested: number, duration: number, tailMargin = 
 }
 
 /**
+ * Round-8 I1 (8-c:412): audio-switch admission guard. Pure + exported for
+ * testing. Returns a reject reason, or null = switch may proceed.
+ *
+ * The old E3 condition (`isColdStart || bufferingForSeek`) conflated REFILLS
+ * with user seeks: refills hold bufferingForSeek around their whole seekTo to
+ * route segments into seekBufferRef, and on cue-less MKV after a far seek each
+ * refill runs 3-5s and chains near-immediately — the flag is up most of wall
+ * time, so switches were rejected and the dropdown silently reverted. A switch
+ * during a refill is structurally identical to a user seek during a refill
+ * (log-proven safe): the rebuild bumps seekGen + stopStreamingChain, and the
+ * condemned refill's stale-generation guards skip every ref write. Only these
+ * genuinely unsafe windows block:
+ *  - cold start (SB/codec state still being born),
+ *  - a USER seek in flight (rebuild would fight the seek for the SB), and
+ *  - non-refill buffering (initial prime / MP4 seek windows own the refs).
+ */
+export function shouldRejectAudioSwitch(
+  isColdStart: boolean,
+  userSeekInFlight: boolean,
+  bufferingForSeek: boolean,
+  refillInProgress: boolean,
+): string | null {
+  if (isColdStart) return 'cold start in progress (E3)';
+  if (userSeekInFlight) return 'user seek in progress (E3)';
+  if (bufferingForSeek && !refillInProgress) return 'buffer priming in progress (E3)';
+  return null;
+}
+
+/**
  * Build a /remux?ss=<time> seek URL from the base remux URL (which already
  * carries ?token=…). Appends with & or ? as appropriate and formats the seek
  * time to millisecond precision (matches the backend's {:.3} parse). Returns
@@ -6492,8 +6521,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       diagLog('[AUDIO] switch rejected: another switch is in flight (E4)');
       return false;
     }
-    if (isColdStartBuffering || bufferingForSeekRef.current) {
-      diagLog('[AUDIO] switch rejected: cold start / seek in progress (E3)');
+    // Round-8 I1: admission via pure guard. Refill-owned bufferingForSeek no
+    // longer blocks (the rebuild condemns the refill exactly like a user seek
+    // does); cold start, user seeks, and non-refill priming still do.
+    const rejectReason = shouldRejectAudioSwitch(
+      isColdStartBuffering,
+      transmuxerSeekInProgressRef.current,
+      bufferingForSeekRef.current,
+      refillInProgressRef.current,
+    );
+    if (rejectReason !== null) {
+      diagLog(`[AUDIO] switch rejected: ${rejectReason}`);
       return false;
     }
     if (trackId === activeAudioTrackId) return true; // no-op

@@ -30,6 +30,11 @@ const BISECT_WALKABLE_GAP_BYTES = 16 * 1024 * 1024;
 export const SEEK_SHADOW_DEFAULT_S = 15;
 export const SEEK_SHADOW_MIN_S = 12;
 export const SEEK_SHADOW_MAX_S = 35;
+/** Round-8: harvested-keyframe gaps LARGER than this are seek-jump artifacts
+ *  (far seeks insert e.g. 155.6s→3317.9s into the harvest), not GOP evidence —
+ *  without the filter every file saturates to SEEK_SHADOW_MAX_S after its
+ *  first far seek. A real GOP is bounded well below this (35s cluster span). */
+export const SEEK_SHADOW_GAP_EVIDENCE_MAX_S = 60;
 /** EBML IDs legal as Cluster children (vendored demuxer's handled set):
  *  Timestamp, CRC-32, SilentTracks, Position, PrevSize, SimpleBlock, BlockGroup. */
 const MKV_CLUSTER_CHILD_IDS = new Set([0xe7, 0xbf, 0x5854, 0xa7, 0xab, 0xa3, 0xa0]);
@@ -281,14 +286,19 @@ export function readMkvClusterPositions(
 /** Round-7: adaptive keyframe-shadow width from the harvested keyframe index —
  *  2 × the max consecutive gap (the shadow can't exceed one GOP; 2× absorbs
  *  harvest sparsity), clamped [SEEK_SHADOW_MIN_S, SEEK_SHADOW_MAX_S]. Fewer
- *  than 2 keyframes → SEEK_SHADOW_DEFAULT_S. `keyframeTimestamps` sorted asc. */
+ *  than 2 keyframes → SEEK_SHADOW_DEFAULT_S. `keyframeTimestamps` sorted asc.
+ *  Round-8: gaps > SEEK_SHADOW_GAP_EVIDENCE_MAX_S are seek-jump artifacts
+ *  (each far seek adds its landing keyframe to the harvest) and are excluded;
+ *  when no gap survives, fall back to the default. */
 export function computeKeyframeShadowSeconds(keyframeTimestamps: number[]): number {
   if (keyframeTimestamps.length < 2) return SEEK_SHADOW_DEFAULT_S;
   let maxGap = 0;
   for (let i = 1; i < keyframeTimestamps.length; i++) {
     const gap = keyframeTimestamps[i] - keyframeTimestamps[i - 1];
+    if (gap > SEEK_SHADOW_GAP_EVIDENCE_MAX_S) continue; // seek-jump artifact, not a GOP
     if (gap > maxGap) maxGap = gap;
   }
+  if (maxGap === 0) return SEEK_SHADOW_DEFAULT_S;
   return Math.min(SEEK_SHADOW_MAX_S, Math.max(SEEK_SHADOW_MIN_S, 2 * maxGap));
 }
 
