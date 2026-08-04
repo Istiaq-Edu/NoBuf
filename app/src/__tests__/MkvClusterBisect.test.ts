@@ -12,6 +12,7 @@ import {
   bisectMkvClusterSearch,
   computeKeyframeShadowSeconds,
   removeMkvClusterPositionsInRange,
+  BISECT_WALKABLE_GAP_BYTES,
 } from '../lib/faststream/utils/MkvClusterBisect';
 
 /**
@@ -266,6 +267,25 @@ describe('bisectShouldStop (walkable-gap terminal rule)', () => {
   it('never stops without both endpoints', () => {
     expect(bisectShouldStop(null, 716375330, 16 * 1024 * 1024)).toBe(false);
     expect(bisectShouldStop(703792419, null, 16 * 1024 * 1024)).toBe(false);
+  });
+
+  // Round-9 I-1: 16MiB permitted a 14.2MiB bracket → 12.8s serial cold walk
+  // (9-c seek #2: injected 738,217,347 for kf target 4283.613s, reported stop
+  // 753,127,152). The stop gap drops to 4MiB so the search keeps probing
+  // through exactly this bracket; probe bytes cache through /stream and
+  // pre-warm the walk, so deeper probing is >= break-even on cold seeks.
+  it('round-9: the search-loop cap is 4MiB', () => {
+    expect(BISECT_WALKABLE_GAP_BYTES).toBe(4 * 1024 * 1024);
+  });
+
+  it('round-9: the 14.2MiB seek-#2 bracket keeps probing at the new cap', () => {
+    expect(bisectShouldStop(738217347, 753127152, BISECT_WALKABLE_GAP_BYTES)).toBe(false);
+  });
+
+  it('round-9: still stops once bracketed within 4MiB', () => {
+    expect(bisectShouldStop(738217347, 738217347 + 4 * 1024 * 1024, BISECT_WALKABLE_GAP_BYTES)).toBe(true);
+    expect(bisectShouldStop(null, 716375330, BISECT_WALKABLE_GAP_BYTES)).toBe(false);
+    expect(bisectShouldStop(703792419, null, BISECT_WALKABLE_GAP_BYTES)).toBe(false);
   });
 });
 

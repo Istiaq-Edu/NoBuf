@@ -20,6 +20,31 @@ use grammers_tl_types as tl;
 /// observed jitter, so real seeks always cross it and jitter never does.
 pub const PROACTIVE_TARGET_EPSILON_BYTES: u64 = 64 * 1024;
 
+/// Round-9 I-2b: freshness window for the player_actively_downloading timestamp.
+/// Must exceed the TS resume reporter's 10s interval and the MP4 reporter's 2s
+/// cadence (so an actively-reporting player never falsely decays) AND cover the
+/// longest observed MKV gap between the seek report and the completion re-report
+/// (the cold getKeyPacket walk: 14.9s max in 9-c). 20s covers all with margin;
+/// after decay the download-semaphore try_acquire remains the fine-grained yield
+/// against genuinely active /stream reads.
+pub const PLAYER_DOWNLOAD_FRESH_WINDOW_MS: u64 = 20_000;
+
+/// True while a "player is downloading" report is fresh enough to make the
+/// proactive prebuffer yield. `stored_ms == 0` means idle (explicit false or
+/// never reported). Saturating: a wall-clock step backwards reads as fresh for
+/// one window instead of panicking/overflowing. Pure + unit-tested.
+pub fn player_download_flag_fresh(now_ms: u64, stored_ms: u64) -> bool {
+    stored_ms != 0 && now_ms.saturating_sub(stored_ms) < PLAYER_DOWNLOAD_FRESH_WINDOW_MS
+}
+
+/// Current UNIX-epoch milliseconds for the freshness timestamp.
+pub(crate) fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// True if a newly reported proactive target is far enough from the current
 /// target to be worth acting on (re-evaluating gaps / sliding the window).
 /// Pure + saturating so it can be unit-tested and never panics on unordered
@@ -249,6 +274,46 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
 mod tests {
     use super::*;
 
+    // --- Round-9 1b: player_actively_downloading freshness decay (I-2b) ---
+    // The MKV seek report stores `true` and nothing ever cleared it (the flag's
+    // ONLY writer is cmd_report_playback_position; MKV has no periodic
+    // reporter), so PROACTIVE's secondary throttle yielded forever — 9-t shows
+    // 0 bytes downloaded in 70s with the offset frozen. The flag becomes a
+    // timestamp that decays after PLAYER_DOWNLOAD_FRESH_WINDOW_MS.
+
+    #[test]
+    fn download_flag_zero_means_idle() {
+        assert!(!player_download_flag_fresh(1_000_000, 0));
+    }
+
+    #[test]
+    fn download_flag_fresh_within_window() {
+        let now = 10_000_000u64;
+        assert!(player_download_flag_fresh(now, now)); // just stored
+        assert!(player_download_flag_fresh(now, now - (PLAYER_DOWNLOAD_FRESH_WINDOW_MS - 1)));
+    }
+
+    #[test]
+    fn download_flag_decays_at_window() {
+        let now = 10_000_000u64;
+        assert!(!player_download_flag_fresh(now, now - PLAYER_DOWNLOAD_FRESH_WINDOW_MS));
+        assert!(!player_download_flag_fresh(now, now - (PLAYER_DOWNLOAD_FRESH_WINDOW_MS + 5_000)));
+    }
+
+    #[test]
+    fn download_flag_window_covers_reporters_and_max_walk() {
+        // MP4 reporter: 2s cadence; TS resume reporter: 10s; longest observed
+        // MKV cold walk between seek report and completion re-report: 14.9s.
+        assert!(PLAYER_DOWNLOAD_FRESH_WINDOW_MS > 15_000);
+    }
+
+    #[test]
+    fn download_flag_clock_jump_is_fresh_not_panic() {
+        // stored > now (wall clock stepped back): saturating_sub → 0 → fresh.
+        // Worst case is one mis-timed yield window — documented, never a panic.
+        assert!(player_download_flag_fresh(1_000, 2_000));
+    }
+
     // --- VBR proactive-target dead-band (issue #4) ---
 
     #[test]
@@ -404,6 +469,7 @@ pub async fn cmd_get_cache_status(
 pub async fn cmd_delete_cache(
     message_id: i32,
     reason: Option<String>,
+    state: State<'_, TelegramState>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
     let reason_str = reason.unwrap_or_else(|| "unknown".to_string());
@@ -413,6 +479,24 @@ pub async fn cmd_delete_cache(
         "[CACHE] cmd_delete_cache called for msg {} reason={} active_dl={} streaming={}",
         message_id, reason_str, has_active_dl, is_streaming
     );
+
+    // Round-9 I-3: cancel the proactive prebuffer (and the bg-cache task belt)
+    // BEFORE deleting. These tasks hold the .dat open via open_data_file_write
+    // (no FILE_SHARE_DELETE on Windows) yet are invisible to BOTH guards below
+    // (tracked via track_proactive/track_task, not the download coordinator) —
+    // 9-t: a starved-alive proactive task kept 109.dat os-32 locked for the
+    // rest of the session after a cache-dialog discard. Cancelling first means
+    // the task exits at its next cancellation check (≤ ~500ms in every state,
+    // including the throttle-yield loop), drops the handle, and its spawn
+    // wrapper retries the deferred deletion. Also closes the meta-resurrection
+    // race (I-3b): the tasks re-check this key before their periodic meta save.
+    // NOT untracking here — the wrapper owns untrack; untracking early would
+    // let a racing position report spawn a second task while the old one drains.
+    {
+        let mut cancelled = state.cancelled_transfers.write().await;
+        cancelled.insert(format!("proactive-{}", message_id));
+        cancelled.insert(format!("bg-cache-{}", message_id));
+    }
 
     // Check for active downloads BEFORE attempting deletion.
     // The download coordinator uses async mutex, so we check here
@@ -458,6 +542,14 @@ pub async fn cmd_start_background_cache(
     let cache_mgr = cache_state.inner().clone();
     let tg_state = Arc::new(state.inner().clone());
 
+    // Round-9 I-3: clear a stale cancel key left by cmd_delete_cache (same
+    // pattern as the proactive spawn) so this fresh task isn't insta-cancelled.
+    {
+        let bg_key = format!("bg-cache-{}", message_id);
+        let mut cancelled = state.cancelled_transfers.write().await;
+        cancelled.remove(&bg_key);
+    }
+
     cache_mgr.track_task(message_id).await;
 
     tokio::spawn(async move {
@@ -467,6 +559,9 @@ pub async fn cmd_start_background_cache(
         .await;
 
         cache_mgr.untrack_task(message_id).await;
+        // Round-9 I-3: handle dropped — retry any deferred deletion (parity
+        // with the proactive spawn wrapper).
+        cache_mgr.retry_deferred_deletions(message_id);
 
         if let Err(e) = result {
             log::error!("Background cache failed for {}: {}", message_id, e);
@@ -638,6 +733,13 @@ async fn background_cache_download(
             // Update meta (serialized via per-message lock). Scoped so the lock
             // drops BEFORE the keyframe-index update below (never nest the two).
             {
+                // Round-9 I-3b: same meta-resurrection guard as the proactive
+                // task — a discard cancels bg-cache-{id} before deleting meta;
+                // saving after that would resurrect the discarded cache.
+                if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                    log::info!("Background cache cancelled for {} — skipping meta save", message_id);
+                    return Ok(());
+                }
                 let _lock = cache_mgr.lock_meta(message_id).await;
                 let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                     message_id,
@@ -741,7 +843,10 @@ pub async fn cmd_report_playback_position(
 
     // Store the player download state so the proactive prebuffer can
     // throttle itself when the IOController is actively downloading.
-    state.player_actively_downloading.store(is_player_downloading, std::sync::atomic::Ordering::Relaxed);
+    // Round-9 I-2b: timestamp with freshness decay, not a raw bool — the MKV
+    // seek path reports true and has no periodic reporter to clear it.
+    let stamp = if is_player_downloading { now_epoch_ms() } else { 0 };
+    state.player_actively_downloading.store(stamp, std::sync::atomic::Ordering::Relaxed);
 
     // Use the exact byte offset if provided (from VBR correction — the linear
     // estimate is wrong for VBR video). Fall back to linear estimate otherwise.
@@ -852,6 +957,11 @@ pub async fn cmd_report_playback_position(
         ).await;
 
         cache_mgr.untrack_proactive(message_id).await;
+        // Round-9 I-3: the task's open_data_file_write handle is dropped now —
+        // retry any deferred deletion queued by a discard during the prebuffer
+        // (previously nothing retried on proactive exit; 109.dat stayed locked
+        // until app exit).
+        cache_mgr.retry_deferred_deletions(message_id);
 
         match result {
             Ok(downloaded) => {
@@ -1269,7 +1379,11 @@ async fn proactive_prebuffer_download(
                     // Secondary throttle: check if the player's IOController is
                     // actively downloading. This flag is set by the frontend via
                     // cmd_report_playback_position(is_player_downloading=true).
-                    if state.player_actively_downloading.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Round-9 I-2b: freshness-decayed timestamp — a stale report
+                    // (MKV seek with no follow-up) stops starving the prebuffer
+                    // after PLAYER_DOWNLOAD_FRESH_WINDOW_MS.
+                    let stored = state.player_actively_downloading.load(std::sync::atomic::Ordering::Relaxed);
+                    if player_download_flag_fresh(now_epoch_ms(), stored) {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         continue;
                     }
@@ -1320,6 +1434,18 @@ async fn proactive_prebuffer_download(
                         // Update meta every 1MB (2 chunks × 512KB) for faster
                         // PREBUFFER HIT detection by /stream handler. Was 4MB.
                         if offset % (1 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
+                            // Round-9 I-3b (meta resurrection): a cache discard
+                            // deletes .meta.json while this task drains toward its
+                            // next cancellation check; load_meta → None here would
+                            // CREATE a fresh meta and resurrect the discarded cache
+                            // with bogus ranges. cmd_delete_cache cancels BEFORE
+                            // deleting, so re-checking the key just before the save
+                            // closes the race to a µs-scale in-flight save (residual
+                            // cleaned by the frontend's retry ladder).
+                            if state.cancelled_transfers.read().await.contains(&transfer_id) {
+                                log::info!("[PROACTIVE] msg {}: cancelled — skipping meta save", message_id);
+                                return Ok(total_downloaded);
+                            }
                             let _lock = cache_mgr.lock_meta(message_id).await;
                             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,

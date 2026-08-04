@@ -6146,6 +6146,46 @@ async fn subtitles_extract_track(
         .and_then(|m| m.load_meta(message_id))
         .map(|m| m.is_complete())
         .unwrap_or(false);
+
+    // Round-9 I-5: frontier gate for partial extraction. The bounded input ends
+    // at the contiguous-from-0 frontier, so with the SAME frontier ffmpeg reads
+    // identical bytes and produces an identical result — replay the memo instead
+    // (9-*: frontier frozen at 32MiB by the mediabunny seed while playback
+    // cached 561M+ far ranges; both retries produced the same "647 chars
+    // partial"). X-Subs-Unchanged tells the frontend the cache front hasn't
+    // advanced. Fully-cached files never consult the memo.
+    let current_frontier = if fully_cached {
+        0
+    } else {
+        cache
+            .as_ref()
+            .as_ref()
+            .and_then(|m| m.load_meta(message_id))
+            .map(|m| crate::stream_cache::contiguous_prefix_end(&m.cached_ranges))
+            .unwrap_or(0)
+    };
+    if !fully_cached {
+        if let Some(mgr) = cache.as_ref().as_ref() {
+            if let Some((body, fmt)) = mgr.subs_partial_memo_get(message_id, stream_idx, ass, current_frontier) {
+                log::info!(
+                    "[SUBS] msg {} s{}: cache frontier unchanged at {}B — replaying memoized partial result ({}B)",
+                    message_id, stream_idx, current_frontier, body.len()
+                );
+                if body.is_empty() {
+                    let mut resp = HttpResponse::NoContent();
+                    resp.insert_header(("X-Subs-Partial", "1"));
+                    resp.insert_header(("X-Subs-Unchanged", "1"));
+                    return resp.finish();
+                }
+                return HttpResponse::Ok()
+                    .content_type("text/plain; charset=utf-8")
+                    .insert_header(("X-Subs-Format", fmt))
+                    .insert_header(("X-Subs-Partial", "1"))
+                    .insert_header(("X-Subs-Unchanged", "1"))
+                    .body(body);
+            }
+        }
+    }
     let input_source = {
         let mut src = subs_input_source(&folder_id_str, message_id, token, &cache);
         // Round-3 (review R1): bound the extraction input to the cached prefix.
@@ -6230,6 +6270,11 @@ async fn subtitles_extract_track(
         let mut resp = HttpResponse::NoContent();
         if !fully_cached {
             resp.insert_header(("X-Subs-Partial", "1"));
+            // Round-9 I-5: memoize the empty partial result at this frontier so
+            // identical retries replay instead of re-running ffmpeg.
+            if let Some(mgr) = cache.as_ref().as_ref() {
+                mgr.subs_partial_memo_store(message_id, stream_idx, ass, current_frontier, Vec::new(), format_hdr.to_string());
+            }
         }
         return resp.finish();
     }
@@ -6257,6 +6302,11 @@ async fn subtitles_extract_track(
         .insert_header(("X-Subs-Format", format_hdr));
     if partial {
         resp.insert_header(("X-Subs-Partial", "1"));
+        // Round-9 I-5: memoize the partial body at this frontier so identical
+        // retries replay instead of re-running ffmpeg on identical input.
+        if let Some(mgr) = cache.as_ref().as_ref() {
+            mgr.subs_partial_memo_store(message_id, stream_idx, ass, current_frontier, text.clone(), format_hdr.to_string());
+        }
     } else {
         resp.insert_header(("Cache-Control", "max-age=86400"));
     }
@@ -6568,7 +6618,7 @@ pub async fn start_streaming_server(
             .allowed_origin("http://nobuf-stream.localhost")
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged"])
             .max_age(3600);
 
         App::new()

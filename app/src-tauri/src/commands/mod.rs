@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicBool};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
@@ -62,12 +62,17 @@ pub struct TelegramState {
     /// following Telegram's official recommendation for parallel downloads.
     /// Initialized on first successful connection; None until then.
     pub download_pool: Arc<Mutex<Option<DownloadPool>>>,
-    /// Whether the player's IOController is actively downloading (NOT paused by lazyLoad).
-    /// Set by cmd_report_playback_position from the frontend every ~10s.
-    /// When true, the proactive prebuffer throttles itself (100ms delay between
-    /// segments) to yield Telegram bandwidth and avoid FLOOD_PREMIUM_WAIT.
-    /// When false (IOController paused), proactive prebuffer runs at full speed.
-    pub player_actively_downloading: Arc<AtomicBool>,
+    /// Millisecond wall-clock timestamp (UNIX epoch) of the last report that said
+    /// the player's IOController is actively downloading; 0 = idle. Set by
+    /// cmd_report_playback_position. The proactive prebuffer yields while the
+    /// timestamp is FRESH (see player_download_flag_fresh) and resumes once it
+    /// decays. Round-9 I-2b: this was an AtomicBool that only that command ever
+    /// wrote — the MKV seek path stores `true` and has no periodic reporter to
+    /// clear it, so one MKV seek starved PROACTIVE for the rest of the session
+    /// (9-t: 0 bytes downloaded in 70s, offset frozen). Freshness-decay makes a
+    /// stale `true` self-heal while keeping MP4 (2s cadence) and TS (10s cadence)
+    /// semantics identical.
+    pub player_actively_downloading: Arc<AtomicU64>,
     /// Latest proactive prebuffer target for each message. Updated by
     /// cmd_report_playback_position so the prebuffer task can slide its window
     /// as the playhead advances instead of being a one-shot fixed-window download.

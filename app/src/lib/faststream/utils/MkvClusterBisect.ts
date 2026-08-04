@@ -9,7 +9,7 @@
 // cue-less MKV seek outside the harvested index fell into mediabunny's raw
 // getKeyPacket linear cluster walk — 6-t showed 83.9MB in 43s (1.95MB/s) with
 // ~800MB left to walk for a 2819.9s target ≈ 7 minutes of frozen player. The
-// user killed the app. Bisection bounds that to ~3-6 ranged probes + a ≤16MB
+// user killed the app. Bisection bounds that to ~3-8 ranged probes + a ≤4MB (round-9)
 // residual walk.
 //
 // All reach-in helpers (readMkvTimestampFactor & co.) are guarded: shape drift
@@ -18,9 +18,13 @@
 
 const MKV_CLUSTER_ID = 0x1f43b675;
 /** Stop bisecting once best + next-above bracket ≤ this gap — the residue is
- *  one cluster's interior; the subsequent walk reads those bytes anyway
- *  (5-t: 16 probes wasted on a 12.58MB monster-cluster interior). */
-const BISECT_WALKABLE_GAP_BYTES = 16 * 1024 * 1024;
+ *  walked serially at Telegram rate on cold seeks, so it must stay SMALL.
+ *  History: 16MiB (round-5, sized to skip probing a 12.58MB monster-cluster
+ *  interior) permitted a 14.2MiB bracket in 9-c seek #2 → 17.7MB serial cold
+ *  walk = 12.8s of the 13.0s click→frame. Round-9: 4MiB (≈23s of content at
+ *  the session's 176KB/s) — the ~2 extra probes cost ≤4MB of ranged reads
+ *  that cache through /stream and pre-warm the walk, strictly ≥ break-even. */
+export const BISECT_WALKABLE_GAP_BYTES = 4 * 1024 * 1024;
 
 /** Round-7 keyframe shadow: getKeyPacket's forward-only walk fails when the
  *  closest cache entry ≤ target sits AFTER the last keyframe before the target
