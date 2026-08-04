@@ -888,7 +888,7 @@ interface FastStreamPlayerProps {
         v.src = videoUrl;
         setLastVideoSrc(videoUrl);
       } else {
-        console.log('[Player] MSE URL is null (mpegts.js mode) — skipping video.src, mpegts.js will set it');
+        console.log('[Player] MSE URL not set yet — active tier (mpegts.js/MKV transmuxer) attaches its own src');
         // mpegts.js will set video.src after attachMediaElement()
         // Mark as MSE blob URL for the durationchange guard
         setLastVideoSrc('mpegts://internal');
@@ -1555,7 +1555,11 @@ interface FastStreamPlayerProps {
       if (embeddedSubFileGenRef.current !== genAtStart) return;
       if ('error' in res) {
         if (res.error === 'empty') toast.info('This subtitle track has no cues');
-        else if (res.error === 'empty-partial') toast.info('No cues in the downloaded portion yet — try again as more downloads');
+        else if (res.error === 'empty-partial') {
+          // Round-9 I-5: distinguish "nothing new downloaded" from a fresh miss.
+          if (res.unchanged) toast.info('Cache front hasn\u2019t advanced — more of the file must download before new cues can appear');
+          else toast.info('No cues in the downloaded portion yet — try again as more downloads');
+        }
         else if (!existing) toast.error('Subtitle extraction failed');
         // Partial re-extract failure: old cues stay active — nothing to undo.
         return;

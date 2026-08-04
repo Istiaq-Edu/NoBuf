@@ -643,6 +643,20 @@ export function isSeekSuperseded(capturedGen: number, liveGen: number): boolean 
   return capturedGen !== liveGen;
 }
 
+/** Round-9 Fix 1a (I-2): byte to report to cmd_report_playback_position for a
+ *  seek. The proactive download starts forward FROM the reported byte and the
+ *  backend only treats a download as "covering" a read when download.start ≤
+ *  read.start (stream_cache.rs find_best_covering_download) — but mediabunny's
+ *  first real read lands slightly BEFORE the target byte (EBML cluster header /
+ *  element IDs precede it; observed ~88KB). Back off 2MB so the download always
+ *  starts before the real read; clamp at 0. Applies identically to the initial
+ *  linear estimate and the post-bisect corrected byte. Pure + exported for
+ *  testing. */
+export const SEEK_BYTE_BACKOFF = 2 * 1024 * 1024;
+export function computeSeekReportByte(rawByte: number, backoff: number = SEEK_BYTE_BACKOFF): number {
+  return Math.max(0, Math.floor(rawByte) - backoff);
+}
+
 /**
  * Zero-audio starvation watchdog rule (Layer 3 of the MKV audio-skip fix).
  * `consecutiveStarvedWindows` counts refill windows that intended audio but
@@ -1861,6 +1875,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // and trigger refill seeks when buffer ahead drops below threshold.
   const refillTimerRef = useRef<number | null>(null);
   const refillInProgressRef = useRef(false);
+  // Round-9 I-7: buffer-cap log gate — true while ahead >= cap so the 2s
+  // re-check loop logs the episode ONCE instead of 67 lines per session.
+  const aboveCapLoggedRef = useRef(false);
   // Streaming chain generation — incremented when chain is stopped/started
   // so ongoing async refills can bail out if superseded by a new seek.
   const streamingChainGenRef = useRef(0);
@@ -2707,6 +2724,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // with a clean slate; the other reset sites are belts):
     nullRefillCountRef.current = 0;
     lastRefillNullRef.current = false;
+    // Round-9 I-7: fresh chain = fresh cap-log episode.
+    aboveCapLoggedRef.current = false;
     console.log('[MSE] Starting streaming chain for transmuxer playback');
     // Trigger first refill immediately — no timer delay
     executeStreamingRefill();
@@ -3097,13 +3116,23 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // this just picks a longer re-check delay when already full).
         const aheadCap = getBufferAheadCap();
         if (ahead >= aheadCap) {
-          console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s exceeds cap ${aheadCap}s — sleeping 2000ms before re-check`);
+          // Round-9 I-7: log only the TRANSITION into the capped state — the
+          // 17→45s oscillation around the soft cap (20s refill chunks vs 30s
+          // cap, by design) printed 67 of these per session at 2s cadence.
+          if (!aboveCapLoggedRef.current) {
+            aboveCapLoggedRef.current = true;
+            console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s exceeds cap ${aheadCap}s — re-checking every 2000ms (logged once per episode)`);
+          }
           setTimeout(() => {
             if (streamingChainGenRef.current === chainGeneration) {
               executeStreamingRefill();
             }
           }, 2000);
         } else {
+          if (aboveCapLoggedRef.current) {
+            aboveCapLoggedRef.current = false;
+            console.log(`[MSE] Buffer ahead ${ahead.toFixed(1)}s back under cap ${aheadCap}s`);
+          }
           // Fix C: null refills back off to 1000ms (see computeRefillChainDelay).
           // MUST stay inside this generation-gated setTimeout wrapper (G5) —
           // do not relocate the reschedule outside the gen check below.
@@ -6181,7 +6210,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    */
   const fetchEmbeddedSubText = useCallback(async (
     streamIdx: number,
-  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean } | { error: 'empty' | 'empty-partial' | 'failed' }> => {
+  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean }> => {
     const url = streamUrlRef.current;
     const parsed = url ? parseStreamUrl(url) : null;
     if (!parsed) return { error: 'failed' };
@@ -6195,7 +6224,12 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         resp = await fetch(endpoint);
       }
       if (resp.status === 204) {
-        return { error: resp.headers.get('X-Subs-Partial') === '1' ? 'empty-partial' : 'empty' };
+        // Round-9 I-5: X-Subs-Unchanged = the backend frontier gate replayed a
+        // memoized result (cache front hasn't advanced since the last attempt).
+        return {
+          error: resp.headers.get('X-Subs-Partial') === '1' ? 'empty-partial' : 'empty',
+          unchanged: resp.headers.get('X-Subs-Unchanged') === '1',
+        };
       }
       if (!resp.ok) {
         diagLog(`[SUBS] track ${streamIdx} extraction failed (HTTP ${resp.status})`);
@@ -6461,6 +6495,21 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     seekBufferRef.current = [];
     for (const item of buffered) {
       sbVideo.appendBuffer(item.data);
+    }
+    // Round-9 Fix 4 (I-4): drain the queue BEFORE restarting the chain — the
+    // user-seek path does this; the switch didn't. Without it the restarted
+    // chain's first refill reads sb.buffered while the appends above are still
+    // queued → buffered.end reports the PRE-switch playhead → cue-snap resolves
+    // the keyframe BEHIND the switch keyframe → a full re-transmux of the window
+    // just produced + byte-identical re-appends (9-c #28-30: 213832/312767/
+    // 96397B twice, SB range unchanged — pure coded-frame replacement).
+    await sbVideo.waitForQueueDrain();
+    // The drain opens a real await window: a user seek can supersede the switch
+    // here. The newer seek owns the chain/refs — restarting the chain for the
+    // OLD position would fight it (same class as the trace-22 stale commit).
+    if (isSeekSuperseded(seekGen, transmuxerSeekGenRef.current)) {
+      diagLog('[AUDIO] mkv switch superseded during queue drain — newer seek owns the chain');
+      return false;
     }
     // Refill chain tops the buffer up from here (same as post-seek).
     startStreamingChain();
@@ -9356,11 +9405,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             // through to the cache-poll, the proactive fill never writes those bytes,
             // and TauriStreamSource empty-retries until the 30s fallback — the seek
             // hangs with no playback and no prebuffer (proven: trace 19, seek 1256.9s).
-            // Back off 2MB so the download always starts before mediabunny's real
-            // read. Cost is a one-time ~2MB pre-roll that's parsed through to the
-            // keyframe; playback is unaffected.
-            const SEEK_BYTE_BACKOFF = 2 * 1024 * 1024;
-            const targetByte = Math.max(0, rawTargetByte - SEEK_BYTE_BACKOFF);
+            // Backoff + 0-clamp live in computeSeekReportByte (module scope, round-9).
+            const targetByte = computeSeekReportByte(rawTargetByte);
             invoke('cmd_report_playback_position', {
               messageId: _fid,
               folderId: _folder,
@@ -9464,6 +9510,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // recordByteTimeAnchor) so a stray byte can't distort the bar.
               const seekAnchor = (transmuxerRef.current as any)?.getLastSeekAnchor?.() ?? null;
               if (seekAnchor) recordByteTimeAnchor(seekAnchor.byteOffset, seekAnchor.time);
+
+              // Round-9 Fix 1a (I-2): re-anchor the backend PROACTIVE prebuffer at
+              // the TRUE cluster byte the bisection resolved. The pre-seek report
+              // above used the linear time-ratio estimate (14.2-22MB off in 9-t) —
+              // PROACTIVE then downloaded from the wrong point while getKeyPacket's
+              // walk pulled the real bytes serially from Telegram. Non-null only
+              // when THIS seek bisected (cold cue-less far seek; cleared at seekTo
+              // entry, generation-gated in bisectSeekTarget) and only after the
+              // supersession guard above — a condemned seek can never re-report.
+              const bisectAnchor = (transmuxerRef.current as any)?.getLastBisectAnchor?.() ?? null;
+              if (bisectAnchor && file?.id && state.current.fileLength > 0 && state.current.duration > 0) {
+                invoke('cmd_report_playback_position', {
+                  messageId: file.id,
+                  folderId: activeFolderId,
+                  currentTimeS: clampedTime,
+                  durationS: state.current.duration,
+                  fileSize: state.current.fileLength,
+                  isPlayerDownloading: true,
+                  playbackRate: 1.0,
+                  byteOffset: computeSeekReportByte(bisectAnchor.byteOffset),
+                }).catch(() => {});
+              }
 
               await sbVideo.waitForQueueDrain();
               if (sbAudio) await sbAudio.waitForQueueDrain();

@@ -753,6 +753,11 @@ class TransmuxerThumbnailPipeline {
     state: 'inflight' | 'done' | 'failed';
     at: number;
     entry?: { elementStartPos: number; startTimestamp: number };
+    // Round-9 Fix 6 (I-6): the in-flight bisect's promise (resolves after the
+    // memo transitions to done/failed; never rejects). processLoop awaits it
+    // instead of blind-polling captureAtTime every ~250ms — 9-* logged 115
+    // false polls vs 6 true captures.
+    promise?: Promise<void>;
   }>();
   /** Round-5 (green bar D3): sink for exact (byte, timeSeconds) pairs from
    *  validated bisection clusters — wired to the player's recordByteTimeAnchor
@@ -866,7 +871,7 @@ class TransmuxerThumbnailPipeline {
       if (this.format === 'mkv') {
         const cueCount = readMkvCuePointCount(this.videoTrack);
         this.isCuelessMkv = (cueCount ?? 0) === 0;
-        if (this.isCuelessMkv) console.warn('[TransmuxerThumbnailPipeline] MKV has no Cues — native-scan captures disabled (index-or-skip)');
+        if (this.isCuelessMkv) console.log('[TransmuxerThumbnailPipeline] MKV has no Cues — native-scan captures disabled (index-or-skip)');
       }
 
       // Get video codec
@@ -975,8 +980,12 @@ class TransmuxerThumbnailPipeline {
       } else {
         // Fire-and-forget: bisect in the background; processLoop's next retry
         // for this bucket falls into 'done'/'failed'/nearEntry above.
-        this.bisectMemo.set(bucketKey, { state: 'inflight', at: performance.now() });
-        void this._bisectAndInject(time, targetTicks, bucketKey);
+        // Round-9 Fix 6: keep the promise in the memo so processLoop can await
+        // the settle instead of blind-polling (_bisectAndInject never rejects —
+        // it writes done/failed internally before resolving).
+        const p = this._bisectAndInject(time, targetTicks, bucketKey);
+        this.bisectMemo.set(bucketKey, { state: 'inflight', at: performance.now(), promise: p });
+        void p;
         return false;
       }
     }
@@ -1164,6 +1173,16 @@ class TransmuxerThumbnailPipeline {
       this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
       console.warn('[TransmuxerThumbnailPipeline] Bisection failed:', e);
     }
+  }
+
+  /** Round-9 Fix 6 (I-6): the in-flight bisect promise for the bucket covering
+   *  `time`, or null when none is running. processLoop awaits this (bounded by
+   *  a race timeout) instead of re-polling captureAtTime every ~250ms while a
+   *  bisect runs — the settle wakes it for an immediate capture. */
+  getInflightBisect(time: number): Promise<void> | null {
+    const bucket = Math.floor(time / BUCKET_SIZE) * BUCKET_SIZE;
+    const memo = this.bisectMemo.get(bucket);
+    return memo?.state === 'inflight' ? memo.promise ?? null : null;
   }
 
   /** Fast TS thumbnail capture using OffsetCustomSource.
@@ -1833,6 +1852,10 @@ export function useThumbnailExtractor(
   // MP4-HEVC→/remux reroute: hover thumbnails via backend /thumb (server-side
   // ffmpeg single-frame JPEG). No client pipeline — just a serialized fetch.
   const remuxThumbBusyRef = useRef(false);
+  // Round-9 Fix 6 (I-6): last hover bucket whose captureAtTime attempt was
+  // logged — gates the transmuxer-branch logs to bucket transitions so retry
+  // polls of the same bucket don't spam the console (115 lines in 9-*).
+  const lastHoverLogBucketRef = useRef<number | null>(null);
   
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -2457,16 +2480,33 @@ export function useThumbnailExtractor(
               await new Promise(r => setTimeout(r, 200));
             }
           } else if (transmuxerPipeline && transmuxerPipeline.ready && !transmuxerPipeline.busy) {
-            console.log('[ThumbnailExtractor] Hover: calling transmuxer captureAtTime for time', desiredTime);
+            // Round-9 Fix 6 (I-6): gate the per-attempt logs to bucket
+            // transitions — the blind 250ms retry loop logged 115 false polls
+            // in 9-* while ONE bisect ran. First attempt per bucket + every
+            // success stay visible; repeat polls of the same bucket go silent.
+            const logBucket = Math.floor(desiredTime / 10) * 10;
+            const logThis = lastHoverLogBucketRef.current !== logBucket;
+            if (logThis) console.log('[ThumbnailExtractor] Hover: calling transmuxer captureAtTime for time', desiredTime);
             const captured = await transmuxerPipeline.captureAtTime(
               desiredTime,
               frameBufferRef.current,
               insertionOrderRef.current,
               forceUpdateCachedTimes,
             );
-            console.log('[ThumbnailExtractor] Hover: transmuxer captureAtTime result', captured);
+            if (logThis || captured) console.log('[ThumbnailExtractor] Hover: transmuxer captureAtTime result', captured);
+            lastHoverLogBucketRef.current = logBucket;
             if (!captured && active) {
-              await new Promise(r => setTimeout(r, 200));
+              // Round-9 Fix 6: when the miss is an in-flight bisect, await its
+              // settle (bounded — hover moves/teardown must stay responsive)
+              // instead of hammering captureAtTime on a fixed 200ms cadence.
+              // On settle the next iteration captures immediately (done/near-
+              // entry) or backs off (failed → 60s cooldown path).
+              const inflight = transmuxerPipeline.getInflightBisect?.(desiredTime) ?? null;
+              if (inflight) {
+                await Promise.race([inflight, new Promise(r => setTimeout(r, 1000))]);
+              } else {
+                await new Promise(r => setTimeout(r, 200));
+              }
             }
           } else {
             console.log('[ThumbnailExtractor] Hover: no pipeline available, mp4=', !!pipeline, 'transmuxer=', !!transmuxerPipeline, 'fmp4=', !!fmp4Pipeline);

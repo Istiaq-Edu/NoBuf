@@ -336,6 +336,14 @@ pub struct StreamCacheManager {
     /// HITs). In-memory: cleared on cache delete, gone on app restart.
     /// Source of truth for the frontend download-speed meter.
     session_downloaded: Arc<std::sync::Mutex<HashMap<i32, u64>>>,
+    /// Round-9 I-5: partial-subs extraction memo. Key (message_id, stream_idx,
+    /// ass); value (contiguous-prefix frontier at extraction time, body bytes,
+    /// format header). The partial extraction reads /stream?cached_prefix=true
+    /// whose body ENDS at the contiguous-from-0 frontier — same frontier ⇒ same
+    /// input ⇒ same output, so re-running ffmpeg is pure waste (9-*: frontier
+    /// frozen at 32MiB while playback cached 561M+ far ranges → identical "647
+    /// chars partial" twice). In-memory only; entries cleared on cache delete.
+    subs_partial_memo: Arc<std::sync::Mutex<HashMap<(i32, i32, bool), (u64, Vec<u8>, String)>>>,
 }
 
 /// Cached HLS layout info for a message, including the Media object
@@ -374,6 +382,7 @@ impl StreamCacheManager {
             stripped_pids_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             playhead_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_downloaded: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            subs_partial_memo: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1020,6 +1029,8 @@ impl StreamCacheManager {
         if let Ok(mut hlc) = self.hls_layout_cache.lock() {
             hlc.remove(&message_id);
         }
+        // Round-9 I-5: drop partial-subs memos — the frontier resets with the cache.
+        self.subs_partial_memo_clear(message_id);
         Ok(true)
     }
 
@@ -1200,10 +1211,55 @@ impl StreamCacheManager {
         self.streaming_active.lock().map(|v| v.contains(&message_id)).unwrap_or(false)
     }
 
+    /// Round-9 I-3: public retry hook for the proactive/bg-cache spawn wrappers.
+    /// Fires after the task returns (its open_data_file_write handle is dropped),
+    /// so a discard-during-prebuffer deletes the .dat seconds later instead of
+    /// leaking it until app exit.
+    pub fn retry_deferred_deletions(&self, message_id: i32) {
+        self.try_deferred_deletions(message_id);
+    }
+
+    /// Round-9 I-5: look up the memoized partial-subs result for this track IF
+    /// the contiguous prefix hasn't grown since it was stored. None = run ffmpeg.
+    pub fn subs_partial_memo_get(
+        &self, message_id: i32, stream_idx: i32, ass: bool, current_frontier: u64,
+    ) -> Option<(Vec<u8>, String)> {
+        let memo = self.subs_partial_memo.lock().ok()?;
+        let (frontier, body, format) = memo.get(&(message_id, stream_idx, ass))?;
+        if *frontier == current_frontier {
+            Some((body.clone(), format.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Round-9 I-5: store a partial-subs extraction result keyed by the frontier
+    /// it was extracted at.
+    pub fn subs_partial_memo_store(
+        &self, message_id: i32, stream_idx: i32, ass: bool,
+        frontier: u64, body: Vec<u8>, format: String,
+    ) {
+        if let Ok(mut memo) = self.subs_partial_memo.lock() {
+            memo.insert((message_id, stream_idx, ass), (frontier, body, format));
+        }
+    }
+
+    /// Round-9 I-5: drop all partial-subs memos for a message (cache deleted —
+    /// the frontier resets, stale bodies must not replay).
+    pub fn subs_partial_memo_clear(&self, message_id: i32) {
+        if let Ok(mut memo) = self.subs_partial_memo.lock() {
+            memo.retain(|(mid, _, _), _| *mid != message_id);
+        }
+    }
+
     /// Bug #8 deferred deletion: Attempt to delete .dat files that were
     /// queued when delete_cache failed due to open file handles on Windows.
     /// Called from untrack_streaming() and unregister_download() — when
     /// all handles should be closed and the .dat file should be deletable.
+    /// Round-9 I-3: also called from the proactive/bg-cache spawn wrappers via
+    /// retry_deferred_deletions — those tasks hold the .dat via
+    /// open_data_file_write and were never followed by a retry, leaving
+    /// discarded caches locked until app exit (9-t: 109.dat os-32).
     fn try_deferred_deletions(&self, message_id: i32) {
         // Only attempt deletion if streaming has ended for this message
         if self.is_streaming(message_id) {
@@ -1264,6 +1320,18 @@ pub fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
     *ranges = merged;
 }
 
+/// Round-9 I-5: end (exclusive) of the contiguous-from-0 cached prefix — the
+/// exact frontier where /stream?cached_prefix=true ends its body, i.e. how many
+/// bytes a partial-subs extraction can read. 0 when nothing is cached from
+/// byte 0 (a mid-file island doesn't help ffmpeg, which reads sequentially).
+/// Assumes ranges sorted+merged (every meta save runs merge_ranges).
+pub fn contiguous_prefix_end(cached_ranges: &[(u64, u64)]) -> u64 {
+    match cached_ranges.first() {
+        Some(&(0, end)) => end + 1,
+        _ => 0,
+    }
+}
+
 /// Find byte ranges that are NOT covered by cached_ranges
 pub fn find_gaps(cached_ranges: &[(u64, u64)], total_size: u64) -> Vec<(u64, u64)> {
     if cached_ranges.is_empty() {
@@ -1308,6 +1376,38 @@ pub fn is_range_cached(cached_ranges: &[(u64, u64)], range_start: u64, range_end
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Round-9 Fix 5 (I-5): contiguous-prefix frontier for the subs gate ---
+    // The partial-subs extraction reads /stream?cached_prefix=true, whose body
+    // ends at the contiguous-from-0 frontier. 9-* logs: frontier frozen at
+    // 33,554,432 (mediabunny's 32MiB seed) while playback cached 561M+ far
+    // ranges → every re-extraction read identical input. The gate memoizes on
+    // this value and skips ffmpeg when it hasn't grown.
+
+    #[test]
+    fn contiguous_prefix_empty_ranges_is_zero() {
+        assert_eq!(contiguous_prefix_end(&[]), 0);
+    }
+
+    #[test]
+    fn contiguous_prefix_frozen_frontier_from_round9() {
+        // The exact 9-* session shape: 32MiB seed + far playback islands.
+        assert_eq!(
+            contiguous_prefix_end(&[(0, 33_554_431), (561_000_000, 600_000_000)]),
+            33_554_432
+        );
+    }
+
+    #[test]
+    fn contiguous_prefix_requires_range_from_zero() {
+        assert_eq!(contiguous_prefix_end(&[(5, 10)]), 0);
+        assert_eq!(contiguous_prefix_end(&[(1, 1000)]), 0);
+    }
+
+    #[test]
+    fn contiguous_prefix_stops_at_first_hole() {
+        assert_eq!(contiguous_prefix_end(&[(0, 9), (20, 30)]), 10);
+    }
 
     #[test]
     fn test_merge_ranges_empty() {

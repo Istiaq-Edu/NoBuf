@@ -170,6 +170,14 @@ export class MediabunnyTransmuxer {
   // Keyframe time of the last resolved seek — paired with the source's captured
   // cluster byte to form a real VBR byte↔time calibration anchor.
   private lastSeekKeyframeTime = -1;
+  // Round-9 Fix 1a (I-2): the cluster byte the seek's bisection injected, with
+  // its time. Non-null ⇔ THIS seek actually bisected (cold cue-less far seek) —
+  // the seek-completion handler re-reports it to the backend so PROACTIVE
+  // anchors at the true read point instead of the linear estimate (9-t: linear
+  // was 14.2-22MB off; the walk paid the difference at Telegram rate). Cleared
+  // at every seekTo entry; NOT getLastSeekAnchor (that byte comes from
+  // captureNextReadStart — up to 32MB late on warm seeks).
+  private lastBisectAnchor: { byteOffset: number; time: number } | null = null;
   // Round-6 Fix B: byte offsets already emitted through onByteTimeAnchor (the
   // cluster-cache harvest re-snapshots the whole cache every seek/refill).
   private emittedAnchorBytes = new Set<number>();
@@ -1000,6 +1008,15 @@ export class MediabunnyTransmuxer {
     return { byteOffset, time: this.lastSeekKeyframeTime };
   }
 
+  /** Round-9 Fix 1a (I-2): the cluster byte THIS seek's bisection injected —
+   *  null when the seek didn't bisect (warm/indexed/cue-ful) or was superseded.
+   *  The completion handler re-reports it to the backend so PROACTIVE anchors
+   *  at the true read point (minus SEEK_BYTE_BACKOFF) instead of the linear
+   *  time-ratio estimate. */
+  getLastBisectAnchor(): { byteOffset: number; time: number } | null {
+    return this.lastBisectAnchor;
+  }
+
   /** Round-6 Fix B: emit an exact (byte, seconds) anchor to the config sink,
    *  once per byte offset (harvest re-snapshots the whole cluster cache). */
   private emitByteTimeAnchor(byteOffset: number, timeSeconds: number): void {
@@ -1037,7 +1054,7 @@ export class MediabunnyTransmuxer {
    *  pipeline has had bisection since round-3, but this session never
    *  hovered). Byte-bisect the cluster at-or-before the target (shared
    *  engine, ~3-6 ranged probes) and inject it into the demuxer's position
-   *  cache so getKeyPacket's walk is bounded to the ≤16MB residual gap.
+   *  cache so getKeyPacket's walk is bounded to the ≤4MB residual gap (round-9).
    *  Degrades silently to the raw walk on any failure.
    *
    *  Round-7 "keyframe shadow" fix (7-c:185-204): getKeyPacket's forward-only
@@ -1093,6 +1110,17 @@ export class MediabunnyTransmuxer {
       });
       if (!result) return; // aborted/failed — degrade to the raw walk
       injectMkvClusterPosition(videoTrack, result.entry);
+      // Round-9 Fix 1a: expose the injected cluster byte for the completion
+      // re-report. Generation-gated: a superseded seek's late bisect result may
+      // still inject (the entry is ground truth, useful to any later walk) but
+      // must NOT claim the anchor slot — the newer seek owns it (cleared at its
+      // seekTo entry).
+      if (generation === this.seekGeneration) {
+        this.lastBisectAnchor = {
+          byteOffset: result.entry.elementStartPos,
+          time: result.entry.startTimestamp / factor,
+        };
+      }
       console.log(`[Transmuxer] seekTo bisect: cluster for ${seekTime.toFixed(1)}s at byte=${result.entry.elementStartPos}, ticks=${result.entry.startTimestamp} (shadow=${shadowSeconds.toFixed(1)}s, ${result.probes} probes, ${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
     } catch (e) {
       console.warn('[Transmuxer] seekTo bisect failed (falling back to linear walk):', e);
@@ -1484,6 +1512,10 @@ export class MediabunnyTransmuxer {
 
     // Increment generation to discard stale callback data
     this.seekGeneration++;
+    // Round-9 Fix 1a: this seek owns the bisect-anchor slot from here — a stale
+    // anchor from a PREVIOUS seek must never be re-reported by this one's
+    // completion (bisectSeekTarget below repopulates it when it runs).
+    this.lastBisectAnchor = null;
     // Layer-3 starvation watchdog: reset the per-window audio emission counter.
     this.windowAudioPacketsAdded = 0;
 
@@ -1629,7 +1661,7 @@ export class MediabunnyTransmuxer {
         // unbounded LINEAR cluster walk (6-t: 83.9MB/43s, ~7min for a 47min
         // seek). Bisect the target cluster first (~3-6 ranged probes) and
         // inject it into the demuxer's position cache so the walk is bounded
-        // to the ≤16MB residual. No-ops fast when a near entry already exists;
+        // to the ≤4MB residual (round-9). No-ops fast when a near entry already exists;
         // degrades to the raw walk on failure/supersession.
         if (this.config.format === 'mkv' && this.mkvCueIndex.length === 0) {
           await this.bisectSeekTarget(videoTrack, seekTime, currentGeneration);
