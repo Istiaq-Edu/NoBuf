@@ -155,6 +155,87 @@ export function pickBisectProbe(
   return Math.min(hiByte - 1, Math.max(loByte + 1, probe));
 }
 
+/** Round-10b L1: align a probe's fetch START down to a Telegram chunk boundary.
+ *
+ *  The backend fetches from Telegram in 512 KiB chunks (`server.rs:386`). A probe
+ *  starting at an arbitrary interpolated byte therefore pays for a leading
+ *  partial chunk whose head is discarded — measured 514,655 wasted bytes on
+ *  probe 1 of the 12-t seek, and it pushes the probe from 4 chunk-fetches to 5.
+ *  Aligning down makes that first chunk fully useful. The extra bytes are free:
+ *  they arrive inside a chunk already being paid for.
+ *
+ *  SAFE BY CONSTRUCTION: `scanForLastMkvClusterAtOrBefore` returns the LAST
+ *  cluster at or before the target, so starting the scan LOWER can only add
+ *  candidates that are still ≤ target — it can never skip the answer.
+ *
+ *  ⚠ The bracket update must still receive the UNALIGNED `mid`. `stepBisectBracket`'s
+ *  'above' branch sets `hi = mid` (the round-5 spin fix); feeding it the aligned
+ *  (lower) value would shrink the bracket further than the evidence supports.
+ *  Pure + exported for testing. */
+export const BISECT_CHUNK_ALIGN_BYTES = 512 * 1024;
+export function alignProbeStart(mid: number, lo: number, alignTo: number = BISECT_CHUNK_ALIGN_BYTES): number {
+  const aligned = Math.floor(mid / alignTo) * alignTo;
+  // Never step below the proven bracket floor: bytes under `lo` are already
+  // known to hold no ≤-target cluster, and re-reading them wastes a chunk.
+  return Math.max(aligned, lo);
+}
+
+/** Round-10 P3-1: clamp a probe's fetch window to the proven bracket top.
+ *
+ *  The driver used to fetch `[mid, mid + window)` clamped only to EOF. But the
+ *  'above' branch of stepBisectBracket has ALREADY PROVEN that no ≤-target
+ *  cluster exists at or above `hi` — so every byte from `hi` upward is known-
+ *  useless, yet was re-downloaded on each probe.
+ *
+ *  Real cost, 10-t seek #2 (7 probes, answer at 766,837,065): probes 4-7 stepped
+ *  DOWN by 514,211 / 306,836 / 142,115 / 139,273 bytes but each still pulled a
+ *  full 2 MiB, so ~1.6-1.9 MB per window was re-fetched territory. Useful new
+ *  bytes across those four probes: 1.08 MB, paid for with 8 MB. Clamping gives
+ *  14.00 MiB -> 8.05 MiB, i.e. 28 -> 17 Telegram chunks. At the server's rate
+ *  limiter (512 KiB per 300 ms = 1.67 MiB/s ceiling, server.rs:386/:395) that is
+ *  8.4s -> 5.1s of pure request spacing, so ~3.3s off a cold seek. (An idealised
+ *  clamp with no slack/floor would reach 7.30 MiB / 15 chunks; the 64 KiB
+ *  straddle slack and 512 KiB chunk floor cost ~0.6s and are correctness
+ *  requirements, not tunables.) DERIVED from the rate-limiter model — not yet
+ *  measured end-to-end on a cold seek.
+ *
+ *  These probes do NOT hit the disk cache: server.rs requires FULL coverage of
+ *  the requested range (`is_range_cached(start, end)`), and each window extended
+ *  below the previously-cached span, so the whole 2 MiB fell through to
+ *  cache-poll/Telegram every time — confirmed in 10-t, where every
+ *  `source_id=warmer` request logs `PREBUFFER HIT` and not one `seek-bisect`
+ *  request does.
+ *
+ *  SLACK keeps a cluster header that straddles `hi` readable: EBML IDs are 4
+ *  bytes and scanForLastMkvClusterAtOrBefore needs the child Timestamp element
+ *  after the ID, so a bare `hi` cut could truncate a cluster start we must see.
+ *  64 KiB is far beyond any cluster header while still discarding ~96% of the
+ *  waste.
+ *
+ *  Never narrows below one Telegram chunk: a sub-chunk request costs the same
+ *  512 KiB round trip, so clamping tighter than that buys nothing and risks
+ *  starving the scan. Pure + exported for testing. */
+export const BISECT_CLAMP_SLACK_BYTES = 64 * 1024;
+export const BISECT_MIN_FETCH_BYTES = 512 * 1024;
+export function computeProbeFetchEnd(
+  mid: number,
+  window: number,
+  hi: number,
+  fileSize: number,
+  slack: number = BISECT_CLAMP_SLACK_BYTES,
+  minFetch: number = BISECT_MIN_FETCH_BYTES,
+): number {
+  const eof = fileSize - 1;
+  const wanted = mid + window - 1;
+  // hi is EXCLUSIVE-ish (proven to hold no ≤-target cluster), so the last byte
+  // worth reading is hi - 1, plus slack for a straddling cluster header.
+  const provenTop = hi - 1 + slack;
+  const clamped = Math.min(wanted, provenTop, eof);
+  // Floor at one chunk so we never issue a pointlessly tiny request.
+  const floored = Math.max(clamped, Math.min(mid + minFetch - 1, eof));
+  return Math.max(mid, Math.min(floored, eof));
+}
+
 export interface BisectBracket {
   lo: number;
   hi: number;
@@ -181,6 +262,78 @@ export function stepBisectBracket(
     br.hi = Math.max(br.lo + 1, mid);
     br.hiTicks = outcome.ticks;
   }
+}
+
+/** Round-22 F2: the bracket below which further probing is degenerate.
+ *
+ *  `alignProbeStart` floors every probe's fetch start to a 512 KiB cell. That is
+ *  right while the bracket is wide — the leading partial chunk would otherwise be
+ *  wasted. But once the bracket narrows to a couple of cells, consecutive
+ *  interpolated mids floor to ADJACENT cells, so the probe advances exactly one
+ *  512 KiB cell per iteration instead of halving. The alignment grain silently
+ *  becomes the search step.
+ *
+ *  Measured, 22-t seek 2 tail (byte-exact multiples of the align cell):
+ *
+ *  ```text
+ *    830,996,480 -> 829,947,904   1024 KiB  = 2 cells
+ *    829,947,904 -> 829,423,616    512 KiB  = 1 cell
+ *    829,423,616 -> 828,899,328    512 KiB  = 1 cell
+ *  ```
+ *
+ *  `bisectShouldStop` cannot rescue this: it needs BOTH `best` and `nextAbove`,
+ *  and a downward creep keeps producing 'below' hits, so `nextAbove` stays null
+ *  and the terminal rule never arms.
+ *
+ *  Those three probes cost ~3.3s of an 11.5s bisect (0.79s round-trip + 0.30s
+ *  limiter each) and bought nothing the subsequent bounded walk would not read
+ *  anyway — the same argument that justifies BISECT_WALKABLE_GAP_BYTES.
+ *
+ *  Sized at 2x the align cell: below this, a halving step is smaller than one
+ *  cell, so alignment cannot express it and the next probe is guaranteed to be
+ *  a creep step or a repeat. */
+export const BISECT_MIN_USEFUL_BRACKET_BYTES = 2 * BISECT_CHUNK_ALIGN_BYTES;
+
+/** True when the bracket is too narrow for another probe to make real progress.
+ *  At that point the residue is left to the bounded walk. Pure + unit-tested. */
+export function bisectBracketTooNarrow(
+  lo: number,
+  hi: number,
+  minUseful: number = BISECT_MIN_USEFUL_BRACKET_BYTES,
+): boolean {
+  return hi - lo <= minUseful;
+}
+
+/** Round-23 G3: creep detection by PROGRESS, not by absolute width.
+ *
+ *  Round-23 research measured the terminal shrink ratio at r ≈ 0.98 (11 of 15
+ *  steps), and computed the creep onset as `alignCell / (1 - r)` = 25 MiB — then
+ *  recommended raising `BISECT_MIN_USEFUL_BRACKET_BYTES` to match.
+ *
+ *  ⛔ REJECTED, and the reason is already pinned by a shipped test
+ *  ("threshold stays well under the walkable-gap budget"). Stopping the search at
+ *  a 25 MiB bracket hands a 25 MiB residue to `getKeyPacket`'s forward walk,
+ *  whose budget is `BISECT_WALKABLE_GAP_BYTES` = 4 MiB. At the session's
+ *  ~176 KB/s that residue is ~2.5 minutes of serial cold walk — catastrophically
+ *  worse than the ~1 s of extra probing it saves. The onset arithmetic is right;
+ *  the conclusion inverts the cost model.
+ *
+ *  What IS safe: stop creeping only once the residue is something the walk can
+ *  actually absorb. So the predicate is the CONJUNCTION —
+ *    (this probe barely moved the bracket) AND (the bracket is walkable).
+ *  Above the walkable gap, slow progress still beats no progress.
+ *
+ *  `minProgress` defaults to one alignment cell because that is the smallest
+ *  move `alignProbeStart` can express: a shrink below it is quantised away. */
+export function bisectProbeIsCreeping(
+  prevWidth: number,
+  width: number,
+  walkableGap: number = BISECT_WALKABLE_GAP_BYTES,
+  minProgress: number = BISECT_CHUNK_ALIGN_BYTES,
+): boolean {
+  if (prevWidth < 0) return false;              // no previous probe to compare
+  if (width > walkableGap) return false;        // walk cannot absorb it — keep going
+  return prevWidth - width < minProgress;       // quantised-away progress
 }
 
 /** Round-5 terminal rule: when the best ≤-target cluster and the next
@@ -265,6 +418,31 @@ export function findClusterCacheEntryNear(
   } catch { return null; }
 }
 
+export function findClusterCacheBracket(
+  videoTrack: unknown,
+  targetTicks: number,
+): { lo: { byte: number; ticks: number }; hi: { byte: number; ticks: number } } | null {
+  try {
+    const positions = readMkvClusterPositions(videoTrack);
+    if (!positions || positions.length < 2) return null;
+    let lo = -1;
+    let hi = positions.length;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (positions[mid].startTimestamp <= targetTicks) lo = mid;
+      else hi = mid;
+    }
+    if (lo < 0 || hi >= positions.length) return null;
+    const lower = positions[lo];
+    const upper = positions[hi];
+    if (!(lower.startTimestamp <= targetTicks && upper.startTimestamp > targetTicks && lower.elementStartPos < upper.elementStartPos)) return null;
+    return {
+      lo: { byte: lower.elementStartPos, ticks: lower.startTimestamp },
+      hi: { byte: upper.elementStartPos, ticks: upper.startTimestamp },
+    };
+  } catch { return null; }
+}
+
 /** Round-6 Fix B: snapshot the demuxer's ORGANIC clusterPositionCache — every
  *  cluster the walk/iteration has parsed is an exact (byte, ticks) pair, the
  *  densest ground-truth byte↔time source available (refills add ~1 cluster per
@@ -340,6 +518,10 @@ export interface MkvBisectSearchOpts {
   fileSize: number;
   /** Bisection lo-bound: first-cluster byte (readMkvClusterSeekStart) or 0. */
   startLo: number;
+  /** Optional cache-derived lower bracket. Must be <= target. */
+  bracketLo?: { byte: number; ticks: number };
+  /** Optional cache-derived upper bracket. Must be > target. */
+  bracketHi?: { byte: number; ticks: number };
   targetTicks: number;
   /** Ticks at EOF (duration × factor) or null → midpoint bisection fallback. */
   hiTicks: number | null;
@@ -365,7 +547,7 @@ export interface MkvBisectSearchResult {
  *  unbounded-walk/skip behavior they had before). */
 export async function bisectMkvClusterSearch(opts: MkvBisectSearchOpts): Promise<MkvBisectSearchResult | null> {
   const {
-    probeUrl, fileSize, startLo, targetTicks, hiTicks,
+    probeUrl, fileSize, startLo, bracketLo, bracketHi, targetTicks, hiTicks,
     shouldContinue = () => true,
     onClusterFound,
     fetchImpl = fetch,
@@ -377,13 +559,78 @@ export async function bisectMkvClusterSearch(opts: MkvBisectSearchOpts): Promise
     let window = 2 * 1024 * 1024; // 2MB start, geometric grow on no-find (cap 8MB)
     let bytesFetched = 0;
     let probes = 0;
-    const br: BisectBracket = { lo: startLo, hi: fileSize, loTicks: 0, hiTicks };
+    // Round-23 G2: the previous probe's exact byte range, to detect the
+    // MIN_FETCH-floor repeat (see the guard in the loop).
+    let lastFetchStart = -1;
+    let lastFetchEnd = -1;
+    // Round-23 G3: bracket width at the previous probe, for creep detection.
+    let prevBracketWidth = -1;
+    const lower = bracketLo &&
+      Number.isFinite(bracketLo.byte) && Number.isFinite(bracketLo.ticks) &&
+      bracketLo.byte >= startLo && bracketLo.byte < fileSize && bracketLo.ticks <= targetTicks
+      ? bracketLo
+      : { byte: startLo, ticks: 0 };
+    const upper = bracketHi &&
+      Number.isFinite(bracketHi.byte) && Number.isFinite(bracketHi.ticks) &&
+      bracketHi.byte > lower.byte && bracketHi.byte < fileSize && bracketHi.ticks > targetTicks
+      ? bracketHi
+      : { byte: fileSize, ticks: hiTicks };
+    const br: BisectBracket = {
+      lo: lower.byte,
+      hi: upper.byte,
+      loTicks: lower.ticks,
+      hiTicks: upper.ticks,
+    };
+    if (bracketLo && bracketHi && upper.byte - lower.byte <= BISECT_WALKABLE_GAP_BYTES) {
+      return {
+        entry: { elementStartPos: lower.byte, startTimestamp: lower.ticks },
+        bytesFetched: 0,
+        probes: 0,
+      };
+    }
 
     for (let iter = 0; iter < 18 && br.hi - br.lo > 64 * 1024 && shouldContinue(); iter++) {
       if (bisectShouldStop(best?.elementStartPos ?? null, nextAbove, BISECT_WALKABLE_GAP_BYTES)) break;
+      // Round-22 F2: stop before the alignment grain becomes the search step.
+      // Below ~2 align cells a halving move cannot be expressed after
+      // `alignProbeStart` floors it, so every further probe creeps one 512 KiB
+      // cell and re-reads bytes the bounded walk covers anyway. Only applies
+      // once we HAVE an answer to fall back on — with `best === null` there is
+      // nothing to walk from, so keep probing.
+      if (best !== null && bisectBracketTooNarrow(br.lo, br.hi)) break;
+      // Round-23 G3: F2 above catches creep only under 1 MiB. 23-t's terminal
+      // steps shrank the bracket by ~2% each while still 25 MiB wide, so they
+      // slipped past it. Cut them once the residue is walkable — never before,
+      // or the walk inherits more than its 4 MiB budget.
+      if (best !== null && bisectProbeIsCreeping(prevBracketWidth, br.hi - br.lo)) break;
+      prevBracketWidth = br.hi - br.lo;
       const mid = pickBisectProbe(br.lo, br.hi, br.loTicks, br.hiTicks, targetTicks);
-      const fetchEnd = Math.min(mid + window - 1, fileSize - 1);
-      const resp = await fetchImpl(probeUrl, { headers: { Range: `bytes=${mid}-${fetchEnd}` } });
+      // Round-10b L1: fetch from a chunk-aligned start so the leading partial
+      // chunk isn't wasted. `mid` itself stays UNALIGNED and is what feeds
+      // stepBisectBracket below — the round-5 'above' rule (hi = mid) must not
+      // be given the lower aligned value.
+      const fetchStart = alignProbeStart(mid, br.lo);
+      const fetchEnd = computeProbeFetchEnd(fetchStart, window, br.hi, fileSize);
+      // Round-23 G2: refuse to re-issue a byte-identical request.
+      //
+      // `computeProbeFetchEnd` floors its result at `mid + BISECT_MIN_FETCH_BYTES`
+      // (:235). Once `hi - fetchStart < minFetch + slack` that floor BINDS, so
+      // fetchEnd becomes a function of `mid` alone — independent of both `window`
+      // and `hi`. The no-cluster grow path below then doubles `window` and
+      // `continue`s, but the request it re-issues is byte-identical. The 2→4→8 MiB
+      // ladder makes that exactly three wasted round-trips before `return null`,
+      // and 23-t shows precisely three, twice (L332/334/336 and L479/481/483 —
+      // all served PREBUFFER HIT, so they were pure latency).
+      //
+      // Returning null is the severe part: the caller degrades to the UNBOUNDED
+      // raw walk that bisection exists to prevent. Breaking here instead keeps
+      // whatever `best` we have, so the walk stays bounded.
+      if (fetchStart === lastFetchStart && fetchEnd === lastFetchEnd) {
+        break;
+      }
+      lastFetchStart = fetchStart;
+      lastFetchEnd = fetchEnd;
+      const resp = await fetchImpl(probeUrl, { headers: { Range: `bytes=${fetchStart}-${fetchEnd}` } });
       if (!resp.ok && resp.status !== 206) return null;
       const buf = new Uint8Array(await resp.arrayBuffer());
       bytesFetched += buf.length;
@@ -391,10 +638,10 @@ export async function bisectMkvClusterSearch(opts: MkvBisectSearchOpts): Promise
       // LAST validated cluster ≤ target in this window. Zero high-side slack:
       // the injected entry must satisfy ts ≤ target or binarySearchLessOrEqual
       // never selects it (verify-c risk 2).
-      const hit = scanForLastMkvClusterAtOrBefore(buf, mid, targetTicks);
+      const hit = scanForLastMkvClusterAtOrBefore(buf, fetchStart, targetTicks);
       if (!hit) {
         // Distinguish "cluster present but ABOVE target" from "no cluster at all".
-        const any = scanForMkvClusterInWindow(buf, mid, 0, Number.MAX_SAFE_INTEGER, 0);
+        const any = scanForMkvClusterInWindow(buf, fetchStart, 0, Number.MAX_SAFE_INTEGER, 0);
         if (!any) {
           if (window < 8 * 1024 * 1024) { window *= 2; continue; } // grow, re-probe same bracket
           return null;

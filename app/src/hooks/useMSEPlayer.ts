@@ -657,6 +657,17 @@ export function computeSeekReportByte(rawByte: number, backoff: number = SEEK_BY
   return Math.max(0, Math.floor(rawByte) - backoff);
 }
 
+export function shouldRetryMkvProactiveReport(
+  reportAccepted: boolean,
+  attempt: number,
+  maxAttempts: number,
+  capturedGen: number,
+  liveGen: number,
+  paused: boolean,
+): boolean {
+  return !reportAccepted && attempt + 1 < maxAttempts && capturedGen === liveGen && !paused;
+}
+
 /**
  * Zero-audio starvation watchdog rule (Layer 3 of the MKV audio-skip fix).
  * `consecutiveStarvedWindows` counts refill windows that intended audio but
@@ -670,6 +681,439 @@ export function shouldTriggerZeroAudioReroute(
   sbHasAudio: boolean,
 ): boolean {
   return sbHasAudio && consecutiveStarvedWindows >= 3;
+}
+
+/**
+ * Round-10 P1-2: does an already-extracted subtitle track still cover the
+ * playhead, or must it be re-extracted?
+ *
+ * The failing session: cues covered 0-196s of an 8888s film while the viewer sat
+ * at 4500s, so NOTHING could render — and nothing in the app ever re-extracted
+ * (`fetchEmbeddedSubText` has exactly one consumer: a manual click). Worse, the
+ * old re-extract branch required `partial && !active`, and the backend's
+ * disk-cache replay omits `X-Subs-Partial`, so a truncated body was often marked
+ * `partial:false` — a permanent dead end.
+ *
+ * Coverage is judged from the CUE LIST, not from a server flag: the cues are
+ * ground truth about what the user can actually see. `GRACE_S` keeps us from
+ * re-extracting during the normal gap between the last cue and the end of a
+ * fully-covered film (dialogue routinely stops minutes before the credits end).
+ *
+ * ROUND-20: this used to take only `lastCueEnd` and ask "has the playhead
+ * outrun the LAST cue?". That is right when cues arrive as a growing prefix from
+ * 0, and wrong the moment island extraction lands SCATTERED PATCHES:
+ *
+ * ```text
+ *   island A  3019s..3574s     (20-c:137, 2997B from byte 509 MB)
+ *   HOLE      3574s..7543s     <- 3969 seconds with no cues at all
+ *   island B  7543s..7574s     (20-c:185,  534B from byte 1341 MB)
+ * ```
+ *
+ * `lastCueEnd` was 7574, so every BACKWARD seek into the hole (6377s, 5421s,
+ * 3109s, 3278s, 2292s, 3328s, 3169s — 20-c) evaluated `playhead > 7574 + grace`
+ * as false and the request was never sent. The backend logs show nothing after
+ * 17:24:18: the frontend gated it before the fetch.
+ *
+ * `mergeCues` already carries the rule this violated — "Coverage is an interval
+ * set, and a max cannot describe it". So ask the interval-set question instead:
+ * IS THERE A CUE COVERING THE PLAYHEAD? A gap in the middle is now as re-extractable
+ * as a gap past the end.
+ *
+ * `cues` is optional so existing callers that only have a `lastCueEnd` keep
+ * working (and keep the old prefix-shaped semantics).
+ * Pure + exported for testing.
+ */
+export const SUB_COVERAGE_GRACE_S = 90;
+export function shouldReExtractSub(
+  playheadS: number,
+  lastCueEndS: number | null,
+  isFullyCovered: boolean,
+  graceS: number = SUB_COVERAGE_GRACE_S,
+  cues?: readonly { startTime: number; endTime: number }[] | null,
+): boolean {
+  if (isFullyCovered) return false;            // whole file extracted — nothing to gain
+  if (!Number.isFinite(playheadS) || playheadS < 0) return false;
+
+  // Interval-set path: a cue whose span contains the playhead (± grace) means
+  // this region IS covered, wherever it sits relative to the last cue.
+  if (cues && cues.length > 0) {
+    for (const c of cues) {
+      if (playheadS >= c.startTime - graceS && playheadS <= c.endTime + graceS) {
+        return false;
+      }
+    }
+    return true;                               // inside a hole, or past the end
+  }
+
+  if (lastCueEndS == null) return true;        // no cues at all → always worth a try
+  return playheadS > lastCueEndS + graceS;     // playhead has outrun the cues
+}
+
+/**
+ * Round-14 F4: should a FAILED subtitle extraction be reported to the user?
+ *
+ * `origin` is the provenance of the request:
+ *   - `'user'` — a click on the subtitle row. Always report. Round-10b fixed a
+ *     silently-dropped click, and going quiet here would reintroduce it.
+ *   - `'auto'` — the session-restore effect re-applying a persisted choice when
+ *     the file opens. Never toast; surface it passively on the row instead.
+ *
+ * Why 'auto' must be silent (forensics C6, log 14-t:120). At open the extractor
+ * is handed the contiguous 0-prefix. On the round-14 capture that was
+ * 3,670,016 B of a 1,566,651,347 B / 8888.136 s film:
+ *
+ *     3670016 / (1566651347 / 8888.136) = 20.8 seconds
+ *
+ * Inception's first 20.8 s is the beach/waves opening — no dialogue. ZERO cues
+ * is the CORRECT result for that input, so the old toast ("No cues in the
+ * downloaded portion yet — try again as more downloads") was unprompted, wrong
+ * (nothing was stalled), and un-actionable: island mode needs a playhead, and
+ * at open there is none.
+ *
+ * Pure + exported for testing.
+ */
+export function shouldReportSubFailure(origin: 'user' | 'auto'): boolean {
+  return origin === 'user';
+}
+
+/**
+ * Round-10 P1-2: end time of the last cue in a track, or null when empty.
+ * ASS tracks render via jassub from `assContent` and keep `cues` empty, so an
+ * ASS track reports null and is treated as "unknown coverage" — the caller then
+ * relies on the server's partial flag rather than re-extracting on every seek.
+ * Pure + exported for testing.
+ */
+export function lastCueEnd(cues: { endTime: number }[]): number | null {
+  let max: number | null = null;
+  for (const c of cues) {
+    if (Number.isFinite(c.endTime) && (max == null || c.endTime > max)) max = c.endTime;
+  }
+  return max;
+}
+
+/**
+ * Round-15 R-3: merge a freshly extracted cue list into the one already shown.
+ *
+ * The repair path used to do `track.cues = []` then `track.loadText(text)` — an
+ * unconditional REPLACE. That is only safe if every extraction is a superset of
+ * the last one, and under island mode it is not: the island is built around the
+ * CURRENT playhead, so a later extraction legitimately covers a narrower span.
+ * Log 15-c:188 caught it destroying real coverage:
+ *
+ *   [SUBS] repair track 3 attempt 1/6: no-progress — coverage 2300s -> 169s
+ *
+ * The user lost 2131 seconds of subtitles they already had. `classifySubRepairOutcome`
+ * did detect it, but only AFTER the write — detection is not protection.
+ *
+ * Worse, the detector is blind to the common case: an extraction covering
+ * 2100-2400s replacing one covering 0-2300s RAISES `lastCueEnd` (2300 -> 2400),
+ * so it scores `ok` while silently dropping every cue before 2100s. Coverage is
+ * an interval set, and a max cannot describe it.
+ *
+ * Union semantics, deduped on (startTime, endTime, text), sorted by start time.
+ * Merging is monotonic by construction: the result always contains every input
+ * cue, so coverage can never shrink no matter what an extraction returns.
+ *
+ * Pure + exported for testing.
+ */
+export function mergeCues<T extends { startTime: number; endTime: number; text: string }>(
+  existing: readonly T[],
+  incoming: readonly T[],
+): T[] {
+  if (existing.length === 0) return incoming.slice();
+  if (incoming.length === 0) return existing.slice();
+
+  const seen = new Set<string>();
+  const out: T[] = [];
+  // `existing` first so that on an exact-duplicate key the ALREADY-DISPLAYED cue
+  // object wins — avoids swapping live VTTCue instances the renderer may hold.
+  for (const cue of [...existing, ...incoming]) {
+    const key = `${cue.startTime}\u0000${cue.endTime}\u0000${cue.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cue);
+  }
+  out.sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
+  return out;
+}
+
+/**
+ * Round-10b: subtitle-repair circuit breaker + backoff.
+ *
+ * Round-10 shipped auto-repair with an in-flight guard and a 120s-region ledger.
+ * That prevents CONCURRENCY but not REPETITION: when a 120s extraction finishes,
+ * playback has already advanced the playhead into a fresh unattempted region,
+ * which re-arms repair immediately — a sustained ~1 extraction per 120s forever.
+ * Over an 8888s film the ledger permits 74 extractions at ~10 MiB each.
+ *
+ * Thresholds are deliberately tighter than the refill breakers: a subtitle
+ * extraction costs up to a 120s backend timeout and gigabytes of reads (4.34 GiB
+ * observed for zero subtitles), so evidence is far more expensive to gather here
+ * than in a refill retry loop.
+ */
+export const SUB_REPAIR_MAX_ATTEMPTS = 6;
+export const SUB_REPAIR_FAILURE_THRESHOLD = 3;
+/**
+ * Round-17: how many consecutive `deferred` verdicts to tolerate before treating
+ * the situation as genuinely stuck and falling back to the failure ladder.
+ *
+ * Derived from the logged recovery, not chosen for roundness: 17-t.md:213
+ * declined at 12:02:51 and :217 served a usable island at 12:02:58 — SEVEN
+ * seconds. At the ~5s defer retry that is 1-2 defers for a normal far seek.
+ * 12 gives ~60s of patience, an order of magnitude over the observed case,
+ * while still terminating for a download that will never reach the playhead.
+ */
+export const SUB_REPAIR_MAX_DEFERS = 12;
+/** Retry delay after a `deferred` verdict. Short by design: the whole point is
+ *  that bytes ARE arriving, so the next attempt should ride the next few MB in.
+ *  Compare SUB_REPAIR_BACKOFF_BASE_MS (150s) which is for a stuck extractor. */
+export const SUB_REPAIR_DEFER_RETRY_MS = 5_000;
+/** > the backend's 120s extraction timeout, so even a worst-case hang cannot
+ *  sustain a 100% duty cycle (the 120s timeout vs 120s region resonance). */
+export const SUB_REPAIR_BACKOFF_BASE_MS = 150_000;
+export const SUB_REPAIR_BACKOFF_CAP_MS = 1_800_000;
+
+/** Per-(file, track) breaker state. Must stay JSON round-trippable — it is
+ *  persisted so "this file's subtitles are broken" survives a file switch. */
+export interface SubRepairBreakerState {
+  /** Consecutive `failed` | `no-progress` outcomes. Zeroed by `ok` or `progress`. */
+  consecutiveFailures: number;
+  /** TOTAL attempts for this (file, track), all outcomes. Enforces the ceiling. */
+  attempts: number;
+  /** `Date.now()` when the last attempt STARTED — not finished. Measuring from
+   *  start is what breaks the 120s-timeout / 120s-region resonance. */
+  lastAttemptStartedAtMs: number;
+  /** Once tripped, only the reset conditions close it — never a bare timer. */
+  open: boolean;
+  /** Cache frontier at the last attempt: the "something changed" signal. */
+  lastFrontierBytes: number | null;
+  /**
+   * Round-17: consecutive `deferred` verdicts (frontier grew, but the region the
+   * viewer is in still isn't cached). Deliberately NOT folded into `attempts` —
+   * a defer is not a failed attempt and must not burn the repair budget — but it
+   * MUST be bounded on its own, or a download that advances forever without ever
+   * reaching the playhead defers forever. Bounded by SUB_REPAIR_MAX_DEFERS.
+   *
+   * Optional for backward compatibility: this state is PERSISTED, so states
+   * written before round-17 come back without the field.
+   */
+  consecutiveDefers?: number;
+}
+
+export function pendingSubSelectionAfterLoad(
+  pendingIdx: number | null,
+  completedIdx: number,
+): number | null {
+  return pendingIdx != null && pendingIdx !== completedIdx ? pendingIdx : null;
+}
+
+export type SubRepairOutcome = 'ok' | 'progress' | 'no-progress' | 'failed' | 'deferred';
+/**
+ * Classify one completed repair from CUE-LIST ground truth.
+ *
+ * `res.partial` is deliberately NOT an input: a truncated or aborted read that
+ * still GREW coverage is `progress`, not a failure. Verified — a read that died
+ * with `Error number -10053` mid-transfer still produced 8 correct cues.
+ *
+ * ASS/SSA tracks (round-16): jassub renders them from `assContent` and `cues`
+ * stays EMPTY by design, so `lastCueEnd` is `null` before AND after every repair.
+ * Scoring those on the cue list made `shouldReExtractSub(playhead, null)` return
+ * true forever and dropped every ASS repair straight through to `'no-progress'`
+ * — even when the extraction had just returned perfectly good subtitle text
+ * (log 16-c:213/:267, `coverage nones → nones` after a 956-char success). That
+ * burned the 6-attempt budget and then disabled repair for the file.
+ *
+ * For those tracks the honest ground truth is the CONTENT LENGTH: it grew ⇒
+ * progress, it is the same ⇒ nothing more to gain right now (`ok`, not a
+ * failure — there is no evidence anything is broken). Pass `beforeS`/`afterS`
+ * as `null` and supply `assBeforeLen`/`assAfterLen` instead.
+ *
+ * Round-17: a 204 decline carrying `empty-partial` is ambiguous on its own — it
+ * can mean "the extractor is broken" or "the bytes for this region simply have
+ * not arrived yet". Scoring both as `failed` is what made the logged bug
+ * permanent: 17-t.md:213 declined at playhead 572,016,605 and :217 served a
+ * 31.1 MiB island CONTAINING that playhead seven seconds later, but the failure
+ * ladder had already committed to 150s → 300s → breaker open.
+ *
+ * The frontier disambiguates it. `X-Subs-Frontier` reports how far the
+ * contiguous cache reached; if it GREW since the last attempt, bytes are still
+ * landing and the right verdict is `'deferred'` — retry soon, spend no failure
+ * budget. If it did not move, nothing is arriving and `'failed'` is honest.
+ *
+ * Pure + exported for testing.
+ */
+export function classifySubRepairOutcome(
+  beforeS: number | null,
+  afterS: number | null,
+  playheadS: number,
+  hadError: boolean,
+  isFullyCovered: boolean,
+  graceS: number = SUB_COVERAGE_GRACE_S,
+  assBeforeLen: number | null = null,
+  assAfterLen: number | null = null,
+  lastFrontierBytes: number | null = null,
+  currentFrontierBytes: number | null = null,
+  cuesAfter: readonly { startTime: number; endTime: number }[] | null = null,
+  cuesBeforeCount: number | null = null,
+): SubRepairOutcome {
+  if (hadError) {
+    // Growth ⇒ the cache is still filling toward this region: defer, don't fail.
+    if (
+      currentFrontierBytes != null &&
+      lastFrontierBytes != null &&
+      currentFrontierBytes > lastFrontierBytes
+    ) {
+      return 'deferred';
+    }
+    return 'failed';
+  }
+
+  // ASS/SSA: no cue list exists, so judge by extracted content instead.
+  if (assAfterLen != null) {
+    if (assAfterLen === 0) return 'no-progress';        // nothing came back
+    if (assBeforeLen == null || assAfterLen > assBeforeLen) return 'progress';
+    // Same content as last time: the extractor has given us all it can for now.
+    // Not a failure — reporting it as one is what tripped the breaker.
+    return 'ok';
+  }
+
+  // Reuse the SHIPPED coverage predicate so the trigger and the verdict can
+  // never disagree about what "covers the playhead" means.
+  //
+  // Round-20: the trigger now passes cue INTERVALS, so this must too — otherwise
+  // a backward-seek repair that correctly filled a hole would be scored against
+  // the old `lastCueEnd` rule and mislabelled. `cuesAfter` is optional; when it
+  // is absent both sides fall back to the same prefix-shaped comparison.
+  if (!shouldReExtractSub(playheadS, afterS, isFullyCovered, graceS, cuesAfter)) return 'ok';
+  // A repair that ADDED cues is progress even if the playhead still is not
+  // covered — the extractor is converging, not stuck.
+  if (cuesAfter && cuesBeforeCount != null && cuesAfter.length > cuesBeforeCount) return 'progress';
+  if (afterS != null && (beforeS == null || afterS > beforeS)) return 'progress';
+  return 'no-progress';
+}
+
+/** Exponential backoff for the NEXT attempt, measured from attempt START.
+ *  Clamp shape mirrors `computeRefillChainDelay`. Pure + exported for testing. */
+export function computeSubRepairBackoffMs(
+  consecutiveFailures: number,
+  baseMs: number = SUB_REPAIR_BACKOFF_BASE_MS,
+  capMs: number = SUB_REPAIR_BACKOFF_CAP_MS,
+): number {
+  if (consecutiveFailures <= 0) return 0;
+  return Math.min(capMs, baseMs * Math.pow(2, consecutiveFailures - 1));
+}
+
+/**
+ * Breaker reducer. Returns a NEW state; never mutates `prev`.
+ *
+ * ORDERING IS LOAD-BEARING: the frontier-growth reset clears STALE pre-growth
+ * failure history FIRST, then this attempt is scored on its own merits. Scoring
+ * first and resetting after would discard the failure of an attempt made WITH
+ * the new frontier — real evidence — and a frontier that grows on every attempt
+ * could then zero the counter forever.
+ *
+ * Pure + exported for testing (`nowMs` injected, so no fake timers needed).
+ */
+export function reduceSubRepairBreaker(
+  prev: SubRepairBreakerState,
+  outcome: SubRepairOutcome,
+  nowMs: number,
+  frontierBytes: number | null,
+  failureThreshold: number = SUB_REPAIR_FAILURE_THRESHOLD,
+  maxDefers: number = SUB_REPAIR_MAX_DEFERS,
+): SubRepairBreakerState {
+  let { consecutiveFailures: f, attempts: a, open, lastFrontierBytes: lf } = prev;
+  let d = prev.consecutiveDefers ?? 0;
+  if (frontierBytes != null && lf != null && frontierBytes > lf) {
+    f = 0;
+    open = false;
+  }
+  if (outcome === 'ok') {
+    return {
+      consecutiveFailures: 0, attempts: 0, lastAttemptStartedAtMs: nowMs,
+      open: false, lastFrontierBytes: frontierBytes ?? lf, consecutiveDefers: 0,
+    };
+  }
+  if (outcome === 'progress') {
+    f = 0;            // converging: reset the failure counter
+    a += 1;           // but the attempt budget is still spent
+    d = 0;            // and we are no longer merely waiting on bytes
+  } else if (outcome === 'deferred' && d + 1 < maxDefers) {
+    // Round-17: the frontier grew but the viewer's region still isn't cached.
+    // Spend NEITHER failure nor attempt budget — this is not a failed attempt,
+    // it is "not yet". Bounded by `maxDefers` so a download that advances
+    // forever without reaching the playhead cannot defer forever; once the
+    // budget is out this falls through to the failure arm below.
+    d += 1;
+  } else {
+    f += 1;
+    a += 1;
+    d = 0;
+    open = f >= failureThreshold;
+  }
+  return {
+    consecutiveFailures: f, attempts: a, lastAttemptStartedAtMs: nowMs,
+    open, lastFrontierBytes: frontierBytes ?? lf, consecutiveDefers: d,
+  };
+}
+
+/** Fresh breaker state for a (file, track) never attempted before. */
+export function emptySubRepairBreakerState(): SubRepairBreakerState {
+  return {
+    consecutiveFailures: 0, attempts: 0, lastAttemptStartedAtMs: 0,
+    open: false, lastFrontierBytes: null, consecutiveDefers: 0,
+  };
+}
+
+/**
+ * Round-27: clear the time-based penalties when the viewer seeks to a region the
+ * breaker has never judged.
+ *
+ * The ladder is per (file, track), but a failure is only ever evidence about the
+ * REGION it was attempted in. 26-c: a repair failed at coverage 2043s, earning a
+ * 150s backoff; the viewer then seeked to 3349s and subtitles stayed dead for the
+ * rest of the session, because the gate was still counting down a penalty earned
+ * ~1300s of content away.
+ *
+ * Clears `consecutiveFailures`, `consecutiveDefers` and the backoff clock, and
+ * closes a breaker that a bare timer would never have closed. Deliberately keeps
+ * `attempts`: the per-file ceiling is a cost bound, not a region verdict, so
+ * seeking cannot be used to buy unlimited repair attempts.
+ */
+export function resetSubRepairBreakerForSeek(
+  prev: SubRepairBreakerState,
+): SubRepairBreakerState {
+  return {
+    ...prev,
+    consecutiveFailures: 0,
+    consecutiveDefers: 0,
+    lastAttemptStartedAtMs: 0,
+    open: false,
+  };
+}
+
+/**
+ * Master gate: may a repair attempt start right now?
+ *
+ * Composes with — does not replace — the in-flight ref and the region ledger.
+ * `isManual: true` bypasses the breaker entirely: a human click is an explicit
+ * request, not a runaway, and the user must always be able to force a retry.
+ * Pure + exported for testing.
+ */
+export function shouldAttemptSubRepair(
+  state: SubRepairBreakerState,
+  nowMs: number,
+  isManual: boolean,
+  maxAttempts: number = SUB_REPAIR_MAX_ATTEMPTS,
+  deferRetryMs: number = SUB_REPAIR_DEFER_RETRY_MS,
+): boolean {
+  if (isManual) return true;
+  if (state.open) return false;
+  if (state.attempts >= maxAttempts) return false;
+  // Round-17: `deferred` retries immediately (within ~5s), not on the failure ladder.
+  const d = state.consecutiveDefers ?? 0;
+  const waitMs = d > 0 ? deferRetryMs : computeSubRepairBackoffMs(state.consecutiveFailures);
+  return nowMs - state.lastAttemptStartedAtMs >= waitMs;
 }
 
 /**
@@ -1831,6 +2275,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const mpegtsDurationRef = useRef<number>(0); // Duration from metadata for mpegts.js
   const proactivePrebufferMsgIdRef = useRef<number>(0); // msg_id being proactively prebuffered
   const proactiveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // 10s position reporting interval
+  const mkvProactiveRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const independentPrebufferRef = useRef<{
     abortController: AbortController | null;
     active: boolean;
@@ -1881,12 +2326,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Streaming chain generation — incremented when chain is stopped/started
   // so ongoing async refills can bail out if superseded by a new seek.
   const streamingChainGenRef = useRef(0);
-  // MKV disk-cache warmer (mirrors MP4's downloadLoop for the GREEN BAR only):
-  // a sequential 0→EOF Range walk over /stream that warms the SAME disk cache
-  // mediabunny reads from, so the prebuffer bar fills contiguously to EOF.
-  // Generation ref lets an in-flight warmer bail when a new file/teardown starts.
-  const mkvWarmerGenRef = useRef(0);
-  const mkvWarmerActiveRef = useRef(false);
+
   // ── Layer-3 MKV fatal reroute state ──
   // Re-entrancy latch: a reroute is in flight (R1 — double-fatal from the same
   // dying pipeline must not start two recoveries).
@@ -2094,6 +2534,60 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const [byteHi, timeHi] = table[hi];
     if (byteHi === byteLo) return timeLo;
     return timeLo + (timeHi - timeLo) * (bytePos - byteLo) / (byteHi - byteLo);
+  }, []);
+
+  /** Round-19: inverse of `byteToTime` — convert a TIME to a real byte offset
+   *  using the same VBR calibration table.
+   *
+   *  The subtitle request needs this. It used to send `(t / duration) * fileLength`,
+   *  a linear CBR guess, and on a VBR file that guess lands in the wrong place:
+   *
+   *    19-t:275  playhead_byte 403,532,396 (linear estimate for t=1613s)
+   *              prefix ends    13,631,488
+   *              -> 372 MiB gap -> "no usable island" -> 204 -> 150s backoff
+   *
+   *  Predestination runs 250,115 B/s on average but is far from constant, so the
+   *  linear estimate for 1613s overshot the true cluster byte and the island
+   *  picker was handed a position the viewer was never at. The anchors in
+   *  `byteToTimeTableRef` are ground truth (real cluster bytes harvested from
+   *  seeks, bisect probes, and the MKV cue index), so inverting them puts the
+   *  request where the viewer actually is.
+   *
+   *  Falls back to the linear estimate when no anchors exist yet (cold open) —
+   *  same behaviour as before, no regression. */
+  const timeToByte = useCallback((timeSec: number): number => {
+    const flen = state.current.fileLength;
+    const dur = state.current.duration;
+    if (!Number.isFinite(timeSec) || timeSec < 0 || flen <= 0) return -1;
+    const linear = (dur > 0)
+      ? Math.max(0, Math.min(flen - 1, Math.floor((timeSec / dur) * flen)))
+      : -1;
+    const table = byteToTimeTableRef.current;
+    if (table.length < 2) return linear;
+    // Table is sorted + strictly increasing in BOTH axes (enforced by the
+    // monotonicity guard in recordByteTimeAnchor), so a time-keyed binary
+    // search is valid on the same array.
+    if (timeSec <= table[0][1]) return table[0][0];
+    if (timeSec >= table[table.length - 1][1]) {
+      // Past the last anchor: extrapolate along the LOCAL rate of the final
+      // segment rather than the file mean — VBR tails differ a lot from it.
+      const [bLast, tLast] = table[table.length - 1];
+      const [bPrev, tPrev] = table[table.length - 2];
+      const rate = (tLast > tPrev) ? (bLast - bPrev) / (tLast - tPrev) : 0;
+      if (rate <= 0) return linear;
+      return Math.max(0, Math.min(flen - 1, Math.floor(bLast + (timeSec - tLast) * rate)));
+    }
+    let lo = 0, hi = table.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (table[mid][1] <= timeSec) lo = mid;
+      else hi = mid;
+    }
+    const [byteLo, timeLo] = table[lo];
+    const [byteHi, timeHi] = table[hi];
+    if (timeHi === timeLo) return byteLo;
+    const interpolated = byteLo + (byteHi - byteLo) * (timeSec - timeLo) / (timeHi - timeLo);
+    return Math.max(0, Math.min(flen - 1, Math.floor(interpolated)));
   }, []);
 
   /** Record a real (byteOffset, time) calibration anchor from a transmuxer seek
@@ -2487,9 +2981,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         clearInterval(proactiveIntervalRef.current);
         proactiveIntervalRef.current = null;
       }
-      // Stop the MKV disk warmer (bump generation → in-flight loop bails).
-      mkvWarmerGenRef.current++;
-      mkvWarmerActiveRef.current = false;
+      if (mkvProactiveRetryTimerRef.current !== null) {
+        clearTimeout(mkvProactiveRetryTimerRef.current);
+        mkvProactiveRetryTimerRef.current = null;
+      }
+
       // Revoke blob URL on cleanup (always the currently active one)
       const currentBlobUrl = blobUrlRef.current;
       if (currentBlobUrl) {
@@ -2598,9 +3094,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       clearInterval(proactiveIntervalRef.current);
       proactiveIntervalRef.current = null;
     }
-    // Stop the MKV disk warmer (bump generation → in-flight loop bails).
-    mkvWarmerGenRef.current++;
-    mkvWarmerActiveRef.current = false;
+    if (mkvProactiveRetryTimerRef.current !== null) {
+      clearTimeout(mkvProactiveRetryTimerRef.current);
+      mkvProactiveRetryTimerRef.current = null;
+    }
+
   };
 
   /** Calculate how many seconds of video are buffered ahead of current playback.
@@ -2731,13 +3229,37 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     executeStreamingRefill();
   };
 
-  const stopStreamingChain = () => {
+  /** Stop the refill chain.
+   *
+   *  `hard` (round-24) additionally kills the stream source's IN-FLIGHT HTTP
+   *  reads via `interruptSeek()` instead of the flag-only `abortSeek()`.
+   *
+   *  Why it is opt-in rather than the default: the generation bump below only
+   *  takes effect when the refill loop reaches its next check, so an 8 MiB read
+   *  already on the wire runs to completion — and because a completed sequential
+   *  read re-arms `startPrefetch`, the chain keeps issuing NEW 8 MiB requests for
+   *  a position the user has left. Measured (11:57:11 seek to t=1494.6s): five
+   *  stale `source_id=playback` reads walked 30.0 -> 44.5 MiB over 18s while the
+   *  viewer sat at 208.5 MiB, starving the bisect probes to 3-4s apart.
+   *
+   *  But `stopStreamingChain()` is ALSO called from `startStreamingChain()`
+   *  itself (init) and from effect cleanup. Condemning the source there would
+   *  abort a cold start, so those callers keep the soft behaviour. Only genuine
+   *  position changes — user seek, audio switch, tier reroute — pass hard=true.
+   */
+  const stopStreamingChain = (hard = false) => {
     streamingChainGenRef.current++;
     refillTimerRef.current = null;
     refillInProgressRef.current = false;
-    // Abort ongoing refill iteration in MediabunnyTransmuxer
-    transmuxerRef.current?.abortSeek();
-    console.log('[MSE] Streaming chain stopped', new Error('STACK').stack?.split('\n').slice(1, 5).join('\n'));
+    // Abort ongoing refill iteration in MediabunnyTransmuxer. interruptSeek()
+    // sets the same abort flag AND calls streamSource.abortInFlight(), so the
+    // stale read stops instead of completing and re-arming its prefetch.
+    if (hard) {
+      transmuxerRef.current?.interruptSeek?.();
+    } else {
+      transmuxerRef.current?.abortSeek();
+    }
+    console.log(`[MSE] Streaming chain stopped${hard ? ' (hard — in-flight reads aborted)' : ''}`, new Error('STACK').stack?.split('\n').slice(1, 5).join('\n'));
   };
 
   /** Execute a streaming refill — continuation or discontinuity mode.
@@ -2845,9 +3367,25 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       bufferingForSeekRef.current = true;
       seekBufferRef.current = [];
 
+      let progressiveRefill = false;
+
       // seekTo creates a fresh Input with the persistent TauriStreamSource,
       // guaranteeing a clean demuxer state that can iterate from any position.
-      const keyframeTimestamp = await transmuxer.seekTo(refillPosition, maxDuration, { skipInitSegment: skipInit, stopTime });
+      const keyframeTimestamp = await transmuxer.seekTo(refillPosition, maxDuration, {
+        skipInitSegment: skipInit,
+        stopTime,
+        onResolved: async (resolvedTimestamp) => {
+          if (chainGeneration !== streamingChainGenRef.current) return;
+          evictOldBuffer();
+          seekOffsetRef.current = resolvedTimestamp;
+          await sb.setTimestampOffset(resolvedTimestamp);
+          const sbA = state.current.audioSourceBuffer;
+          if (sbA) await sbA.setTimestampOffset(resolvedTimestamp);
+          if (chainGeneration !== streamingChainGenRef.current) return;
+          progressiveRefill = true;
+          bufferingForSeekRef.current = false;
+        },
+      });
 
       if (Number.isFinite(stopTime) && keyframeTimestamp !== null) {
         console.log(`[MSE] Abutting refill: seekKf=${keyframeTimestamp.toFixed(3)}s bufEnd=${refillPosition.toFixed(3)}s stopKf=${stopTime.toFixed(3)}s overlap=${(refillPosition - keyframeTimestamp).toFixed(3)}s`);
@@ -2981,13 +3519,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }
 
       if (keyframeTimestamp !== null) {
-        evictOldBuffer();
-        const tsOffset = keyframeTimestamp;
-        seekOffsetRef.current = tsOffset;
-        await sb.setTimestampOffset(tsOffset);
         const sbA = state.current.audioSourceBuffer;
-        if (sbA) await sbA.setTimestampOffset(tsOffset);
-
         const buffer = seekBufferRef.current;
         seekBufferRef.current = [];
         let segmentCount = 0;
@@ -3008,7 +3540,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           }
         }
 
-        console.log(`[MSE] Discontinuity refill: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${segmentCount} segments`);
+        console.log(`[MSE] ${progressiveRefill ? 'Progressive' : 'Discontinuity'} refill: keyframe=${keyframeTimestamp.toFixed(2)}s, flushed ${segmentCount} buffered segments`);
         await sb.waitForQueueDrain();
         if (sbA) await sbA.waitForQueueDrain();
 
@@ -4864,8 +5396,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       bufferingForSeekRef.current = false;
       zeroAudioWindowsRef.current = 0;
       nullRefillCountRef.current = 0;
-      mkvWarmerGenRef.current++;          // in-flight warmer loop bails at next gen check
-      mkvWarmerActiveRef.current = false;
+
       try { transmuxer.dispose(); } catch (_) {} // aborts in-flight seekTo (expected-error filtered)
       transmuxerRef.current = null;
       setIsTransmuxerActive(false);
@@ -6207,14 +6738,55 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    * tracks ('empty', or 'empty-partial' when the prefix just doesn't hold cues
    * YET), 429 extraction in-flight (single retry after Retry-After), C0-byte
    * mangling (E8 strip).
+   *
+   * Round-17: every arm also carries `frontier` — the backend's contiguous cache
+   * frontier in bytes (`X-Subs-Frontier`), or null when the header is absent.
+   * The breaker's growth-reset arm (`reduceSubRepairBreaker`) needs a
+   * byte-accurate frontier to distinguish "declined, but bytes are still
+   * arriving" from "declined, and nothing is moving". Before this the call site
+   * passed a hardcoded `null` and that arm was dead code.
    */
   const fetchEmbeddedSubText = useCallback(async (
     streamIdx: number,
-  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean }> => {
+  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean; frontier: number | null } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean; frontier: number | null }> => {
     const url = streamUrlRef.current;
     const parsed = url ? parseStreamUrl(url) : null;
-    if (!parsed) return { error: 'failed' };
-    const endpoint = `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/track/${streamIdx}?token=${encodeURIComponent(parsed.token)}`;
+    if (!parsed) return { error: 'failed', frontier: null };
+    // Round-10 P1-1: tell the backend WHERE THE VIEWER IS so extraction reads the
+    // cached island around the playhead instead of the contiguous-from-0 prefix.
+    // Without this, a seek-first session gets cues for the wrong part of the film
+    // (frontier froze at 196s of an 8888s film while watching at 4500s → nothing
+    // could render).
+    //
+    // Round-19: this used to be the LINEAR time/duration ratio, and the comment
+    // claimed the picker "only needs to land in the right cached RANGE, not on an
+    // exact byte". That is true — and the linear estimate does not land in the
+    // right range on a VBR file. Predestination (19-t:275): t=1613s estimated to
+    // byte 403,532,396 while the cache held 0-13,631,488, so the backend saw a
+    // 372 MiB gap, declined with 204, and subtitles never came back. `timeToByte`
+    // inverts the ground-truth anchor table instead, and degrades to exactly this
+    // linear formula while the table is still empty.
+    const t = videoRef.current?.currentTime ?? 0;
+    const mapped = (Number.isFinite(t) && t > 0) ? timeToByte(t) : -1;
+    const playheadByte = mapped >= 0 ? mapped : null;
+    // Round-19: log BOTH mappings so a future log shows the VBR error directly
+    // instead of requiring it to be re-derived by hand.
+    if (playheadByte != null) {
+      const flen = state.current.fileLength;
+      const dur = state.current.duration;
+      const linear = (dur > 0 && flen > 0)
+        ? Math.floor((t / dur) * flen)
+        : -1;
+      const anchors = byteToTimeTableRef.current.length;
+      diagLog(
+        `[SUBS] track ${streamIdx} playhead t=${t.toFixed(0)}s -> byte ${playheadByte}` +
+        (linear >= 0 && linear !== playheadByte
+          ? ` (linear would be ${linear}, VBR delta ${((playheadByte - linear) / 1048576).toFixed(1)}MiB, ${anchors} anchors)`
+          : ` (${anchors} anchors)`),
+      );
+    }
+    const endpoint = `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/track/${streamIdx}?token=${encodeURIComponent(parsed.token)}`
+      + (playheadByte != null ? `&playhead_byte=${playheadByte}` : '');
     try {
       let resp = await fetch(endpoint);
       if (resp.status === 429) {
@@ -6226,27 +6798,45 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       if (resp.status === 204) {
         // Round-9 I-5: X-Subs-Unchanged = the backend frontier gate replayed a
         // memoized result (cache front hasn't advanced since the last attempt).
+        // Round-17: X-Subs-Frontier carries the byte frontier (current_frontier
+        // from server.rs:6536) so the breaker's growth-reset arm can tell "bytes
+        // are still arriving" from "genuinely broken". Parse it on every 204.
+        const frontierRaw = resp.headers.get('X-Subs-Frontier');
+        const frontier = frontierRaw != null ? Number(frontierRaw) : null;
         return {
           error: resp.headers.get('X-Subs-Partial') === '1' ? 'empty-partial' : 'empty',
           unchanged: resp.headers.get('X-Subs-Unchanged') === '1',
+          frontier: Number.isFinite(frontier) ? frontier : null,
         };
       }
       if (!resp.ok) {
         diagLog(`[SUBS] track ${streamIdx} extraction failed (HTTP ${resp.status})`);
-        return { error: 'failed' };
+        return { error: 'failed', frontier: null };
       }
       const format = resp.headers.get('X-Subs-Format') === 'ass' ? 'ass' as const : 'srt' as const;
-      const partial = resp.headers.get('X-Subs-Partial') === '1';
+      // Round-10 P1-3: X-Subs-Coverage:full is an explicit "whole file extracted"
+      // declaration from the disk-cache path. Without it, a replayed body arrived
+      // with NO coverage header, the frontend inferred partial=false, and the
+      // re-extract branch could never fire again for that file — the permanent
+      // dead end from session A. `partial` now means "coverage is NOT known-full".
+      const coverageFull = resp.headers.get('X-Subs-Coverage') === 'full';
+      const partial = coverageFull ? false : resp.headers.get('X-Subs-Partial') === '1';
+      const okFrontierRaw = resp.headers.get('X-Subs-Frontier');
+      const okFrontierNum = okFrontierRaw != null ? Number(okFrontierRaw) : null;
+      const okFrontier = Number.isFinite(okFrontierNum) ? okFrontierNum : null;
       const raw = await resp.text();
       const text = stripControlChars(raw);
-      if (!text.trim()) return { error: partial ? 'empty-partial' : 'empty' };
+      if (!text.trim()) return { error: partial ? 'empty-partial' : 'empty', frontier: okFrontier };
       diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${partial ? ', partial' : ''})`);
-      return { text, format, partial };
+      return { text, format, partial, frontier: okFrontier };
     } catch (e: any) {
       diagLog(`[SUBS] track ${streamIdx} fetch error: ${e?.message}`);
-      return { error: 'failed' };
+      return { error: 'failed', frontier: null };
     }
-  }, []);
+    // Round-19: `timeToByte` is a dependency now. It is itself `useCallback([])`
+    // and reads the anchor table through a ref, so this stays stable — but
+    // listing it keeps the closure honest if that ever changes.
+  }, [timeToByte]);
 
   /** Build the /subtitles font URLs for the current file (jassub `fonts` opt). */
   const getEmbeddedSubFontUrls = useCallback((): string[] => {
@@ -6434,7 +7024,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // supersession check sits immediately after the await; setTimestampOffset MUST
     // precede the append loop (wrapper applies offset on queue drain).
     const seekGen = ++transmuxerSeekGenRef.current;
-    stopStreamingChain();
+    // Round-24: hard stop. This is a real position/track change, so the in-flight
+    // refill read must die rather than complete and re-arm its 8 MiB prefetch.
+    // Safe with the documented ordering ("stopStreamingChain MUST precede
+    // seekTo"): seekTo re-condemns on entry and releases in its finally.
+    stopStreamingChain(true);
     refillInProgressRef.current = false;
     nullRefillCountRef.current = 0; // breaker: rebuild = fresh chain
     burstBufferRef.current = [];
@@ -7010,8 +7604,13 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // the ONLY trigger that starts/slides the proactive task; without it the
       // task keeps filling the disk cache from wherever the initial bootstrap
       // left off (front of file) instead of racing ahead of the new seek point.
-      // Use a linear byte estimate: VBR correction isn't available here, but
-      // it's close enough to steer the downloader to the right region.
+      // Round-27: use the VBR anchor table, not a linear estimate. The old
+      // comment claimed "VBR correction isn't available here" — it is;
+      // timeToByte() lives in this same hook and inverts byteToTimeTableRef.
+      // On a 1.46GB VBR MKV the linear estimate was 10.3MB past the true
+      // cluster byte (26-c:89 bisect=341,002,649 vs reported 351,267,118),
+      // which both drew the prebuffer bar ~12s behind the seek point and
+      // handed the subtitle island picker a position the viewer was never at.
       if (!isPausedRef.current) {
         const _fileId = file?.id;
         const _folderId = activeFolderId; // null = "home" — backend accepts Option
@@ -7019,7 +7618,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         const _dur = mpegtsDurationRef.current || state.current.duration || 0;
         if (_fileId && _fileSize > 0 && _dur > 0) {
           proactivePrebufferMsgIdRef.current = _fileId;
-          const seekByte = Math.round((timeSeconds / _dur) * _fileSize);
+          const _linearByte = Math.round((timeSeconds / _dur) * _fileSize);
+          const _vbrByte = timeToByte(timeSeconds);
+          const seekByte = (_vbrByte >= 0) ? _vbrByte : _linearByte;
           invoke('cmd_report_playback_position', {
             messageId: _fileId,
             folderId: _folderId,
@@ -7030,13 +7631,68 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
             playbackRate: 1.0,
             byteOffset: seekByte,
           }).catch(() => {});
-          diagLog(`[MPEGTS] Remux seek: reported position to proactive (byte ${seekByte}, t=${timeSeconds.toFixed(1)}s)`);
+          diagLog(`[MPEGTS] Remux seek: reported position to proactive (byte ${seekByte}, t=${timeSeconds.toFixed(1)}s`
+            + (_vbrByte >= 0
+              ? `, VBR delta ${((_vbrByte - _linearByte) / 1048576).toFixed(1)}MiB vs linear, ${byteToTimeTableRef.current.length} anchors)`
+              : `, linear — no anchors yet)`));
         }
       }
     } catch (e: any) {
       diagLog(`[MPEGTS] Remux-seek recreation failed: ${e.message}`);
       (window as any).__nobuf_userSeekInProgress = false;
     }
+  };
+
+  /** Start the backend's single MKV disk warmer from a known playback byte.
+   * A seek report can be rejected while a seek-bisect probe is still fresh;
+   * bounded retries keep that one-shot trigger from killing post-seek fetching. */
+  const reportMkvProactivePosition = (timeSeconds: number, rawByte: number, capturedGen = transmuxerSeekGenRef.current) => {
+    const fileId = file?.id;
+    const folderId = activeFolderId;
+    const fileSize = state.current.fileLength;
+    const duration = state.current.duration;
+    if (!fileId || fileSize <= 0 || duration <= 0 || isPausedRef.current) return;
+    proactivePrebufferMsgIdRef.current = fileId;
+    const byteOffset = computeSeekReportByte(rawByte);
+    const maxAttempts = 4;
+    const retryDelays = [1200, 2500, 5000, 9000];
+
+    const report = async (attempt: number): Promise<void> => {
+      if (formatRef.current !== 'mkv' || capturedGen !== transmuxerSeekGenRef.current || isPausedRef.current) return;
+      let accepted = false;
+      try {
+        accepted = await invoke<boolean>('cmd_report_playback_position', {
+          messageId: fileId,
+          folderId,
+          currentTimeS: timeSeconds,
+          durationS: duration,
+          fileSize,
+          isPlayerDownloading: refillInProgressRef.current,
+          playbackRate: videoRef.current?.playbackRate || 1.0,
+          byteOffset,
+        });
+      } catch { /* retry below */ }
+      if (accepted) {
+        console.log(`[MSE] MKV proactive active at byte ${byteOffset} (attempt ${attempt + 1})`);
+        return;
+      }
+      if (!shouldRetryMkvProactiveReport(
+        accepted,
+        attempt,
+        maxAttempts,
+        capturedGen,
+        transmuxerSeekGenRef.current,
+        isPausedRef.current,
+      )) {
+        console.warn(`[MSE] MKV proactive report deferred/exhausted at byte ${byteOffset} (attempt ${attempt + 1})`);
+        return;
+      }
+      mkvProactiveRetryTimerRef.current = setTimeout(() => {
+        mkvProactiveRetryTimerRef.current = null;
+        void report(attempt + 1);
+      }, retryDelays[attempt]);
+    };
+    void report(0);
   };
 
   /**
@@ -7057,123 +7713,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *   within [0, seedData.byteLength] bypass HTTP, eliminating per-request
    *   Tauri/WebView2 round-trips that otherwise make init take 30s+.
    */
-  /**
-   * MKV disk-cache warmer — the green-bar counterpart to MP4's downloadLoop.
-   *
-   * WHY THIS EXISTS (and why it's separate from the transmuxer):
-   * MP4's green bar reaches EOF because its downloadLoop issues SEQUENTIAL Range
-   * requests 0→fileLength against /stream, and every /stream fetch is written to
-   * the backend disk cache (cached_ranges). The MKV path never does a sequential
-   * walk: mediabunny only PULLS scattered cluster bytes for decode, so the disk
-   * cache fills as sparse islands and the bar never marches to EOF.
-   * We CANNOT fix this by widening the transmuxer window — mediabunny's
-   * Conversion.execute() cannot be paused (confirmed: it exposes only
-   * init/execute/cancel + trim{start,end}), so running it far ahead races the
-   * playhead and the eviction backpressure punches permanent holes → stall
-   * (documented at the startStreamingChain prime comment).
-   *
-   * So we mirror MP4 at the layer that actually fills the bar: a sequential
-   * 0→EOF Range walk over /stream that warms the SAME disk cache mediabunny
-   * later reads from (cache hits — no double download). It is fully decoupled
-   * from the transmuxer/Conversion and from the 30s MSE playback buffer.
-   *
-   * COORDINATOR SAFETY: uses a distinct source_id ("warmer") so the backend's
-   * zombie-cancel logic never cross-cancels it against the player's scattered
-   * "playback" seek reads (TauriStreamSource uses source_id "playback"). The
-   * warmer yields (throttles) while the player is actively fetching so playback
-   * always wins the rate-limiter budget.
-   */
-  const startMkvDiskWarmer = (baseStreamUrl: string, startByte: number = 0) => {
-    const gen = ++mkvWarmerGenRef.current;  // supersedes any prior warmer (e.g. after a seek)
-    const fileLen = state.current.fileLength;
-    if (!fileLen || fileLen <= 0) return;
-    // Distinct source_id so the coordinator treats this as its own sequential
-    // download, isolated from the player's "playback" reads.
-    const sep = baseStreamUrl.includes('?') ? '&' : '?';
-    const warmerUrl = `${baseStreamUrl}${sep}source_id=warmer`;
-
-    mkvWarmerActiveRef.current = true;
-    const WARMER_CHUNK = 4 * 1024 * 1024; // 4 MiB sequential chunks
-    // Align start to a chunk boundary so warmed ranges stay chunk-aligned with
-    // the coordinator's download granularity. Arithmetic (not bitwise) — byte
-    // offsets exceed 2^31 (file is 1.76GB), so & would overflow 32-bit ints.
-    const clampedStart = Math.max(0, Math.min(startByte, fileLen - 1));
-    const alignedStart = clampedStart - (clampedStart % WARMER_CHUNK);
-
-    (async () => {
-      let offset = alignedStart;
-      try {
-        while (
-          !cancelledRef.current &&
-          gen === mkvWarmerGenRef.current &&
-          offset < fileLen
-        ) {
-          // Yield to playback: if the player is actively downloading (cold
-          // start / seek / refill fetching), sleep so /stream gets the full
-          // rate-limiter budget. The disk warm is best-effort background work.
-          // Includes transmuxerSeekInProgressRef so the warmer stays throttled
-          // for the ENTIRE seek — including the multi-second transmux iteration
-          // that runs after bufferingForSeekRef flips false (trace-31 fix).
-          if (shouldWarmerYield(
-            state.current.downloading,
-            bufferingForSeekRef.current,
-            transmuxerSeekInProgressRef.current,
-          )) {
-            await new Promise((r) => setTimeout(r, 1000));
-            continue;
-          }
-
-          const end = Math.min(offset + WARMER_CHUNK - 1, fileLen - 1);
-
-          // Skip ranges already on disk so we don't re-request cached bytes.
-          // trackDownloadedRange below still records the range for the bar;
-          // the backend serves cached hits instantly.
-          let resp: Response | null = null;
-          try {
-            resp = await fetch(warmerUrl, { headers: { Range: `bytes=${offset}-${end}` } });
-          } catch {
-            // Transient network/HTTP error — back off and retry same offset.
-            await new Promise((r) => setTimeout(r, 2000));
-            continue;
-          }
-          if (cancelledRef.current || gen !== mkvWarmerGenRef.current) break;
-
-          if (resp.status === 503) {
-            // Backend at max concurrent downloads — retry this offset later.
-            await new Promise((r) => setTimeout(r, 2000));
-            continue;
-          }
-          if (!resp.ok && resp.status !== 206) {
-            // Non-recoverable for this range — stop warming (don't spin).
-            break;
-          }
-
-          const buf = await resp.arrayBuffer();
-          if (cancelledRef.current || gen !== mkvWarmerGenRef.current) break;
-          const got = buf.byteLength;
-          if (got <= 0) {
-            await new Promise((r) => setTimeout(r, 1000));
-            continue;
-          }
-
-          // Warm the green bar with the REAL fetched range (contiguous,
-          // unlike the transmuxer's estimated islands). Disk-cache accounting
-          // happens in the backend at the download site itself.
-          trackDownloadedRange(offset, offset + got - 1);
-
-          offset += got;
-        }
-        if (!cancelledRef.current && gen === mkvWarmerGenRef.current) {
-          diagLog(`[MSE] MKV disk warmer finished at byte ${offset}/${fileLen}`);
-        }
-      } catch (e: any) {
-        if (!cancelledRef.current) diagLog(`[MSE] MKV disk warmer error: ${e?.message ?? String(e)}`);
-      } finally {
-        if (gen === mkvWarmerGenRef.current) mkvWarmerActiveRef.current = false;
-      }
-    })();
-  };
-
   const _initMkvTransmuxerPlayer = async (
     url: string,
     mediaSource: MediaSource,
@@ -7497,12 +8036,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       // On-demand refill loop keeps the buffer topped up (bounded lookahead).
       startStreamingChain();
-
-      // Green-bar parity with MP4: warm the disk cache sequentially to EOF in
-      // the background (separate source_id, yields to playback). This is what
-      // makes the MKV prebuffer bar march to EOF like MP4's, without touching
-      // the bounded MSE playback buffer or the unpausable transmuxer Conversion.
-      if (url) startMkvDiskWarmer(url);
+      reportMkvProactivePosition(0, 0);
     } catch (e: any) {
       bufferingForSeekRef.current = false;
       // Dismiss the overlay on prime failure too — otherwise it hangs until the
@@ -9361,67 +9895,26 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // this one was resolving (5-8s on a cold far jump) — preventing a stale
         // seek from committing currentTime/chain/refill on a PREVIOUS position.
         const seekGen = ++transmuxerSeekGenRef.current;
+        if (mkvProactiveRetryTimerRef.current !== null) {
+          clearTimeout(mkvProactiveRetryTimerRef.current);
+          mkvProactiveRetryTimerRef.current = null;
+        }
         clearDownloadedRanges();
 
-        // Cancel the stale MKV disk warmer NOW, at seek START. WHY HERE (not at
-        // completion): the warmer is repositioned in the seek's .then() block
-        // AFTER the 10-17s transmux iteration — so without this, the pre-seek
-        // warmer (e.g. warming 0-68MB) keeps competing for the throttled pipe
-        // during the ENTIRE iteration, starving the seek's own reads and
-        // inflating iteration to 10-17s (trace-31 root cause). Bumping the gen
-        // makes the in-flight warmer loop bail at its next gen check; the
-        // completion handler starts a fresh warmer at the resolved target. A
-        // superseded seek bails before that reposition (isSeekSuperseded guard),
-        // so no orphan warmer is left at an abandoned position.
-        mkvWarmerGenRef.current++;
-        mkvWarmerActiveRef.current = false;
-
-        // Re-target the backend proactive download to the seek position. Without
-        // this, the Rust prebuffer keeps downloading SEQUENTIALLY from the OLD
-        // playhead while mediabunny's getKeyPacket blocks on cold seek-target
-        // cluster bytes → the 5-29s "prebuffers from wrong place / won't play"
-        // stall. cmd_report_playback_position with an explicit byteOffset makes
-        // the backend detect the playhead jump and re-prioritize (see
-        // [PROACTIVE] "playhead jumped forward … re-evaluating gaps"). We pass the
-        // linear byte estimate for the target time; the backend refines from its
-        // own reads. MKV-only — TS uses its periodic reporter + byte-offset index.
-        {
-          const _fid = file?.id, _folder = activeFolderId, _fsz = state.current.fileLength; // _folder null = "home"
-          if (_fid && _fsz > 0 && state.current.duration > 0) {
-            // Prefer the REAL VBR cluster byte from mediabunny's parsed Cues; fall
-            // back to the linear estimate only if the cue index is unavailable.
-            const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(clampedTime) ?? -1;
-            const rawTargetByte = realByte >= 0
-              ? realByte
-              : Math.floor((clampedTime / state.current.duration) * _fsz);
-            // SEEK-BACKOFF: the proactive download starts forward FROM the byte we
-            // report, and the backend only treats a download as "covering" a read
-            // when download.start_byte <= read.start_byte (stream_cache.rs
-            // find_best_covering_download). But mediabunny's actual first cluster
-            // read lands SLIGHTLY BEFORE the cue's clusterPosition (it parses the
-            // EBML cluster header / element IDs that precede the cue byte — observed
-            // ~88KB earlier: cue=628973912 vs real read=628883456). Reporting the
-            // exact cue byte leaves that prefix permanently uncached: the read falls
-            // through to the cache-poll, the proactive fill never writes those bytes,
-            // and TauriStreamSource empty-retries until the 30s fallback — the seek
-            // hangs with no playback and no prebuffer (proven: trace 19, seek 1256.9s).
-            // Backoff + 0-clamp live in computeSeekReportByte (module scope, round-9).
-            const targetByte = computeSeekReportByte(rawTargetByte);
-            invoke('cmd_report_playback_position', {
-              messageId: _fid,
-              folderId: _folder,
-              currentTimeS: clampedTime,
-              durationS: state.current.duration,
-              fileSize: _fsz,
-              isPlayerDownloading: true,
-              playbackRate: 1.0,
-              byteOffset: targetByte,
-            }).catch(() => {});
-          }
+        // Freeze proactive download while the seek resolves. The seek's first
+        // byte is not known yet; reporting an estimate here makes PROACTIVE
+        // compete with bisect/getKeyPacket on the shared Telegram limiter.
+        const _seekFileId = file?.id;
+        if (_seekFileId) {
+          proactivePrebufferMsgIdRef.current = 0;
+          invoke('cmd_stop_proactive_prebuffer', { messageId: _seekFileId }).catch(() => {});
         }
 
-        // Stop streaming chain — new seek will start its own chain after completion
-        stopStreamingChain();
+        // Stop streaming chain — new seek will start its own chain after completion.
+        // Round-24 hard stop: this is THE user-seek path that produced the 18s
+        // stale ladder. Without aborting in-flight reads the old position keeps
+        // fetching 8 MiB at a time and starves the new seek's bisect probes.
+        stopStreamingChain(true);
         refillInProgressRef.current = false;
         zeroAudioWindowsRef.current = 0; // starvation watchdog: new position, fresh count
         nullRefillCountRef.current = 0; // breaker: new position, fresh count
@@ -9439,7 +9932,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
           // Reset SourceBuffers for seek
           const sbAudio = state.current.audioSourceBuffer;
-          const resetPromises = [sbVideo.resetForSeek()];
+          const resetPromises = [sbVideo.resetForSeekNonBlocking()];
           if (sbAudio) resetPromises.push(sbAudio.resetForSeek());
 
           Promise.all(resetPromises).then(async () => {
@@ -9520,17 +10013,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // entry, generation-gated in bisectSeekTarget) and only after the
               // supersession guard above — a condemned seek can never re-report.
               const bisectAnchor = (transmuxerRef.current as any)?.getLastBisectAnchor?.() ?? null;
-              if (bisectAnchor && file?.id && state.current.fileLength > 0 && state.current.duration > 0) {
-                invoke('cmd_report_playback_position', {
-                  messageId: file.id,
-                  folderId: activeFolderId,
-                  currentTimeS: clampedTime,
-                  durationS: state.current.duration,
-                  fileSize: state.current.fileLength,
-                  isPlayerDownloading: true,
-                  playbackRate: 1.0,
-                  byteOffset: computeSeekReportByte(bisectAnchor.byteOffset),
-                }).catch(() => {});
+              const resolvedSeekByte = bisectAnchor?.byteOffset ?? seekAnchor?.byteOffset ?? -1;
+              if (resolvedSeekByte >= 0) {
+                reportMkvProactivePosition(clampedTime, resolvedSeekByte, seekGen);
               }
 
               await sbVideo.waitForQueueDrain();
@@ -9566,40 +10051,50 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   return b.length > 0 ? b.end(b.length - 1) : keyframeTimestamp;
                 } catch { return keyframeTimestamp; }
               })();
-              video.currentTime = computeSeekLandingTime(clampedTime, keyframeTimestamp, bufferedEnd);
+              const landingTime = computeSeekLandingTime(clampedTime, keyframeTimestamp, bufferedEnd);
 
-              // PROBE (seek-to-play): the 'seeked' event fires once the browser
-              // has decoded the target position and playback can resume — the true
-              // end of the click→first-frame window. One-shot listener logs the
-              // delta from executeTransmuxerSeek entry, capturing reset +
-              // getKeyPacket + transmux + append + decode (not just transmux 'total=').
+              // Install the probe before assigning currentTime: a cache-hot seek can
+              // dispatch `seeked` before the next statement runs.
               if (seekToPlayStartRef.current > 0) {
                 const startedAt = seekToPlayStartRef.current;
                 const tgt = seekToPlayTargetRef.current;
                 seekToPlayStartRef.current = 0;
+                let settled = false;
+                let seekedAt = 0;
+                const reportSeekFrame = (eventName: 'playing' | 'timeupdate' | 'timeout') => {
+                  if (settled) return;
+                  settled = true;
+                  video.removeEventListener('playing', onPlaying);
+                  video.removeEventListener('timeupdate', onTimeupdate);
+                  let ranges = '';
+                  try {
+                    for (let i = 0; i < video.buffered.length; i++) {
+                      ranges += `${i ? ',' : ''}[${video.buffered.start(i).toFixed(2)}-${video.buffered.end(i).toFixed(2)}]`;
+                    }
+                  } catch { /* video may be detached during teardown */ }
+                  console.log(`[MSE] SEEK-FRAME: ${(performance.now() - seekedAt).toFixed(0)}ms after seeked, event=${eventName}, readyState=${video.readyState}, paused=${video.paused}, current=${video.currentTime.toFixed(2)}s, buffered=${ranges || 'empty'}`);
+                };
+                const onPlaying = () => reportSeekFrame('playing');
+                const onTimeupdate = () => reportSeekFrame('timeupdate');
                 const onSeeked = () => {
                   video.removeEventListener('seeked', onSeeked);
-                  console.log(`[MSE] SEEK-TO-PLAY: ${(performance.now() - startedAt).toFixed(0)}ms (click→first frame) for target ${tgt.toFixed(1)}s`);
+                  seekedAt = performance.now();
+                  console.log(`[MSE] SEEK-TO-PLAY: ${(performance.now() - startedAt).toFixed(0)}ms (click→seeked) for target ${tgt.toFixed(1)}s`);
+                  video.addEventListener('playing', onPlaying, { once: true });
+                  video.addEventListener('timeupdate', onTimeupdate, { once: true });
+                  setTimeout(() => {
+                    if (!settled) reportSeekFrame('timeout');
+                  }, 1500);
                 };
                 video.addEventListener('seeked', onSeeked, { once: true });
               }
+              video.currentTime = landingTime;
+              sbVideo.pruneBufferedRangesExcept(landingTime);
+              if (sbAudio) sbAudio.pruneBufferedRangesExcept(landingTime);
 
               // Start streaming chain for continuous playback after limited seek
               startStreamingChain();
 
-              // Reposition the MKV disk warmer to the seek target so the green
-              // bar warms forward from HERE, not from the pre-seek position.
-              // Bumping the generation inside startMkvDiskWarmer supersedes the
-              // previous warmer (fixes "previous prebuffer not paused → multiple
-              // positioned prebuffers running at once"). Prefer the real VBR
-              // cluster byte for the resolved keyframe; fall back to linear.
-              if (streamUrl && state.current.fileLength > 0 && state.current.duration > 0) {
-                const realByte = (transmuxerRef.current as any)?.getByteOffsetForTime?.(keyframeTimestamp) ?? -1;
-                const warmFrom = realByte >= 0
-                  ? realByte
-                  : Math.floor((keyframeTimestamp / state.current.duration) * state.current.fileLength);
-                startMkvDiskWarmer(streamUrl, warmFrom);
-              }
               transmuxerSeekInProgressRef.current = false; // Seek complete — allow new seeks
 
               // Update keyframeIndexReady if the transmuxer's partial index became available
@@ -9970,6 +10465,10 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       clearInterval(proactiveIntervalRef.current);
       proactiveIntervalRef.current = null;
     }
+    if (mkvProactiveRetryTimerRef.current !== null) {
+      clearTimeout(mkvProactiveRetryTimerRef.current);
+      mkvProactiveRetryTimerRef.current = null;
+    }
     setIsPaused(true);
     setIsPrefetching(false);
   };
@@ -10034,6 +10533,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     // MP4/MKV/WebM: restart download loop
     if (!state.current.downloading && streamUrl && downloadLoopRef.current) {
       downloadLoopRef.current(streamUrl);
+    }
+    if (formatRef.current === 'mkv' && transmuxerRef.current && videoRef.current) {
+      const currentTime = videoRef.current.currentTime;
+      const exactByte = timeToByte(currentTime);
+      if (exactByte >= 0) reportMkvProactivePosition(currentTime, exactByte);
     }
     // MP4: restart the backend PROACTIVE reporter so the green bar resumes its
     // march to EOF. pausePrefetch stopped the backend task and cleared the

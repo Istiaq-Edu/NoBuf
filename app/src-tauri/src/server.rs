@@ -378,6 +378,16 @@ pub(crate) struct StreamQuery {
     /// primary (never a 500). Also keys the remux disk cache so outputs made
     /// with different tracks can never be served interchangeably.
     pub(crate) audio_idx: Option<i32>,
+    /// Round-10b: the viewer's current byte position, sent by the FRONTEND to
+    /// `/subtitles/...`. The extractor uses it to build a stitched header+island
+    /// TEMP FILE and hands ffmpeg a local path — it is NOT forwarded to
+    /// `/stream`. Serving a stitched body over HTTP violated the Range contract
+    /// (a request for `bytes=N-` returned bytes from offset 0), which sent
+    /// ffmpeg's matroska demuxer into a +660 B/step resync loop: 444 requests,
+    /// 4.34 GiB re-read, zero cues. A real file has real offsets, so the temp
+    /// file makes that failure structurally impossible.
+    /// Absent → the legacy contiguous-prefix behaviour.
+    pub(crate) playhead_byte: Option<u64>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -405,6 +415,268 @@ const MIN_API_CALL_INTERVAL_MS: u64 = 300;
 /// in the list. Verified via ffprobe: emits no PCE, preserves channel count.
 /// Chained BEFORE asetpts (ffmpeg allows only one -af per stream).
 const AAC_LAYOUT_FILTER: &str = "aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1|7.1";
+
+/// Round-10 P1-1: byte offset of the first MKV `Cluster` element (EBML ID
+/// `1F 43 B6 75`) within `head`, i.e. the end of the header region that carries
+/// EBML/Info/**Tracks**/CodecPrivate. Returns None when no cluster ID appears in
+/// the searched window (non-MKV container, or a header longer than the window).
+///
+/// Used to build the stitched subtitle-extraction input: everything before the
+/// first cluster is the header ffmpeg needs to interpret ANY later cluster, and
+/// MKV cluster timestamps are absolute, so a mid-file island still self-locates.
+pub(crate) fn find_first_mkv_cluster(head: &[u8]) -> Option<usize> {
+    const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+    head.windows(4).position(|w| w == CLUSTER_ID)
+}
+
+/// Round-10 P1-1: choose the cached range to stitch after the header for a
+/// subtitle extraction targeting `playhead_byte`.
+///
+/// Picks the cached range CONTAINING the playhead; if none contains it, the
+/// nearest range that starts at or after it (a forward island still yields the
+/// cues just ahead of the viewer, which is what a just-completed seek produces).
+/// Ranges at or before the header end are skipped — they are already covered by
+/// the header prefix and stitching them would duplicate bytes.
+///
+/// Returns None when nothing usable is cached, in which case the caller must
+/// fall back to the plain contiguous-prefix behaviour rather than serve a
+/// header-only body (which would yield zero cues and look like "no subtitles").
+/// Round-17: how far from the playhead a cached range may sit and still be a
+/// sane subtitle-extraction input, in EITHER direction.
+///
+/// Derived, not chosen for roundness. The MKV transmuxer path keeps
+/// `MAX_BUFFER_AHEAD_SECONDS = 30` (useMSEPlayer.ts:1735) of buffer, and the
+/// sliding window keeps `SLIDING_WINDOW_BACKWARD_SECONDS = 30` behind. At the
+/// logged file's measured rate (1,566,651,347 B / 8888.136 s = 176,263 B/s):
+///
+/// ```text
+///   30 s x 176,263 B/s = 5,287,890 B = 5.04 MiB  ->  8 MiB (next power of two)
+///   8 MiB back at that rate = 47.6 s of runtime
+/// ```
+///
+/// It must also exceed SUBS_ISLAND_MIN_BYTES (2 MiB), or every admitted island
+/// would be rejected by the size floor immediately after.
+///
+/// **Why BOTH directions, not just forward.** Capping only the forward rule
+/// looks sufficient — it stops the EOF-tail pick — but it makes things worse.
+/// The prefix-coverage gate at the call site is guarded by `island.is_none()`,
+/// so ANY `Some(..)` skips it. With only a forward cap the search falls through
+/// to the backward rule, which returns the 32 MiB prefix (565 MB BEHIND the
+/// playhead) as `Some(..)`, bypasses the gate, and serves opening-credits cues
+/// to a viewer 56 minutes in — exactly the defect round-16 added that gate to
+/// prevent. Bounding both directions is what lets the picker return `None` and
+/// hand the decision to the gate.
+pub(crate) const SUBS_ISLAND_MAX_DISTANCE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Round-26: hard ceiling on the byte span handed to ffmpeg as an extraction
+/// input, applied to EVERY arm of `pick_subs_island`.
+///
+/// **Why this has to exist before the prebuffer sweep changes.** Arm 1 returns a
+/// range that straddles the playhead with no length test at all — the distance
+/// constant above bounds only how FAR an island may sit, never how BIG it may
+/// be, and `SUBS_ISLAND_MIN_BYTES` is a floor. `build_subs_island_file` then
+/// allocates `vec![0u8; isl_len]`, reads the whole span, and copies it into a
+/// temp `.mkv` on every extraction. The only thing keeping that cheap today is
+/// cache FRAGMENTATION: the straddling range is a small sliver because nobody
+/// fills the hole around the playhead.
+///
+/// Round-26 makes the sweep resume at the first uncached byte, which fills that
+/// hole by design and coalesces the playhead range with everything swept toward
+/// EOF. Without a ceiling the straddling island therefore grows with sweep
+/// progress — measured projection on the logged 1.46 GB file: 4 MiB sliver today
+/// -> 26 MiB once the hand-off band fills -> ~400 MiB after ten minutes of sweep
+/// -> 1,494 MiB at full coverage. `subs_memo_key` hashes `(start, end)`, so each
+/// extension also invalidates the memo and re-runs a full-island ffmpeg pass per
+/// poll. That is the "16 min -> seconds" regression (commit 7b1946a) returning
+/// through a new door.
+///
+/// 12 MiB = 8 MiB (SUBS_ISLAND_MAX_DISTANCE_BYTES, the furthest an island may
+/// legitimately start from the playhead) + 4 MiB of body, so a window anchored at
+/// the far edge of the admitted distance still carries several whole clusters. It
+/// must stay comfortably above SUBS_ISLAND_MIN_BYTES or every clamped island
+/// would be rejected by the floor immediately afterwards; the ratio is asserted
+/// in tests rather than left to inspection.
+pub(crate) const SUBS_ISLAND_MAX_BYTES: u64 = 12 * 1024 * 1024;
+
+/// Round-26: clamp an admitted island to `SUBS_ISLAND_MAX_BYTES`, keeping the
+/// playhead inside the returned window.
+///
+/// Pure so the bound is unit-testable without a filesystem. Rules:
+///
+/// * A span already within the cap is returned unchanged — no behaviour change
+///   for the fragmented shapes that exist today.
+/// * When the playhead lies inside the span, the window is anchored AT the
+///   playhead and extends forward: playback moves forward, so cues ahead of the
+///   viewer are the ones worth having, and anchoring at the playhead keeps the
+///   later `snap_island_start_to_cluster` call scanning the same region it does
+///   now.
+/// * A forward anchor that would overrun the span end is pulled back so the
+///   window always ends at `end` — never returns a range outside the input.
+/// * When the playhead is outside the span (arms 2 and 3), the window is taken
+///   from the edge nearest the playhead.
+fn clamp_subs_island(start: u64, end: u64, playhead: u64, max_bytes: u64) -> (u64, u64) {
+    debug_assert!(end >= start, "clamp_subs_island called with an inverted span");
+    if end.saturating_sub(start).saturating_add(1) <= max_bytes {
+        return (start, end);
+    }
+    let span = max_bytes.saturating_sub(1);
+    if playhead >= start && playhead <= end {
+        // Straddling: prefer forward from the playhead, pulling back at the tail.
+        let anchor = playhead.min(end.saturating_sub(span));
+        (anchor.max(start), anchor.max(start).saturating_add(span).min(end))
+    } else if playhead < start {
+        // Forward island: nearest edge is its start.
+        (start, start.saturating_add(span).min(end))
+    } else {
+        // Backward island: nearest edge is its end.
+        (end.saturating_sub(span).max(start), end)
+    }
+}
+
+pub(crate) fn pick_subs_island(
+    cached_ranges: &[(u64, u64)],
+    playhead_byte: u64,
+    header_end: u64,
+) -> Option<(u64, u64)> {
+    let usable = |&(s, e): &(u64, u64)| e > header_end && e > s;
+    // Round-26: every arm returns a span clamped to SUBS_ISLAND_MAX_BYTES. The
+    // distance constant bounds how FAR an island may sit; this bounds how BIG the
+    // ffmpeg input may get, which cache coalescing would otherwise grow without
+    // limit. See `clamp_subs_island` for the projection that forced it.
+    let clamp = |s: u64, e: u64| {
+        let (cs, ce) = clamp_subs_island(s.max(header_end), e, playhead_byte, SUBS_ISLAND_MAX_BYTES);
+        Some((cs, ce))
+    };
+    // 1. A range that straddles the playhead is ideal. No distance test applies:
+    //    the viewer is literally inside it.
+    if let Some(&(s, e)) = cached_ranges.iter().filter(|r| usable(r)).find(|&&(s, e)| s <= playhead_byte && playhead_byte <= e) {
+        return clamp(s, e);
+    }
+    // 2. Otherwise the nearest range starting after the playhead — but only if
+    //    playback could plausibly reach it soon. The logged bug picked a 78 KB
+    //    EOF tail 967 MB (91.5 min of runtime) ahead, which the player's
+    //    tail-probe reads leave cached on EVERY file.
+    let fwd_limit = playhead_byte.saturating_add(SUBS_ISLAND_MAX_DISTANCE_BYTES);
+    if let Some(&(s, e)) = cached_ranges.iter().filter(|r| usable(r))
+        .filter(|&&(s, _)| s > playhead_byte && s <= fwd_limit)
+        .min_by_key(|&&(s, _)| s)
+    {
+        return clamp(s, e);
+    }
+    // 3. Last resort: the LAST usable range before the playhead, bounded the same
+    //    way. Unbounded, this arm returns the 0-prefix for a late-film playhead —
+    //    confidently the wrong region.
+    let back_limit = playhead_byte.saturating_sub(SUBS_ISLAND_MAX_DISTANCE_BYTES);
+    cached_ranges
+        .iter()
+        .filter(|r| usable(r))
+        .filter(|&&(_, e)| e < playhead_byte && e >= back_limit)
+        .max_by_key(|&&(s, _)| s)
+        .and_then(|&(s, e)| clamp(s, e))
+}
+
+/// Round-14 F5: snap an island start DOWN to the first MKV Cluster boundary at
+/// or after `raw_start`, searching at most `ALIGN_SCAN` bytes and never past
+/// `isl_end`.
+///
+/// **This is load-bearing — do not delete it.** Round-10b shipped a comment
+/// claiming alignment was "free tidiness" that yielded "identical cue sets".
+/// Round-14 measured that claim and falsified it: cutting an island mid-cluster
+/// costs cues, because ffmpeg discards the partial leading cluster rather than
+/// resyncing into it.
+///
+/// ```text
+/// fixture 300s / 1s GOP / 300 cues / 300 clusters, same island start
+///   aligned   (snapped to cluster) -> 148 cues
+///   unaligned (mid-cluster)        -> 147 cues   (-0.7%)
+/// ```
+///
+/// An independent fixture measured ~5%. The magnitude is content- and
+/// GOP-dependent; the DIRECTION is not.
+///
+/// Returns `raw_start` unchanged when no Cluster ID is found in the window —
+/// the snap must DEGRADE to the caller's start, never invent an offset, and
+/// never push the start below `raw_start` (that would re-include bytes the
+/// caller deliberately excluded).
+pub(crate) fn snap_island_start_to_cluster(window: &[u8], raw_start: u64) -> u64 {
+    match find_first_mkv_cluster(window) {
+        Some(off) => raw_start.saturating_add(off as u64),
+        None => raw_start,
+    }
+}
+
+/// Round-16: should a `/stream` read bootstrap from Telegram instead of waiting
+/// on the disk cache?
+///
+/// A player needs a few contiguous MB before it can parse PAT/PMT/IDR, so when
+/// only a tiny prefix is cached it must bootstrap or it times out waiting.
+///
+/// A `cached_prefix` reader is NOT a player. It is the subtitle extractor: it
+/// serves whatever prefix exists, ends at the frontier (`STREAM-PREFIX-END`),
+/// and never falls back to Telegram. Bootstrapping it queues it behind a
+/// whole-file download it will never consume — and because the extractor asks
+/// for `0-<eof>`, that is a 1.5 GB queue on a cold cache.
+///
+/// Measured (16-t): the FIRST open of a cold file issued
+/// `range 0-1566651346 source_id=subs`, hit the 512 KB `< 5MB bootstrap
+/// threshold` arm, and the request was still unanswered 35 s later — long past
+/// the `[MSE] Init timeout check` at 20 s. The SECOND open of the same file
+/// issued the SAME whole-file range against a 7 MB cache and returned
+/// immediately via `STREAM-PREFIX-END`. Same range, same code, opposite outcome:
+/// the bootstrap arm was the whole difference.
+///
+/// Pure + exported for testing.
+pub(crate) fn should_bootstrap_from_telegram(
+    cached_end: u64,
+    start_byte: u64,
+    cached_prefix_mode: bool,
+    min_bootstrap_bytes: u64,
+) -> bool {
+    if cached_end < start_byte {
+        return true; // nothing cached at or after start_byte
+    }
+    if cached_prefix_mode {
+        return false; // prefix readers end at the frontier; they never starve
+    }
+    (cached_end - start_byte + 1) < min_bootstrap_bytes
+}
+
+/// Round-16: when island mode declines, is the cached PREFIX an acceptable
+/// substitute input for subtitle extraction?
+///
+/// It is acceptable only when the viewer is actually inside it. The prefix is
+/// the opening of the film; feeding it to the extractor while the viewer is an
+/// hour in returns the opening credits' cues, which is not "partial coverage",
+/// it is the wrong region entirely.
+///
+/// Measured (16-t:388-401, msg 108 @ 250,114 B/s):
+///   viewer   byte 503,761,549 = 2014 s (33.6 min)
+///   island   1.43 MB — under the 2 MB floor, so declined (correct: a
+///            sub-cluster island yields zero cues)
+///   prefix   0-16,777,216     = the first 67 s
+///   → extractor handed the first 67 s while the viewer was 2014 s in,
+///     off by 32.5 minutes, and it duly returned 957 B of opening-credit ASS.
+///
+/// The floor is right. The FALLBACK is what was wrong: "no usable island" was
+/// being read as "the opening will do".
+///
+/// `grace_bytes` covers the viewer sitting just past the frontier — cues run a
+/// little ahead of the playhead, so an exact comparison would reject a prefix
+/// that genuinely still covers them.
+///
+/// Pure + exported for testing.
+pub(crate) fn prefix_covers_playhead(
+    playhead_byte: Option<u64>,
+    prefix_end: u64,
+    grace_bytes: u64,
+) -> bool {
+    match playhead_byte {
+        // No playhead reported (e.g. extraction at open, before playback starts):
+        // the prefix IS where the viewer is about to be, so it is correct.
+        None => true,
+        Some(pb) => pb <= prefix_end.saturating_add(grace_bytes),
+    }
+}
 
 /// Rate limiter: ensures at least MIN_API_CALL_INTERVAL_MS has passed since
 /// the last upload.GetFile call. Uses a tokio Mutex to make the check-sleep-store
@@ -693,6 +965,20 @@ async fn stream_media(
     log::info!("[STREAM-REQ] msg {} incoming range {}-{} ({:.1}MB start, len {}B, partial={}, source_id={})",
         message_id, start_byte, end_byte, start_byte as f64 / 1_048_576.0, content_length, is_partial,
         query.source_id.as_deref().unwrap_or("-"));
+
+    // Round-14 F1: a bisect probe means the user is staring at a spinner. Stamp
+    // the clock so PROACTIVE declines to spawn an 893 MB prefetch into the same
+    // 300ms-spaced limiter (14-t:184-187: the prefetch spawned in the SAME
+    // SECOND as probe 1, and probes then landed 3-4s apart against a 1.2s
+    // uncontended floor). Each probe re-arms it, so the hold tracks the bisect's
+    // real duration and expires on its own once probing stops — never sticky
+    // (round-9 I-2b: a sticky flag starved PROACTIVE to 0 bytes in 70s).
+    if crate::commands::streaming::is_seek_critical_source(query.source_id.as_deref()) {
+        data.seek_critical_read_at.store(
+            crate::commands::streaming::now_epoch_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     // FAST PATH: if the requested range is fully cached, serve from disk immediately
     // Acquire lock_meta before load_meta to prevent concurrent save_meta from
@@ -1152,19 +1438,15 @@ async fn stream_media(
                         .map(|(_, e)| *e)
                         .max()
                         .unwrap_or(0);
-                    if cached_end < start_byte {
-                        // Nothing cached at or after start_byte
-                        true
-                    } else {
-                        let cached_run = cached_end - start_byte + 1;
-                        if cached_run < MIN_BOOTSTRAP_CACHED_BYTES {
-                            log::info!("[STREAM-CACHE-POLL] msg {}: cached run {}-{} = {} bytes (< {}MB bootstrap threshold) — using Telegram bootstrap",
-                                message_id, start_byte, cached_end, cached_run, MIN_BOOTSTRAP_CACHED_BYTES / (1024 * 1024));
-                            true
-                        } else {
-                            false
-                        }
+                    let bootstrap = should_bootstrap_from_telegram(
+                        cached_end, start_byte, cached_prefix_mode, MIN_BOOTSTRAP_CACHED_BYTES,
+                    );
+                    if bootstrap && cached_end >= start_byte {
+                        log::info!("[STREAM-CACHE-POLL] msg {}: cached run {}-{} = {} bytes (< {}MB bootstrap threshold) — using Telegram bootstrap",
+                            message_id, start_byte, cached_end, cached_end - start_byte + 1,
+                            MIN_BOOTSTRAP_CACHED_BYTES / (1024 * 1024));
                     }
+                    bootstrap
                 }
             } else {
                 true
@@ -1224,8 +1506,11 @@ async fn stream_media(
             // the body cleanly at the frontier. ffmpeg finalizes the cues parsed
             // so far (exit 0; CUT shape, fixture-verified).
             if cached_prefix_stream {
-                log::info!("[STREAM-PREFIX-END] msg {} ended at cache frontier offset {} ({}B of {} sent — cached_prefix mode)",
-                    message_id, read_offset, bytes_sent, content_length);
+                // Round-16: no log here. Breaking out of the poll loop falls
+                // straight into the `cached_prefix_stream && bytes_sent <
+                // content_length` guard below, which announces the same fact with
+                // more detail — so logging here produced an exact duplicate on
+                // every prefix read (16-t:391/392, :545/546, :551/552, :557/558).
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
@@ -2155,7 +2440,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2762,6 +3047,16 @@ fn build_sub_extract_args(
     args.push(input.into());
     args.push("-map".into());
     args.push(format!("0:{}", stream_idx));
+    // Round-10 P0-1: keep cue timestamps ABSOLUTE. ffmpeg's output stage
+    // subtracts the first demuxed packet's timestamp, so when the served byte
+    // region excludes cluster 0 (any scattered/post-seek cache — exactly what
+    // the playhead-island input produces) every cue is silently rebased toward
+    // zero: verified 559.9s desync at exit 0, well-formed SRT, correct cue
+    // count. Nothing in exit status, stderr, cue count or byte length reveals
+    // it. Verified byte-identical on fully-cached input, so it is unconditional.
+    // NEVER pair with -start_at_zero (see build_ss_timestamp_args): that combo
+    // re-rebases the output timeline and reintroduces the exact bug.
+    args.push("-copyts".into());
     if ass {
         args.push("-c:s".into());
         args.push("copy".into());
@@ -4365,7 +4660,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -5893,8 +6188,14 @@ async fn audio_tracks_list(
 /// time (two tracks extracting concurrently would each pull the whole file
 /// over /stream); a duplicate request gets 429 + Retry-After and the client
 /// retries briefly.
-fn subs_inflight() -> &'static StdMutex<std::collections::HashSet<i32>> {
-    static SET: std::sync::OnceLock<StdMutex<std::collections::HashSet<i32>>> = std::sync::OnceLock::new();
+/// Round-10 P2-2: keyed by (folder, message, stream_idx) — NOT message alone.
+/// A message-only key made requesting track 3 while track 2 extracted return 429,
+/// so a multi-track file could dead-end in the UI (the frontend drops the click
+/// while a fetch is live, so the user just saw nothing happen). Per-TRACK
+/// serialisation still prevents duplicate work on the same track, which is the
+/// only case that actually wastes an ffmpeg run.
+fn subs_inflight() -> &'static StdMutex<std::collections::HashSet<(i64, i32, i32)>> {
+    static SET: std::sync::OnceLock<StdMutex<std::collections::HashSet<(i64, i32, i32)>>> = std::sync::OnceLock::new();
     SET.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
 }
 
@@ -5921,6 +6222,169 @@ fn subs_input_source(
     )
 }
 
+/// Round-13 R-3: memo key for a partial subtitle extraction — it must describe
+/// WHAT THE EXTRACTION READS.
+///
+/// The key used to be `contiguous_prefix_end` alone: the contiguous run from byte
+/// 0. That is the quantity round-10 already proved is the wrong bound for island
+/// extraction, and it barely moves during playback (the downloader fetches around
+/// the playhead, not from byte 0). Observed in 13-t, the key sat at 48,234,496 B
+/// = 274 s while the viewer was at 5171 s, so the second extraction hit the memo
+/// and replayed a stale 263-byte body —
+///
+/// ```text
+/// [SUBS] msg 109 s3: cache frontier unchanged at 48234496B
+///        — replaying memoized partial result (263B)
+/// ```
+///
+/// — even though the island for playhead 3598 s (byte 628,163,769) and the one
+/// for 5171 s (byte ~911,457,038) are completely different reads. The island fix
+/// was being silently cancelled by a round-9 cache.
+///
+/// Island mode therefore keys on the span. Hashed rather than XOR-folded because
+/// `s ^ (e << 1)` collides for distinct spans, and a collision here replays cues
+/// from the wrong region of the file — precisely the bug being fixed. The prefix
+/// path keeps the original frontier-only semantics.
+pub(crate) fn subs_memo_key(island: Option<(u64, u64)>, frontier: u64) -> u64 {
+    match island {
+        Some((s, e)) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (s, e).hash(&mut h);
+            h.finish()
+        }
+        None => frontier,
+    }
+}
+
+/// Round-10b: minimum island size. An island smaller than one MKV cluster
+/// yields ZERO cues — ffmpeg logs `Truncating packet of size N to M` and emits
+/// nothing (verified: a 100 KB island of a file whose clusters are ~1 MB).
+/// 2 MiB comfortably exceeds a cluster in every real release profile.
+pub(crate) const SUBS_ISLAND_MIN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Round-10b: build a stitched `header ++ island` MKV on disk and return its
+/// path, for extracting subtitles near the playhead from a partially-cached file.
+///
+/// WHY A FILE AND NOT AN HTTP BODY: round-10 served the stitched bytes from
+/// `/stream`, which broke the Range contract — a request for `bytes=N-` returned
+/// the bytes at offset 0, so ffmpeg's matroska demuxer resynced forward 660 B at
+/// a time, 444 times, re-reading ~10 MiB each pass (4.34 GiB total) and produced
+/// zero cues. A real file has real offsets, so that failure mode cannot occur:
+/// verified 1 open / 0 seeks / 100 % read once.
+///
+/// Cluster timestamps in MKV are ABSOLUTE, so a mid-file island still self-locates
+/// once the header supplies EBML/Info/Tracks/CodecPrivate. Requires `-copyts` on
+/// the ffmpeg side or the output stage rebases every cue toward zero.
+///
+/// Returns `Some((path, island_start, island_end))` when island mode applies —
+/// the span is returned so the caller can key the partial-result memo on WHAT WAS
+/// READ (round-13 R-3). `None` means island mode declined and the caller must
+/// fall back to the existing prefix-bounded HTTP path.
+fn build_subs_island_file(
+    cache: &Option<StreamCacheManager>,
+    folder_id: &str,
+    message_id: i32,
+    stream_idx: i32,
+    playhead_byte: u64,
+) -> Option<(std::path::PathBuf, u64, u64)> {
+    let cache_mgr = cache.as_ref()?;
+    let meta = cache_mgr.load_meta(message_id)?;
+    let data_path = cache_mgr.data_path(message_id);
+
+    // The header must be cached from byte 0 or there is nothing to anchor the
+    // island to. 1 MiB is far more than any real MKV header (5,827 B observed).
+    const HEADER_SCAN: u64 = 1024 * 1024;
+    let prefix_end = crate::stream_cache::contiguous_prefix_end(&meta.cached_ranges);
+    let scan_len = prefix_end.min(HEADER_SCAN);
+    if scan_len == 0 {
+        return None;
+    }
+    let header = {
+        let mut f = std::fs::File::open(&data_path).ok()?;
+        use std::io::Read;
+        let mut buf = vec![0u8; scan_len as usize];
+        f.read_exact(&mut buf).ok()?;
+        buf
+    };
+    // Non-MKV containers (TS/MP4) never match the Cluster ID, so they fall back.
+    let cluster_off = find_first_mkv_cluster(&header)? as u64;
+
+    let (isl_start_raw, isl_end) = pick_subs_island(&meta.cached_ranges, playhead_byte, cluster_off)?;
+    if isl_end <= isl_start_raw {
+        return None;
+    }
+    // An island below one cluster produces a body that CANNOT yield cues.
+    if isl_end - isl_start_raw + 1 < SUBS_ISLAND_MIN_BYTES {
+        log::info!(
+            "[SUBS-ISLAND] msg {} s{}: island {}-{} is {}B < {}B minimum — falling back to prefix",
+            message_id, stream_idx, isl_start_raw, isl_end,
+            isl_end - isl_start_raw + 1, SUBS_ISLAND_MIN_BYTES
+        );
+        return None;
+    }
+
+    // Snap the island start DOWN to a cluster boundary when one is nearby.
+    // The WHY, the measurement that proves it, and the degrade contract all live
+    // on `snap_island_start_to_cluster` — which is pure and unit-tested, so a
+    // future cleanup that deletes it breaks a test instead of silently losing
+    // cues (round-14 F5).
+    let isl_start = {
+        const ALIGN_SCAN: u64 = 512 * 1024;
+        let scan_from = isl_start_raw;
+        let scan_to = (isl_start_raw + ALIGN_SCAN).min(isl_end);
+        let mut buf = vec![0u8; (scan_to - scan_from) as usize];
+        let read_ok = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::open(&data_path)?;
+            f.seek(SeekFrom::Start(scan_from))?;
+            use std::io::Read;
+            f.read_exact(&mut buf)?;
+            Ok(())
+        })().is_ok();
+        if read_ok {
+            snap_island_start_to_cluster(&buf, scan_from)
+        } else {
+            isl_start_raw
+        }
+    };
+
+    let isl_len = isl_end - isl_start + 1;
+    let island = {
+        let mut f = std::fs::File::open(&data_path).ok()?;
+        f.seek(SeekFrom::Start(isl_start)).ok()?;
+        use std::io::Read;
+        let mut buf = vec![0u8; isl_len as usize];
+        f.read_exact(&mut buf).ok()?;
+        buf
+    };
+
+    // Unique per (folder, message, track, island) + a nonce, so concurrent
+    // extractions for different tracks can never collide on the same path.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = subs_cache_dir(cache).join(format!(
+        "island_{}_{}_s{}_{}_{}.mkv",
+        folder_id.replace(['/', '\\', ':'], "_"),
+        message_id, stream_idx, isl_start, nonce
+    ));
+    {
+        use std::io::Write;
+        let mut out = std::fs::File::create(&path).ok()?;
+        out.write_all(&header[..cluster_off as usize]).ok()?;
+        out.write_all(&island).ok()?;
+        out.flush().ok()?;
+    } // handle closed HERE, before ffmpeg opens it — no os-32 overlap window.
+
+    log::info!(
+        "[SUBS-ISLAND] msg {} s{}: temp file {} = header 0-{} ({}B) + island {}-{} ({}B) for playhead byte {}",
+        message_id, stream_idx, path.display(), cluster_off, cluster_off,
+        isl_start, isl_end, isl_len, playhead_byte
+    );
+    Some((path, isl_start, isl_end))
+}
+
 /// Subtitle disk-cache dir (`{remux_dir}/subs`), created on demand.
 fn subs_cache_dir(cache: &Option<StreamCacheManager>) -> std::path::PathBuf {
     let base = if let Some(ref cache_mgr) = *cache {
@@ -5943,7 +6407,16 @@ async fn probe_sub_tracks(
     data: &web::Data<Arc<TelegramState>>,
     cache: &web::Data<Option<StreamCacheManager>>,
 ) -> Result<SubProbeResult, HttpResponse> {
-    if let Some(json) = data.sub_tracks_json.read().await.get(&message_id) {
+    // Round-10 P0-3: key the memo by (folder, message). Telegram message_id is
+    // unique only within a peer, so keying by message_id alone served folder A's
+    // TRACK LISTING for folder B's same-id message — the media cache already
+    // fixed this class ("channel A's msg 18 poison channel B's msg 18").
+    // i64::MIN is the established sentinel for the me/home/null folder.
+    let folder_key: i64 = match folder_id {
+        "me" | "home" | "null" => i64::MIN,
+        s => s.parse::<i64>().unwrap_or(i64::MIN),
+    };
+    if let Some(json) = data.sub_tracks_json.read().await.get(&(folder_key, message_id)) {
         // Memo stores the serialized SubProbeResult verbatim.
         if let Ok(parsed) = serde_json::from_str::<SubProbeResult>(json) {
             return Ok(parsed);
@@ -6006,7 +6479,7 @@ async fn probe_sub_tracks(
     // case, and the header probe sees stream declarations even on partially
     // cached files — unlike the audio partial-probe race).
     if let Ok(json) = serde_json::to_string(&result) {
-        data.sub_tracks_json.write().await.insert(message_id, json);
+        data.sub_tracks_json.write().await.insert((folder_key, message_id), json);
     }
     Ok(result)
 }
@@ -6066,10 +6539,17 @@ async fn subtitles_extract_track(
     cache: web::Data<Option<StreamCacheManager>>,
 ) -> impl Responder {
     let (folder_id_str, message_id, stream_idx) = path.into_inner();
+    // Round-10 P0-3: total folder key for the in-memory subs caches. Same
+    // sentinel convention as the media cache (see resolve_media_from_path):
+    // i64::MIN stands in for the me/home/null folder so the key is total.
+    let folder_key: i64 = match folder_id_str.as_str() {
+        "me" | "home" | "null" => i64::MIN,
+        s => s.parse::<i64>().unwrap_or(i64::MIN),
+    };
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None,
+        audio_idx: None, playhead_byte: None,
     };
     if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         return resp;
@@ -6102,27 +6582,36 @@ async fn subtitles_extract_track(
     let cache_path = subs_dir.join(sub_cache_filename(&folder_id_str, message_id, stream_idx, ass));
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
         if !bytes.is_empty() {
+            // Round-10 P1-3: a disk hit is by definition a WHOLE-FILE extraction
+            // (P0-2 only promotes when served_whole_file), so declare full
+            // coverage explicitly. Previously this path sent no coverage header
+            // at all, so the frontend computed partial=false for ANY replayed
+            // body — including truncated ones from before the P0-2 fix — and the
+            // re-extract branch could never fire again for that file.
             return HttpResponse::Ok()
                 .content_type("text/plain; charset=utf-8")
                 .insert_header(("X-Subs-Format", format_hdr))
+                .insert_header(("X-Subs-Coverage", "full"))
                 .insert_header(("Cache-Control", "max-age=86400"))
                 .body(bytes);
         }
     }
 
-    // Per-message serialization (thumb_inflight pattern).
+    // Per-TRACK serialization (round-10 P2-2: was per-message, which 429'd a
+    // second track and dead-ended the UI).
+    let inflight_key = (folder_key, message_id, stream_idx);
     {
         let mut set = match subs_inflight().lock() {
             Ok(s) => s,
             Err(_) => return HttpResponse::InternalServerError().body("lock poisoned"),
         };
-        if !set.insert(message_id) {
+        if !set.insert(inflight_key) {
             return HttpResponse::TooManyRequests()
                 .insert_header(("Retry-After", "2"))
                 .body("Subtitle extraction already in progress");
         }
     }
-    struct SubsInflightGuard(i32);
+    struct SubsInflightGuard((i64, i32, i32));
     impl Drop for SubsInflightGuard {
         fn drop(&mut self) {
             if let Ok(mut s) = subs_inflight().lock() {
@@ -6130,7 +6619,7 @@ async fn subtitles_extract_track(
             }
         }
     }
-    let _guard = SubsInflightGuard(message_id);
+    let _guard = SubsInflightGuard(inflight_key);
 
     let ffmpeg_path = match crate::ffmpeg_util::ensure_ffmpeg() {
         Ok(p) => p,
@@ -6164,17 +6653,106 @@ async fn subtitles_extract_track(
             .map(|m| crate::stream_cache::contiguous_prefix_end(&m.cached_ranges))
             .unwrap_or(0)
     };
+    // Round-10b: island TEMP FILE, built BEFORE the memo gate (round-13 R-3) so
+    // the memo can be keyed on the island actually read. A stitched local file
+    // has real byte offsets, so it cannot violate the Range contract the way
+    // round-10's sparse HTTP body did (444 resync requests, 4.34 GiB, zero cues).
+    //
+    // ONLY the extractor gets this. The ffprobe track listing and the font dump
+    // share subs_input_source and MUST stay unbounded: stream declarations and
+    // attachments live in the header region, so an island would hide subtitle
+    // tracks from the picker and break font extraction outright.
+    let island: Option<(std::path::PathBuf, u64, u64)> = if fully_cached {
+        None
+    } else {
+        query.playhead_byte.and_then(|pb| {
+            build_subs_island_file(&cache, &folder_id_str, message_id, stream_idx, pb)
+        })
+    };
+    let island_tmp: Option<std::path::PathBuf> = island.as_ref().map(|(p, _, _)| p.clone());
+
+    // Round-16: island mode declined and we are about to fall back to the cached
+    // PREFIX — but the prefix is the opening of the film. Handing it to the
+    // extractor while the viewer is 33 minutes in returns the opening credits'
+    // cues (16-t:388-401: first 67 s served for a viewer at 2014 s, 957 B of
+    // useless ASS). Report "nothing yet for this region" instead of confidently
+    // returning the wrong one; the repair loop retries as the cache fills.
+    //
+    // `X-Subs-Partial` keeps the frontend on its existing partial path, so this
+    // reuses the shipped retry/backoff behaviour rather than inventing an error.
+    if island.is_none() && !fully_cached {
+        // One cluster of grace: cues legitimately run slightly ahead of the playhead.
+        const PREFIX_COVERAGE_GRACE_BYTES: u64 = SUBS_ISLAND_MIN_BYTES;
+        if !prefix_covers_playhead(query.playhead_byte, current_frontier, PREFIX_COVERAGE_GRACE_BYTES) {
+            log::info!(
+                "[SUBS-ISLAND] msg {} s{}: no usable island and prefix ends at {}B while playhead is {}B \
+                 — declining rather than extracting the wrong region",
+                message_id, stream_idx, current_frontier,
+                query.playhead_byte.unwrap_or(0)
+            );
+            return HttpResponse::NoContent()
+                .insert_header(("X-Subs-Partial", "1"))
+                // Round-17: the frontend's breaker has a growth-reset arm
+                // (useMSEPlayer.ts:912) that was dead code because the call site
+                // passed `null` — it had no byte-accurate frontier to pass. The
+                // server computes exactly that number and used to discard it.
+                // Emitting it turns "declined" into "declined, and here is how far
+                // the cache had actually got", which is what lets the client tell
+                // "bytes are still arriving" from "genuinely broken".
+                .insert_header(("X-Subs-Frontier", current_frontier.to_string()))
+                .finish();
+        }
+    }
+
+    // Round-10b: RAII cleanup. The extractor has six return arms below; a Drop
+    // guard covers every one of them (and a panic) without six easy-to-miss
+    // remove_file calls. Deletion happens after ffmpeg's child has exited, so
+    // there is no writer/reader overlap and no os-32 SHARING_VIOLATION window.
+    // A failed delete is non-fatal — the recursive startup purge sweeps orphans.
+    struct IslandTmpGuard(Option<std::path::PathBuf>);
+    impl Drop for IslandTmpGuard {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.0 {
+                if let Err(e) = std::fs::remove_file(p) {
+                    log::debug!("[SUBS-ISLAND] temp cleanup skipped for {}: {}", p.display(), e);
+                }
+            }
+        }
+    }
+    let _island_guard = IslandTmpGuard(island_tmp.clone());
+
+    // Round-13 R-3: the memo key must describe WHAT THE EXTRACTION READS.
+    //
+    // It used to be `contiguous_prefix_end` alone — the contiguous run from byte
+    // 0. That is exactly the quantity round-10 proved is the wrong bound for
+    // island extraction, and it barely moves during playback (the downloader
+    // fetches around the playhead, not from byte 0). Observed in 13-t: the key
+    // sat at 48,234,496 B = 274s while the viewer was at 5171s, so the second
+    // extraction hit the memo and replayed a stale 263-byte body —
+    //
+    //   [SUBS] msg 109 s3: cache frontier unchanged at 48234496B
+    //          — replaying memoized partial result (263B)
+    //
+    // — even though the island for playhead 3598s (byte 628163769) and the one
+    // for 5171s (byte ~911457038) are completely different reads. The island fix
+    // was being silently cancelled by a round-9 cache.
+    //
+    // Keying on (island_start, island_end) when island mode is active means a
+    // different island is always a different key, so it always re-extracts. The
+    // prefix path keeps the original frontier-only semantics unchanged.
+    let memo_key = subs_memo_key(island.as_ref().map(|(_, s, e)| (*s, *e)), current_frontier);
     if !fully_cached {
         if let Some(mgr) = cache.as_ref().as_ref() {
-            if let Some((body, fmt)) = mgr.subs_partial_memo_get(message_id, stream_idx, ass, current_frontier) {
+            if let Some((body, fmt)) = mgr.subs_partial_memo_get(folder_key, message_id, stream_idx, ass, memo_key) {
                 log::info!(
-                    "[SUBS] msg {} s{}: cache frontier unchanged at {}B — replaying memoized partial result ({}B)",
-                    message_id, stream_idx, current_frontier, body.len()
+                    "[SUBS] msg {} s{}: identical input (memo key {}) — replaying memoized partial result ({}B)",
+                    message_id, stream_idx, memo_key, body.len()
                 );
                 if body.is_empty() {
                     let mut resp = HttpResponse::NoContent();
                     resp.insert_header(("X-Subs-Partial", "1"));
                     resp.insert_header(("X-Subs-Unchanged", "1"));
+                    resp.insert_header(("X-Subs-Frontier", current_frontier.to_string()));
                     return resp.finish();
                 }
                 return HttpResponse::Ok()
@@ -6182,11 +6760,14 @@ async fn subtitles_extract_track(
                     .insert_header(("X-Subs-Format", fmt))
                     .insert_header(("X-Subs-Partial", "1"))
                     .insert_header(("X-Subs-Unchanged", "1"))
+                    .insert_header(("X-Subs-Frontier", current_frontier.to_string()))
                     .body(body);
             }
         }
     }
-    let input_source = {
+    let input_source = if let Some(ref p) = island_tmp {
+        p.to_string_lossy().to_string()
+    } else {
         let mut src = subs_input_source(&folder_id_str, message_id, token, &cache);
         // Round-3 (review R1): bound the extraction input to the cached prefix.
         // The body serves disk bytes and ENDS at the frontier — ffmpeg finalizes
@@ -6201,6 +6782,23 @@ async fn subtitles_extract_track(
         }
         src
     };
+    // Round-10 P0-2: partial-ness is a property of WHAT WE SERVED, decided here
+    // and BEFORE ffmpeg runs — never sniffed from ffmpeg's stderr prose.
+    //
+    // The old guard was `!fully_cached || stderr.contains("ended prematurely")`.
+    // That substring only appears for the SIMPLE TRUNCATION shape. Verified by
+    // execution on three fixtures: truncated-at-frontier emits "File ended
+    // prematurely" (matches), but a cluster-0-less region and a header+tail
+    // stitch both emit "... invalid as first byte of an EBML number" (NO match).
+    // So any sparse/islanded input whose file happens to be fully cached would
+    // be judged COMPLETE and its incomplete body renamed into the permanent
+    // on-disk cache — and the disk-hit at the top of this handler returns that
+    // body forever with no validation. Permanently wrong subtitles.
+    //
+    // `served_whole_file` is the ONLY promotion authority. The stderr check stays
+    // as a belt-and-braces OR-term (it still catches a truncated response on a
+    // file we believed was complete) but is no longer load-bearing.
+    let served_whole_file = fully_cached;
     let tmp_path = subs_dir.join(format!(
         "{}.tmp",
         sub_cache_filename(&folder_id_str, message_id, stream_idx, ass)
@@ -6270,19 +6868,50 @@ async fn subtitles_extract_track(
         let mut resp = HttpResponse::NoContent();
         if !fully_cached {
             resp.insert_header(("X-Subs-Partial", "1"));
+            resp.insert_header(("X-Subs-Frontier", current_frontier.to_string()));
             // Round-9 I-5: memoize the empty partial result at this frontier so
             // identical retries replay instead of re-running ffmpeg.
             if let Some(mgr) = cache.as_ref().as_ref() {
-                mgr.subs_partial_memo_store(message_id, stream_idx, ass, current_frontier, Vec::new(), format_hdr.to_string());
+                mgr.subs_partial_memo_store(folder_key, message_id, stream_idx, ass, memo_key, Vec::new(), format_hdr.to_string());
             }
         }
         return resp.finish();
     }
 
-    // "File ended prematurely" with cues present = partial extraction (P8):
-    // serve but don't promote to the deterministic cache.
+    // Round-10 P0-2: promotion authority is `served_whole_file` (decided from the
+    // byte set we served, above), NOT ffmpeg's stderr prose. The stderr term is
+    // retained only as a belt-and-braces extra reason to withhold promotion —
+    // it can add `partial`, never remove it. See the comment at served_whole_file
+    // for the three-fixture evidence that stderr sniffing is blind to sparse and
+    // stitched inputs.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let partial = !fully_cached || stderr.contains("ended prematurely");
+    let partial = !served_whole_file || stderr.contains("ended prematurely");
+    // Round-10 P2-3: resurrection guard. Mirrors the round-9 I-3b prior art in
+    // commands/streaming.rs:736-742 — a discard cancels the transfer BEFORE
+    // deleting meta, so any write that lands afterwards resurrects a cache the
+    // user just discarded. The subs path had no equivalent: a completing
+    // extraction would create_dir_all the subs dir back, rename into it, and
+    // re-store a memo that delete_cache had already cleared. If the .dat is gone,
+    // the bytes this body was derived from are gone too — serve it once, persist
+    // nothing.
+    let cache_vanished = cache
+        .as_ref()
+        .as_ref()
+        .map(|m| m.load_meta(message_id).is_none())
+        .unwrap_or(false);
+    if cache_vanished {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        log::info!(
+            "[SUBS] msg {} s{}: cache discarded during extraction — serving without persisting (no resurrection)",
+            message_id, stream_idx
+        );
+        let mut resp = HttpResponse::Ok();
+        resp.content_type("text/plain; charset=utf-8")
+            .insert_header(("X-Subs-Format", format_hdr))
+            .insert_header(("X-Subs-Partial", "1"))
+            .insert_header(("X-Subs-Frontier", current_frontier.to_string()));
+        return resp.body(text);
+    }
     if partial {
         let _ = tokio::fs::remove_file(&tmp_path).await;
     } else if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path).await {
@@ -6305,7 +6934,7 @@ async fn subtitles_extract_track(
         // Round-9 I-5: memoize the partial body at this frontier so identical
         // retries replay instead of re-running ffmpeg on identical input.
         if let Some(mgr) = cache.as_ref().as_ref() {
-            mgr.subs_partial_memo_store(message_id, stream_idx, ass, current_frontier, text.clone(), format_hdr.to_string());
+            mgr.subs_partial_memo_store(folder_key, message_id, stream_idx, ass, memo_key, text.clone(), format_hdr.to_string());
         }
     } else {
         resp.insert_header(("Cache-Control", "max-age=86400"));
@@ -6330,7 +6959,7 @@ async fn subtitles_font(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None,
+        audio_idx: None, playhead_byte: None,
     };
     if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         return resp;
@@ -6433,7 +7062,7 @@ async fn remux_hover_thumb(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None,
+        audio_idx: None, playhead_byte: None,
     };
     let (_media, total_size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         Ok(r) => r,
@@ -6618,7 +7247,7 @@ pub async fn start_streaming_server(
             .allowed_origin("http://nobuf-stream.localhost")
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged"])
+            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged", "X-Subs-Coverage"])
             .max_age(3600);
 
         App::new()
@@ -6649,6 +7278,25 @@ pub async fn start_streaming_server(
             })
     })
     .workers(resolve_streaming_worker_count())
+    // Round-16: actix's DEFAULT client_request_timeout is 5s — the deadline for a
+    // client to finish sending its request head. ffmpeg opens /stream as an HTTP
+    // client for the background disk remux, and when a seek arrives mid-remux the
+    // old process is torn down while the new one (`-ss 2000.153`) is connecting.
+    // Under that contention ffmpeg's head lands past the 5s default and actix
+    // answers 408 — a status the app never emits itself (16-t:310-316):
+    //
+    //   [REMUX] ffmpeg (msg 108): HTTP error 408 Request Timeout
+    //   [REMUX] msg 108: ffmpeg exited with error ... skipping background remux
+    //
+    // The user-visible seek still completed, so this looked harmless — but the
+    // background remux was skipped, so every later seek on that file re-runs the
+    // full transcode instead of hitting the disk cache.
+    //
+    // 60s is generous for a request HEAD (not the body, which streams for
+    // minutes) and does not weaken any real timeout: a stalled client still
+    // disconnects, and the handlers keep their own extraction timeouts.
+    .client_request_timeout(std::time::Duration::from_secs(60))
+    .client_disconnect_timeout(std::time::Duration::from_secs(30))
     .bind(("127.0.0.1", port))?
     .run();
 
@@ -6671,6 +7319,103 @@ pub async fn start_server(
 mod tests {
     use actix_cors::Cors;
     use actix_web::{test as actix_test, web, App, HttpResponse, http::Method, http::header as actix_header};
+
+    const MIN_BOOTSTRAP: u64 = 5 * 1024 * 1024;
+
+    /// Round-16: the cold-open stall. A subtitle read (`cached_prefix=true`) asks
+    /// for the whole file; on a cold cache only 512 KB is present, so the old
+    /// code took the `< 5MB bootstrap threshold` arm and queued the request
+    /// behind a 1.5 GB Telegram download it would never consume. The request was
+    /// still unanswered 35 s later (16-t:79-84).
+    #[test]
+    fn cold_open_subs_read_does_not_bootstrap() {
+        // Exact numbers from 16-t:79-81.
+        assert!(
+            !super::should_bootstrap_from_telegram(524_287, 0, true, MIN_BOOTSTRAP),
+            "a cached_prefix read must serve the prefix and end at the frontier, never bootstrap"
+        );
+    }
+
+    /// The same request on a warm cache already worked (16-t:543-546). Behaviour
+    /// must be identical in both states — that is what proves the prefix reader
+    /// never depended on the bootstrap.
+    #[test]
+    fn warm_open_subs_read_also_does_not_bootstrap() {
+        assert!(!super::should_bootstrap_from_telegram(7_340_031, 0, true, MIN_BOOTSTRAP));
+    }
+
+    /// A PLAYER with a tiny prefix still bootstraps — it genuinely starves
+    /// without contiguous data, and removing that would reintroduce the stall
+    /// the threshold was added to prevent.
+    #[test]
+    fn player_with_tiny_prefix_still_bootstraps() {
+        assert!(super::should_bootstrap_from_telegram(524_287, 0, false, MIN_BOOTSTRAP));
+    }
+
+    #[test]
+    fn player_with_enough_prefix_waits_on_cache() {
+        assert!(!super::should_bootstrap_from_telegram(7_340_031, 0, false, MIN_BOOTSTRAP));
+    }
+
+    /// Nothing cached at/after the offset bootstraps regardless of mode —
+    /// there is no prefix to serve, so the prefix reader would return empty.
+    #[test]
+    fn nothing_cached_bootstraps_in_both_modes() {
+        assert!(super::should_bootstrap_from_telegram(0, 1_000_000, true, MIN_BOOTSTRAP));
+        assert!(super::should_bootstrap_from_telegram(0, 1_000_000, false, MIN_BOOTSTRAP));
+    }
+
+    /// Boundary: exactly the threshold is enough for a player (>= not >).
+    #[test]
+    fn player_at_exact_threshold_does_not_bootstrap() {
+        assert!(!super::should_bootstrap_from_telegram(MIN_BOOTSTRAP - 1, 0, false, MIN_BOOTSTRAP));
+        assert!(super::should_bootstrap_from_telegram(MIN_BOOTSTRAP - 2, 0, false, MIN_BOOTSTRAP));
+    }
+
+    // ── Round-16: prefix fallback must not serve the wrong region ──────────
+    //
+    // 16-t:388-401 (msg 108, 250,114 B/s): the island was 1.43 MB — under the
+    // 2 MB floor, so declined, correctly. The code then fell back to the cached
+    // prefix (0-16,777,216 = the first 67 s) while the viewer sat at byte
+    // 503,761,549 = 2014 s. Off by 32.5 minutes; the extractor returned 957 B of
+    // opening-credit ASS and the repair loop scored it as real coverage.
+
+    const GRACE: u64 = 2 * 1024 * 1024;
+
+    #[test]
+    fn prefix_rejected_when_viewer_is_far_past_it() {
+        // The exact numbers from the log.
+        assert!(
+            !super::prefix_covers_playhead(Some(503_761_549), 16_777_216, GRACE),
+            "the first 67s must not be used as subtitle input for a viewer 33 minutes in"
+        );
+    }
+
+    #[test]
+    fn prefix_accepted_when_viewer_is_inside_it() {
+        // Same file, viewer 40 s in (byte ~10 MB) with the same 16 MB prefix.
+        assert!(super::prefix_covers_playhead(Some(10_000_000), 16_777_216, GRACE));
+    }
+
+    #[test]
+    fn prefix_accepted_at_open_when_no_playhead_reported() {
+        // Extraction fires before playback starts: the prefix is exactly where
+        // the viewer is about to be. Rejecting here would break the open path.
+        assert!(super::prefix_covers_playhead(None, 16_777_216, GRACE));
+    }
+
+    #[test]
+    fn prefix_accepted_just_past_frontier_within_grace() {
+        // Cues legitimately run slightly ahead of the playhead.
+        assert!(super::prefix_covers_playhead(Some(16_777_216 + GRACE), 16_777_216, GRACE));
+        assert!(!super::prefix_covers_playhead(Some(16_777_216 + GRACE + 1), 16_777_216, GRACE));
+    }
+
+    #[test]
+    fn prefix_grace_cannot_overflow() {
+        // A saturating add guards a bogus u64::MAX frontier.
+        assert!(super::prefix_covers_playhead(Some(u64::MAX), u64::MAX, GRACE));
+    }
 
     async fn test_handler() -> HttpResponse {
         HttpResponse::Ok().body("test")
@@ -7503,6 +8248,470 @@ mod tests {
         let inp = retry.iter().position(|s| s == "-i").unwrap();
         assert!(enc < inp, "-sub_charenc must be an INPUT option (before -i)");
         assert_eq!(retry[enc + 1], "latin1");
+    }
+
+    /// Round-10 P0-1: `-copyts` keeps cue timestamps ABSOLUTE, and must NEVER be
+    /// paired with `-start_at_zero`.
+    ///
+    /// ffmpeg's output stage subtracts the first DEMUXED packet's timestamp. When
+    /// the served byte region excludes cluster 0 — every scattered/post-seek
+    /// cache, i.e. exactly the playhead-island input — cues are silently rebased
+    /// toward zero. Measured on a 900s fixture whose surviving cue sits at 800s:
+    /// emitted 00:04:00,074 without the flag vs 00:13:20,000 with it = 559.9s
+    /// desync, at exit 0, with well-formed SRT, plausible cue count and correct
+    /// inter-cue deltas. Nothing observable reveals it.
+    ///
+    /// The `-start_at_zero` half of the trap: build_ss_timestamp_args pairs
+    /// `-copyts -start_at_zero` for /remux seeks, and that combo REBASES the
+    /// output timeline (see its doc comment). Copying that pattern here would
+    /// silently reintroduce the desync, so the absence is asserted, not assumed.
+    #[test]
+    fn sub_extract_args_keep_absolute_timestamps() {
+        for (input, idx, ass) in [
+            ("http://in", 2, false),
+            ("C:\\cache\\file.mkv", 3, true),
+        ] {
+            let args = super::build_sub_extract_args(input, idx, ass, false, "out.tmp");
+            assert!(
+                args.iter().any(|s| s == "-copyts"),
+                "-copyts required or a cluster-0-less region desyncs every cue: {:?}",
+                args
+            );
+            assert!(
+                !args.iter().any(|s| s == "-start_at_zero"),
+                "-start_at_zero re-rebases the output timeline — never pair it here: {:?}",
+                args
+            );
+            // Must be an OUTPUT-stage option: after -i, or ffmpeg applies it to
+            // the input and the rebase returns.
+            let copyts = args.iter().position(|s| s == "-copyts").unwrap();
+            let inp = args.iter().position(|s| s == "-i").unwrap();
+            assert!(copyts > inp, "-copyts belongs after -i: {:?}", args);
+        }
+        // The latin1 retry path must carry the same guarantee.
+        let retry = super::build_sub_extract_args("http://in", 2, false, true, "out.tmp");
+        assert!(retry.iter().any(|s| s == "-copyts"), "retry keeps -copyts: {:?}", retry);
+        assert!(!retry.iter().any(|s| s == "-start_at_zero"));
+    }
+
+    /// Round-13 R-3: the memo key must describe WHAT THE EXTRACTION READS.
+    ///
+    /// 13-t:220 — two DIFFERENT island reads (playhead 3598s at byte 628,163,769
+    /// and 5171s at ~911,457,038) shared one memo key, because the key was the
+    /// 0-contiguous prefix (48,234,496 B = 274 s) which barely moves during
+    /// playback. The second extraction therefore replayed a stale 263-byte body
+    /// and subtitles never advanced past 3844 s.
+    ///
+    /// This pins the invariant that makes the island fix effective at all:
+    /// distinct island spans MUST key distinctly, or a stale replay silently
+    /// cancels the re-extraction.
+    #[test]
+    fn subs_memo_key_distinguishes_islands_the_prefix_could_not() {
+        let prefix = 48_234_496; // the frozen 0-prefix from 13-t
+        let isl_3598s = Some((628_163_769u64, 641_728_511u64));
+        let isl_5171s = Some((911_457_038u64, 924_021_780u64));
+
+        // The bug: the OLD key was `prefix` for both — identical, hence the replay.
+        assert_eq!(
+            super::subs_memo_key(None, prefix),
+            super::subs_memo_key(None, prefix),
+            "prefix-only keying is what collided in 13-t"
+        );
+
+        // The fix: distinct islands ⇒ distinct keys ⇒ always re-extracts.
+        assert_ne!(
+            super::subs_memo_key(isl_3598s, prefix),
+            super::subs_memo_key(isl_5171s, prefix),
+            "distinct island spans must not share a memo key"
+        );
+
+        // An identical island at an unchanged frontier still replays — the
+        // round-9 behaviour worth keeping (avoids a redundant ffmpeg run).
+        assert_eq!(
+            super::subs_memo_key(isl_3598s, prefix),
+            super::subs_memo_key(isl_3598s, prefix),
+        );
+
+        // Island mode must not alias the prefix path.
+        assert_ne!(super::subs_memo_key(isl_3598s, prefix), super::subs_memo_key(None, prefix));
+
+        // Adjacent/overlapping spans differ (an XOR fold would collide here).
+        assert_ne!(super::subs_memo_key(Some((0, 1)), 0), super::subs_memo_key(Some((2, 0)), 0));
+    }
+
+    /// Round-14 F5: the island-start cluster SNAP is load-bearing, and a comment
+    /// cannot enforce that. Round-10b shipped a comment claiming alignment was
+    /// "free tidiness" that yielded "identical cue sets"; round-14 MEASURED that
+    /// claim and falsified it:
+    ///
+    ///   fixture 300s / 1s GOP / 300 cues / 300 clusters, same island start
+    ///     aligned   (snapped to cluster) -> 148 cues
+    ///     unaligned (mid-cluster)        -> 147 cues   (-0.7%)
+    ///
+    /// An independent fixture measured ~5%. Magnitude is content-dependent; the
+    /// direction is not. This exercises the PRODUCTION function the extractor
+    /// calls, so deleting the snap breaks a test instead of silently losing cues.
+    #[test]
+    fn island_start_snap_finds_cluster_boundary_in_scan_window() {
+        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+
+        // A window whose only Cluster ID sits at a non-zero offset — exactly the
+        // mid-cluster case the snap exists to correct. The absolute island start
+        // must move forward by that offset.
+        let mut buf = vec![0xAAu8; 4096];
+        buf[1234..1238].copy_from_slice(&CLUSTER_ID);
+        assert_eq!(
+            super::snap_island_start_to_cluster(&buf, 600_000_000),
+            600_001_234,
+            "snap must advance the start to the cluster boundary; without it the \
+             island begins mid-cluster and ffmpeg discards the partial leading \
+             cluster (measured -0.7% to -5% cues)"
+        );
+
+        // Cluster already at offset 0 => start is unchanged (idempotent).
+        let mut at_zero = vec![0xAAu8; 64];
+        at_zero[0..4].copy_from_slice(&CLUSTER_ID);
+        assert_eq!(
+            super::snap_island_start_to_cluster(&at_zero, 42),
+            42,
+            "an already-aligned start must not move"
+        );
+
+        // No Cluster ID in range => DEGRADE to the caller's start. The snap must
+        // never invent an offset, and never push the start backwards.
+        assert_eq!(
+            super::snap_island_start_to_cluster(&vec![0xAAu8; 4096], 12_345),
+            12_345,
+            "with no cluster in the window the snap must return the raw start"
+        );
+
+        // Empty window (scan_to == scan_from) must not panic.
+        assert_eq!(super::snap_island_start_to_cluster(&[], 7), 7);
+    }
+
+    /// Round-10b: an island smaller than one MKV cluster yields ZERO cues —
+    /// ffmpeg logs `Truncating packet of size N to M` and emits nothing
+    /// (verified against a real fixture: a ~100 KB island of a file whose
+    /// clusters are ~1 MB produced 0 cues, while a 20 % island produced 9).
+    /// The extractor must therefore DECLINE island mode below the minimum and
+    /// fall back to the prefix path, rather than emit a body that cannot work.
+    #[test]
+    fn subs_island_minimum_size_is_above_a_real_cluster() {
+        // The guard must exceed a realistic cluster. The failing fixture had a
+        // single cluster of 1,093,994 B (from ffmpeg's own truncation message).
+        assert!(
+            super::SUBS_ISLAND_MIN_BYTES > 1_093_994,
+            "minimum island must exceed the 1,093,994 B cluster that produced 0 cues"
+        );
+    }
+
+    /// Round-10b: island selection must still prefer the range containing the
+    /// playhead — the whole point of the fix. Guards against a regression where
+    /// the minimum-size check accidentally reorders the tiers.
+    #[test]
+    fn subs_island_prefers_playhead_range_over_zero_prefix() {
+        const HDR: u64 = 1000;
+        // Real shape: a small 0-prefix plus a far island around the seek target.
+        let ranges = vec![(0u64, 34_603_007u64), (700_000_000, 800_000_000)];
+        let picked = super::pick_subs_island(&ranges, 793_000_000, HDR);
+        let (s, e) = picked.expect("the straddling range must still win over the 0-prefix");
+        // Round-26: this used to assert the raw span (700_000_000, 800_000_000).
+        // That equality incidentally pinned the UNBOUNDED size of a straddling
+        // island — the exact property that would have let cache coalescing grow
+        // the ffmpeg input to file size. The assertion the test NAMES is tier
+        // ordering, so assert that directly: the pick comes from the playhead's
+        // own range, not the 0-prefix.
+        assert!(
+            s >= 700_000_000 && e <= 800_000_000,
+            "must be a window of the playhead's range, got {s}-{e}",
+        );
+        assert!(s <= 793_000_000 && 793_000_000 <= e, "playhead must stay inside the window");
+        // And that island clears the minimum, so it is actually usable.
+        assert!(e - s + 1 >= super::SUBS_ISLAND_MIN_BYTES);
+        // ...while never exceeding the round-26 ceiling.
+        assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES);
+    }
+
+    /// Round-26 T1: the ceiling that makes coverage-derived prebuffering safe.
+    ///
+    /// These assert a BOUND, not a happy path. The regression they prevent is
+    /// silent: cue output stays correct while the ffmpeg input grows toward file
+    /// size, so only a size assertion can catch it.
+    #[test]
+    fn island_never_exceeds_the_ceiling_for_any_arm() {
+        const HDR: u64 = 1000;
+        const MAX: u64 = super::SUBS_ISLAND_MAX_BYTES;
+        let huge = 900 * 1024 * 1024u64;
+
+        // arm 1: straddling
+        let straddle = vec![(HDR, huge)];
+        let (s, e) = super::pick_subs_island(&straddle, huge / 2, HDR).unwrap();
+        assert!(e - s + 1 <= MAX, "arm 1 unbounded: {}B", e - s + 1);
+
+        // arm 2: forward island within the distance limit
+        let playhead = 100_000_000u64;
+        let fwd = vec![(playhead + 1_000_000, playhead + 1_000_000 + huge)];
+        let (s, e) = super::pick_subs_island(&fwd, playhead, HDR).unwrap();
+        assert!(e - s + 1 <= MAX, "arm 2 unbounded: {}B", e - s + 1);
+
+        // arm 3: backward island within the distance limit. The playhead must sit
+        // far enough into the file for a `huge` span to fit behind it.
+        let back_playhead = huge + 100_000_000u64;
+        let back = vec![(back_playhead - 4 * 1024 * 1024 - huge, back_playhead - 4 * 1024 * 1024)];
+        let (s, e) = super::pick_subs_island(&back, back_playhead, HDR).unwrap();
+        assert!(e - s + 1 <= MAX, "arm 3 unbounded: {}B", e - s + 1);
+    }
+
+    /// The exact failure mode the sweep change would otherwise introduce: as the
+    /// prebuffer fills forward, the straddling range coalesces and grows. Island
+    /// size must NOT track that growth.
+    #[test]
+    fn island_size_does_not_grow_with_sweep_progress() {
+        const HDR: u64 = 1000;
+        let playhead = 50_000_000u64;
+        let chunk = 8 * 1024 * 1024u64;
+
+        let after = |chunks: u64| {
+            let ranges = vec![(HDR, playhead + chunks * chunk)];
+            let (s, e) = super::pick_subs_island(&ranges, playhead, HDR).unwrap();
+            e - s + 1
+        };
+
+        let one = after(1);
+        let hundred = after(100);
+        assert!(
+            hundred <= 4 * one,
+            "island grew with sweep progress: 1 chunk -> {one}B, 100 chunks -> {hundred}B",
+        );
+        assert!(hundred <= super::SUBS_ISLAND_MAX_BYTES);
+    }
+
+    /// A clamped island must still be usable: above the floor, and containing the
+    /// viewer. A ceiling that starved the extractor would trade one bug for another.
+    #[test]
+    fn clamped_island_stays_usable() {
+        assert!(
+            super::SUBS_ISLAND_MAX_BYTES > super::SUBS_ISLAND_MIN_BYTES,
+            "ceiling {} must exceed floor {} or every clamped island is rejected",
+            super::SUBS_ISLAND_MAX_BYTES, super::SUBS_ISLAND_MIN_BYTES,
+        );
+        assert!(
+            super::SUBS_ISLAND_MAX_BYTES >= super::SUBS_ISLAND_MAX_DISTANCE_BYTES,
+            "an island admitted at max distance must still fit a usable body",
+        );
+
+        const HDR: u64 = 1000;
+        let ranges = vec![(HDR, 900 * 1024 * 1024u64)];
+        for playhead in [HDR + 1, 10_000_000, 450_000_000, 900 * 1024 * 1024 - 1] {
+            let (s, e) = super::pick_subs_island(&ranges, playhead, HDR).unwrap();
+            assert!(s <= playhead && playhead <= e, "playhead {playhead} outside {s}-{e}");
+            assert!(e - s + 1 >= super::SUBS_ISLAND_MIN_BYTES, "below floor at {playhead}");
+            assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES, "above ceiling at {playhead}");
+        }
+    }
+
+    /// Spans already within the ceiling must pass through byte-identical — the
+    /// clamp must not perturb the fragmented shapes that exist today.
+    #[test]
+    fn clamp_is_identity_below_the_ceiling() {
+        const MAX: u64 = super::SUBS_ISLAND_MAX_BYTES;
+        for (s, e, ph) in [
+            (1000u64, 1000 + 2 * 1024 * 1024u64, 1_500_000u64),
+            (500_000_000, 500_000_000 + MAX - 1, 500_000_100),
+        ] {
+            assert_eq!(super::clamp_subs_island(s, e, ph, MAX), (s, e));
+        }
+    }
+
+    /// The clamp must never invent a range outside its input, at either edge.
+    #[test]
+    fn clamp_never_escapes_the_source_span() {
+        const MAX: u64 = 12 * 1024 * 1024;
+        let (s, e) = (1_000u64, 500_000_000u64);
+        for ph in [s, s + 1, 250_000_000, e - 1, e] {
+            let (cs, ce) = super::clamp_subs_island(s, e, ph, MAX);
+            assert!(cs >= s && ce <= e, "escaped {s}-{e} with playhead {ph}: got {cs}-{ce}");
+            assert!(ce >= cs, "inverted window at {ph}");
+            assert!(ce - cs + 1 <= MAX, "over cap at {ph}");
+            assert!(cs <= ph && ph <= ce, "playhead {ph} dropped out of {cs}-{ce}");
+        }
+    }
+
+    /// Round-10 P1-1: locating the first MKV Cluster bounds the header region
+    /// (EBML/Info/Tracks/CodecPrivate) that must precede any islanded cluster.
+    #[test]
+    fn finds_first_mkv_cluster() {
+        let mut buf = vec![0xAAu8; 900];
+        buf.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]);
+        buf.extend_from_slice(&[0xBBu8; 100]);
+        assert_eq!(super::find_first_mkv_cluster(&buf), Some(900));
+        // Only the FIRST occurrence matters — a later cluster must not win.
+        let mut two = buf.clone();
+        two.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]);
+        assert_eq!(super::find_first_mkv_cluster(&two), Some(900));
+        // No cluster in window → None (caller falls back to prefix mode).
+        assert_eq!(super::find_first_mkv_cluster(&[0u8; 64]), None);
+        // Shorter than the ID must not panic.
+        assert_eq!(super::find_first_mkv_cluster(&[0x1F, 0x43]), None);
+    }
+
+    /// Round-17, the PRODUCTION failure, with the real numbers from 17-t.md:212-213.
+    ///
+    /// ```text
+    /// [SUBS-ISLAND] island 1566572544-1566651346 is 78803B < 2097152B minimum
+    /// [SUBS-ISLAND] no usable island and prefix ends at 33554432B while
+    ///               playhead is 572016605B — declining
+    /// ```
+    ///
+    /// The player's `playback-tail` / `thumbnail-tail` probes leave a ~78 KB
+    /// cached range at EOF on EVERY file. The old unbounded forward rule picked
+    /// it — 967 MB (91.5 min of runtime) past the playhead.
+    #[test]
+    fn rejects_eof_tail_probe_artifact_from_production_log() {
+        const HDR: u64 = 5_827; // "header 0-5827" from the same log line
+        let playhead = 572_016_605u64;
+        let ranges = vec![
+            (0u64, 33_554_432u64),                    // cached prefix, 32 MB
+            (1_566_572_544u64, 1_566_651_346u64),     // EOF tail probe, 78,803 B
+        ];
+
+        // Both candidates are ~half a gigabyte away in opposite directions, so
+        // NEITHER may be served. `None` lets the caller's coverage gate decline.
+        assert_eq!(
+            super::pick_subs_island(&ranges, playhead, HDR), None,
+            "EOF tail is 967 MB ahead and the prefix 538 MB behind — both must be rejected",
+        );
+
+        // Distances, stated so a future reader does not have to recompute them.
+        assert_eq!(1_566_572_544u64 - playhead, 994_555_939);
+        assert_eq!(playhead - 33_554_432u64, 538_462_173);
+    }
+
+    /// The recovery from the SAME session, 7 seconds later (17-t.md:217):
+    /// island 547,814,419-580,386,815 served for playhead 573,250,145.
+    /// That island CONTAINS the playhead declined at :213, so rule 1 admits it
+    /// and the distance bound is never consulted. This is the case the fix must
+    /// not break.
+    #[test]
+    fn admits_the_straddling_island_that_actually_recovered() {
+        const HDR: u64 = 5_827;
+        let ranges = vec![(0u64, 33_554_432u64), (547_814_419u64, 580_386_815u64)];
+
+        // Round-26: these were `assert_eq!` against the full 31.1 MiB span. The
+        // property the test NAMES is admission ("must still be admitted"); the
+        // exact span was incidental, and pinning it also pinned the unbounded
+        // island size. Assert admission from the right range instead.
+        for (playhead, why) in [
+            (573_250_145u64, "the island that recovered at 12:02:58 must still be admitted"),
+            (572_016_605u64, "same island contains the earlier declined playhead"),
+        ] {
+            let (s, e) = super::pick_subs_island(&ranges, playhead, HDR).expect(why);
+            assert!(s >= 547_814_419 && e <= 580_386_815, "{why}: got {s}-{e}");
+            assert!(s <= playhead && playhead <= e, "{why}: playhead outside {s}-{e}");
+            assert!(e - s + 1 >= super::SUBS_ISLAND_MIN_BYTES, "{why}: below floor");
+            assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES, "{why}: above ceiling");
+        }
+    }
+
+    /// The bound must exceed the size floor, or every admitted island would be
+    /// rejected by `build_subs_island_file` moments later.
+    #[test]
+    fn island_distance_bound_exceeds_size_floor() {
+        assert!(
+            super::SUBS_ISLAND_MAX_DISTANCE_BYTES > super::SUBS_ISLAND_MIN_BYTES,
+            "distance bound {} must exceed the {}B island minimum",
+            super::SUBS_ISLAND_MAX_DISTANCE_BYTES, super::SUBS_ISLAND_MIN_BYTES,
+        );
+    }
+
+    /// Boundary arithmetic: exactly-at-the-bound is admitted, one byte past is not.
+    #[test]
+    fn island_distance_bound_is_inclusive() {
+        const HDR: u64 = 1_000;
+        const D: u64 = super::SUBS_ISLAND_MAX_DISTANCE_BYTES;
+        let playhead = 500_000_000u64;
+
+        // Forward: a range starting exactly D ahead is IN.
+        let at = vec![(playhead + D, playhead + D + 10_000_000)];
+        assert!(super::pick_subs_island(&at, playhead, HDR).is_some());
+        // One byte further out is OUT.
+        let past = vec![(playhead + D + 1, playhead + D + 10_000_000)];
+        assert_eq!(super::pick_subs_island(&past, playhead, HDR), None);
+
+        // Backward: a range ENDING exactly D behind is IN.
+        let back_at = vec![(playhead - D - 10_000_000, playhead - D)];
+        assert!(super::pick_subs_island(&back_at, playhead, HDR).is_some());
+        // One byte further back is OUT.
+        let back_past = vec![(playhead - D - 10_000_000, playhead - D - 1)];
+        assert_eq!(super::pick_subs_island(&back_past, playhead, HDR), None);
+    }
+
+    /// Degenerate inputs must not panic (saturating arithmetic near 0 / u64::MAX).
+    #[test]
+    fn island_distance_bound_handles_edges() {
+        const HDR: u64 = 1_000;
+        assert_eq!(super::pick_subs_island(&[], 500_000, HDR), None);
+        // Playhead at 0: the backward limit saturates instead of underflowing.
+        assert_eq!(super::pick_subs_island(&[(0, 500)], 0, HDR), None); // e <= header_end → unusable
+        // Playhead at u64::MAX: the forward limit saturates instead of overflowing.
+        let far = vec![(10_000u64, 20_000u64)];
+        assert_eq!(super::pick_subs_island(&far, u64::MAX, HDR), None);
+    }
+
+    /// Round-10 P1-1: island selection. The whole point is to serve bytes NEAR
+    /// THE PLAYHEAD instead of the contiguous-from-0 prefix, which froze at 196s
+    /// of an 8888s film while the viewer sat at 4500s.
+    #[test]
+    fn picks_island_covering_playhead() {
+        const HDR: u64 = 1000;
+        // Real shape from the failing session: a 0-prefix plus a far island the
+        // player downloaded around the seek target.
+        let ranges = vec![(0u64, 34_603_007u64), (700_000_000, 800_000_000)];
+
+        // Playhead inside the far island → that island wins, NOT the 0-prefix.
+        // Round-26: was `assert_eq!(.., Some((700_000_000, 800_000_000)))`. The
+        // named property is "the far island wins over the 0-prefix"; asserting
+        // the exact 95 MiB span also froze the island size, which is what let
+        // cache coalescing grow the ffmpeg input without limit.
+        let (s, e) = super::pick_subs_island(&ranges, 793_000_000, HDR)
+            .expect("far island must win over the 0-prefix");
+        assert!(s >= 700_000_000 && e <= 800_000_000, "came from the 0-prefix: {s}-{e}");
+        assert!(s <= 793_000_000 && 793_000_000 <= e, "playhead outside {s}-{e}");
+        assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES);
+        // Playhead in a gap, 200 MB (~19 min of runtime) short of the island.
+        // Round-17: this used to return the far island. It is now REJECTED — a
+        // range that distant is not what the viewer is watching, and returning
+        // `Some` here bypasses the caller's prefix-coverage gate. `None` hands
+        // the decision to that gate, which declines with 204 + X-Subs-Partial.
+        assert_eq!(super::pick_subs_island(&ranges, 500_000_000, HDR), None);
+        // Playhead 100 MB PAST every range: likewise too far behind to be the
+        // region on screen. Previously returned the far island.
+        assert_eq!(super::pick_subs_island(&ranges, 900_000_000, HDR), None);
+        // ...but just inside the bound, the same range is still admitted, in
+        // both directions. (8 MiB = 8,388,608 B.) Round-26: assert ADMISSION and
+        // provenance, not the raw span — the span is now capped.
+        for (playhead, why) in [
+            (700_000_000u64 - 8_000_000, "range 8 MB ahead is within the 8 MiB bound"),
+            (800_000_000u64 + 8_000_000, "range 8 MB behind is within the 8 MiB bound"),
+        ] {
+            let (s, e) = super::pick_subs_island(&ranges, playhead, HDR).expect(why);
+            assert!(s >= 700_000_000 && e <= 800_000_000, "{why}: got {s}-{e}");
+            assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES, "{why}: above ceiling");
+            assert!(e - s + 1 >= super::SUBS_ISLAND_MIN_BYTES, "{why}: below floor");
+        }
+        // Playhead inside the 0-prefix → clamped to start at the header end so
+        // the stitched body never duplicates header bytes. Round-26: the 33 MiB
+        // prefix now also clamps to the ceiling, so assert the header-end rule
+        // (the property this case exists for) rather than the whole span.
+        let (s, e) = super::pick_subs_island(&ranges, 10_000, HDR).expect("0-prefix is admitted");
+        assert!(s >= HDR, "island must not duplicate header bytes: starts at {s} < {HDR}");
+        assert!(s <= 10_000 && 10_000 <= e, "playhead outside {s}-{e}");
+        assert!(e <= 34_603_007, "must stay inside the 0-prefix: {s}-{e}");
+        assert!(e - s + 1 <= super::SUBS_ISLAND_MAX_BYTES);
+        // Nothing cached → None → caller keeps the old prefix behaviour.
+        assert_eq!(super::pick_subs_island(&[], 123, HDR), None);
+        // A range entirely inside the header contributes nothing.
+        assert_eq!(super::pick_subs_island(&[(0, 500)], 200, HDR), None);
     }
 
     /// Font dump arg builder: -dump_attachment:<idx> BEFORE -i (input option),
