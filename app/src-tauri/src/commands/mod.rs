@@ -73,11 +73,20 @@ pub struct TelegramState {
     /// stale `true` self-heal while keeping MP4 (2s cadence) and TS (10s cadence)
     /// semantics identical.
     pub player_actively_downloading: Arc<AtomicU64>,
+    /// Round-14 F1: epoch-ms of the last `seek-bisect` probe seen by /stream;
+    /// 0 = none. PROACTIVE declines to spawn while this is FRESH (see
+    /// `seek_critical_read_fresh`), so a cue-less MKV bisect does not race an
+    /// 893 MB background prefetch for the 300ms-spaced Telegram limiter
+    /// (observed 14-t:184-187 — the prefetch spawned in the same second as the
+    /// first probe). A TIMESTAMP, never a bool: round-9 I-2b proved a sticky
+    /// flag here starves the prefetch permanently (0 bytes in 70s).
+    pub seek_critical_read_at: Arc<AtomicU64>,
     /// Latest proactive prebuffer target for each message. Updated by
     /// cmd_report_playback_position so the prebuffer task can slide its window
     /// as the playhead advances instead of being a one-shot fixed-window download.
     /// (current_byte, duration_s, playback_rate, file_size)
     pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
+    pub proactive_generations: Arc<tokio::sync::RwLock<HashMap<i32, u64>>>,
     /// Exact media duration (seconds) as resolved by the /remux ffprobe pass,
     /// keyed by message_id. The /fmp4/metadata endpoint (which the seek bar reads)
     /// otherwise derives duration from Telegram DocumentAttributeVideo → PTS-tail →
@@ -95,7 +104,7 @@ pub struct TelegramState {
     /// message_id. Same rationale as `audio_tracks_json`: stream layout is
     /// immutable per file and each probe costs an ffprobe pass over the
     /// (possibly uncached, rate-limited) stream.
-    pub sub_tracks_json: Arc<tokio::sync::RwLock<HashMap<i32, String>>>,
+    pub sub_tracks_json: Arc<tokio::sync::RwLock<HashMap<(i64, i32), String>>>,
     /// PTS-tail-derived duration (seconds) keyed by message_id. Computing this
     /// requires downloading the last 512KB of the file from Telegram to read the
     /// final video PTS. That value never changes for a given file, but the

@@ -5,7 +5,12 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
-import { useMSEPlayer, readPersistedSubTrack, persistSubTrack } from '../../hooks/useMSEPlayer';
+import { useMSEPlayer, readPersistedSubTrack, persistSubTrack, shouldReExtractSub, lastCueEnd,
+  shouldReportSubFailure,
+  mergeCues,
+  classifySubRepairOutcome, reduceSubRepairBreaker, shouldAttemptSubRepair,
+  emptySubRepairBreakerState, computeSubRepairBackoffMs, resetSubRepairBreakerForSeek,
+  SUB_REPAIR_MAX_ATTEMPTS, type SubRepairBreakerState, type SubRepairOutcome } from '../../hooks/useMSEPlayer';
 import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
 import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
@@ -14,6 +19,19 @@ import { VideoCacheDialog } from './VideoCacheDialog';
 import { useSubtitles } from '../../hooks/useSubtitles';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
+
+export function subRepairRegionRetryDelay(outcome: SubRepairOutcome): number | null {
+  if (outcome === 'progress') return 5_000;
+  if (outcome === 'deferred') return 0;
+  return null;
+}
+
+export function shouldStagePendingPartialSubTrack(
+  error: 'empty' | 'empty-partial' | 'failed',
+  hasExistingTrack: boolean,
+): boolean {
+  return error === 'empty-partial' && !hasExistingTrack;
+}
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -138,6 +156,12 @@ interface FastStreamPlayerProps {
   const embeddedSubTracksRef = useRef<Map<number, { track: SubtitleTrack; partial: boolean }>>(new Map());
   const embeddedSubLoadingIdxRef = useRef<number | null>(null);
   const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
+  // Round-14 F4: tracks whose AUTOMATIC session-restore found no usable cues.
+  // Drives a passive marker on the subtitle row instead of an unprompted toast
+  // (F4.5 (b)). Cleared per track on any successful extraction, and wholesale on
+  // a file switch — "unavailable" is a statement about one file's cache state,
+  // never a durable property of the track.
+  const [embeddedSubUnavailable, setEmbeddedSubUnavailable] = useState<Set<number>>(new Set());
   // Generation counter bumped on every file switch: an extraction that started
   // on file A must NOT activate/persist/clear state after the player moved to
   // file B (review finding: stale cues crossing a mid-extraction file switch).
@@ -162,6 +186,7 @@ interface FastStreamPlayerProps {
     embeddedSubTracksRef.current.clear();
     embeddedSubLoadingIdxRef.current = null;
     setEmbeddedSubBusyIdx(null);
+    setEmbeddedSubUnavailable(new Set()); // round-14 F4: per-file, never durable
     embeddedSubFileGenRef.current++; // invalidate any in-flight extraction
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.id]);
@@ -1043,6 +1068,13 @@ interface FastStreamPlayerProps {
         ranges.push([v.buffered.start(i), v.buffered.end(i)]);
       }
       setBufferedRanges(ranges);
+      // Round-10 P1-2: repair stale subtitle coverage automatically. Nothing in
+      // the app re-extracted after a seek, so cues for 0-196s stayed on screen
+      // (i.e. blank) while the viewer watched at 4500s. Checked on the existing
+      // timeupdate tick — no new timer, no new I/O — and only fires when an
+      // ACTIVE track's cues have genuinely fallen behind the playhead.
+      // maybeRepairSubCoverage self-throttles and no-ops while a fetch is live.
+      maybeRepairSubCoverageRef.current?.(ct);
     };
     const onPlay = () => {
       // Clear remux loading overlay — video is actually playing now
@@ -1524,21 +1556,64 @@ interface FastStreamPlayerProps {
   // activates; later clicks toggle the already-loaded track without refetch.
   // The choice is persisted per file (-1 = explicitly off) and re-applied on
   // the next open of the same file.
-  const toggleEmbeddedSub = useCallback(async (idx: number, label: string, language: string) => {
+  // Round-14 F4: `origin` distinguishes a human click from the session-restore
+  // effect that re-applies a persisted choice on open. Both paths run the SAME
+  // extraction — only the FAILURE REPORTING differs. It defaults to 'user' so
+  // every existing caller keeps today's behaviour; only the auto-restore site
+  // passes 'auto'.
+  //
+  // Why this exists (14-t:120, forensics C6): on open, the extractor gets the
+  // contiguous 0-prefix — 3,670,016 B = 20.8 s of an 8888 s film. Inception's
+  // first 20 s is the beach/waves sequence with no dialogue, so ZERO cues is the
+  // CORRECT result for that input. The old code still fired
+  // "No cues in the downloaded portion yet — try again as more downloads",
+  // which is (a) unprompted, (b) wrong (nothing is stalled), and (c) advice the
+  // user cannot act on — island mode needs a playhead, and at open there is none.
+  const toggleEmbeddedSub = useCallback(async (idx: number, label: string, language: string, origin: 'user' | 'auto' = 'user') => {
     const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
-    // Already loaded → plain toggle; EXCEPT a partial track being re-ENABLED:
-    // re-extract against the (larger) cached prefix and swap the cues in place
-    // (round-3 B-4; the server never disk-caches partials, so each re-request
-    // re-runs and self-improves until fully_cached flips it final).
+    // Already loaded → plain toggle; EXCEPT a track whose cues no longer reach the
+    // playhead, which is re-extracted against the island around the viewer.
+    //
+    // Round-10 P1-2: the old condition was `partial && !active`. That dead-ended:
+    // the backend's disk-cache replay omits X-Subs-Partial, so a truncated body
+    // arrived as partial:false and could NEVER re-extract (session A: cues for
+    // 0-196s of an 8888s film, viewer at 4500s, nothing renderable, no escape).
+    // Coverage is now judged from the cue list itself — ground truth about what
+    // the user can actually see — so a stale track repairs on the next click even
+    // while it is active.
     const existing = embeddedSubTracksRef.current.get(idx);
-    if (existing && !(existing.partial && !subs.activeTracks.includes(existing.track))) {
-      const wasActive = subs.activeTracks.includes(existing.track);
+    const isActive = existing ? subs.activeTracks.includes(existing.track) : false;
+    const staleForPlayhead = existing
+      ? shouldReExtractSub(
+          vidRef.current?.currentTime ?? 0,
+          lastCueEnd(existing.track.cues),
+          !existing.partial,
+          undefined,
+          // Round-20: pass the cue INTERVALS so a backward seek into a hole
+          // between two islands is seen as uncovered.
+          existing.track.cues,
+        )
+      : false;
+    // Re-extract only when the cues can't serve the viewer: stale coverage, or a
+    // partial track being switched back ON. Everything else is a plain toggle.
+    if (existing && !staleForPlayhead && !(existing.partial && !isActive)) {
       subs.toggleTrack(existing.track);
-      persistSubTrack(fileKey, wasActive ? -1 : idx);
+      persistSubTrack(fileKey, isActive ? -1 : idx);
       return;
     }
-    // Fetch in flight for this idx → ignore the click (spinner shows).
-    if (embeddedSubLoadingIdxRef.current != null) return;
+    // The persisted-track restore may already be extracting this exact track when
+    // the user opens the menu. That request will activate it on success; don't
+    // turn a normal early click into an error-looking toast.
+    if (embeddedSubLoadingIdxRef.current != null) {
+      if (embeddedSubLoadingIdxRef.current !== idx || origin !== 'user') {
+        if (origin === 'user') toast.info('Subtitle extraction already running — one moment');
+      }
+      return;
+    }
+    // Round-10b: a manual toggle is an explicit human request, so it RESETS the
+    // breaker for this track. Automatic repair may have given up; the user
+    // asking again must always get a real attempt.
+    subBreakerRef.current.delete(`${file.id}:${idx}`);
     embeddedSubLoadingIdxRef.current = idx;
     setEmbeddedSubBusyIdx(idx);
     const genAtStart = embeddedSubFileGenRef.current;
@@ -1554,6 +1629,41 @@ interface FastStreamPlayerProps {
       // A's cues to file B; the finally must not clobber B's state either).
       if (embeddedSubFileGenRef.current !== genAtStart) return;
       if ('error' in res) {
+        if (origin === 'user' && shouldStagePendingPartialSubTrack(res.error, !!existing)) {
+          const track = new SubtitleTrack(label, language || null);
+          embeddedSubTracksRef.current.set(idx, { track, partial: true });
+          subs.activateTrack(subs.addTrack(track));
+          persistSubTrack(fileKey, idx);
+          setEmbeddedSubUnavailable((prev) => {
+            if (!prev.has(idx)) return prev;
+            const next = new Set(prev);
+            next.delete(idx);
+            return next;
+          });
+          subRepairAttemptedRef.current.delete(
+            `${file.id}:${idx}:${Math.floor((vidRef.current?.currentTime ?? 0) / 120)}`,
+          );
+          return;
+        }
+        // Round-14 F4: an AUTOMATIC session-restore must not narrate its own
+        // failure. The user did not ask for this extraction, the advice
+        // ("try again as more downloads") is wrong at open, and island mode
+        // cannot help without a playhead. Record it silently instead — the
+        // subtitle button renders a passive "unavailable" marker (F4.5 (b)),
+        // which is honest without hijacking the screen.
+        //
+        // A MANUAL click still reports everything, exactly as before: round-10b
+        // fixed a silently-dropped click, and over-suppressing here would
+        // reintroduce that defect (F4.2).
+        if (!shouldReportSubFailure(origin)) {
+          setEmbeddedSubUnavailable((prev) => {
+            if (prev.has(idx)) return prev;
+            const next = new Set(prev);
+            next.add(idx);
+            return next;
+          });
+          return;
+        }
         if (res.error === 'empty') toast.info('This subtitle track has no cues');
         else if (res.error === 'empty-partial') {
           // Round-9 I-5: distinguish "nothing new downloaded" from a fresh miss.
@@ -1564,11 +1674,29 @@ interface FastStreamPlayerProps {
         // Partial re-extract failure: old cues stay active — nothing to undo.
         return;
       }
+      // Round-14 F4: a successful extraction clears any prior "unavailable"
+      // marker for this track (the cache front advanced, or the user seeked
+      // into a region that has cues).
+      setEmbeddedSubUnavailable((prev) => {
+        if (!prev.has(idx)) return prev;
+        const next = new Set(prev);
+        next.delete(idx);
+        return next;
+      });
       if (existing) {
-        // Refresh in place: loadText REPLACES state for ASS (assContent) but
-        // APPENDS cues for SRT/VTT (parser.oncue pushes) — reset first.
-        existing.track.cues = [];
-        existing.track.loadText(res.text);
+        // Round-15 R-3: MERGE, never clobber — same defect as the repair path.
+        // loadText REPLACES state for ASS (assContent) but APPENDS cues for
+        // SRT/VTT (parser.oncue pushes), so the live track cannot be reused
+        // directly; parse into a scratch track and union the cue lists.
+        const scratch = new SubtitleTrack(null, null);
+        scratch.loadText(res.text);
+        if (scratch.isASS) {
+          existing.track.cues = [];
+          existing.track.loadText(res.text);
+        } else {
+          existing.track.cues = mergeCues(existing.track.cues, scratch.cues);
+          existing.track.format = scratch.format;
+        }
         existing.partial = res.partial;
         // Re-activate to force the renderer to re-read the cue list.
         subs.deactivateTrack(existing.track);
@@ -1588,6 +1716,224 @@ interface FastStreamPlayerProps {
     }
   }, [subs, msePlayer, activeFolderId, file.id]);
 
+  // Round-10 P1-2: automatic subtitle-coverage repair.
+  //
+  // Session A: the viewer seeked to 4500s of an 8888s film while the extracted
+  // cues covered 0-196s. Nothing rendered, and nothing in the app ever
+  // re-extracted — `fetchEmbeddedSubText` had exactly one consumer (a manual
+  // click), and even that dead-ended on the `partial` flag. This closes the loop:
+  // when an ACTIVE track's cues fall behind the playhead, re-extract against the
+  // island around the viewer and swap the cues in place.
+  //
+  // Driven by the existing timeupdate tick (no new timer, no polling). Guards:
+  //   - only for an ACTIVE embedded track (never resurrects a disabled one)
+  //   - coverage judged from the cue list, so ASS/jassub tracks (cues stay empty)
+  //     report unknown coverage and are left alone
+  //   - one repair per playhead REGION, so a still-short result can't spin
+  //   - skipped while any extraction is in flight, and generation-guarded so a
+  //     file switch mid-fetch discards the result
+  const subRepairAttemptedRef = useRef<Set<string>>(new Set());
+  // Round-10b: breaker state per (file, track). Survives file switches so
+  // "this file's subtitles are broken" is learnable, LRU-bounded so it cannot
+  // grow without limit. Keyed the same way as the region ledger.
+  const subBreakerRef = useRef<Map<string, SubRepairBreakerState>>(new Map());
+  const SUB_BREAKER_LRU_CAP = 32;
+  const getBreaker = useCallback((key: string): SubRepairBreakerState => {
+    return subBreakerRef.current.get(key) ?? emptySubRepairBreakerState();
+  }, []);
+  const setBreaker = useCallback((key: string, next: SubRepairBreakerState) => {
+    const m = subBreakerRef.current;
+    m.delete(key);          // re-insert so Map iteration order is LRU
+    m.set(key, next);
+    while (m.size > SUB_BREAKER_LRU_CAP) {
+      const oldest = m.keys().next().value;
+      if (oldest === undefined) break;
+      m.delete(oldest);
+    }
+  }, []);
+  const maybeRepairSubCoverageRef = useRef<((t: number) => void) | null>(null);
+  useEffect(() => {
+    maybeRepairSubCoverageRef.current = (playheadS: number) => {
+      if (embeddedSubLoadingIdxRef.current != null) return;
+      if (!Number.isFinite(playheadS) || playheadS <= 0) return;
+      for (const [idx, entry] of embeddedSubTracksRef.current) {
+        if (!subs.activeTracks.includes(entry.track)) continue;
+        // Round-20: pass the cue INTERVALS. With only `lastCueEnd` this gate
+        // silently skipped every backward seek into a hole between two islands
+        // (20-c: 7 consecutive seeks, zero requests reached the backend).
+        if (!shouldReExtractSub(
+          playheadS, lastCueEnd(entry.track.cues), !entry.partial,
+          undefined, entry.track.cues,
+        )) continue;
+        // Round-10b: the breaker gates BEFORE the region ledger. The ledger
+        // bounds distinct regions; only the breaker bounds total attempts, and
+        // only it can learn that this file is simply not repairable right now.
+        const bkey = `${file.id}:${idx}`;
+        // Round-27: a backoff is evidence about the REGION it was earned in, not
+        // about the file. 26-c: a failure at coverage 2043s bought a 150s ladder,
+        // the viewer seeked to 3349s, and subtitles stayed dead for the rest of
+        // the session waiting out a penalty earned ~1300s of content away. When
+        // the playhead enters a 120s region this track has never attempted, drop
+        // the time-based penalties (the `attempts` ceiling deliberately survives,
+        // so seeking cannot buy unlimited repairs).
+        const regionKey = `${file.id}:${idx}:${Math.floor(playheadS / 120)}`;
+        if (!subRepairAttemptedRef.current.has(regionKey)) {
+          const stale = getBreaker(bkey);
+          if (stale.consecutiveFailures > 0 || stale.open || (stale.consecutiveDefers ?? 0) > 0) {
+            setBreaker(bkey, resetSubRepairBreakerForSeek(stale));
+            console.log(
+              `[SUBS] repair breaker reset for track ${idx}: new region at ${playheadS.toFixed(0)}s ` +
+              `(was ${stale.consecutiveFailures} failures, open=${stale.open})`,
+            );
+          }
+        }
+        const st = getBreaker(bkey);
+        if (!shouldAttemptSubRepair(st, Date.now(), false)) {
+          continue;
+        }
+        // One attempt per ~2-minute region, on top of the breaker: a genuinely
+        // uncached region must not re-fetch on every tick.
+        if (subRepairAttemptedRef.current.has(regionKey)) continue;
+        subRepairAttemptedRef.current.add(regionKey);
+        void repairSubCoverage(idx, entry, bkey, playheadS, regionKey);
+        return; // one at a time; the backend serialises extractions anyway
+      }
+    };
+  });
+
+  const repairSubCoverage = useCallback(async (
+    idx: number,
+    entry: { track: SubtitleTrack; partial: boolean },
+    bkey: string,
+    playheadS: number,
+    regionKey?: string,
+  ) => {
+    if (embeddedSubLoadingIdxRef.current != null) return;
+    embeddedSubLoadingIdxRef.current = idx;
+    const genAtStart = embeddedSubFileGenRef.current;
+    const startedAt = Date.now();
+    const before = lastCueEnd(entry.track.cues);
+    // Round-20: cue COUNT before the repair. A backward-seek repair fills a hole
+    // in the middle of the timeline, which raises the count without moving
+    // `lastCueEnd` at all — so the count is what proves it did something.
+    const cuesBeforeCount = entry.track.cues?.length ?? 0;
+    // Round-16: ASS/SSA keeps `cues` empty (jassub renders `assContent`), so the
+    // cue list cannot describe its coverage. Track content length instead.
+    const assBeforeLen = entry.track.isASS ? (entry.track.assContent?.length ?? 0) : null;
+    const stBefore = getBreaker(bkey);
+    const attemptNo = stBefore.attempts + 1;
+    let hadError = false;
+    let after: number | null = before;
+    let assAfterLen: number | null = assBeforeLen;
+    // Round-17: the backend's contiguous cache frontier, from X-Subs-Frontier.
+    // `reduceSubRepairBreaker` resets the failure counter when this GROWS between
+    // attempts — the mechanism that reopens the breaker as data arrives. It was
+    // dead code until now because this call site passed a hardcoded `null`.
+    let frontierBytes: number | null = null;
+    try {
+      const res = await msePlayer.fetchEmbeddedSubText(idx);
+      if (embeddedSubFileGenRef.current !== genAtStart) return; // file switched
+      frontierBytes = res.frontier;
+      if ('error' in res) {
+        hadError = true;
+      } else {
+        // Round-15 R-3: MERGE, never clobber. The old code did
+        // `entry.track.cues = []; entry.track.loadText(res.text)` — a blind
+        // replace that destroyed coverage whenever a later island-mode
+        // extraction returned a narrower span (15-c:188: 2300s -> 169s).
+        //
+        // `cues = []` cannot simply be dropped: loadText APPENDS for SRT/VTT
+        // (parser.oncue pushes), so reusing the live track would duplicate every
+        // cue. Parse into a scratch track instead, then union the two lists.
+        //
+        // ASS is exempt: loadText stores `assContent` and leaves `cues` empty
+        // (SubtitleTrack.ts:80-86), so there is no cue list to merge and jassub
+        // needs the replacement content verbatim.
+        const scratch = new SubtitleTrack(null, null);
+        scratch.loadText(res.text);
+        if (scratch.isASS) {
+          entry.track.cues = [];
+          entry.track.loadText(res.text);
+          assAfterLen = entry.track.assContent?.length ?? 0;
+        } else {
+          entry.track.cues = mergeCues(entry.track.cues, scratch.cues);
+          entry.track.format = scratch.format;
+        }
+        entry.partial = res.partial;
+        after = lastCueEnd(entry.track.cues);
+        // Re-activate so the renderer re-reads the cue list.
+        subs.deactivateTrack(entry.track);
+        subs.activateTrack(entry.track);
+      }
+    } catch {
+      hadError = true;
+    } finally {
+      // Round-10b: clear UNCONDITIONALLY. The old code only cleared when the
+      // generation still matched, so a file switch mid-repair left the flag set
+      // and blocked EVERY future repair for the session.
+      if (embeddedSubLoadingIdxRef.current === idx) {
+        embeddedSubLoadingIdxRef.current = null;
+      }
+    }
+    if (embeddedSubFileGenRef.current !== genAtStart) return;
+    const outcome = classifySubRepairOutcome(
+      before, after, playheadS, hadError, !entry.partial,
+      undefined, assBeforeLen, assAfterLen,
+      // Round-17: growth between attempts turns a 204 decline from `failed`
+      // (150s ladder) into `deferred` (retry soon, no failure budget spent).
+      stBefore.lastFrontierBytes, frontierBytes,
+      // Round-20: cue intervals + the pre-repair count, so a backward-seek
+      // repair that filled a mid-file hole is scored on what it actually did.
+      entry.track.cues, cuesBeforeCount,
+    );
+    const stAfter = reduceSubRepairBreaker(stBefore, outcome, startedAt, frontierBytes);
+    setBreaker(bkey, stAfter);
+    const retryDelay = subRepairRegionRetryDelay(outcome);
+    if (regionKey && retryDelay != null) {
+      if (retryDelay === 0) {
+        subRepairAttemptedRef.current.delete(regionKey);
+      } else {
+        setTimeout(() => {
+          if (embeddedSubFileGenRef.current === genAtStart) {
+            subRepairAttemptedRef.current.delete(regionKey);
+          }
+        }, retryDelay);
+      }
+    }
+    const elapsed = Date.now() - startedAt;
+    // Round-10b: 12-t.md had 444 identical lines with no counter, so the runaway
+    // was invisible until byte totals were summed by hand. Every line now carries
+    // attempt n/max, coverage before→after, elapsed ms, and the outcome.
+    console.log(
+      `[SUBS] repair track ${idx} attempt ${attemptNo}/${SUB_REPAIR_MAX_ATTEMPTS}: ` +
+      `${outcome} — ` +
+      (assAfterLen != null
+        // ASS/SSA has no cue list, so "coverage 2300s" is meaningless for it —
+        // report what actually changed (16-c:213 logged `nones → nones`).
+        ? `content ${assBeforeLen ?? 0}B → ${assAfterLen}B, `
+        : `coverage ${before?.toFixed(0) ?? 'none'}s → ${after?.toFixed(0) ?? 'none'}s, `) +
+      `playhead ${playheadS.toFixed(0)}s, ${elapsed}ms`,
+    );
+    if (stAfter.open && !stBefore.open) {
+      console.warn(
+        `[SUBS] repair BREAKER OPEN for track ${idx} after ${stAfter.consecutiveFailures} ` +
+        `consecutive non-progress attempts — automatic repair suspended for this file. ` +
+        `A manual track toggle still forces a retry.`,
+      );
+    } else if (!stAfter.open && stAfter.consecutiveFailures > 0) {
+      console.log(
+        `[SUBS] repair backoff for track ${idx}: next attempt in ` +
+        `${Math.round(computeSubRepairBackoffMs(stAfter.consecutiveFailures) / 1000)}s`,
+      );
+    }
+  }, [subs, msePlayer, getBreaker, setBreaker]);
+
+  // Reset the per-region repair ledger when the file changes. The BREAKER map
+  // deliberately survives: a file known to be unrepairable must stay known.
+  useEffect(() => {
+    subRepairAttemptedRef.current.clear();
+  }, [file.id]);
+
   // Re-apply the persisted embedded-subtitle choice when the track list for
   // this file materializes (plan §2.4: never auto-enable without a persisted
   // choice; -1 = explicit off, absent = no stored preference).
@@ -1601,7 +1947,10 @@ interface FastStreamPlayerProps {
     if (persisted == null || persisted < 0) return; // off / no choice
     const t = msePlayer.embeddedSubTracks.find((s) => s.idx === persisted && s.kind === 'text');
     if (!t) return;
-    void toggleEmbeddedSub(t.idx, t.label, t.language);
+    // Round-14 F4: 'auto' — this is session restore, not a human request. A
+    // failure here must not toast (forensics C6: it fired on EVERY open of a
+    // partially-cached file with a persisted choice).
+    void toggleEmbeddedSub(t.idx, t.label, t.language, 'auto');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msePlayer.embeddedSubTracks, file.id, activeFolderId]);
 
@@ -1877,12 +2226,19 @@ interface FastStreamPlayerProps {
                     const loaded = embeddedSubTracksRef.current.get(t.idx);
                     const active = !!loaded && subs.activeTracks.includes(loaded.track);
                     const busy = embeddedSubBusyIdx === t.idx;
+                    // Round-14 F4.5(b): a silent auto-restore failure surfaces
+                    // here instead of as a toast. Suppressed while busy/active.
+                    const unavailable = embeddedSubUnavailable.has(t.idx) && !busy && !active;
                     const disabled = t.kind !== 'text' || busy;
                     return (
                       <button
                         key={t.idx}
                         disabled={disabled}
-                        title={t.kind !== 'text' ? 'Image-based subtitles — not supported' : t.label}
+                        title={t.kind !== 'text'
+                          ? 'Image-based subtitles — not supported'
+                          : unavailable
+                            ? 'No cues in the downloaded portion yet — click to retry'
+                            : t.label}
                         onClick={() => { void toggleEmbeddedSub(t.idx, t.label, t.language); }}
                         className={`block w-full text-left px-3 py-1.5 text-sm truncate ${
                           t.kind !== 'text'
@@ -1892,7 +2248,10 @@ interface FastStreamPlayerProps {
                               : 'text-white hover:bg-white/10'
                         }`}
                       >
-                        {busy ? `${t.label} — extracting…` : `${t.label}${t.kind !== 'text' ? ' (image-based)' : ''}`}
+                        {busy
+                          ? `${t.label} — extracting…`
+                          : `${t.label}${t.kind !== 'text' ? ' (image-based)' : ''}`}
+                        {unavailable && <span className="text-white/40"> — not downloaded yet</span>}
                       </button>
                     );
                   })}

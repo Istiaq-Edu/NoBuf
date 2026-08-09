@@ -343,7 +343,7 @@ pub struct StreamCacheManager {
     /// input ⇒ same output, so re-running ffmpeg is pure waste (9-*: frontier
     /// frozen at 32MiB while playback cached 561M+ far ranges → identical "647
     /// chars partial" twice). In-memory only; entries cleared on cache delete.
-    subs_partial_memo: Arc<std::sync::Mutex<HashMap<(i32, i32, bool), (u64, Vec<u8>, String)>>>,
+    subs_partial_memo: Arc<std::sync::Mutex<HashMap<(i64, i32, i32, bool), (u64, Vec<u8>, String)>>>,
 }
 
 /// Cached HLS layout info for a message, including the Media object
@@ -688,6 +688,31 @@ impl StreamCacheManager {
             }
         }
         None
+    }
+
+    /// Round-28: distance from `target` to the nearest active download's
+    /// effective progress, or `None` when no download is active.
+    ///
+    /// Used by the proactive sweep to decide whether yielding the 2-permit
+    /// download semaphore to `/stream` is worth 5 s. Yielding only helps when
+    /// `/stream` is actually working the seek target; when it is far away (its
+    /// readahead still marching forward from a pre-seek estimate) the sweep is
+    /// the viewer's only supply line and must not sleep. See
+    /// `PROACTIVE_YIELD_STREAM_NEAR_BYTES`.
+    ///
+    /// Distance is absolute: a download BEHIND the target is just as unhelpful
+    /// as one ahead of it. `last_progress.max(start_byte)` mirrors
+    /// `find_best_covering_download`'s effective-progress rule so both agree on
+    /// where a download actually is.
+    pub async fn distance_to_nearest_download(&self, message_id: i32, target: u64) -> Option<u64> {
+        let downloads = self.active_downloads.lock().await;
+        let dls = downloads.get(&message_id)?;
+        dls.iter()
+            .map(|dl| {
+                let effective_progress = dl.last_progress.max(dl.start_byte);
+                effective_progress.abs_diff(target)
+            })
+            .min()
     }
 
     /// Find the BEST covering download for a message — the one whose
@@ -1061,33 +1086,42 @@ impl StreamCacheManager {
         let mut total_freed: u64 = 0;
         let mut failed_files: Vec<(PathBuf, std::io::Error)> = Vec::new();
 
-        // Walk the directory tree and delete files one by one
-        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Handle subdirectories (e.g., remux/)
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub_entry in sub_entries.flatten() {
-                            let sub_path = sub_entry.path();
-                            let size = std::fs::metadata(&sub_path).map(|m| m.len()).unwrap_or(0);
-                            match std::fs::remove_file(&sub_path) {
-                                Ok(()) => total_freed += size,
-                                Err(e) => failed_files.push((sub_path, e)),
-                            }
+        // Round-10 P2-5: recurse to ANY depth. The old code walked exactly one
+        // level, so a depth-2 subdirectory (remux/subs — created by
+        // subs_cache_dir) was passed to remove_file(), which on Windows fails
+        // with "Access is denied. (os error 5)" for a DIRECTORY unconditionally —
+        // reproduced on an empty dir. That produced the every-shutdown warning
+        // `Still can't delete "...\stream-cache\remux\subs": os error 5` plus a
+        // bogus "1 files still locked after retry", which masked real leaks.
+        //
+        // Discriminator worth keeping in mind: a genuine Windows lock leak
+        // surfaces as os error 32 (SHARING_VIOLATION). os error 5 on a path that
+        // IS a directory means a recursion bug, not a held handle.
+        fn purge_dir(
+            dir: &std::path::Path,
+            freed: &mut u64,
+            failed: &mut Vec<(PathBuf, std::io::Error)>,
+        ) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        purge_dir(&path, freed, failed);
+                        // Remove the now-empty directory. A real lock leaves it
+                        // non-empty, and the file-level error is already recorded,
+                        // so a failure here needs no separate report.
+                        let _ = std::fs::remove_dir(&path);
+                    } else {
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => *freed += size,
+                            Err(e) => failed.push((path, e)),
                         }
-                    }
-                    // Try to remove the now-empty subdirectory
-                    let _ = std::fs::remove_dir(&path);
-                } else {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => total_freed += size,
-                        Err(e) => failed_files.push((path, e)),
                     }
                 }
             }
         }
+        purge_dir(&self.cache_dir, &mut total_freed, &mut failed_files);
 
         // Retry locked files after a short delay (handles race with
         // file handles closing from server shutdown)
@@ -1221,11 +1255,18 @@ impl StreamCacheManager {
 
     /// Round-9 I-5: look up the memoized partial-subs result for this track IF
     /// the contiguous prefix hasn't grown since it was stored. None = run ffmpeg.
+    ///
+    /// Round-10 P0-3: keyed by `folder_key` too. Telegram message_id is unique
+    /// only within a peer, so keying by message_id alone let folder A's msg 18
+    /// replay its cues for folder B's msg 18 — the same class of bug already
+    /// fixed for the media cache (see server.rs "channel A's msg 18 poison
+    /// channel B's msg 18"). Callers pass `folder_id.unwrap_or(i64::MIN)`, the
+    /// established total-key sentinel for the me/home/null folder.
     pub fn subs_partial_memo_get(
-        &self, message_id: i32, stream_idx: i32, ass: bool, current_frontier: u64,
+        &self, folder_key: i64, message_id: i32, stream_idx: i32, ass: bool, current_frontier: u64,
     ) -> Option<(Vec<u8>, String)> {
         let memo = self.subs_partial_memo.lock().ok()?;
-        let (frontier, body, format) = memo.get(&(message_id, stream_idx, ass))?;
+        let (frontier, body, format) = memo.get(&(folder_key, message_id, stream_idx, ass))?;
         if *frontier == current_frontier {
             Some((body.clone(), format.clone()))
         } else {
@@ -1236,19 +1277,24 @@ impl StreamCacheManager {
     /// Round-9 I-5: store a partial-subs extraction result keyed by the frontier
     /// it was extracted at.
     pub fn subs_partial_memo_store(
-        &self, message_id: i32, stream_idx: i32, ass: bool,
+        &self, folder_key: i64, message_id: i32, stream_idx: i32, ass: bool,
         frontier: u64, body: Vec<u8>, format: String,
     ) {
         if let Ok(mut memo) = self.subs_partial_memo.lock() {
-            memo.insert((message_id, stream_idx, ass), (frontier, body, format));
+            memo.insert((folder_key, message_id, stream_idx, ass), (frontier, body, format));
         }
     }
 
     /// Round-9 I-5: drop all partial-subs memos for a message (cache deleted —
     /// the frontier resets, stale bodies must not replay).
+    ///
+    /// Deliberately folder-AGNOSTIC: the disk cache is keyed by message_id alone,
+    /// so a delete for msg N invalidates every folder's memo for msg N. Clearing
+    /// too much is safe (the next request re-extracts); clearing too little would
+    /// replay a body whose bytes are gone.
     pub fn subs_partial_memo_clear(&self, message_id: i32) {
         if let Ok(mut memo) = self.subs_partial_memo.lock() {
-            memo.retain(|(mid, _, _), _| *mid != message_id);
+            memo.retain(|(_, mid, _, _), _| *mid != message_id);
         }
     }
 
@@ -1524,6 +1570,69 @@ mod tests {
     fn test_is_range_cached_not_covered() {
         let ranges = vec![(0, 499)];
         assert!(!is_range_cached(&ranges, 500, 999));
+    }
+
+    /// Round-10 P2-5: clear_all_robust must recurse to ANY depth. The old
+    /// one-level walk handed `remux/subs` (depth 2) to `remove_file()`, which on
+    /// Windows returns "Access is denied. (os error 5)" for a DIRECTORY
+    /// unconditionally — reproducible on an EMPTY dir. Every shutdown logged a
+    /// bogus "1 files still locked after retry", masking real leaks (which show
+    /// os error 32 / SHARING_VIOLATION instead).
+    #[test]
+    fn clear_all_robust_recurses_to_any_depth() {
+        let root = std::env::temp_dir().join(format!("nobuf_test_deep_purge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // depth 3: cache_dir/remux/subs/<file> — the exact shape subs_cache_dir makes
+        let deep = root.join("remux").join("subs");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("home_109_s3.srt"), b"cues").unwrap();
+        std::fs::write(root.join("remux").join("out.mp4"), b"video").unwrap();
+        std::fs::write(root.join("109.dat"), b"data").unwrap();
+
+        let mgr = StreamCacheManager::new(root.clone()).unwrap();
+        assert!(mgr.clear_all_robust().is_ok(), "purge must not report locked files");
+
+        assert!(!deep.join("home_109_s3.srt").exists(), "depth-3 file must be deleted");
+        assert!(!root.join("remux").join("out.mp4").exists(), "depth-2 file must be deleted");
+        assert!(!root.join("109.dat").exists(), "depth-1 file must be deleted");
+        assert!(!deep.exists(), "emptied nested dir must be removed, not remove_file'd");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Round-10 P0-3: the partial-subs memo must be keyed by folder as well as
+    /// message. Telegram message_id is unique only within a peer, so a
+    /// message-only key let folder A's cues replay for folder B's same-id
+    /// message — the class the media cache already fixed ("channel A's msg 18
+    /// poison channel B's msg 18"). Clear stays folder-agnostic on purpose: the
+    /// .dat is keyed by message alone, so a delete must invalidate every folder.
+    #[test]
+    fn subs_partial_memo_is_folder_scoped() {
+        let dir = std::env::temp_dir().join("nobuf_test_subs_memo_folder");
+        let mgr = StreamCacheManager::new(dir).unwrap();
+        const A: i64 = 111;
+        const B: i64 = 222;
+        const MSG: i32 = 18;
+
+        mgr.subs_partial_memo_store(A, MSG, 3, false, 1000, b"FOLDER-A".to_vec(), "srt".into());
+        mgr.subs_partial_memo_store(B, MSG, 3, false, 1000, b"FOLDER-B".to_vec(), "srt".into());
+
+        assert_eq!(
+            mgr.subs_partial_memo_get(A, MSG, 3, false, 1000).unwrap().0,
+            b"FOLDER-A".to_vec(),
+            "folder A must never see folder B's body"
+        );
+        assert_eq!(
+            mgr.subs_partial_memo_get(B, MSG, 3, false, 1000).unwrap().0,
+            b"FOLDER-B".to_vec(),
+        );
+        // An unseen folder is a miss, not a silent hit on someone else's cues.
+        assert!(mgr.subs_partial_memo_get(999, MSG, 3, false, 1000).is_none());
+        // Frontier still gates: same key, grown prefix ⇒ re-extract.
+        assert!(mgr.subs_partial_memo_get(A, MSG, 3, false, 2000).is_none());
+        // Clear is folder-agnostic: the .dat is message-keyed, so both go.
+        mgr.subs_partial_memo_clear(MSG);
+        assert!(mgr.subs_partial_memo_get(A, MSG, 3, false, 1000).is_none());
+        assert!(mgr.subs_partial_memo_get(B, MSG, 3, false, 1000).is_none());
     }
 
     #[test]

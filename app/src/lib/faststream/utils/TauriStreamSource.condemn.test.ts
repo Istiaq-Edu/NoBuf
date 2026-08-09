@@ -31,6 +31,24 @@ const hangingFetch = () => vi.fn((_u: any, init: any) => new Promise((_r, rej) =
   init.signal.addEventListener('abort', () => rej(new DOMException('x', 'AbortError')))));
 const makeSource = () => createTauriStreamSource({ url: 'http://t/stream', fileSize: 16 }) as any;
 
+async function consumeRead(source: any, start: number, end: number): Promise<Uint8Array> {
+  const value = await source._options.read(start, end);
+  if (value instanceof Uint8Array) return value;
+  const reader = value.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    chunks.push(next.value);
+    size += next.value.byteLength;
+  }
+  const merged = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.byteLength; }
+  return merged;
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe('TauriStreamSource sticky condemn (fix A1)', () => {
@@ -43,14 +61,14 @@ describe('TauriStreamSource sticky condemn (fix A1)', () => {
     vi.stubGlobal('fetch', servingFetch());
     const s = makeSource();
     s.abortInFlight();                       // lands while nothing is in flight
-    await expect(s._options.read(0, 16))     // pre-fix this RESOLVED (spike-pinned bug)
+    await expect(consumeRead(s, 0, 16))     // pre-fix this RESOLVED (spike-pinned bug)
       .rejects.toThrow('[TauriStreamSource] read aborted (superseded by seek)');
   });
 
   it('condemn MID-fetch still rejects (existing abort mapping kept)', async () => {
     vi.stubGlobal('fetch', hangingFetch());
     const s = makeSource();
-    const p = s._options.read(0, 16);
+    const p = consumeRead(s, 0, 16);
     await new Promise(r => setTimeout(r, 10));
     s.abortInFlight();
     await expect(p).rejects.toThrow('read aborted (superseded by seek)');
@@ -60,9 +78,9 @@ describe('TauriStreamSource sticky condemn (fix A1)', () => {
     vi.stubGlobal('fetch', servingFetch());
     const s = makeSource();
     s.abortInFlight();
-    await expect(s._options.read(0, 16)).rejects.toThrow('superseded by seek');
+    await expect(consumeRead(s, 0, 16)).rejects.toThrow('superseded by seek');
     s.resetSupersession();                   // seekTo-entry clear (fix A1)
-    const data: Uint8Array = await s._options.read(0, 16);
+    const data = await consumeRead(s, 0, 16);
     expect(Array.from(data)).toEqual(Array.from(FILE));
   });
 
@@ -77,11 +95,11 @@ describe('TauriStreamSource sticky condemn (fix A1)', () => {
     // zombie walk marches into NEW territory and dies at its first network touch).
     // Hence no read between reset and re-condemn here — the first fetch-touching
     // read must reject.
-    await expect(s._options.read(0, 16)).rejects.toThrow('superseded by seek');
+    await expect(consumeRead(s, 0, 16)).rejects.toThrow('superseded by seek');
   });
 
   it('a fresh source is not condemned (thumbnail instance unaffected)', async () => {
     vi.stubGlobal('fetch', servingFetch());
-    await expect(makeSource()._options.read(0, 16)).resolves.toHaveLength(16);
+    await expect(consumeRead(makeSource(), 0, 16)).resolves.toHaveLength(16);
   });
 });

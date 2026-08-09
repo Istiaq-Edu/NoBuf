@@ -393,6 +393,60 @@ describe('bisectMkvClusterSearch (shared driver — round-6 player far-seek)', (
     });
     expect(res).toBeNull();
   });
+
+  it('uses a walkable cache bracket with zero network probes', async () => {
+    let fetches = 0;
+    const lo = { byte: 100 * 1024 * 1024, ticks: 40_000 };
+    const hi = { byte: lo.byte + 3 * 1024 * 1024, ticks: 41_000 };
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream?source_id=seek-bisect',
+      fileSize: 512 * 1024 * 1024,
+      startLo: 4096,
+      bracketLo: lo,
+      bracketHi: hi,
+      targetTicks: 40_500,
+      hiTicks: 100_000,
+      fetchImpl: (async () => {
+        fetches++;
+        throw new Error('walkable cache bracket must not probe');
+      }) as unknown as typeof fetch,
+    });
+    expect(fetches).toBe(0);
+    expect(res).toEqual({
+      entry: { elementStartPos: lo.byte, startTimestamp: lo.ticks },
+      bytesFetched: 0,
+      probes: 0,
+    });
+  });
+
+  it('uses exact cache anchors as a hard search bracket', async () => {
+    const MIB = 1024 * 1024;
+    const { clusters, fetchImpl: baseFetch } = makeSyntheticFile(64 * MIB, MIB, 1000, 4096);
+    const targetTicks = 40_500;
+    const below = clusters.find(c => c.ticks === 36_000)!;
+    const above = clusters.find(c => c.ticks === 44_000)!;
+    const ranges: [number, number][] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const m = /bytes=(\d+)-(\d+)/.exec(init?.headers?.Range ?? '');
+      if (!m) throw new Error('no range');
+      ranges.push([Number(m[1]), Number(m[2])]);
+      return baseFetch(url, init);
+    }) as typeof fetch;
+    const res = await bisectMkvClusterSearch({
+      probeUrl: 'http://x/stream?source_id=seek-bisect', fileSize: 64 * MIB,
+      startLo: 4096,
+      bracketLo: { byte: below.byte, ticks: below.ticks },
+      bracketHi: { byte: above.byte, ticks: above.ticks },
+      targetTicks, hiTicks: 63_000, fetchImpl,
+    });
+    expect(res).not.toBeNull();
+    expect(res!.entry).toEqual({ elementStartPos: clusters.find(c => c.ticks === 40_000)!.byte, startTimestamp: 40_000 });
+    expect(ranges.length).toBeGreaterThan(0);
+    for (const [start, end] of ranges) {
+      expect(start).toBeGreaterThanOrEqual(below.byte);
+      expect(end).toBeLessThan(above.byte + 64 * 1024);
+    }
+  });
 });
 
 describe('computeKeyframeShadowSeconds (round-7 keyframe shadow)', () => {

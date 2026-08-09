@@ -38,6 +38,7 @@ import {
   bisectMkvClusterSearch,
   computeKeyframeShadowSeconds,
   findClusterCacheEntryNear,
+  findClusterCacheBracket,
   injectMkvClusterPosition,
   readMkvClusterPositions,
   readMkvClusterSeekStart,
@@ -131,6 +132,22 @@ export function shouldAbandonResolvedSeek(
   seekAbortFlag: boolean, disposed: boolean, capturedGen: number, liveGen: number,
 ): boolean {
   return seekAbortFlag || disposed || capturedGen !== liveGen;
+}
+
+/** Round-24: may THIS seek release the stream source's condemnation?
+ *
+ *  `seekTo` holds `superseded` across its whole search phase (bisect + keyframe
+ *  walk) so a stale pre-seek refill cannot keep fetching 8 MiB chunks and
+ *  starving the probes for the 2 global download permits. The release therefore
+ *  has to happen on EVERY exit path, which means a `finally` — and a bare
+ *  release there is wrong: a newer `seekTo` may already have condemned the
+ *  source for itself, and this seek's late-running `finally` would clear the new
+ *  seek's flag, resurrecting the exact starvation the fix removes.
+ *
+ *  Only the seek that still owns the current generation may release.
+ *  Pure + exported so the rule is bound by test, not re-modelled in one. */
+export function mayReleaseSeekCondemnation(capturedGen: number, liveGen: number): boolean {
+  return capturedGen === liveGen;
 }
 
 export class MediabunnyTransmuxer {
@@ -1094,6 +1111,10 @@ export class MediabunnyTransmuxer {
       const baseUrl = this.config.sourceConfig.url;
       const sep = baseUrl.includes('?') ? '&' : '?';
       const started = performance.now();
+      const cacheBracket = findClusterCacheBracket(videoTrack, shadowedTicks);
+      if (cacheBracket) {
+        console.log(`[Transmuxer] seekTo bisect: using cached cluster bracket ${cacheBracket.lo.ticks}-${cacheBracket.hi.ticks} ticks (${cacheBracket.lo.byte}-${cacheBracket.hi.byte})`);
+      }
       const result = await bisectMkvClusterSearch({
         // Dedicated source_id: probes jump far apart by design — sharing
         // 'playback' would trip the coordinator's zombie-cancel against the
@@ -1101,6 +1122,7 @@ export class MediabunnyTransmuxer {
         probeUrl: `${baseUrl}${sep}source_id=seek-bisect`,
         fileSize: this.config.sourceConfig.fileSize,
         startLo: readMkvClusterSeekStart(videoTrack) ?? 0,
+        ...(cacheBracket ? { bracketLo: cacheBracket.lo, bracketHi: cacheBracket.hi } : {}),
         targetTicks: shadowedTicks,
         hiTicks: this.duration > 0 && Number.isFinite(this.duration) ? Math.round(this.duration * factor) : null,
         shouldContinue: () => !shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, generation, this.seekGeneration),
@@ -1490,7 +1512,15 @@ export class MediabunnyTransmuxer {
    * Returns the keyframe timestamp so the caller can set the correct
    * SourceBuffer.timestampOffset.
    */
-  async seekTo(seekTime: number, maxDuration: number = Infinity, options?: { skipInitSegment?: boolean; stopTime?: number }): Promise<number | null> {
+  async seekTo(
+    seekTime: number,
+    maxDuration: number = Infinity,
+    options?: {
+      skipInitSegment?: boolean;
+      stopTime?: number;
+      onResolved?: (keyframeTimestamp: number) => void | Promise<void>;
+    },
+  ): Promise<number | null> {
     if (this.disposed) return null;
 
     // Abort any ongoing seek transmux loop
@@ -1503,12 +1533,17 @@ export class MediabunnyTransmuxer {
     // in the coordinator's zombie-cancel logic (both source_id=None) so neither
     // ever completes and the seek hangs. Aborting frees the slot immediately.
     (this.streamSource as any)?.abortInFlight?.();
-    // Fix A1 (round-2): clear the sticky condemnation set by interruptSeek()/a prior entry —
-    // THIS seek's reads must pass. Entry is synchronous from here through seekGeneration++,
-    // so nothing this seek issues can be condemned. Scope: protects the user-drain supersede
-    // path; a user seek superseding an in-flight REFILL self-clears in ~µs (accepted residual,
-    // see reports/seek-interrupt-solution.md).
-    (this.streamSource as any)?.resetSupersession?.();
+    // Round-10b L2(a): resetSupersession() was here — moved down to AFTER the
+    // bisect completes. The stale pre-seek download ran for **11 seconds** into
+    // the seek because the abort had nothing to cancel (the subscriber completed
+    // just before the abort) and this reset cleared the flag before the stale
+    // download's next request. Keeping `superseded=true` throughout the bisect
+    // condemns stale reads immediately, freeing their API budget for the probes.
+    //
+    // The bisect is IMMUNE to the flag: `bisectMkvClusterSearch` defaults
+    // `fetchImpl = fetch` and calls it directly — raw global `fetch`, never
+    // `TauriStreamSource.read()`, so `superseded` cannot condemn a probe.
+    // Verified at `MkvClusterBisect.ts:427,442`.
 
     // Increment generation to discard stale callback data
     this.seekGeneration++;
@@ -1601,6 +1636,45 @@ export class MediabunnyTransmuxer {
         this.input = new Input({ source: this.streamSource!, formats, initInput: this.initInputRef ?? undefined });
       }
 
+      // Round-10b L2(a): release the condemnation HERE — before any read that
+      // goes through TauriStreamSource (canRead / getPrimaryVideoTrack below).
+      // It is deliberately NOT released at the top of seekTo any more: holding
+      // `superseded` across the abort means the stale pre-seek download is
+      // condemned on its very next read instead of competing with this seek for
+      // the 300ms-spaced rate limiter (observed: it survived 11s into the seek).
+      //
+      // Round-24: the reset was HERE, and that is too early. The comment above
+      // said "moved down to AFTER the bisect completes" but the code released
+      // the flag at this point — before `bisectSeekTarget` (further down). A
+      // cue-less far seek spends its entire bisect (12.8s measured) with the
+      // condemnation already lifted, so the stale refill's NEXT read sails
+      // through and its sequential prefetch re-arms an 8 MiB ladder.
+      //
+      // Measured (session 11:57:11, target 1494.6s, resolved cluster
+      // 218,618,959): five stale `source_id=playback` reads walked 30.0 -> 44.5
+      // MiB for 18s after the seek, while the viewer was at 208.5 MiB. With only
+      // two global download permits (`lib.rs:255 Semaphore::new(2)`, acquired per
+      // chunk at `download_pool.rs:377`) that ladder starved the probes: they
+      // landed 3.0/3.0/4.0s apart against a 0.3s limiter floor.
+      //
+      // The reset now happens after the keyframe is resolved (see below). Safe,
+      // and verified rather than assumed: `canRead()` and `getPrimaryVideoTrack()`
+      // are memoized (`input.ts:271 _demuxerPromise ??=`,
+      // `matroska-demuxer.ts:320 readMetadataPromise ??=`) and issue NO read()
+      // once metadata is parsed — and our Input is persistent across seeks
+      // ("reusing persistent MKV Input"). The bisect is independently immune: it
+      // calls raw global `fetch` (`MkvClusterBisect.ts:524,582`), never
+      // TauriStreamSource.read().
+      //
+      // Round-25: clear the condemnation HERE, before the metadata reads below.
+      // Two condemnations reach this point — one from the caller
+      // (`stopStreamingChain(true)` -> `interruptSeek()` -> `abortInFlight()`)
+      // and one from this function's own entry. Round-24 left both in force
+      // across `canRead()`, which killed every seek on the fresh-Input branches
+      // and rerouted the file to /remux. The search-phase condemnation is
+      // re-armed a few lines below, once the metadata reads are done.
+      (this.streamSource as any)?.resetSupersession?.();
+
       const canRead = await this.input.canRead();
       if (!canRead) {
         throw new Error(`Cannot read ${this.config.format} file after seek`);
@@ -1615,10 +1689,55 @@ export class MediabunnyTransmuxer {
         throw new Error('No video track found after seek');
       }
 
+      // Round-25: re-arm the condemnation for the SEARCH phase only.
+      //
+      // The three awaits above are metadata reads. On the persistent-Input path
+      // they are memoized and touch no bytes, but the fresh-Input branches
+      // (`byteOffsetKeyframe`, and the no-index else-branch) build a NEW Input
+      // whose `_demuxerPromise` is empty — canRead() must then parse metadata
+      // from the network. Round-24 left the source condemned across them, so
+      // that read threw '(superseded by seek)', seekTo's catch classified it as
+      // an expected cancellation, and the caller rerouted the whole file to
+      // /remux. 25-c: every one of five seeks died this way, and /remux has no
+      // bisect, so it reported LINEAR byte estimates to the prebuffer (verified
+      // byte-exact against the log) — 40-60 MB off the true cluster on this VBR
+      // file. That is the "prebuffer points way off" symptom.
+      //
+      // Round-27: re-arm the condemnation for the BISECT ONLY.
+      //
+      // The round-25 comment here claimed "nothing legitimately reads through
+      // TauriStreamSource until the forward iteration". That is FALSE, and the
+      // 27-c diagnostic proved it byte-exact:
+      //
+      //   27-c:100  bisect: cluster for 956.6s at byte=161496300   <- SUCCEEDED
+      //   27-c:101  Seek canceled/disposed: superseded=false (gen 4->4)
+      //             aborted=false disposed=false expectedErr=true
+      //             err=[TauriStreamSource] read aborted (superseded by seek)
+      //
+      // Nothing about that seek was stale — same generation, no abort, no
+      // dispose. The ONLY thing that killed it was the flag this seek set on
+      // ITSELF here, which then condemned `getKeyPacket` below (:1745/:1774).
+      // The bisect is immune (raw global `fetch`), but the keyframe WALK is not:
+      // it reads the residual cluster bytes through TauriStreamSource. So the
+      // bisect resolved the cluster and the walk immediately threw, the catch
+      // classified it "expected", and the caller rerouted the whole file to
+      // /remux — on EVERY seek. Every downstream symptom (linear prebuffer
+      // bytes, dead subtitles) followed from that reroute.
+      //
+      // The condemnation still buys what round-24 wanted — stale refill reads
+      // are locked out during the expensive bisect — but it MUST be released
+      // before the walk, which is a legitimate read belonging to THIS seek.
+      (this.streamSource as any)?.abortInFlight?.();
+
       const seekStartTime = performance.now();
 
       // Find the nearest keyframe at or before seekTime.
       const videoKeyStart = performance.now();
+      // Round-22 F0: `videoKeyStart` spans BOTH the bisect and the keyframe walk.
+      // These two accumulators split it so the log can attribute the cost
+      // correctly. -1 = "this path did not run" (indexed seeks never bisect).
+      let bisectMs = -1;
+      let walkMs = -1;
       const videoSink = new EncodedPacketSink(videoTrack);
       let cachedKeyframeTs: number | null = null;
       if (this.config.format === 'mkv') {
@@ -1654,7 +1773,13 @@ export class MediabunnyTransmuxer {
         : cachedKeyframeTs ?? seekTime;
 
       if (useCachedIndex || byteOffsetKeyframe !== null) {
+        // Round-27: the walk is THIS seek's own read — release the condemnation
+        // before it. No bisect ran on this branch, so the flag has been held
+        // since :1698 purely to fence stale refills out of the index lookup.
+        (this.streamSource as any)?.resetSupersession?.();
+        const walkStart = performance.now();
         keyPacket = await videoSink.getKeyPacket(seekTargetTs, { verifyKeyPackets: false });
+        walkMs = performance.now() - walkStart;
         console.log(`[Transmuxer] seekTo: using keyframe index — seekTargetTs=${seekTargetTs.toFixed(3)}s, seekTime=${seekTime.toFixed(2)}s, byteOffset=${byteOffsetKeyframe?.byteOffset ?? 'N/A'}`);
       } else {
         // Round-6 Fix A: cue-less MKV + harvest miss ⇒ getKeyPacket would do an
@@ -1664,13 +1789,33 @@ export class MediabunnyTransmuxer {
         // to the ≤4MB residual (round-9). No-ops fast when a near entry already exists;
         // degrades to the raw walk on failure/supersession.
         if (this.config.format === 'mkv' && this.mkvCueIndex.length === 0) {
+          // Round-22 F0: time the bisect SEPARATELY from the walk.
+          //
+          // `videoKeyStart` is stamped above at the top of this block, but the
+          // bisect runs here — so the "getKeyPacket took" line below has always
+          // reported bisect + walk while being read as walk alone. Rounds 8, 9
+          // and 14 sized the walk against that number and over-attributed it
+          // 2-4x. Splitting the two is a prerequisite for any latency work:
+          // otherwise every optimisation is measured against a figure that
+          // already contains the thing it is trying to reduce.
+          const bisectStart = performance.now();
           await this.bisectSeekTarget(videoTrack, seekTime, currentGeneration);
+          bisectMs = performance.now() - bisectStart;
           if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
             console.log(`[Transmuxer] Seek abandoned during bisect: target=${seekTime.toFixed(2)}s`);
             return null;
           }
         }
+        const walkStart = performance.now();
+        // Round-27: THE 27-c FAILURE SITE. The bisect above is immune to the
+        // condemnation (raw global `fetch`), but this walk is not — it reads the
+        // residual cluster bytes through TauriStreamSource. Held condemned, it
+        // threw '(superseded by seek)' the instant the bisect succeeded, and the
+        // whole file dropped to /remux. Release before the walk: it is this
+        // seek's own read, not a stale one.
+        (this.streamSource as any)?.resetSupersession?.();
         keyPacket = await videoSink.getKeyPacket(seekTime, { verifyKeyPackets: true });
+        walkMs = performance.now() - walkStart;
       }
 
       // Edge case: seekTime near 0.0 may have no keyframe "at or before" it
@@ -1688,7 +1833,21 @@ export class MediabunnyTransmuxer {
         }
       }
 
-      console.log(`[Transmuxer] seekTo: video getKeyPacket took ${performance.now() - videoKeyStart}ms, skipInit=${skipInit}, usedIndex=${useCachedIndex}, byteOffsetSeek=${byteOffsetKeyframe !== null}`);
+      // Round-22 F0: report bisect and walk SEPARATELY.
+      //
+      // This line used to print only the combined `videoKeyStart` span and label
+      // it "getKeyPacket took". Because the bisect runs inside that span, every
+      // prior round read a bisect-inflated number as pure walk cost. `total` is
+      // kept so old logs stay comparable; `bisect` and `walk` are the new truth.
+      // `-1` means that path did not run.
+      const totalKeyMs = performance.now() - videoKeyStart;
+      const bisectStr = bisectMs >= 0 ? `${bisectMs.toFixed(1)}ms` : 'n/a';
+      const walkStr = walkMs >= 0 ? `${walkMs.toFixed(1)}ms` : 'n/a';
+      console.log(
+        `[Transmuxer] seekTo: keyframe resolve total=${totalKeyMs.toFixed(1)}ms ` +
+        `(bisect=${bisectStr}, walk=${walkStr}), ` +
+        `skipInit=${skipInit}, usedIndex=${useCachedIndex}, byteOffsetSeek=${byteOffsetKeyframe !== null}`,
+      );
 
       if (!keyPacket) {
         // Round-7 belt: on the raw cue-less path a null can still be the
@@ -1700,12 +1859,23 @@ export class MediabunnyTransmuxer {
         if (this.config.format === 'mkv' && this.mkvCueIndex.length === 0 && seekTime >= 1.0
             && computeKeyframeShadowSeconds(this.keyframeTimestamps) < SEEK_SHADOW_MAX_S) {
           console.log(`[Transmuxer] seekTo: keyframe-shadow retry with max shadow (${SEEK_SHADOW_MAX_S}s) for ${seekTime.toFixed(2)}s`);
+          const retryBisectStart = performance.now();
           await this.bisectSeekTarget(videoTrack, seekTime, currentGeneration, SEEK_SHADOW_MAX_S);
+          const retryBisectMs = performance.now() - retryBisectStart;
           if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
             console.log(`[Transmuxer] Seek abandoned during shadow retry: target=${seekTime.toFixed(2)}s`);
             return null;
           }
+          const retryWalkStart = performance.now();
           keyPacket = await videoSink.getKeyPacket(seekTime, { verifyKeyPackets: true });
+          const retryWalkMs = performance.now() - retryWalkStart;
+          // Round-22 F0: this whole retry runs AFTER the resolve log above, so
+          // its cost was previously invisible in every log — a second full
+          // bisect + walk attributed to nothing. Report it on its own line.
+          console.log(
+            `[Transmuxer] seekTo: shadow-retry cost bisect=${retryBisectMs.toFixed(1)}ms, ` +
+            `walk=${retryWalkMs.toFixed(1)}ms, resolved=${keyPacket ? 'yes' : 'no'}`,
+          );
         }
       }
 
@@ -1727,6 +1897,14 @@ export class MediabunnyTransmuxer {
       // Output creation, audio resolve, and the init-segment emit.
       if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
         console.log(`[Transmuxer] Seek abandoned post-resolve (condemned while walking): target=${seekTime.toFixed(2)}s resolved=${keyframeTimestamp.toFixed(3)}s`);
+        // Round-23 G1b: this early return skips markSeekResolved() below, which is
+        // what DISARMS the source's seek state. Leaving it armed means the next
+        // read — belonging to the superseding seek — is treated as this corpse's
+        // post-seek read. Release the seek-scoped state explicitly before bailing.
+        // Deliberately NOT calling markSeekResolved(): that ARMS anchor capture,
+        // and pairing the superseding seek's cluster byte with this corpse's
+        // keyframe time is the corrupt-anchor bug the guard above exists to avoid.
+        (this.streamSource as any)?.clearSeekState?.();
         return null;
       }
 
@@ -1734,8 +1912,24 @@ export class MediabunnyTransmuxer {
       // iteration (the read that actually contains this keyframe's data), so the
       // caller can add a REAL (clusterByte, keyframeTimestamp) VBR anchor — not
       // the Cues/SeekHead tail byte getKeyPacket just read to locate it.
+      //
+      // Round-24: release the seek condemnation HERE, not at the top. Everything
+      // above this line (canRead/getPrimaryVideoTrack from memoized metadata, the
+      // bisect via raw global fetch, the keyframe walk) either needs no
+      // TauriStreamSource read or is immune to the flag — so the whole search
+      // phase can run with stale reads condemned. The forward iteration below is
+      // the first thing that legitimately needs read() to succeed, so this is the
+      // latest correct release point and the earliest safe one.
+      (this.streamSource as any)?.resetSupersession?.();
       (this.streamSource as any)?.markSeekResolved?.();
       this.lastSeekKeyframeTime = keyframeTimestamp;
+
+      await options?.onResolved?.(keyframeTimestamp);
+
+      if (shouldAbandonResolvedSeek(this.seekAbortFlag, this.disposed, currentGeneration, this.seekGeneration)) {
+        (this.streamSource as any)?.clearSeekState?.();
+        return null;
+      }
 
       // Collect keyframe timestamp for incremental index building — each seek
       // adds its keyframe to the index, enabling faster nearby seeks with
@@ -1863,12 +2057,41 @@ export class MediabunnyTransmuxer {
       );
 
       if (isSuperseded || isAborted || isDisposed || isExpectedError) {
-        console.log('[Transmuxer] Seek canceled/disposed (expected during seek)');
+        // Round-27: name WHICH condition fired. Five paths reach this branch and
+        // the old message printed none of them, so a seek that had already
+        // resolved its cluster byte (26-c:89 bisect success) still logged as
+        // "expected" and rerouted the whole file to /remux with no way to tell
+        // why from the log.
+        console.log(
+          '[Transmuxer] Seek canceled/disposed:'
+          + ` superseded=${isSuperseded} (gen ${currentGeneration}->${this.seekGeneration})`
+          + ` aborted=${isAborted} disposed=${isDisposed} expectedErr=${isExpectedError}`
+          + ` err=${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`
+        );
       } else {
         console.error('[Transmuxer] Seek failed:', e);
         this.config.onError(e instanceof Error ? e : new Error(String(e)));
       }
       return null;
+    } finally {
+      // Round-24: guaranteed release of the seek condemnation.
+      //
+      // Holding `superseded` through the search phase (see the release at
+      // markSeekResolved above) means every EARLY exit between abortInFlight()
+      // and that point would otherwise leave the source condemned forever:
+      // `Cannot read … after seek`, `No video track found`, and the four
+      // `return null` abandon paths. A condemned source throws on every read, so
+      // a single failed seek would kill playback until some later seek happened
+      // to succeed. Six such paths exist — this finally covers all of them plus
+      // the catch above.
+      //
+      // Generation-guarded: only release if THIS seek is still the current one.
+      // A newer seekTo() bumps seekGeneration and sets its own condemnation; an
+      // unguarded release here would run AFTER that and clear the new seek's
+      // flag, resurrecting exactly the stale-read starvation this fix removes.
+      if (mayReleaseSeekCondemnation(currentGeneration, this.seekGeneration)) {
+        (this.streamSource as any)?.resetSupersession?.();
+      }
     }
   }
 
