@@ -31,6 +31,14 @@ use std::io::{Write, Seek, SeekFrom, Read};
 /// it can be unit-tested without spinning up a server.
 pub const MIN_STREAMING_WORKERS: usize = 2;
 pub const MAX_STREAMING_WORKERS: usize = 4;
+const STREAMING_CORS_EXPOSED_HEADERS: [&str; 22] = [
+    "Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason",
+    "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time",
+    "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset",
+    "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration",
+    "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged",
+    "X-Subs-Coverage", "X-Subs-Frontier",
+];
 
 pub fn streaming_worker_count(available_cores: usize) -> usize {
     available_cores
@@ -7504,7 +7512,7 @@ pub async fn start_streaming_server(
             .allowed_origin("http://nobuf-stream.localhost")
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason", "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time", "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset", "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration", "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged", "X-Subs-Coverage"])
+            .expose_headers(STREAMING_CORS_EXPOSED_HEADERS)
             .max_age(3600);
 
         App::new()
@@ -7768,7 +7776,7 @@ mod tests {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
-            .expose_headers(["Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason"])
+            .expose_headers(super::STREAMING_CORS_EXPOSED_HEADERS)
             .allow_private_network_access()
             .max_age(3600);
 
@@ -7797,6 +7805,7 @@ mod tests {
         assert!(lower.contains("content-length"), "Content-Length must be exposed");
         assert!(lower.contains("accept-ranges"), "Accept-Ranges must be exposed");
         assert!(lower.contains("x-reason"), "X-Reason must be exposed");
+        assert!(lower.contains("x-subs-frontier"), "X-Subs-Frontier must be exposed");
     }
 
     // ========================================================================
