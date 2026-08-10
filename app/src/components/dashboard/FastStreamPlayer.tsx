@@ -21,7 +21,7 @@ import { SubtitleOverlay } from './SubtitleOverlay';
 import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
 
 export function subRepairRegionRetryDelay(outcome: SubRepairOutcome): number | null {
-  if (outcome === 'progress') return 5_000;
+  if (outcome === 'progress' || outcome === 'progress-uncovered') return 5_000;
   if (outcome === 'deferred') return 0;
   return null;
 }
@@ -156,6 +156,7 @@ interface FastStreamPlayerProps {
   const embeddedSubTracksRef = useRef<Map<number, { track: SubtitleTrack; partial: boolean }>>(new Map());
   const embeddedSubLoadingIdxRef = useRef<number | null>(null);
   const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
+  const [subtitleRevision, setSubtitleRevision] = useState(0);
   // Round-14 F4: tracks whose AUTOMATIC session-restore found no usable cues.
   // Drives a passive marker on the subtitle row instead of an unprompted toast
   // (F4.5 (b)). Cleared per track on any successful extraction, and wholesale on
@@ -1701,6 +1702,7 @@ interface FastStreamPlayerProps {
         // Re-activate to force the renderer to re-read the cue list.
         subs.deactivateTrack(existing.track);
         subs.activateTrack(existing.track);
+        setSubtitleRevision((revision) => revision + 1);
         return;
       }
       const track = new SubtitleTrack(label, language || null);
@@ -1864,6 +1866,7 @@ interface FastStreamPlayerProps {
         // Re-activate so the renderer re-reads the cue list.
         subs.deactivateTrack(entry.track);
         subs.activateTrack(entry.track);
+        setSubtitleRevision((revision) => revision + 1);
       }
     } catch {
       hadError = true;
@@ -2501,7 +2504,7 @@ interface FastStreamPlayerProps {
           />
         )}
         {!err && (
-          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} assFonts={msePlayer.getEmbeddedSubFontUrls()} />
+          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} revision={subtitleRevision} assFonts={msePlayer.getEmbeddedSubFontUrls()} />
         )}
         {load && !err && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

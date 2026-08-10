@@ -37,6 +37,17 @@ pub fn streaming_worker_count(available_cores: usize) -> usize {
         .clamp(MIN_STREAMING_WORKERS, MAX_STREAMING_WORKERS)
 }
 
+fn canonical_folder_key(folder_id: &str) -> i64 {
+    match folder_id {
+        "me" | "home" | "null" => i64::MIN,
+        s => s.parse::<i64>().unwrap_or(i64::MIN),
+    }
+}
+
+fn canonical_stored_folder_key(folder_id: i64) -> i64 {
+    if folder_id == 0 { i64::MIN } else { folder_id }
+}
+
 /// Resolve the worker count from the live machine, falling back to MIN when the
 /// core count is unavailable (per `std::thread::available_parallelism` docs).
 pub fn resolve_streaming_worker_count() -> usize {
@@ -505,13 +516,12 @@ pub(crate) const SUBS_ISLAND_MAX_BYTES: u64 = 12 * 1024 * 1024;
 ///
 /// * A span already within the cap is returned unchanged — no behaviour change
 ///   for the fragmented shapes that exist today.
-/// * When the playhead lies inside the span, the window is anchored AT the
-///   playhead and extends forward: playback moves forward, so cues ahead of the
-///   viewer are the ones worth having, and anchoring at the playhead keeps the
-///   later `snap_island_start_to_cluster` call scanning the same region it does
-///   now.
-/// * A forward anchor that would overrun the span end is pulled back so the
-///   window always ends at `end` — never returns a range outside the input.
+/// * When the playhead lies inside the span, the window is backward-biased:
+///   three quarters preroll and one quarter look-ahead. A subtitle visible at a
+///   seek target commonly started before that target, so a forward-only window
+///   loses the exact cue the viewer expects to see.
+/// * The biased window is clamped at either source edge and never escapes the
+///   cached range.
 /// * When the playhead is outside the span (arms 2 and 3), the window is taken
 ///   from the edge nearest the playhead.
 fn clamp_subs_island(start: u64, end: u64, playhead: u64, max_bytes: u64) -> (u64, u64) {
@@ -521,9 +531,13 @@ fn clamp_subs_island(start: u64, end: u64, playhead: u64, max_bytes: u64) -> (u6
     }
     let span = max_bytes.saturating_sub(1);
     if playhead >= start && playhead <= end {
-        // Straddling: prefer forward from the playhead, pulling back at the tail.
-        let anchor = playhead.min(end.saturating_sub(span));
-        (anchor.max(start), anchor.max(start).saturating_add(span).min(end))
+        // Subtitle preroll is asymmetric: the cue visible at the seek target may
+        // have started earlier. Keep 3/4 of the bounded window behind the
+        // playhead and 1/4 ahead, clamped to the cached source span.
+        let backward = span.saturating_mul(3) / 4;
+        let anchor = playhead.saturating_sub(backward).max(start)
+            .min(end.saturating_sub(span));
+        (anchor, anchor.saturating_add(span).min(end))
     } else if playhead < start {
         // Forward island: nearest edge is its start.
         (start, start.saturating_add(span).min(end))
@@ -639,6 +653,10 @@ pub(crate) fn should_bootstrap_from_telegram(
         return false; // prefix readers end at the frontier; they never starve
     }
     (cached_end - start_byte + 1) < min_bootstrap_bytes
+}
+
+pub(crate) fn should_skip_cache_poll(cached_prefix: bool, cache_missing_or_cold: bool) -> bool {
+    !cached_prefix && cache_missing_or_cold
 }
 
 /// Round-16: when island mode declines, is the cached PREFIX an acceptable
@@ -918,7 +936,7 @@ async fn stream_media(
     // cache_mgr_opt was here — now replaced by cache_mgr_for_stream created
     // inside the streaming path (no longer needed at function scope).
 
-    let cache_folder_id = folder_id_str.parse::<i64>().unwrap_or(0);
+    let cache_folder_id = canonical_folder_key(&folder_id_str);
     let cache_filename = match &media {
         Media::Document(d) => d.name().to_string(),
         _ => format!("{}.mp4", message_id),
@@ -1414,7 +1432,7 @@ async fn stream_media(
         // Only use poll-wait when the proactive has already written some
         // data to disk (meta file exists with cached ranges). This means
         // the proactive is actively downloading and will fill more data soon.
-        let skip_poll = cache_mgr_for_stream.is_none() || {
+        let cache_missing_or_cold = cache_mgr_for_stream.is_none() || {
             if let Some(ref cache_mgr) = cache_mgr_for_stream {
                 let _lock = cache_mgr.lock_meta(message_id).await;
                 let meta = cache_mgr.load_meta(message_id);
@@ -1452,6 +1470,7 @@ async fn stream_media(
                 true
             }
         };
+        let skip_poll = should_skip_cache_poll(cached_prefix_stream, cache_missing_or_cold);
 
         if skip_poll {
             log::debug!("[STREAM-CACHE-POLL] msg {}: no disk cache exists — using Telegram download directly (bootstrap)", message_id);
@@ -1697,7 +1716,12 @@ async fn stream_media(
                                 if let Err(e) = cache_mgr.save_meta(&meta) {
                                     log::warn!("[STREAM-FALLBACK] Failed to save meta for msg {}: {}", message_id, e);
                                 }
+                                let complete_now = meta.is_complete();
                                 drop(_lock);
+                                if complete_now {
+                                    if let Some(ref mut file) = cache_file_mut { let _ = file.flush(); }
+                                    crate::server::maybe_spawn_complete_subtitle_promotion(cache_mgr.clone(), message_id);
+                                }
                             }
                             // Broadcast progress to coordinator subscribers
                             if _registered {
@@ -1764,8 +1788,13 @@ async fn stream_media(
                         if let Err(e) = cache_mgr.save_meta(&meta) {
                             log::warn!("[STREAM-FALLBACK] Final meta flush failed for msg {}: {}", message_id, e);
                         }
+                        let complete_now = meta.is_complete();
+                        drop(_lock);
+                        if complete_now {
+                            if let Some(ref mut file) = cache_file_mut { let _ = file.flush(); }
+                            crate::server::maybe_spawn_complete_subtitle_promotion(cache_mgr.clone(), message_id);
+                        }
                     }
-                    drop(_lock);
                 }
             }
         }
@@ -2031,7 +2060,7 @@ async fn download_and_cache_range(
     let _lock = cache_mgr.lock_meta(message_id).await;
     let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
         message_id,
-        folder_id: 0,
+        folder_id: i64::MIN,
         total_size,
         filename: String::new(),
         cached_ranges: Vec::new(),
@@ -3014,6 +3043,57 @@ fn sub_cache_filename(folder_id: &str, message_id: i32, stream_idx: i32, ass: bo
 }
 
 /// Font attachment disk-cache filename (under `{remux_dir}/subs/`).
+fn durable_subs_root(cache: &Option<StreamCacheManager>) -> std::path::PathBuf {
+    if let Some(cache_mgr) = cache.as_ref() {
+        return cache_mgr.cache_dir().parent()
+            .unwrap_or(cache_mgr.cache_dir())
+            .join("subtitle-cache");
+    }
+    std::env::temp_dir().join("nobuf-subtitle-cache")
+}
+
+fn durable_sub_cache_path(
+    cache: &Option<StreamCacheManager>,
+    folder_key: i64,
+    message_id: i32,
+    stream_idx: i32,
+    source_size: u64,
+    ass: bool,
+) -> std::path::PathBuf {
+    durable_subs_root(cache)
+        .join(folder_key.to_string())
+        .join(message_id.to_string())
+        .join(format!("s{}_{}.{}", stream_idx, source_size, if ass { "ass" } else { "srt" }))
+}
+
+fn should_promote_complete_subtitles(media_complete: bool, promotion_running: bool) -> bool {
+    media_complete && !promotion_running
+}
+
+fn should_publish_complete_subtitles(current_generation: u64, job_generation: u64) -> bool {
+    current_generation == job_generation
+}
+
+fn build_all_sub_extract_args(
+    input: &str,
+    tracks: &[(i32, bool, String)],
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".into(), "-loglevel".into(), "error".into(),
+        "-nostdin".into(), "-y".into(), "-i".into(), input.into(),
+    ];
+    for (stream_idx, ass, output) in tracks {
+        args.extend(["-map".into(), format!("0:{}", stream_idx), "-an".into(), "-vn".into(), "-copyts".into()]);
+        if *ass {
+            args.extend(["-c:s".into(), "copy".into(), "-f".into(), "ass".into()]);
+        } else {
+            args.extend(["-f".into(), "srt".into()]);
+        }
+        args.extend(["-flush_packets".into(), "1".into(), output.clone()]);
+    }
+    args
+}
+
 fn sub_font_cache_filename(folder_id: &str, message_id: i32, att_idx: i32) -> String {
     format!("{}_{}_f{}.bin", folder_id, message_id, att_idx)
 }
@@ -4721,7 +4801,7 @@ async fn fmp4_segment(
                             let _lock = cache_mgr.lock_meta(message_id).await;
                             let mut m = cache_mgr.load_meta(message_id).unwrap_or(CacheMeta {
                                 message_id,
-                                folder_id: folder_id_str.parse::<i64>().unwrap_or(0),
+                                folder_id: canonical_folder_key(&folder_id_str),
                                 total_size,
                                 filename: format!("{}.ts", message_id),
                                 cached_ranges: Vec::new(),
@@ -5542,7 +5622,7 @@ async fn fmp4_metadata(
                                                         let _lock4 = cache_mgr.lock_meta(message_id).await;
                                                         let mut meta2 = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                                             message_id,
-                                                            folder_id: 0,
+                                                            folder_id: i64::MIN,
                                                             total_size: m.total_size,
                                                             filename: String::new(),
                                                             cached_ranges: vec![],
@@ -6199,6 +6279,170 @@ fn subs_inflight() -> &'static StdMutex<std::collections::HashSet<(i64, i32, i32
     SET.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
 }
 
+fn subs_promotion_inflight() -> &'static StdMutex<std::collections::HashSet<(i64, i32)>> {
+    static SET: std::sync::OnceLock<StdMutex<std::collections::HashSet<(i64, i32)>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| StdMutex::new(std::collections::HashSet::new()))
+}
+
+fn subs_promotion_generations() -> &'static StdMutex<HashMap<(i64, i32), u64>> {
+    static MAP: std::sync::OnceLock<StdMutex<HashMap<(i64, i32), u64>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+struct SubtitlePromotionGuard { key: (i64, i32) }
+
+impl Drop for SubtitlePromotionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = subs_promotion_inflight().lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) fn maybe_spawn_complete_subtitle_promotion(
+    cache_mgr: StreamCacheManager,
+    message_id: i32,
+) -> bool {
+    let meta = match cache_mgr.load_meta(message_id) {
+        Some(meta) if meta.is_complete() => meta,
+        _ => return false,
+    };
+    let canonical_folder = canonical_stored_folder_key(meta.folder_id);
+    let key = (canonical_folder, message_id);
+    let promotion_generation = subs_promotion_generations().lock().ok()
+        .and_then(|generations| generations.get(&key).copied()).unwrap_or(0);
+    {
+        let mut active = match subs_promotion_inflight().lock() {
+            Ok(active) => active,
+            Err(_) => return false,
+        };
+        if !should_promote_complete_subtitles(true, active.contains(&key)) {
+            return false;
+        }
+        active.insert(key);
+    }
+    tokio::spawn(async move {
+        let _promotion_guard = SubtitlePromotionGuard { key };
+        let result = promote_complete_subtitles(
+            cache_mgr.clone(), meta, canonical_folder, promotion_generation,
+        ).await;
+        match result {
+            Ok(count) => log::info!("[SUBS-FINALIZE] msg {}: published {} complete text track(s)", message_id, count),
+            Err(e) => log::warn!("[SUBS-FINALIZE] msg {}: {}", message_id, e),
+        }
+    });
+    true
+}
+
+async fn promote_complete_subtitles(
+    cache_mgr: StreamCacheManager,
+    meta: CacheMeta,
+    canonical_folder: i64,
+    promotion_generation: u64,
+) -> Result<usize, String> {
+    if !meta.is_complete() {
+        return Err("media cache is not complete".into());
+    }
+    let input = cache_mgr.data_path(meta.message_id);
+    let input_str = input.to_string_lossy().to_string();
+    let ffprobe = crate::ffmpeg_util::ensure_ffprobe().map_err(|e| e.to_string())?;
+    let probe = TokioCommand::new(ffprobe)
+        .args(["-hide_banner", "-loglevel", "error", "-print_format", "json", "-show_streams", &input_str])
+        .output().await.map_err(|e| format!("ffprobe spawn failed: {}", e))?;
+    if !probe.status.success() {
+        return Err("ffprobe failed on complete local media".into());
+    }
+    let inv = parse_subtitle_probe_json(&String::from_utf8_lossy(&probe.stdout));
+    let text_tracks: Vec<_> = inv.tracks.into_iter().filter(|t| t.kind == "text").collect();
+    if text_tracks.is_empty() {
+        return Ok(0);
+    }
+    let cache_opt = Some(cache_mgr.clone());
+    let mut outputs = Vec::new();
+    for track in text_tracks {
+        let ass = track.codec == "ass" || track.codec == "ssa";
+        let final_path = durable_sub_cache_path(
+            &cache_opt, canonical_folder, meta.message_id, track.index, meta.total_size, ass,
+        );
+        if std::fs::metadata(&final_path).map(|m| m.len() > 0).unwrap_or(false) {
+            continue;
+        }
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("subtitle cache mkdir failed: {}", e))?;
+        }
+        let ext = if ass { "ass" } else { "srt" };
+        let tmp = final_path.with_extension(format!("tmp.{}", ext));
+        outputs.push((track.index, ass, tmp, final_path));
+    }
+    if outputs.is_empty() {
+        return Ok(0);
+    }
+    let args_tracks: Vec<_> = outputs.iter().map(|(idx, ass, tmp, _)| {
+        (*idx, *ass, tmp.to_string_lossy().to_string())
+    }).collect();
+    let ffmpeg = crate::ffmpeg_util::ensure_ffmpeg().map_err(|e| e.to_string())?;
+    let mut command = TokioCommand::new(ffmpeg);
+    command.args(build_all_sub_extract_args(&input_str, &args_tracks))
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(30 * 60), command.output(),
+    ).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("ffmpeg spawn failed: {}", e)),
+        Err(_) => {
+            for (_, _, tmp, _) in &outputs { let _ = std::fs::remove_file(tmp); }
+            return Err("ffmpeg timed out after 30 minutes".into());
+        }
+    };
+    if !output.status.success() {
+        for (_, _, tmp, _) in &outputs { let _ = std::fs::remove_file(tmp); }
+        return Err(format!("ffmpeg failed with status {:?}", output.status.code()));
+    }
+    if !cache_mgr.load_meta(meta.message_id).is_some_and(|current| current.is_complete() && current.total_size == meta.total_size) {
+        for (_, _, tmp, _) in &outputs { let _ = std::fs::remove_file(tmp); }
+        return Err("media cache was discarded or changed during finalization".into());
+    }
+    let key = (canonical_folder, meta.message_id);
+    let generations = subs_promotion_generations().lock()
+        .map_err(|_| "subtitle promotion generation lock poisoned".to_string())?;
+    if !should_publish_complete_subtitles(
+        generations.get(&key).copied().unwrap_or(0), promotion_generation,
+    ) {
+        drop(generations);
+        for (_, _, tmp, _) in &outputs { let _ = std::fs::remove_file(tmp); }
+        return Err("subtitle promotion superseded by cache deletion".into());
+    }
+    let mut published = 0;
+    for (_, _, tmp, final_path) in outputs {
+        if std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false) {
+            std::fs::rename(&tmp, &final_path)
+                .map_err(|e| format!("subtitle publish failed: {}", e))?;
+            published += 1;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    drop(generations);
+    Ok(published)
+}
+
+pub(crate) fn invalidate_durable_subtitles(
+    cache_mgr: &StreamCacheManager,
+    folder_key: i64,
+    message_id: i32,
+) {
+    let folder_key = canonical_stored_folder_key(folder_key);
+    let key = (folder_key, message_id);
+    if let Ok(mut generations) = subs_promotion_generations().lock() {
+        let next = generations.get(&key).copied().unwrap_or(0).wrapping_add(1);
+        generations.insert(key, next);
+        let path = durable_subs_root(&Some(cache_mgr.clone()))
+            .join(folder_key.to_string())
+            .join(message_id.to_string());
+        if path.exists() { let _ = std::fs::remove_dir_all(path); }
+    }
+}
+
 /// Resolve the ffmpeg/ffprobe input for a subtitle operation: the local cache
 /// file when the WHOLE file is cached (fastest: no HTTP, no Telegram), else
 /// our own /stream endpoint with `source_id=subs` so the download coordinator
@@ -6412,10 +6656,7 @@ async fn probe_sub_tracks(
     // TRACK LISTING for folder B's same-id message — the media cache already
     // fixed this class ("channel A's msg 18 poison channel B's msg 18").
     // i64::MIN is the established sentinel for the me/home/null folder.
-    let folder_key: i64 = match folder_id {
-        "me" | "home" | "null" => i64::MIN,
-        s => s.parse::<i64>().unwrap_or(i64::MIN),
-    };
+    let folder_key = canonical_folder_key(folder_id);
     if let Some(json) = data.sub_tracks_json.read().await.get(&(folder_key, message_id)) {
         // Memo stores the serialized SubProbeResult verbatim.
         if let Ok(parsed) = serde_json::from_str::<SubProbeResult>(json) {
@@ -6429,7 +6670,14 @@ async fn probe_sub_tracks(
             return Err(HttpResponse::InternalServerError().body(format!("ffprobe not found: {}", e)))
         }
     };
-    let input_source = subs_input_source(folder_id, message_id, token, cache);
+    let input_source = {
+        let source = subs_input_source(folder_id, message_id, token, cache);
+        if source.starts_with("http") {
+            format!("{}&cached_prefix=true", source)
+        } else {
+            source
+        }
+    };
 
     // Header-only probe: stream declarations (incl. subs + attachments) live in
     // the MKV Track header / MP4 moov — 5MB budget is enough even on partially
@@ -6542,19 +6790,36 @@ async fn subtitles_extract_track(
     // Round-10 P0-3: total folder key for the in-memory subs caches. Same
     // sentinel convention as the media cache (see resolve_media_from_path):
     // i64::MIN stands in for the me/home/null folder so the key is total.
-    let folder_key: i64 = match folder_id_str.as_str() {
-        "me" | "home" | "null" => i64::MIN,
-        s => s.parse::<i64>().unwrap_or(i64::MIN),
-    };
+    let folder_key = canonical_folder_key(&folder_id_str);
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None, playhead_byte: None,
     };
-    if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
-        return resp;
-    }
+    let resolved_total_size = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
+        Ok((_, total_size)) => total_size,
+        Err(resp) => return resp,
+    };
     let token = query.token.as_deref().unwrap_or("");
+
+    // Complete artifacts are source-sized and identity-keyed, so they can be
+    // served before ffprobe. This keeps reopen/cache-hit playback local even
+    // though the disposable stream-cache and in-memory inventory were cleared.
+    for (ass, format_hdr) in [(false, "srt"), (true, "ass")] {
+        let durable = durable_sub_cache_path(
+            &cache, folder_key, message_id, stream_idx, resolved_total_size, ass,
+        );
+        if let Ok(bytes) = tokio::fs::read(&durable).await {
+            if !bytes.is_empty() {
+                return HttpResponse::Ok()
+                    .content_type("text/plain; charset=utf-8")
+                    .insert_header(("X-Subs-Format", format_hdr))
+                    .insert_header(("X-Subs-Coverage", "full"))
+                    .insert_header(("Cache-Control", "max-age=86400"))
+                    .body(bytes);
+            }
+        }
+    }
 
     // Validate against the (memoized) probe: must be a TEXT subtitle stream.
     let inv = match probe_sub_tracks(&folder_id_str, message_id, token, &data, &cache).await {
@@ -6577,25 +6842,9 @@ async fn subtitles_extract_track(
     let ass = track.codec == "ass" || track.codec == "ssa";
     let format_hdr = if ass { "ass" } else { "srt" };
 
-    // Disk cache hit → serve immediately (extraction is deterministic).
-    let subs_dir = subs_cache_dir(&cache);
-    let cache_path = subs_dir.join(sub_cache_filename(&folder_id_str, message_id, stream_idx, ass));
-    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-        if !bytes.is_empty() {
-            // Round-10 P1-3: a disk hit is by definition a WHOLE-FILE extraction
-            // (P0-2 only promotes when served_whole_file), so declare full
-            // coverage explicitly. Previously this path sent no coverage header
-            // at all, so the frontend computed partial=false for ANY replayed
-            // body — including truncated ones from before the P0-2 fix — and the
-            // re-extract branch could never fire again for that file.
-            return HttpResponse::Ok()
-                .content_type("text/plain; charset=utf-8")
-                .insert_header(("X-Subs-Format", format_hdr))
-                .insert_header(("X-Subs-Coverage", "full"))
-                .insert_header(("Cache-Control", "max-age=86400"))
-                .body(bytes);
-        }
-    }
+    let durable_path = durable_sub_cache_path(
+        &cache, folder_key, message_id, stream_idx, resolved_total_size, ass,
+    );
 
     // Per-TRACK serialization (round-10 P2-2: was per-message, which 429'd a
     // second track and dead-ended the UI).
@@ -6799,6 +7048,7 @@ async fn subtitles_extract_track(
     // as a belt-and-braces OR-term (it still catches a truncated response on a
     // file we believed was complete) but is no longer load-bearing.
     let served_whole_file = fully_cached;
+    let subs_dir = subs_cache_dir(&cache);
     let tmp_path = subs_dir.join(format!(
         "{}.tmp",
         sub_cache_filename(&folder_id_str, message_id, stream_idx, ass)
@@ -6914,9 +7164,16 @@ async fn subtitles_extract_track(
     }
     if partial {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-    } else if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path).await {
-        log::warn!("[SUBS] msg {} s{}: cache rename failed: {}", message_id, stream_idx, e);
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+    } else {
+        if let Some(parent) = durable_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                log::warn!("[SUBS] msg {} s{}: durable cache mkdir failed: {}", message_id, stream_idx, e);
+            }
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &durable_path).await {
+            log::warn!("[SUBS] msg {} s{}: durable cache publish failed: {}", message_id, stream_idx, e);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
     }
 
     log::info!(
@@ -8164,6 +8421,73 @@ mod tests {
         assert_eq!(super::subtitle_kind(""), "unsupported");
     }
 
+    #[test]
+    fn saved_messages_folder_key_is_consistent_across_routes_and_cache_meta() {
+        for alias in ["home", "me", "null"] {
+            assert_eq!(super::canonical_folder_key(alias), i64::MIN);
+        }
+        assert_eq!(super::canonical_folder_key("-100123"), -100123);
+        assert_eq!(super::canonical_folder_key("invalid"), i64::MIN);
+        assert_eq!(super::canonical_stored_folder_key(0), i64::MIN);
+        assert_eq!(super::canonical_stored_folder_key(-100123), -100123);
+    }
+
+    #[test]
+    fn complete_subtitle_publish_requires_current_generation() {
+        assert!(super::should_publish_complete_subtitles(7, 7));
+        assert!(!super::should_publish_complete_subtitles(8, 7));
+    }
+
+    #[test]
+    fn cache_deletion_advances_subtitle_promotion_generation() {
+        let root = std::env::temp_dir().join(format!("nobuf-sub-gen-{}", std::process::id())).join("stream-cache");
+        let mgr = crate::stream_cache::StreamCacheManager::new(root.clone()).unwrap();
+        let key = (i64::MIN, 987654321);
+        let before = super::subs_promotion_generations().lock().unwrap()
+            .get(&key).copied().unwrap_or(0);
+        super::invalidate_durable_subtitles(&mgr, key.0, key.1);
+        let after = super::subs_promotion_generations().lock().unwrap()
+            .get(&key).copied().unwrap_or(0);
+        assert_eq!(after, before.wrapping_add(1));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn complete_subtitle_promotion_requires_whole_media_and_single_flight() {
+        assert!(super::should_promote_complete_subtitles(true, false));
+        assert!(!super::should_promote_complete_subtitles(false, false));
+        assert!(!super::should_promote_complete_subtitles(true, true));
+    }
+
+    #[test]
+    fn complete_subtitle_promotion_publication_generation_rejects_discarded_job() {
+        assert!(super::should_publish_complete_subtitles(7, 7));
+        assert!(!super::should_publish_complete_subtitles(8, 7));
+    }
+
+    #[test]
+    fn batch_subtitle_extract_maps_every_text_track_once() {
+        let args = super::build_all_sub_extract_args("complete.mkv", &[
+            (2, false, "two.tmp.srt".into()),
+            (3, true, "three.tmp.ass".into()),
+        ]);
+        let joined = args.join(" ");
+        assert!(joined.contains("-map 0:2 -an -vn -copyts -f srt -flush_packets 1 two.tmp.srt"));
+        assert!(joined.contains("-map 0:3 -an -vn -copyts -c:s copy -f ass -flush_packets 1 three.tmp.ass"));
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-i").count(), 1);
+    }
+
+    #[test]
+    fn durable_subtitle_path_is_outside_disposable_stream_cache_and_source_sized() {
+        let root = std::env::temp_dir().join("nobuf-sub-path-test").join("stream-cache");
+        let mgr = crate::stream_cache::StreamCacheManager::new(root.clone()).unwrap();
+        let path = super::durable_sub_cache_path(&Some(mgr), i64::MIN, 109, 3, 1_566_651_347, false);
+        assert!(!path.starts_with(&root));
+        assert!(path.to_string_lossy().contains("subtitle-cache"));
+        assert!(path.to_string_lossy().contains("s3_1566651347.srt"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     /// Round-3 subs fix: every extraction flushes cues to disk per-packet so the
     /// output survives a kill_on_drop mid-extraction (timeout salvage belt).
     #[test]
@@ -8190,6 +8514,8 @@ mod tests {
         let q = Query::<super::StreamQuery>::from_query("cached_only=true&cached_prefix=true").unwrap();
         assert_eq!(q.cached_only, Some(true));
         assert_eq!(q.cached_prefix, Some(true));
+        assert!(!super::should_skip_cache_poll(true, true));
+        assert!(super::should_skip_cache_poll(false, true));
         // Numeric shorthand must keep failing loudly, not silently coerce.
         assert!(Query::<super::StreamQuery>::from_query("cached_prefix=1").is_err());
     }
@@ -8512,6 +8838,18 @@ mod tests {
 
     /// Spans already within the ceiling must pass through byte-identical — the
     /// clamp must not perturb the fragmented shapes that exist today.
+    #[test]
+    fn subtitle_island_reserves_three_quarters_for_preroll() {
+        let max = 12 * 1024 * 1024;
+        let playhead = 100 * 1024 * 1024;
+        let (start, end) = super::clamp_subs_island(0, 200 * 1024 * 1024, playhead, max);
+        let behind = playhead - start;
+        let ahead = end - playhead;
+        assert!(behind > ahead * 2, "expected backward bias, got behind={behind} ahead={ahead}");
+        assert!(start <= playhead && playhead <= end);
+        assert_eq!(end - start + 1, max);
+    }
+
     #[test]
     fn clamp_is_identity_below_the_ceiling() {
         const MAX: u64 = super::SUBS_ISLAND_MAX_BYTES;

@@ -52,6 +52,14 @@ describe('round-17: 204 decline classification', () => {
     )).toBe('failed');
   });
 
+  it('treats the first partial frontier as DEFERRED when bytes exist', () => {
+    expect(classifySubRepairOutcome(
+      null, null, 6367, true, false,
+      undefined, null, null,
+      null, FRONTIER_LATER,
+    )).toBe('deferred');
+  });
+
   it('still scores FAILED when the frontier went backwards', () => {
     expect(classifySubRepairOutcome(
       null, null, 3238, true, false,
@@ -66,13 +74,22 @@ describe('round-17: 204 decline classification', () => {
       undefined, null, null,
       null, null,
     )).toBe('failed');
-    // ...and when only one side is known, which cannot prove growth.
+    // A current frontier without a baseline is evidence that this is a partial,
+    // still-materializing input; only a missing current frontier is unknowable.
     expect(classifySubRepairOutcome(
       null, null, 3238, true, false, undefined, null, null, null, FRONTIER_LATER,
-    )).toBe('failed');
+    )).toBe('deferred');
     expect(classifySubRepairOutcome(
       null, null, 3238, true, false, undefined, null, null, FRONTIER_AT_DECLINE, null,
     )).toBe('failed');
+  });
+
+  it('keeps normal dialogue gaps inside the coverage grace at ok', () => {
+    expect(classifySubRepairOutcome(
+      2248, 7085, 7075, false, false,
+      undefined, null, null, null, null,
+      [{ startTime: 7082.78, endTime: 7084.87 }], 24,
+    )).toBe('ok');
   });
 
   it('does not disturb the non-error paths', () => {

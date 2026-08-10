@@ -171,7 +171,7 @@ export type MkvCaptureDecision =
 export function decideMkvCaptureStrategy(
   timestamps: number[], time: number, maxGap: number, cueless: boolean,
 ): MkvCaptureDecision {
-  if (timestamps.length > 0) {
+  if (!cueless && timestamps.length > 0) {
     let lo = 0, hi = timestamps.length - 1;
     while (lo < hi) {
       const mid = lo + ((hi - lo + 1) >> 1);
@@ -945,7 +945,10 @@ class TransmuxerThumbnailPipeline {
     // block later hovers (the 103s walk also busy-locked every subsequent capture). This region
     // is await-free, so two hovers cannot interleave between decision and busy=true.
     const mkvDecision = decideMkvCaptureStrategy(
-      this.keyframeTimestamps, time, THUMB_INDEX_MAX_GAP, this.isCuelessMkv,
+      this.keyframeTimestamps,
+      time,
+      THUMB_INDEX_MAX_GAP,
+      this.isCuelessMkv,
     );
     // Round-3 Fix C: 'skip' becomes bisect-inject-capture. A synthetic
     // clusterPositionCache entry at-or-before the hover time bounds mediabunny's

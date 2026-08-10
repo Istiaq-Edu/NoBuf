@@ -5,6 +5,7 @@ import { subRepairRegionRetryDelay } from '../components/dashboard/FastStreamPla
 describe('subtitle repair region retry delay', () => {
   it('delays progress before reopening the same region', () => {
     expect(subRepairRegionRetryDelay('progress')).toBe(5_000);
+    expect(subRepairRegionRetryDelay('progress-uncovered')).toBe(5_000);
   });
   it('lets deferred reuse the breaker short-delay gate', () => {
     expect(subRepairRegionRetryDelay('deferred')).toBe(0);

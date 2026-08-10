@@ -56,13 +56,15 @@ interface Props {
   activeTracks: SubtitleTrack[];
   /** Video currentTime, driven by the player's timeupdate (seconds). */
   currentTime: number;
+  /** Changes whenever an active track's cue payload is merged in place. */
+  revision?: number;
   /** Font URLs for embedded ASS tracks (MKV attachments served by the
    *  backend). Passed to jassub's `fonts` option; absent = unchanged
    *  behavior for sidecar ASS. */
   assFonts?: string[];
 }
 
-export function SubtitleOverlay({ vidRef, activeTracks, currentTime, assFonts }: Props) {
+export function SubtitleOverlay({ vidRef, activeTracks, currentTime, revision = 0, assFonts }: Props) {
   const vttTracks = useMemo(() => activeTracks.filter((t) => !t.isASS), [activeTracks]);
   const assTrack = useMemo(() => activeTracks.find((t) => t.isASS) ?? null, [activeTracks]);
 
@@ -104,7 +106,28 @@ export function SubtitleOverlay({ vidRef, activeTracks, currentTime, assFonts }:
       }
     }
     return rendered;
-  }, [vttTracks, currentTime]);
+  }, [vttTracks, currentTime, revision]);
+
+  useEffect(() => {
+    if (revision === 0) return;
+    for (const track of vttTracks) {
+      const active = activeCues(track.cues, currentTime);
+      const nearest = track.cues.reduce<VTTCue | null>((best, cue) => {
+        if (!best) return cue;
+        const cueDistance = currentTime < cue.startTime ? cue.startTime - currentTime
+          : currentTime > cue.endTime ? currentTime - cue.endTime : 0;
+        const bestDistance = currentTime < best.startTime ? best.startTime - currentTime
+          : currentTime > best.endTime ? currentTime - best.endTime : 0;
+        return cueDistance < bestDistance ? cue : best;
+      }, null);
+      console.log(
+        `[SUBS-RENDER] revision=${revision} t=${currentTime.toFixed(2)}s cues=${track.cues.length} ` +
+        `nearest=${nearest ? `${nearest.startTime.toFixed(2)}-${nearest.endTime.toFixed(2)}s` : 'none'} active=${active.length}`,
+      );
+    }
+    // This is deliberately revision-triggered, not timeupdate-triggered.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision]);
 
   if (lines.length === 0 && !assTrack) return null;
 
