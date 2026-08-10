@@ -78,6 +78,36 @@ pub fn proactive_resume_byte(
         .unwrap_or(start_byte)
 }
 
+/// Choose the next gap for a whole-file warmer. Prefer the viewer's forward
+/// supply line, then backfill the earliest remaining hole behind it.
+pub fn proactive_whole_file_resume(
+    cached_ranges: &[(u64, u64)],
+    total_size: u64,
+    playhead_byte: u64,
+) -> Option<(u64, bool)> {
+    let gaps = crate::stream_cache::find_gaps(cached_ranges, total_size);
+    if let Some((start, _)) = gaps.iter().find(|(_, end)| *end >= playhead_byte) {
+        return Some(((*start).max(playhead_byte), false));
+    }
+    gaps.first().map(|(start, _)| (*start, true))
+}
+
+
+pub fn proactive_candidate_gaps(
+    cached_ranges: &[(u64, u64)],
+    total_size: u64,
+    resume_byte: u64,
+    max_byte: u64,
+    backfilling: bool,
+) -> Vec<(u64, u64)> {
+    find_gaps(cached_ranges, total_size)
+        .into_iter()
+        .filter(|(start, end)| (backfilling || *end >= resume_byte) && *start < max_byte)
+        .map(|(start, end)| (start.max(resume_byte), end.min(max_byte)))
+        .filter(|(start, end)| *start <= *end)
+        .collect()
+}
+
 /// Round-26: merge gaps separated by less than one Telegram chunk.
 ///
 /// Each gap becomes its own download iterator, and the smallest unit Telegram
@@ -230,6 +260,10 @@ pub fn player_download_flag_fresh(now_ms: u64, stored_ms: u64) -> bool {
     stored_ms != 0 && now_ms.saturating_sub(stored_ms) < PLAYER_DOWNLOAD_FRESH_WINDOW_MS
 }
 
+pub fn should_defer_proactive_spawn(is_player_downloading: bool) -> bool {
+    is_player_downloading
+}
+
 /// Round-14 F1: how long a `seek-bisect` probe suppresses the PROACTIVE spawn.
 ///
 /// A cue-less MKV seek runs a byte-range bisect (3-7 probes) and then a forward
@@ -294,6 +328,19 @@ pub(crate) fn now_epoch_ms() -> u64 {
 /// operands. A move of exactly the epsilon counts as significant.
 pub fn is_significant_target_change(current: u64, new_target: u64) -> bool {
     new_target.abs_diff(current) >= PROACTIVE_TARGET_EPSILON_BYTES
+}
+
+pub fn should_retarget_proactive(
+    backfilling: bool,
+    offset: u64,
+    previous_target: Option<u64>,
+    target: u64,
+) -> bool {
+    if backfilling {
+        return previous_target.is_some_and(|previous| is_backward_reanchor(previous, target));
+    }
+    target > offset + 10 * 1024 * 1024 ||
+        previous_target.is_some_and(|previous| is_backward_reanchor(previous, target))
 }
 
 /// Holds the per-session streaming config (token + port)
@@ -527,6 +574,8 @@ mod tests {
     #[test]
     fn download_flag_zero_means_idle() {
         assert!(!player_download_flag_fresh(1_000_000, 0));
+        assert!(!should_defer_proactive_spawn(false));
+        assert!(should_defer_proactive_spawn(true));
     }
 
     // --- Round-14 F1: seek-critical suppression of the PROACTIVE spawn ---
@@ -789,6 +838,65 @@ mod tests {
         let resume = resume_byte(&ranges, TOTAL, last);
         assert!(resume <= last, "resume {resume} past EOF {last}");
         assert_eq!(resume, last);
+    }
+
+    #[test]
+    fn whole_file_warmer_prioritizes_forward_gap() {
+        let ranges = [(0, 99), (200, 299), (400, 999)];
+        assert_eq!(super::proactive_whole_file_resume(&ranges, 1_000, 150), Some((150, false)));
+    }
+
+    #[test]
+    fn whole_file_warmer_backfills_after_forward_path_reaches_eof() {
+        assert_eq!(
+            super::proactive_whole_file_resume(&[(100, 999)], 1_000, 500),
+            Some((0, true)),
+        );
+    }
+
+    #[test]
+    fn whole_file_warmer_stops_only_when_globally_complete() {
+        assert_eq!(super::proactive_whole_file_resume(&[(0, 999)], 1_000, 500), None);
+    }
+
+    #[test]
+    fn backfill_candidates_include_holes_before_playhead() {
+        let ranges = [(100, 999)];
+        assert_eq!(
+            super::proactive_candidate_gaps(&ranges, 1_000, 0, 1_000, true),
+            vec![(0, 99)],
+        );
+        assert!(super::proactive_candidate_gaps(&ranges, 1_000, 500, 1_000, false).is_empty());
+    }
+
+    #[test]
+    fn stable_playhead_does_not_interrupt_backfill_behind_it() {
+        assert!(!super::should_retarget_proactive(true, 0, None, 500 * 1024 * 1024));
+        assert!(!super::should_retarget_proactive(
+            true, 8 * 1024 * 1024, Some(500 * 1024 * 1024), 500 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn backward_seek_interrupts_backfill_to_reprioritize_viewer() {
+        assert!(super::should_retarget_proactive(
+            true, 8 * 1024 * 1024, Some(500 * 1024 * 1024), 480 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn forward_playback_does_not_interrupt_backfill() {
+        assert!(!super::should_retarget_proactive(
+            true, 8 * 1024 * 1024, Some(500 * 1024 * 1024), 540 * 1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn forward_mode_keeps_existing_jump_rules() {
+        assert!(super::should_retarget_proactive(false, 100, None, 20 * 1024 * 1024));
+        assert!(super::should_retarget_proactive(
+            false, 500 * 1024 * 1024, Some(500 * 1024 * 1024), 480 * 1024 * 1024,
+        ));
     }
 
     // --- Round-26 T6: the post-seek yield that had never executed ---
@@ -1377,11 +1485,15 @@ pub async fn cmd_delete_cache(
         return Err("Cache has active download — retry later".to_string());
     }
 
+    let deleted_folder = cache_state.load_meta(message_id).map(|meta| meta.folder_id);
     let deleted = cache_state
         .delete_cache(message_id)
         .map_err(|e| format!("Failed to delete cache: {}", e))?;
     if !deleted {
         return Err("Cache is still streaming — retry later".to_string());
+    }
+    if let Some(folder_id) = deleted_folder {
+        crate::server::invalidate_durable_subtitles(cache_state.inner(), folder_id, message_id);
     }
     log::info!("[CACHE] cmd_delete_cache succeeded for msg {} reason={}", message_id, reason_str);
     Ok(true)
@@ -1439,6 +1551,7 @@ pub async fn cmd_start_background_cache(
             log::error!("Background cache failed for {}: {}", message_id, e);
         } else {
             log::info!("Background cache completed for {}", message_id);
+            crate::server::maybe_spawn_complete_subtitle_promotion(cache_mgr.clone(), message_id);
         }
     });
 
@@ -1742,12 +1855,21 @@ pub async fn cmd_report_playback_position(
     // playhead alive and cancel only the stale forward-walk left behind by a seek.
     cache_state.set_playhead_byte(message_id, current_byte);
 
+    // A fresh report can arrive after the previous worker was stopped but
+    // before foreground playback has finished its post-seek refill. Do not
+    // admit a replacement worker during that window; the frontend retry will
+    // re-report once the foreground read is no longer active.
+    if should_defer_proactive_spawn(is_player_downloading) {
+        log::info!("[PROACTIVE] msg {}: foreground playback downloading — deferring proactive spawn", message_id);
+        return Ok(false);
+    }
+
     // Don't start if a proactive prebuffer is already running for this message.
     // NOTE: We do NOT check has_active_task() here because the /stream endpoint's
     // download is tracked there too — it would always return true during playback,
     // preventing the proactive prebuffer from ever starting.
     if cache_state.has_proactive_task(message_id).await {
-        return Ok(false); // target updated; existing task will use it
+        return Ok(true);
     }
 
     // Clear any previous cancellation so a new task can start after stop.
@@ -1807,7 +1929,7 @@ pub async fn cmd_report_playback_position(
     // Don't start if already fully cached
     if let Some(meta) = cache_state.load_meta(message_id) {
         if meta.is_complete() {
-            return Ok(false);
+            return Ok(true); // terminal success; do not schedule a retry
         }
     }
 
@@ -1822,30 +1944,21 @@ pub async fn cmd_report_playback_position(
     // for Telegram after the initial seek.
     let max_ahead_byte = file_size;
 
-    // Only care about gaps from current_byte onward, capped at max_ahead_byte
-    let ahead_gaps: Vec<(u64, u64)> = find_gaps(&cached_ranges, file_size)
-        .into_iter()
+    // Prefer the forward supply line, but if it is already complete, restart
+    // against remaining earlier holes so the warmer can reach global EOF.
+    let all_gaps = find_gaps(&cached_ranges, file_size);
+    let ahead_gaps: Vec<(u64, u64)> = all_gaps.iter().copied()
         .filter(|(_start, end)| *end >= current_byte)
         .map(|(start, end)| (start.max(current_byte), end.min(max_ahead_byte)))
         .filter(|(start, end)| *start <= *end)
         .collect();
-
-    if ahead_gaps.is_empty() {
-        return Ok(false); // Nothing to download ahead
-    }
-
-    let total_ahead_bytes: u64 = ahead_gaps.iter()
-        .map(|(s, e)| e - s + 1)
-        .sum();
-
-    // Only start if there's meaningful work (>2MB ahead)
-    if total_ahead_bytes < 2 * 1024 * 1024 {
-        return Ok(false);
-    }
+    let candidate_gaps = if ahead_gaps.is_empty() { &all_gaps } else { &ahead_gaps };
+    if candidate_gaps.is_empty() { return Ok(true); }
+    let total_ahead_bytes: u64 = candidate_gaps.iter().map(|(s, e)| e - s + 1).sum();
 
     log::info!(
         "[PROACTIVE] msg {}: playhead={}s (byte {}), {} uncached bytes ahead ({} gaps) — window to EOF (byte {}) — spawning proactive download",
-        message_id, current_time_s as i64, current_byte, total_ahead_bytes, ahead_gaps.len(), max_ahead_byte
+        message_id, current_time_s as i64, current_byte, total_ahead_bytes, candidate_gaps.len(), max_ahead_byte
     );
 
     let client = { state.client.lock().await.clone() }
@@ -1854,6 +1967,10 @@ pub async fn cmd_report_playback_position(
     let cache_mgr = cache_state.inner().clone();
     let tg_state = Arc::new(state.inner().clone());
 
+    if !cache_mgr.try_track_proactive(message_id).await {
+        return Ok(true);
+    }
+
     let proactive_generation = {
         let mut generations = state.proactive_generations.write().await;
         let next = generations.get(&message_id).copied().unwrap_or(0).wrapping_add(1);
@@ -1861,19 +1978,14 @@ pub async fn cmd_report_playback_position(
         next
     };
 
-    cache_mgr.track_proactive(message_id).await;
-
     tokio::spawn(async move {
+        let _claim_guard = ProactiveClaimGuard { cache: cache_mgr.clone(), message_id };
         let result = proactive_prebuffer_download(
             message_id, folder_id, current_byte, max_ahead_byte, proactive_generation,
             client, tg_state.clone(), cache_mgr.clone(),
         ).await;
 
-        let still_owner = tg_state.proactive_generations.read().await
-            .get(&message_id).copied() == Some(proactive_generation);
-        if still_owner {
-            cache_mgr.untrack_proactive(message_id).await;
-        }
+        // The claim guard releases the slot after this future exits.
         // Round-9 I-3: the task's open_data_file_write handle is dropped now —
         // retry any deferred deletion queued by a discard during the prebuffer
         // (previously nothing retried on proactive exit; 109.dat stayed locked
@@ -1888,6 +2000,7 @@ pub async fn cmd_report_playback_position(
             }
             Err(e) => log::warn!("[PROACTIVE] msg {}: download failed: {}", message_id, e),
         }
+        crate::server::maybe_spawn_complete_subtitle_promotion(cache_mgr.clone(), message_id);
     });
 
     Ok(true)
@@ -1899,7 +2012,7 @@ pub async fn cmd_report_playback_position(
 pub async fn cmd_stop_proactive_prebuffer(
     message_id: i32,
     state: State<'_, TelegramState>,
-    cache_state: State<'_, StreamCacheManager>,
+    _cache_state: State<'_, StreamCacheManager>,
 ) -> Result<bool, String> {
     let transfer_id = format!("proactive-{}", message_id);
     {
@@ -1908,9 +2021,21 @@ pub async fn cmd_stop_proactive_prebuffer(
         generations.insert(message_id, next);
     }
     state.cancelled_transfers.write().await.insert(transfer_id);
-    cache_state.untrack_proactive(message_id).await;
     log::info!("[PROACTIVE] msg {}: stopped", message_id);
     Ok(true)
+}
+
+struct ProactiveClaimGuard {
+    cache: StreamCacheManager,
+    message_id: i32,
+}
+
+impl Drop for ProactiveClaimGuard {
+    fn drop(&mut self) {
+        let cache = self.cache.clone();
+        let message_id = self.message_id;
+        let _ = tokio::spawn(async move { cache.untrack_proactive(message_id).await; });
+    }
 }
 
 /// Proactive prebuffer download task — downloads from `start_byte` to
@@ -2045,6 +2170,7 @@ async fn proactive_prebuffer_download(
     const MAX_IDLE_CYCLES: u32 = 30; // ~60s idle before exiting (was 15/30s)
     let mut jumped = false; // Set by inner loop on playhead jump, checked by outer loop
     let mut last_target_byte: Option<u64> = None; // Track last target across ALL gaps (prevents loop)
+    let mut backfill_entry_target: Option<u64> = None;
     loop {
         // Check cancellation
         if state.cancelled_transfers.read().await.contains(&transfer_id)
@@ -2088,6 +2214,7 @@ async fn proactive_prebuffer_download(
                 message_id, start_byte, latest_current_byte,
                 start_byte.saturating_sub(latest_current_byte) as f64 / (1024.0 * 1024.0));
             start_byte = latest_current_byte;
+            backfill_entry_target = None;
             jumped = true;
         }
         if computed_max_ahead_byte > max_ahead_byte {
@@ -2097,9 +2224,22 @@ async fn proactive_prebuffer_download(
         let current_meta = cache_mgr.load_meta(message_id);
         let current_ranges = current_meta.as_ref().map(|m| m.cached_ranges.clone()).unwrap_or_default();
 
-        // Round-26: resume at the first uncached byte at or after the viewer.
-        // Rationale, evidence and the load-bearing clamp live on the function.
-        let proactive_start_byte = proactive_resume_byte(&current_ranges, total_size, start_byte);
+        let Some((proactive_start_byte, backfilling)) =
+            proactive_whole_file_resume(&current_ranges, total_size, start_byte)
+        else {
+            log::info!("[PROACTIVE] msg {}: whole file cached, exiting", message_id);
+            break;
+        };
+
+        if backfilling {
+            let anchor = backfill_entry_target.get_or_insert(latest_current_byte);
+            log::info!(
+                "[PROACTIVE] msg {}: forward path cached — backfilling earlier hole at byte {} (entry target {})",
+                message_id, proactive_start_byte, anchor,
+            );
+        } else {
+            backfill_entry_target = None;
+        }
 
         if proactive_start_byte != start_byte {
             log::info!(
@@ -2109,12 +2249,9 @@ async fn proactive_prebuffer_download(
             );
         }
 
-        let raw_ahead_gaps: Vec<(u64, u64)> = find_gaps(&current_ranges, total_size)
-            .into_iter()
-            .filter(|(gap_start, gap_end)| *gap_end >= proactive_start_byte && *gap_start < max_ahead_byte)
-            .map(|(gap_start, gap_end)| (gap_start.max(proactive_start_byte), gap_end.min(max_ahead_byte)))
-            .filter(|(start, end)| *start <= *end)
-            .collect();
+        let raw_ahead_gaps = proactive_candidate_gaps(
+            &current_ranges, total_size, proactive_start_byte, max_ahead_byte, backfilling,
+        );
 
         // Round-26 T4: merge gaps separated by less than one Telegram chunk, so
         // the fragmented neighbourhood the sweep now aims into does not cost one
@@ -2300,7 +2437,10 @@ async fn proactive_prebuffer_download(
                         let prev_target = last_target_byte;
                         last_target_byte = Some(target_byte);
 
-                        if target_byte > offset + 10 * 1024 * 1024 {
+                        if (!backfilling && target_byte > offset + 10 * 1024 * 1024)
+                            || (backfilling && should_retarget_proactive(
+                                true, offset, backfill_entry_target, target_byte,
+                            )) {
                             log::info!(
                                 "[PROACTIVE] msg {}: playhead jumped forward to byte {} (current offset {}), re-evaluating gaps",
                                 message_id, target_byte, offset
@@ -2413,7 +2553,7 @@ async fn proactive_prebuffer_download(
                             let _lock = cache_mgr.lock_meta(message_id).await;
                             let mut meta = cache_mgr.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,
-                                folder_id: folder_id.unwrap_or(0), // 0 = home/Saved Messages sentinel
+                                folder_id: folder_id.unwrap_or(i64::MIN),
                                 total_size,
                                 filename: filename.clone(),
                                 cached_ranges: Vec::new(),

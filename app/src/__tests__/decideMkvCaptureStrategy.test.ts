@@ -24,11 +24,11 @@ describe('decideMkvCaptureStrategy', () => {
   const TS = [0, 10, 20, 30]; // harvested keyframes
   const GAP = 12;             // THUMB_INDEX_MAX_GAP (useThumbnailExtractor.ts)
 
-  it('index hit within gap → indexed capture with the FOUND timestamp (both cue states)', () => {
-    expect(decideMkvCaptureStrategy(TS, 15, GAP, true)).toEqual({ strategy: 'index', timestamp: 10 });
+  it('index hit within gap → indexed capture only for a cue-indexed MKV', () => {
+    expect(decideMkvCaptureStrategy(TS, 15, GAP, true)).toEqual({ strategy: 'skip' });
     expect(decideMkvCaptureStrategy(TS, 15, GAP, false)).toEqual({ strategy: 'index', timestamp: 10 });
-    expect(decideMkvCaptureStrategy(TS, 30, GAP, true)).toEqual({ strategy: 'index', timestamp: 30 }); // exact hit
-    expect(decideMkvCaptureStrategy(TS, 42, GAP, true)).toEqual({ strategy: 'index', timestamp: 30 }); // gap boundary =12
+    expect(decideMkvCaptureStrategy(TS, 30, GAP, true)).toEqual({ strategy: 'skip' });
+    expect(decideMkvCaptureStrategy(TS, 42, GAP, true)).toEqual({ strategy: 'skip' });
   });
 
   it('gap miss: cue-less → skip (the unbounded-scan fix); cue-indexed → native (tier untouched)', () => {
@@ -50,3 +50,4 @@ describe('decideMkvCaptureStrategy', () => {
     expect(decideMkvCaptureStrategy(TS, 29.9, GAP, true)).toEqual({ strategy: 'index', timestamp: 20 });
   });
 });
+

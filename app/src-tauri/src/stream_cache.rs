@@ -1196,6 +1196,16 @@ impl StreamCacheManager {
         self.proactive_tasks.lock().await.push(message_id);
     }
 
+    /// Atomically claim the one proactive slot for a message.
+    pub async fn try_track_proactive(&self, message_id: i32) -> bool {
+        let mut tasks = self.proactive_tasks.lock().await;
+        if tasks.contains(&message_id) {
+            return false;
+        }
+        tasks.push(message_id);
+        true
+    }
+
     /// Untrack a proactive prebuffer task
     pub async fn untrack_proactive(&self, message_id: i32) {
         self.proactive_tasks.lock().await.retain(|&id| id != message_id);
@@ -1666,6 +1676,30 @@ mod tests {
         // delete_cache clears the counter (no meta/data files exist — Ok path)
         mgr.delete_cache(msg).unwrap();
         assert_eq!(mgr.session_downloaded_bytes(msg), 0);
+    }
+
+    #[tokio::test]
+    async fn proactive_claim_is_atomic_and_reusable_after_release() {
+        let dir = std::env::temp_dir().join(format!("nobuf-proactive-claim-{}", std::process::id()));
+        let manager = StreamCacheManager::new(dir.clone()).unwrap();
+        assert!(manager.try_track_proactive(109).await);
+        assert!(!manager.try_track_proactive(109).await);
+        manager.untrack_proactive(109).await;
+        assert!(manager.try_track_proactive(109).await);
+        manager.untrack_proactive(109).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn proactive_stop_policy_keeps_claim_until_owner_releases_it() {
+        let dir = std::env::temp_dir().join(format!("nobuf-proactive-stop-{}", std::process::id()));
+        let manager = StreamCacheManager::new(dir.clone()).unwrap();
+        assert!(manager.try_track_proactive(109).await);
+        assert!(!manager.try_track_proactive(109).await);
+        manager.untrack_proactive(109).await;
+        assert!(manager.try_track_proactive(109).await);
+        manager.untrack_proactive(109).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -898,6 +898,8 @@ export interface SubRepairBreakerState {
    * written before round-17 come back without the field.
    */
   consecutiveDefers?: number;
+  /** The bounded defer budget has been exhausted for this file/track. */
+  deferExhausted?: boolean;
 }
 
 export function pendingSubSelectionAfterLoad(
@@ -907,7 +909,7 @@ export function pendingSubSelectionAfterLoad(
   return pendingIdx != null && pendingIdx !== completedIdx ? pendingIdx : null;
 }
 
-export type SubRepairOutcome = 'ok' | 'progress' | 'no-progress' | 'failed' | 'deferred';
+export type SubRepairOutcome = 'ok' | 'progress' | 'progress-uncovered' | 'no-progress' | 'failed' | 'deferred';
 /**
  * Classify one completed repair from CUE-LIST ground truth.
  *
@@ -960,8 +962,7 @@ export function classifySubRepairOutcome(
     // Growth ⇒ the cache is still filling toward this region: defer, don't fail.
     if (
       currentFrontierBytes != null &&
-      lastFrontierBytes != null &&
-      currentFrontierBytes > lastFrontierBytes
+      (lastFrontierBytes == null || currentFrontierBytes > lastFrontierBytes)
     ) {
       return 'deferred';
     }
@@ -985,9 +986,19 @@ export function classifySubRepairOutcome(
   // the old `lastCueEnd` rule and mislabelled. `cuesAfter` is optional; when it
   // is absent both sides fall back to the same prefix-shaped comparison.
   if (!shouldReExtractSub(playheadS, afterS, isFullyCovered, graceS, cuesAfter)) return 'ok';
+  // The trigger's grace window is for deciding whether another extraction is
+  // warranted. Once it says the region is uncovered, require a cue that truly
+  // spans the playhead before allowing `ok`.
+  const hasActiveCue = cuesAfter?.some(
+    (cue) => playheadS >= cue.startTime && playheadS <= cue.endTime,
+  ) ?? false;
+  if (cuesAfter && !hasActiveCue) {
+    if (cuesBeforeCount != null && cuesAfter.length > cuesBeforeCount) return 'progress-uncovered';
+    return 'deferred';
+  }
   // A repair that ADDED cues is progress even if the playhead still is not
   // covered — the extractor is converging, not stuck.
-  if (cuesAfter && cuesBeforeCount != null && cuesAfter.length > cuesBeforeCount) return 'progress';
+  if (cuesAfter && cuesBeforeCount != null && cuesAfter.length > cuesBeforeCount) return 'progress-uncovered';
   if (afterS != null && (beforeS == null || afterS > beforeS)) return 'progress';
   return 'no-progress';
 }
@@ -1024,6 +1035,7 @@ export function reduceSubRepairBreaker(
 ): SubRepairBreakerState {
   let { consecutiveFailures: f, attempts: a, open, lastFrontierBytes: lf } = prev;
   let d = prev.consecutiveDefers ?? 0;
+  let deferExhausted = prev.deferExhausted ?? false;
   if (frontierBytes != null && lf != null && frontierBytes > lf) {
     f = 0;
     open = false;
@@ -1032,13 +1044,14 @@ export function reduceSubRepairBreaker(
     return {
       consecutiveFailures: 0, attempts: 0, lastAttemptStartedAtMs: nowMs,
       open: false, lastFrontierBytes: frontierBytes ?? lf, consecutiveDefers: 0,
+      deferExhausted: false,
     };
   }
   if (outcome === 'progress') {
     f = 0;            // converging: reset the failure counter
     a += 1;           // but the attempt budget is still spent
     d = 0;            // and we are no longer merely waiting on bytes
-  } else if (outcome === 'deferred' && d + 1 < maxDefers) {
+  } else if ((outcome === 'deferred' || outcome === 'progress-uncovered') && !deferExhausted && d + 1 < maxDefers) {
     // Round-17: the frontier grew but the viewer's region still isn't cached.
     // Spend NEITHER failure nor attempt budget — this is not a failed attempt,
     // it is "not yet". Bounded by `maxDefers` so a download that advances
@@ -1046,6 +1059,7 @@ export function reduceSubRepairBreaker(
     // budget is out this falls through to the failure arm below.
     d += 1;
   } else {
+    if (outcome === 'deferred' || outcome === 'progress-uncovered') deferExhausted = true;
     f += 1;
     a += 1;
     d = 0;
@@ -1053,7 +1067,7 @@ export function reduceSubRepairBreaker(
   }
   return {
     consecutiveFailures: f, attempts: a, lastAttemptStartedAtMs: nowMs,
-    open, lastFrontierBytes: frontierBytes ?? lf, consecutiveDefers: d,
+    open, lastFrontierBytes: frontierBytes ?? lf, consecutiveDefers: d, deferExhausted,
   };
 }
 
@@ -1061,7 +1075,7 @@ export function reduceSubRepairBreaker(
 export function emptySubRepairBreakerState(): SubRepairBreakerState {
   return {
     consecutiveFailures: 0, attempts: 0, lastAttemptStartedAtMs: 0,
-    open: false, lastFrontierBytes: null, consecutiveDefers: 0,
+    open: false, lastFrontierBytes: null, consecutiveDefers: 0, deferExhausted: false,
   };
 }
 
@@ -1086,7 +1100,11 @@ export function resetSubRepairBreakerForSeek(
   return {
     ...prev,
     consecutiveFailures: 0,
-    consecutiveDefers: 0,
+    // Deferred evidence is file-level supply state, not a verdict about the
+    // old region. Preserve it across region changes so the bounded defer cap
+    // cannot be reset by deleting and recreating a region ledger entry.
+    consecutiveDefers: prev.consecutiveDefers ?? 0,
+    deferExhausted: prev.deferExhausted ?? false,
     lastAttemptStartedAtMs: 0,
     open: false,
   };
@@ -2276,6 +2294,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const proactivePrebufferMsgIdRef = useRef<number>(0); // msg_id being proactively prebuffered
   const proactiveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // 10s position reporting interval
   const mkvProactiveRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mkvProactiveReportInFlightRef = useRef(false);
   const independentPrebufferRef = useRef<{
     abortController: AbortController | null;
     active: boolean;
@@ -3199,7 +3218,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // start playing fast, then let refills catch up. Safe because abutting refills
   // no longer overlap (the old PIPELINE_ERROR_DECODE risk that justified 25s is
   // gone). Kept ≥ one refill chunk so the first refill has runway to iterate.
-  const SEEK_START_DURATION = 8;
+  const SEEK_START_DURATION = 20;
   // Maximum maxDuration for refill seeks. Capped to prevent excessive
   // iteration when video plays far past seekOffsetRef.current. When
   // (video.currentTime - seekOffset) + ahead + REFILL_CHUNK_DURATION
@@ -6855,7 +6874,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   useEffect(() => {
     if (!streamUrl) return;
     const t = window.setTimeout(() => { void loadEmbeddedSubTracks(); }, 1500);
-    return () => window.clearTimeout(t);
+    const retry = window.setInterval(() => { void loadEmbeddedSubTracks(); }, 5_000);
+    return () => {
+      window.clearTimeout(t);
+      window.clearInterval(retry);
+    };
   }, [streamUrl, mp4ReinitNonce, loadEmbeddedSubTracks]);
 
   /**
@@ -7652,6 +7675,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const fileSize = state.current.fileLength;
     const duration = state.current.duration;
     if (!fileId || fileSize <= 0 || duration <= 0 || isPausedRef.current) return;
+    if (mkvProactiveRetryTimerRef.current !== null || mkvProactiveReportInFlightRef.current) return;
     proactivePrebufferMsgIdRef.current = fileId;
     const byteOffset = computeSeekReportByte(rawByte);
     const maxAttempts = 4;
@@ -7660,6 +7684,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const report = async (attempt: number): Promise<void> => {
       if (formatRef.current !== 'mkv' || capturedGen !== transmuxerSeekGenRef.current || isPausedRef.current) return;
       let accepted = false;
+      mkvProactiveReportInFlightRef.current = true;
       try {
         accepted = await invoke<boolean>('cmd_report_playback_position', {
           messageId: fileId,
@@ -7672,6 +7697,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           byteOffset,
         });
       } catch { /* retry below */ }
+      finally { mkvProactiveReportInFlightRef.current = false; }
       if (accepted) {
         console.log(`[MSE] MKV proactive active at byte ${byteOffset} (attempt ${attempt + 1})`);
         return;
@@ -7693,6 +7719,20 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       }, retryDelays[attempt]);
     };
     void report(0);
+  };
+
+  const startMkvProactiveReporter = () => {
+    const fileId = file?.id;
+    if (!fileId || formatRef.current !== 'mkv' || proactiveIntervalRef.current || isPausedRef.current) return;
+    const tick = () => {
+      const video = videoRef.current;
+      if (!video || video.ended || isPausedRef.current || transmuxerSeekInProgressRef.current ||
+          (window as any).__nobuf_userSeekInProgress === true) return;
+      const exactByte = timeToByte(video.currentTime);
+      if (exactByte >= 0) reportMkvProactivePosition(video.currentTime, exactByte);
+    };
+    proactiveIntervalRef.current = setInterval(tick, 2_000);
+    tick();
   };
 
   /**
@@ -8037,6 +8077,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // On-demand refill loop keeps the buffer topped up (bounded lookahead).
       startStreamingChain();
       reportMkvProactivePosition(0, 0);
+      startMkvProactiveReporter();
     } catch (e: any) {
       bufferingForSeekRef.current = false;
       // Dismiss the overlay on prime failure too — otherwise it hangs until the
@@ -10014,10 +10055,6 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               // supersession guard above — a condemned seek can never re-report.
               const bisectAnchor = (transmuxerRef.current as any)?.getLastBisectAnchor?.() ?? null;
               const resolvedSeekByte = bisectAnchor?.byteOffset ?? seekAnchor?.byteOffset ?? -1;
-              if (resolvedSeekByte >= 0) {
-                reportMkvProactivePosition(clampedTime, resolvedSeekByte, seekGen);
-              }
-
               await sbVideo.waitForQueueDrain();
               if (sbAudio) await sbAudio.waitForQueueDrain();
 
@@ -10085,6 +10122,29 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
                   setTimeout(() => {
                     if (!settled) reportSeekFrame('timeout');
                   }, 1500);
+                  const monitorStartedAt = performance.now();
+                  const monitor = window.setInterval(() => {
+                    if (
+                      performance.now() - monitorStartedAt > 15_000 ||
+                      video.ended ||
+                      seekGen !== transmuxerSeekGenRef.current
+                    ) {
+                      clearInterval(monitor);
+                      return;
+                    }
+                    let ahead = 0;
+                    try {
+                      for (let i = 0; i < video.buffered.length; i++) {
+                        if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) {
+                          ahead = video.buffered.end(i) - video.currentTime;
+                          break;
+                        }
+                      }
+                    } catch { /* detached video */ }
+                    if (!video.paused && (video.readyState < 3 || ahead < 2)) {
+                      console.log(`[MSE] SEEK-STALL: gen=${seekGen} t=${video.currentTime.toFixed(2)}s ahead=${ahead.toFixed(2)}s readyState=${video.readyState} paused=${video.paused}`);
+                    }
+                  }, 500);
                 };
                 video.addEventListener('seeked', onSeeked, { once: true });
               }
@@ -10094,6 +10154,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
               // Start streaming chain for continuous playback after limited seek
               startStreamingChain();
+
+              // Report only after the foreground refill owns the pipeline. The
+              // previous pre-drain report observed refillInProgress=false and
+              // admitted PROACTIVE while playback was still landing the seek.
+              if (resolvedSeekByte >= 0) {
+                reportMkvProactivePosition(clampedTime, resolvedSeekByte, seekGen);
+              }
+              startMkvProactiveReporter();
 
               transmuxerSeekInProgressRef.current = false; // Seek complete — allow new seeks
 
@@ -10538,6 +10606,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const currentTime = videoRef.current.currentTime;
       const exactByte = timeToByte(currentTime);
       if (exactByte >= 0) reportMkvProactivePosition(currentTime, exactByte);
+      startMkvProactiveReporter();
     }
     // MP4: restart the backend PROACTIVE reporter so the green bar resumes its
     // march to EOF. pausePrefetch stopped the backend task and cleared the

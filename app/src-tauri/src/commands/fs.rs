@@ -1088,7 +1088,7 @@ pub async fn cmd_download_file(
                             let _lock = cache_state.lock_meta(message_id).await;
                             let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,
-                                folder_id: folder_id.unwrap_or(0),
+                                folder_id: folder_id.unwrap_or(i64::MIN),
                                 total_size,
                                 filename: dl_filename.clone(),
                                 cached_ranges: Vec::new(),
@@ -1224,7 +1224,7 @@ pub async fn cmd_download_file(
             let _lock = cache_state.lock_meta(message_id).await;
             let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                 message_id,
-                folder_id: folder_id.unwrap_or(0),
+                folder_id: folder_id.unwrap_or(i64::MIN),
                 total_size,
                 filename: dl_filename.clone(),
                 cached_ranges: Vec::new(),
