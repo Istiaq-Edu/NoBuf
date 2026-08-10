@@ -184,6 +184,47 @@ export function decideMkvCaptureStrategy(
   return cueless ? { strategy: 'skip' } : { strategy: 'native' };
 }
 
+export type ThumbnailBisectMemoEntry = {
+  state: 'inflight' | 'done' | 'failed';
+  at: number;
+  entry?: { elementStartPos: number; startTimestamp: number };
+  promise?: Promise<void>;
+  fallbackAttempted?: boolean;
+};
+
+export function startSingleThumbnailBisect(
+  memo: Map<number, ThumbnailBisectMemoEntry>,
+  bucket: number,
+  now: number,
+  operation: () => Promise<void>,
+  fallbackAttempted = false,
+): Promise<void> {
+  const current = memo.get(bucket);
+  if (current?.state === 'inflight' && current.promise) return current.promise;
+  const promise = Promise.resolve().then(operation);
+  memo.set(bucket, { state: 'inflight', at: now, promise, fallbackAttempted });
+  return promise;
+}
+
+export function shouldStartThumbnailFallback(entry: ThumbnailBisectMemoEntry | undefined): boolean {
+  return entry?.fallbackAttempted !== true;
+}
+
+export type ThumbnailBisectAction = 'capture' | 'wait' | 'cooldown' | 'start';
+
+export function decideThumbnailBisectAction(
+  entry: ThumbnailBisectMemoEntry | undefined,
+  hasNearEntry: boolean,
+  now: number,
+  cooldownMs = 60_000,
+): ThumbnailBisectAction {
+  if (entry?.state === 'failed' && now - entry.at < cooldownMs) return 'cooldown';
+  if (entry?.fallbackAttempted && entry.state === 'done') return 'cooldown';
+  if (hasNearEntry || entry?.state === 'done') return 'capture';
+  if (entry?.state === 'inflight') return 'wait';
+  return 'start';
+}
+
 /** Cue-point count from mediabunny's already-parsed MKV metadata (pure in-memory read — zero
  *  I/O; getPrimaryVideoTrack already ran readMetadata). Reaches vendored internals by the same
  *  convention as MediabunnyTransmuxer.extractMkvCueIndex; null = layout drift. */
@@ -749,16 +790,7 @@ class TransmuxerThumbnailPipeline {
   // capture throw can evict it (verify-c risk 4). Failed buckets retry after a
   // cooldown. Adjacent buckets are served without re-bisecting via the R10
   // clusterPositionCache consult (organic AND injected entries qualify).
-  private bisectMemo = new Map<number, {
-    state: 'inflight' | 'done' | 'failed';
-    at: number;
-    entry?: { elementStartPos: number; startTimestamp: number };
-    // Round-9 Fix 6 (I-6): the in-flight bisect's promise (resolves after the
-    // memo transitions to done/failed; never rejects). processLoop awaits it
-    // instead of blind-polling captureAtTime every ~250ms — 9-* logged 115
-    // false polls vs 6 true captures.
-    promise?: Promise<void>;
-  }>();
+  private bisectMemo = new Map<number, ThumbnailBisectMemoEntry>();
   /** Round-5 (green bar D3): sink for exact (byte, timeSeconds) pairs from
    *  validated bisection clusters — wired to the player's recordByteTimeAnchor
    *  so cached islands render at true VBR positions. Optional; no-op when unset. */
@@ -972,13 +1004,12 @@ class TransmuxerThumbnailPipeline {
       // R10: an existing cache entry (organic or injected) near the target
       // already bounds the walk — capture directly, no bisection.
       const nearEntry = findClusterCacheEntryNear(this.videoTrack, targetTicks, windowTicks);
-      if (nearEntry) {
+      const action = decideThumbnailBisectAction(memo, !!nearEntry, performance.now());
+      if (action === 'capture') {
         bisectedTicks = targetTicks;
-      } else if (memo?.state === 'done') {
-        bisectedTicks = targetTicks;
-      } else if (memo?.state === 'inflight') {
+      } else if (action === 'wait') {
         return false; // busy NOT taken — near hovers stay serviceable
-      } else if (memo?.state === 'failed' && performance.now() - memo.at < 60_000) {
+      } else if (action === 'cooldown') {
         return false; // cooldown — don't hammer a failing region
       } else {
         // Fire-and-forget: bisect in the background; processLoop's next retry
@@ -986,8 +1017,12 @@ class TransmuxerThumbnailPipeline {
         // Round-9 Fix 6: keep the promise in the memo so processLoop can await
         // the settle instead of blind-polling (_bisectAndInject never rejects —
         // it writes done/failed internally before resolving).
-        const p = this._bisectAndInject(time, targetTicks, bucketKey);
-        this.bisectMemo.set(bucketKey, { state: 'inflight', at: performance.now(), promise: p });
+        const p = startSingleThumbnailBisect(
+          this.bisectMemo,
+          bucketKey,
+          performance.now(),
+          () => this._bisectAndInject(time, targetTicks, bucketKey),
+        );
         void p;
         return false;
       }
@@ -1028,11 +1063,19 @@ class TransmuxerThumbnailPipeline {
         if (!keyPacket) {
           // Keyframe may live in an EARLIER cluster than the bisected one
           // (verify-c risk 3): back off one probe step once, then cooldown.
-          this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
           console.warn(`[TransmuxerThumbnailPipeline] Bisected getKeyPacket(${time.toFixed(1)}) found no keyframe — backing off`);
           const factor = readMkvTimestampFactor(this.videoTrack);
-          if (factor !== null && time > 35) {
-            void this._bisectAndInject(time - 35, Math.round((time - 35) * factor), bucket);
+          const memo = this.bisectMemo.get(bucket);
+          if (factor !== null && time > 35 && shouldStartThumbnailFallback(memo)) {
+            void startSingleThumbnailBisect(
+              this.bisectMemo,
+              bucket,
+              performance.now(),
+              () => this._bisectAndInject(time - 35, Math.round((time - 35) * factor), bucket, true),
+              true,
+            );
+          } else {
+            this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
           }
           return false;
         }
@@ -1137,6 +1180,7 @@ class TransmuxerThumbnailPipeline {
     targetSeconds: number,
     targetTicks: number,
     bucketKey: number,
+    fallbackAttempted = false,
   ): Promise<void> {
     const started = performance.now();
     try {
@@ -1162,18 +1206,18 @@ class TransmuxerThumbnailPipeline {
       });
 
       if (!result || !this.active) {
-        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
         return;
       }
       const entry = result.entry;
       if (!injectMkvClusterPosition(this.videoTrack, entry)) {
-        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
         return;
       }
-      this.bisectMemo.set(bucketKey, { state: 'done', at: performance.now(), entry });
+      this.bisectMemo.set(bucketKey, { state: 'done', at: performance.now(), entry, fallbackAttempted });
       console.log(`[TransmuxerThumbnailPipeline] Bisected cluster for ${targetSeconds.toFixed(1)}s: byte=${entry.elementStartPos}, ticks=${entry.startTimestamp} (${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
     } catch (e) {
-      this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now() });
+      this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
       console.warn('[TransmuxerThumbnailPipeline] Bisection failed:', e);
     }
   }
