@@ -8,8 +8,9 @@ import { isVideoFile } from '../../utils';
 import { useMSEPlayer, readPersistedSubTrack, persistSubTrack, shouldReExtractSub, lastCueEnd,
   shouldReportSubFailure,
   mergeCues,
+  mergeAssContent, assDialogueIntervals,
   classifySubRepairOutcome, reduceSubRepairBreaker, shouldAttemptSubRepair,
-  emptySubRepairBreakerState, computeSubRepairBackoffMs, resetSubRepairBreakerForSeek,
+  emptySubRepairBreakerState, computeSubRepairBackoffMs, selectSubRepairBreakerKey,
   SUB_REPAIR_MAX_ATTEMPTS, type SubRepairBreakerState, type SubRepairOutcome } from '../../hooks/useMSEPlayer';
 import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
@@ -193,6 +194,8 @@ interface FastStreamPlayerProps {
   }, [file.id]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
+  const loadRef = useRef(true);
+  loadRef.current = load;
   const [err, setErr] = useState<string | null>(null);
   // Track the actual URL set as <video>.src for diagnostic display
   const [lastVideoSrc, setLastVideoSrc] = useState<string | null>(null);
@@ -637,37 +640,18 @@ interface FastStreamPlayerProps {
           //     guarded) so byteToTime self-calibrates off the linear fallback.
           if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
             const cachedRanges = status.cached_ranges as [number, number][];
-            const seekTarget = (window as any).__nobuf_seekTargetTime;
             // (rawPlayhead removed with the GREEN-BAR diagnostic log; re-add
             //  `const rawPlayhead = vidRef.current?.currentTime ?? 0;` if re-enabling.)
-            // (B) Capture a VBR anchor for the active seek before converting.
-            // ROUND-5 GATE (user report: "seeked to 5min → instant 1-2min of
-            // green that isn't downloaded"): this heuristic pairs the nearest
-            // cached-range START with the seek time. That's sound ONLY on the
-            // linear /remux-tier where ffmpeg's reads for the seek create that
-            // range. On the MKV transmuxer tier it's poison: thumbnail-probe /
-            // old-seek islands get snapped to the playhead (island start ↔
-            // seekTarget) → the whole island instantly renders as phantom
-            // prebuffer AT the seek point, and the bogus anchor then blocks the
-            // transmuxer's real ground-truth anchor (getLastSeekAnchor,
-            // monotonicity guard rejects the later correct pair). The
-            // transmuxer records its own exact anchors — skip the guess there.
-            if (!isTransmuxer() && typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
-              const linearByte = (seekTarget / durForBar) * status.total_bytes;
-              // Nearest cached-range START to the linear estimate = ffmpeg's real
-              // cluster read for this seek. Ignore the front (0) and tail ranges.
-              let best: number | null = null;
-              let bestDist = Infinity;
-              for (const [s] of cachedRanges) {
-                if (s < 4 * 1024 * 1024) continue; // skip cold-start front reads
-                const d = Math.abs(s - linearByte);
-                if (d < bestDist) { bestDist = d; best = s; }
-              }
-              // Only trust it when the range start is within 128MB of the estimate
-              // (VBR skew is large but bounded — see backend max_window 256MB).
-              if (best !== null && bestDist < 128 * 1024 * 1024) {
-                recordByteTimeAnchor(best, seekTarget);
-              }
+            // The backend marks only the final timestamp-seeked ffmpeg input and
+            // publishes the exact source-container Range it requested. Use that
+            // measured pair; choosing the cached range nearest a linear estimate
+            // mapped correct VBR downloads to the wrong timeline position.
+            if (
+              !isTransmuxer() && recordByteTimeAnchor &&
+              typeof status.remux_seek_time_s === 'number' &&
+              typeof status.remux_seek_actual_byte === 'number'
+            ) {
+              recordByteTimeAnchor(status.remux_seek_actual_byte, status.remux_seek_time_s);
             }
             // Show EVERY cached range. This bar is sourced from the backend disk
             // cache (status.cached_ranges) — every range in it is ON DISK and
@@ -1107,6 +1091,17 @@ interface FastStreamPlayerProps {
     const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
     const onWait = () => { if (!suppressLoadingSpinnerRef.current) setLoad(true); };
     const onPlay2 = () => setLoad(false);
+    const onRemuxSeekPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{ presented?: boolean }>).detail;
+      console.log(
+        `[Player] remux seek presentation: presented=${detail?.presented === true} ` +
+        `covers={spinner:${loadRef.current},cold:${coldStartBufferingRef.current},remux:${isRemuxLoadingRef.current}}`,
+      );
+      if (detail?.presented === true) {
+        setLoad(false);
+        if (isRemuxLoadingRef.current) setIsRemuxLoading(false);
+      }
+    };
     const onProgress = () => {
       // Update buffer end for UI
       if (v.buffered.length > 0) {
@@ -1133,6 +1128,7 @@ interface FastStreamPlayerProps {
     v.addEventListener('ended', onEnded);
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
+    v.addEventListener('nobuf:remux-seek-presentation', onRemuxSeekPresentation);
     v.addEventListener('progress', onProgress);
     const onDurChange = () => {
       if (!file) return;
@@ -1262,6 +1258,7 @@ interface FastStreamPlayerProps {
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
+      v.removeEventListener('nobuf:remux-seek-presentation', onRemuxSeekPresentation);
       v.removeEventListener('progress', onProgress);
       v.removeEventListener('durationchange', onDurChange);
     };
@@ -1614,7 +1611,13 @@ interface FastStreamPlayerProps {
     // Round-10b: a manual toggle is an explicit human request, so it RESETS the
     // breaker for this track. Automatic repair may have given up; the user
     // asking again must always get a real attempt.
-    subBreakerRef.current.delete(`${file.id}:${idx}`);
+    // Breakers are region-scoped: clear every region for this track so a manual
+    // request always gets a fresh attempt, regardless of where automatic repair
+    // previously stopped.
+    const breakerPrefix = `${file.id}:${idx}:`;
+    for (const key of subBreakerRef.current.keys()) {
+      if (key.startsWith(breakerPrefix)) subBreakerRef.current.delete(key);
+    }
     embeddedSubLoadingIdxRef.current = idx;
     setEmbeddedSubBusyIdx(idx);
     const genAtStart = embeddedSubFileGenRef.current;
@@ -1692,8 +1695,10 @@ interface FastStreamPlayerProps {
         const scratch = new SubtitleTrack(null, null);
         scratch.loadText(res.text);
         if (scratch.isASS) {
-          existing.track.cues = [];
-          existing.track.loadText(res.text);
+          // Island extraction returns only the current region. Replacing the ASS
+          // payload here discarded every previously downloaded region whenever
+          // the user manually refreshed the active track.
+          existing.track.loadText(mergeAssContent(existing.track.assContent, res.text));
         } else {
           existing.track.cues = mergeCues(existing.track.cues, scratch.cues);
           existing.track.format = scratch.format;
@@ -1735,9 +1740,10 @@ interface FastStreamPlayerProps {
   //   - skipped while any extraction is in flight, and generation-guarded so a
   //     file switch mid-fetch discards the result
   const subRepairAttemptedRef = useRef<Set<string>>(new Set());
-  // Round-10b: breaker state per (file, track). Survives file switches so
-  // "this file's subtitles are broken" is learnable, LRU-bounded so it cannot
-  // grow without limit. Keyed the same way as the region ledger.
+  // Breaker state is per (file, track, 120-second region). A failed or deferred
+  // opening-prefix extraction is evidence about that region only; it must not
+  // spend the attempt ceiling for a later seek where a usable island exists.
+  // The LRU cap keeps the bounded per-region state from growing without limit.
   const subBreakerRef = useRef<Map<string, SubRepairBreakerState>>(new Map());
   const SUB_BREAKER_LRU_CAP = 32;
   const getBreaker = useCallback((key: string): SubRepairBreakerState => {
@@ -1763,32 +1769,18 @@ interface FastStreamPlayerProps {
         // Round-20: pass the cue INTERVALS. With only `lastCueEnd` this gate
         // silently skipped every backward seek into a hole between two islands
         // (20-c: 7 consecutive seeks, zero requests reached the backend).
+        const coverageIntervals = entry.track.isASS
+          ? assDialogueIntervals(entry.track.assContent)
+          : entry.track.cues;
         if (!shouldReExtractSub(
-          playheadS, lastCueEnd(entry.track.cues), !entry.partial,
-          undefined, entry.track.cues,
+          playheadS, lastCueEnd(coverageIntervals), !entry.partial,
+          undefined, coverageIntervals,
         )) continue;
-        // Round-10b: the breaker gates BEFORE the region ledger. The ledger
-        // bounds distinct regions; only the breaker bounds total attempts, and
-        // only it can learn that this file is simply not repairable right now.
-        const bkey = `${file.id}:${idx}`;
-        // Round-27: a backoff is evidence about the REGION it was earned in, not
-        // about the file. 26-c: a failure at coverage 2043s bought a 150s ladder,
-        // the viewer seeked to 3349s, and subtitles stayed dead for the rest of
-        // the session waiting out a penalty earned ~1300s of content away. When
-        // the playhead enters a 120s region this track has never attempted, drop
-        // the time-based penalties (the `attempts` ceiling deliberately survives,
-        // so seeking cannot buy unlimited repairs).
-        const regionKey = `${file.id}:${idx}:${Math.floor(playheadS / 120)}`;
-        if (!subRepairAttemptedRef.current.has(regionKey)) {
-          const stale = getBreaker(bkey);
-          if (stale.consecutiveFailures > 0 || stale.open || (stale.consecutiveDefers ?? 0) > 0) {
-            setBreaker(bkey, resetSubRepairBreakerForSeek(stale));
-            console.log(
-              `[SUBS] repair breaker reset for track ${idx}: new region at ${playheadS.toFixed(0)}s ` +
-              `(was ${stale.consecutiveFailures} failures, open=${stale.open})`,
-            );
-          }
-        }
+        const regionKey = selectSubRepairBreakerKey(String(file.id), idx, playheadS);
+        // Breaker and ledger share the same region key. A deferred retry stays
+        // bounded within this region, while a distant seek starts with clean
+        // evidence and its own attempt ceiling.
+        const bkey = regionKey;
         const st = getBreaker(bkey);
         if (!shouldAttemptSubRepair(st, Date.now(), false)) {
           continue;
@@ -1822,22 +1814,26 @@ interface FastStreamPlayerProps {
     // Round-16: ASS/SSA keeps `cues` empty (jassub renders `assContent`), so the
     // cue list cannot describe its coverage. Track content length instead.
     const assBeforeLen = entry.track.isASS ? (entry.track.assContent?.length ?? 0) : null;
+    const assBeforeCount = entry.track.isASS ? assDialogueIntervals(entry.track.assContent).length : null;
     const stBefore = getBreaker(bkey);
     const attemptNo = stBefore.attempts + 1;
     let hadError = false;
     let after: number | null = before;
     let assAfterLen: number | null = assBeforeLen;
+    let assIntervalsAfter = entry.track.isASS ? assDialogueIntervals(entry.track.assContent) : null;
     // Round-17: the backend's contiguous cache frontier, from X-Subs-Frontier.
     // `reduceSubRepairBreaker` resets the failure counter when this GROWS between
     // attempts — the mechanism that reopens the breaker as data arrives. It was
     // dead code until now because this call site passed a hardcoded `null`.
     let frontierBytes: number | null = null;
+    let supplyActive = false;
     try {
       const res = await msePlayer.fetchEmbeddedSubText(idx);
       if (embeddedSubFileGenRef.current !== genAtStart) return; // file switched
       frontierBytes = res.frontier;
       if ('error' in res) {
         hadError = true;
+        supplyActive = res.supplyActive === true;
       } else {
         // Round-15 R-3: MERGE, never clobber. The old code did
         // `entry.track.cues = []; entry.track.loadText(res.text)` — a blind
@@ -1854,9 +1850,9 @@ interface FastStreamPlayerProps {
         const scratch = new SubtitleTrack(null, null);
         scratch.loadText(res.text);
         if (scratch.isASS) {
-          entry.track.cues = [];
-          entry.track.loadText(res.text);
+          entry.track.loadText(mergeAssContent(entry.track.assContent, res.text));
           assAfterLen = entry.track.assContent?.length ?? 0;
+          assIntervalsAfter = assDialogueIntervals(entry.track.assContent);
         } else {
           entry.track.cues = mergeCues(entry.track.cues, scratch.cues);
           entry.track.format = scratch.format;
@@ -1888,6 +1884,8 @@ interface FastStreamPlayerProps {
       // Round-20: cue intervals + the pre-repair count, so a backward-seek
       // repair that filled a mid-file hole is scored on what it actually did.
       entry.track.cues, cuesBeforeCount,
+      assIntervalsAfter, assBeforeCount,
+      supplyActive,
     );
     const stAfter = reduceSubRepairBreaker(stBefore, outcome, startedAt, frontierBytes);
     setBreaker(bkey, stAfter);

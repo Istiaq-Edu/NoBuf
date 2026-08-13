@@ -1439,9 +1439,19 @@ mod tests {
 #[tauri::command]
 pub async fn cmd_get_cache_status(
     message_id: i32,
+    state: State<'_, TelegramState>,
     cache_state: State<'_, StreamCacheManager>,
 ) -> Result<Option<stream_cache::CacheStatus>, String> {
-    Ok(cache_state.get_status(message_id))
+    let mut status = cache_state.get_status(message_id);
+    if let (Some(status), Some((seek_s, estimated, actual))) = (
+        status.as_mut(),
+        state.remux_seek_anchors.read().await.get(&message_id).copied(),
+    ) {
+        status.remux_seek_time_s = Some(seek_s);
+        status.remux_seek_estimated_byte = Some(estimated);
+        status.remux_seek_actual_byte = Some(actual);
+    }
+    Ok(status)
 }
 
 /// Delete cache for a specific message
@@ -1835,7 +1845,7 @@ pub async fn cmd_report_playback_position(
 
     // Use the exact byte offset if provided (from VBR correction — the linear
     // estimate is wrong for VBR video). Fall back to linear estimate otherwise.
-    let current_byte = if let Some(byte) = byte_offset {
+    let estimated_byte = if let Some(byte) = byte_offset {
         byte.min(file_size)
     } else if duration_s > 0.0 {
         let ratio = (current_time_s / duration_s).clamp(0.0, 1.0);
@@ -1843,6 +1853,18 @@ pub async fn cmd_report_playback_position(
     } else {
         0u64
     };
+    // Keep later reports on the same measured container offset. Without this,
+    // the next periodic report overwrites ffmpeg's authoritative target with
+    // the original bad estimate. A distant seek falls outside the time window
+    // and uses its new estimate until ffmpeg publishes the replacement anchor.
+    let remux_anchor = state.remux_seek_anchors.read().await.get(&message_id).copied();
+    let current_byte = crate::server::corrected_playback_report_byte(
+        estimated_byte,
+        byte_offset.is_some(),
+        current_time_s,
+        remux_anchor,
+        file_size,
+    );
 
     // Store the latest target so a running proactive task can slide its window.
     state.proactive_targets.write().await.insert(

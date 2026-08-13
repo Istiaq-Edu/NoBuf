@@ -17,43 +17,57 @@
  * file entirely.
  */
 import { describe, it, expect } from 'vitest';
-import { classifySubRepairOutcome } from '../hooks/useMSEPlayer';
+import { assDialogueIntervals, classifySubRepairOutcome, mergeAssContent } from '../hooks/useMSEPlayer';
+
+const ass = (start: string, end: string, text: string) =>
+  `[Script Info]\nScriptType: v4.00+\n[Events]\nDialogue: 0,${start},${end},Default,,0,0,0,,${text}`;
+
+function classifyAss(before: string, after: string, playhead: number) {
+  return classifySubRepairOutcome(
+    null, null, playhead, false, false, undefined,
+    before.length, after.length, null, null, null, null,
+    assDialogueIntervals(after), assDialogueIntervals(before).length,
+  );
+}
 
 describe('classifySubRepairOutcome — ASS/SSA tracks (no cue list)', () => {
-  it('scores a successful ASS extraction as progress, not no-progress', () => {
-    // The exact 16-c:213 scenario: 0 bytes -> 956 bytes at playhead 2005s.
-    const outcome = classifySubRepairOutcome(
-      null, null, 2005, false, false, undefined,
-      0,    // assBeforeLen — nothing loaded yet
-      956,  // assAfterLen  — the extraction that got scored a failure
-    );
-    expect(outcome).toBe('progress');
+  it('scores an ASS dialogue covering the playhead as ok', () => {
+    expect(classifyAss('', ass('0:33:20.00', '0:33:30.00', 'visible'), 2005)).toBe('ok');
   });
 
-  it('scores the 16-c:267 case (1495 chars) as progress too', () => {
-    expect(
-      classifySubRepairOutcome(null, null, 2015, false, false, undefined, 0, 1495),
-    ).toBe('progress');
+  it('treats ordinary silence near extracted ASS dialogue as covered', () => {
+    expect(classifyAss('', ass('0:33:00.00', '0:33:10.00', 'nearby'), 2050)).toBe('ok');
   });
 
-  it('treats unchanged ASS content as ok — NOT a breaker-tripping failure', () => {
-    // Re-extracting the same region returns the same text. That is the extractor
-    // having nothing more to give right now, not evidence of a fault.
-    expect(
-      classifySubRepairOutcome(null, null, 2005, false, false, undefined, 956, 956),
-    ).toBe('ok');
+  it('keeps retrying when new dialogue still does not cover the playhead', () => {
+    expect(classifyAss('', ass('0:10:00.00', '0:10:10.00', 'earlier'), 2015)).toBe('progress-uncovered');
+  });
+
+  it('treats unchanged uncovered ASS as deferred, not success', () => {
+    const content = ass('0:10:00.00', '0:10:10.00', 'earlier');
+    expect(classifyAss(content, content, 2005)).toBe('deferred');
   });
 
   it('still reports no-progress when ASS extraction returns nothing', () => {
-    expect(
-      classifySubRepairOutcome(null, null, 2005, false, false, undefined, 956, 0),
-    ).toBe('no-progress');
+    expect(classifyAss(ass('0:10:00.00', '0:10:10.00', 'old'), '[Events]', 2005)).toBe('no-progress');
   });
 
-  it('growing ASS content across repairs is progress', () => {
-    expect(
-      classifySubRepairOutcome(null, null, 3000, false, false, undefined, 956, 4200),
-    ).toBe('progress');
+  it('merges dialogue islands without losing the existing header or cues', () => {
+    const first = ass('0:10:00.00', '0:10:10.00', 'first');
+    const second = ass('0:50:00.00', '0:50:10.00', 'second');
+    const merged = mergeAssContent(first, second);
+    expect(merged.match(/^Dialogue:/gm)).toHaveLength(2);
+    expect(merged).toContain('ScriptType: v4.00+');
+    expect(mergeAssContent(merged, second)).toBe(merged);
+  });
+
+  it('manual refresh keeps earlier ASS islands instead of replacing them', () => {
+    const opening = ass('0:00:32.00', '0:00:42.00', 'opening');
+    const later = ass('1:16:45.00', '1:16:50.00', 'later');
+    const merged = mergeAssContent(opening, later);
+    expect(merged).toContain('opening');
+    expect(merged).toContain('later');
+    expect(assDialogueIntervals(merged)).toHaveLength(2);
   });
 
   it('a hard error is still failed, regardless of content', () => {
@@ -62,15 +76,10 @@ describe('classifySubRepairOutcome — ASS/SSA tracks (no cue list)', () => {
     ).toBe('failed');
   });
 
-  it('SIX consecutive successful ASS repairs never trip the breaker', () => {
-    // The regression that mattered: 6 failures disables repair for the file.
-    // Simulate a track whose content grows, then plateaus.
-    const lengths = [0, 956, 1495, 2400, 2400, 2400, 2400];
-    const outcomes = lengths.slice(1).map((len, i) =>
-      classifySubRepairOutcome(null, null, 2000 + i * 10, false, false, undefined, lengths[i], len),
-    );
-    expect(outcomes).not.toContain('no-progress');
-    expect(outcomes).not.toContain('failed');
+  it('does not mistake a smaller unrelated island for success', () => {
+    const covering = ass('0:33:20.00', '0:33:30.00', 'visible');
+    const unrelated = ass('0:10:00.00', '0:10:10.00', 'earlier');
+    expect(classifyAss(covering, unrelated, 2005)).toBe('deferred');
   });
 });
 

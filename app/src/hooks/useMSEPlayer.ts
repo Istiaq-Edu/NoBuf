@@ -54,8 +54,13 @@ export function clampSeekTime(requested: number, duration: number, tailMargin = 
   return Math.min(requested, upper);
 }
 
+/** Remux seek reports must not suppress the distance-aware backend warmer. */
+export function remuxSeekReportPlayerDownloading(): boolean {
+  return false;
+}
+
 /**
- * Round-8 I1 (8-c:412): audio-switch admission guard. Pure + exported for
+ * Round-8 I1 (8-c:412): audio-switch admission guard.
  * testing. Returns a reject reason, or null = switch may proceed.
  *
  * The old E3 condition (`isColdStart || bufferingForSeek`) conflated REFILLS
@@ -150,15 +155,9 @@ export function isHevcFamilyCodec(codec: string | null | undefined): boolean {
 }
 
 /**
- * Compute the BYTE-FORWARD (start_byte) estimate for a /remux seek, or
- * undefined when byte-forward must NOT be used.
- *
- * Byte-forward feeds ffmpeg [TS init_prefix + raw /stream bytes from the
- * offset] via stdin — that is ONLY valid when the underlying /stream content
- * is real MPEG-TS (timed_id3 files). For MKV and MP4 sources the /stream
- * bytes are Matroska/ISOBMFF: feeding a mid-file slice to ffmpeg's stdin
- * dies instantly with "Invalid data found" (execution-proven), so those
- * sources must always seek with ffmpeg `-ss` over the seekable HTTP input.
+ * Compute a byte-forward input offset for a /remux seek, or undefined when
+ * source metadata isn't sufficient. Byte-forward is valid only for real MPEG-TS;
+ * Matroska and ISOBMFF remain ss-only because mid-file slices lack a bootstrap.
  * Pure + exported for testing.
  */
 export function computeRemuxSeekStartByte(
@@ -910,6 +909,69 @@ export function pendingSubSelectionAfterLoad(
 }
 
 export type SubRepairOutcome = 'ok' | 'progress' | 'progress-uncovered' | 'no-progress' | 'failed' | 'deferred';
+
+export interface AssDialogueInterval {
+  startTime: number;
+  endTime: number;
+}
+
+export function upsertByteTimeAnchor(
+  current: readonly [number, number][],
+  byteOffset: number,
+  time: number,
+): [number, number][] {
+  if (!Number.isFinite(byteOffset) || byteOffset < 0 || !Number.isFinite(time) || time < 0) {
+    return current as [number, number][];
+  }
+  const candidate = current
+    .filter(([, t]) => Math.abs(t - time) >= 0.5)
+    .map(([b, t]) => [b, t] as [number, number]);
+  // A nearby-byte anchor with a different time is not equivalent. Keeping the
+  // original table is safer than deleting the same-time anchor and silently
+  // accepting a conflicting byte/time pair.
+  if (candidate.some(([b]) => Math.abs(b - byteOffset) < 65536)) {
+    return current as [number, number][];
+  }
+  let lo = 0, hi = candidate.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (candidate[m][0] < byteOffset) lo = m + 1; else hi = m; }
+  const prev = candidate[lo - 1];
+  const next = candidate[lo];
+  if ((prev && time <= prev[1]) || (next && time >= next[1])) return current as [number, number][];
+  candidate.splice(lo, 0, [byteOffset, time]);
+  return candidate;
+}
+
+function parseAssTimestamp(value: string): number | null {
+  const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})(?:\.(\d{1,2}))?$/);
+  if (!match) return null;
+  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3])
+    + Number((match[4] ?? '').padEnd(2, '0')) / 100;
+}
+
+export function assDialogueIntervals(content: string | null | undefined): AssDialogueInterval[] {
+  if (!content) return [];
+  const intervals: AssDialogueInterval[] = [];
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.startsWith('Dialogue:')) continue;
+    const fields = line.slice('Dialogue:'.length).split(',', 4);
+    if (fields.length < 3) continue;
+    const startTime = parseAssTimestamp(fields[1]);
+    const endTime = parseAssTimestamp(fields[2]);
+    if (startTime != null && endTime != null) intervals.push({ startTime, endTime });
+  }
+  return intervals;
+}
+
+/** Preserve the first complete ASS header/styles and union dialogue rows. */
+export function mergeAssContent(existing: string | null | undefined, incoming: string): string {
+  if (!existing) return incoming;
+  const lines = (value: string) => value.split(String.fromCharCode(10)).map((line) => line.charCodeAt(line.length - 1) === 13 ? line.slice(0, -1) : line);
+  const seen = new Set(lines(existing).filter((line) => line.startsWith('Dialogue:')));
+  const additions = lines(incoming)
+    .filter((line) => line.startsWith('Dialogue:') && !seen.has(line));
+  if (additions.length === 0) return existing;
+  return `${existing.trimEnd()}\n${additions.join('\n')}\n`;
+}
 /**
  * Classify one completed repair from CUE-LIST ground truth.
  *
@@ -951,14 +1013,18 @@ export function classifySubRepairOutcome(
   hadError: boolean,
   isFullyCovered: boolean,
   graceS: number = SUB_COVERAGE_GRACE_S,
-  assBeforeLen: number | null = null,
+  _assBeforeLen: number | null = null,
   assAfterLen: number | null = null,
   lastFrontierBytes: number | null = null,
   currentFrontierBytes: number | null = null,
   cuesAfter: readonly { startTime: number; endTime: number }[] | null = null,
   cuesBeforeCount: number | null = null,
+  assIntervalsAfter: readonly AssDialogueInterval[] | null = null,
+  assBeforeCount: number | null = null,
+  supplyActive: boolean = false,
 ): SubRepairOutcome {
   if (hadError) {
+    if (supplyActive) return 'deferred';
     // Growth ⇒ the cache is still filling toward this region: defer, don't fail.
     if (
       currentFrontierBytes != null &&
@@ -971,11 +1037,17 @@ export function classifySubRepairOutcome(
 
   // ASS/SSA: no cue list exists, so judge by extracted content instead.
   if (assAfterLen != null) {
-    if (assAfterLen === 0) return 'no-progress';        // nothing came back
-    if (assBeforeLen == null || assAfterLen > assBeforeLen) return 'progress';
-    // Same content as last time: the extractor has given us all it can for now.
-    // Not a failure — reporting it as one is what tripped the breaker.
-    return 'ok';
+    const count = assIntervalsAfter?.length ?? 0;
+    if (count === 0) return 'no-progress';
+    const lastAssEnd = assIntervalsAfter?.reduce<number | null>(
+      (latest, cue) => latest == null || cue.endTime > latest ? cue.endTime : latest,
+      null,
+    ) ?? null;
+    if (!shouldReExtractSub(playheadS, lastAssEnd, false, graceS, assIntervalsAfter)) {
+      return 'ok';
+    }
+    if (assBeforeCount != null && count > assBeforeCount) return 'progress-uncovered';
+    return 'deferred';
   }
 
   // Reuse the SHIPPED coverage predicate so the trigger and the verdict can
@@ -1106,6 +1178,9 @@ export function resetSubRepairBreakerForSeek(
     consecutiveDefers: prev.consecutiveDefers ?? 0,
     deferExhausted: prev.deferExhausted ?? false,
     lastAttemptStartedAtMs: 0,
+    // Byte progress is region-local. A 7 MiB opening prefix cannot be compared
+    // with a newly forming 1 MiB island thousands of seconds away.
+    lastFrontierBytes: null,
     open: false,
   };
 }
@@ -1118,6 +1193,18 @@ export function resetSubRepairBreakerForSeek(
  * request, not a runaway, and the user must always be able to force a retry.
  * Pure + exported for testing.
  */
+export function subRepairBreakerKey(fileId: string, trackIdx: number, playheadS: number): string {
+  return `${fileId}:${trackIdx}:${Math.floor(playheadS / 120)}`;
+}
+
+export function selectSubRepairBreakerKey(
+  fileId: string,
+  trackIdx: number,
+  playheadS: number,
+): string {
+  return subRepairBreakerKey(fileId, trackIdx, playheadS);
+}
+
 export function shouldAttemptSubRepair(
   state: SubRepairBreakerState,
   nowMs: number,
@@ -2478,10 +2565,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   const needsRemuxSeekRef = useRef(false);
   // Base remux URL (no ss) used to build seek URLs; set alongside needsRemuxSeek.
   const remuxSeekBaseUrlRef = useRef<string | null>(null);
-  // TRUE only when the underlying /stream bytes are real MPEG-TS (timed_id3):
-  // gates BYTE-FORWARD (start_byte) remux seeks. MKV/MP4 sources leave this
-  // false and always seek via ffmpeg -ss (mid-file Matroska/ISOBMFF bytes fed
-  // to ffmpeg stdin die with "Invalid data found" — execution-proven).
+  // True only when /remux may consume byte-forward TS input. Matroska and
+  // ISOBMFF remain false and use ffmpeg's container-aware -ss HTTP path.
   const remuxSourceIsTsRef = useRef(false);
   // Set synchronously when onMP4BoxReady reroutes an MP4-HEVC file to /remux.
   // The MP4 init callers (fetchMoovFromTail / forward scan / faststart path)
@@ -2615,23 +2700,9 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  (byteOffsetAtOrBeforeTime), but sourced from mediabunny's own seek reads so
    *  the green prebuffer bar lands at the correct spot for VBR MKV. */
   const recordByteTimeAnchor = useCallback((byteOffset: number, time: number) => {
-    if (!Number.isFinite(byteOffset) || byteOffset < 0 || !Number.isFinite(time) || time < 0) return;
-    const table = byteToTimeTableRef.current;
-    // Skip if an anchor at (nearly) this byte position already exists.
-    if (table.some(([b]) => Math.abs(b - byteOffset) < 65536)) return;
-    // MONOTONICITY GUARD: byteToTime interpolates assuming the table is strictly
-    // increasing in BOTH byte and time (larger byte ⇒ later time). A bad anchor
-    // (e.g. a stray Cues/tail read paired with a mid-file time) would violate
-    // this, producing wrong or zero/negative-width ranges → the green bar jumps
-    // far away or vanishes. Reject any anchor that breaks monotonicity with its
-    // would-be neighbours instead of corrupting the whole mapping.
-    let lo = 0, hi = table.length;
-    while (lo < hi) { const m = (lo + hi) >> 1; if (table[m][0] < byteOffset) lo = m + 1; else hi = m; }
-    const prev = table[lo - 1]; // largest byte < byteOffset
-    const next = table[lo];     // smallest byte > byteOffset
-    if (prev && time <= prev[1]) return; // time must exceed earlier-byte anchor
-    if (next && time >= next[1]) return; // and precede later-byte anchor
-    table.splice(lo, 0, [byteOffset, time]);
+    const current = byteToTimeTableRef.current;
+    const next = upsertByteTimeAnchor(current, byteOffset, time);
+    if (next !== current) byteToTimeTableRef.current = next;
   }, []);
 
   // (Range reporting to the backend was removed: the backend command
@@ -6737,7 +6808,11 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const { tracks, fonts } = normalizeSubList(await resp.json());
       setEmbeddedSubTracks(tracks);
       setEmbeddedSubFonts(fonts);
-      diagLog(`[SUBS] ${tracks.length} embedded subtitle track(s), ${fonts.length} font(s)`);
+      const textCount = tracks.filter((track) => track.kind === 'text').length;
+      const bitmapCount = tracks.filter((track) => track.kind === 'bitmap').length;
+      diagLog(
+        `[SUBS] ${textCount} usable text subtitle track(s), ${bitmapCount} image-based track(s), ${fonts.length} font(s)`,
+      );
     } catch (e: any) {
       diagLog(`[SUBS] /subtitles list fetch error: ${e?.message} — embedded section stays hidden`);
       if (embeddedSubsFetchedForRef.current === fileKey) embeddedSubsFetchedForRef.current = null;
@@ -6767,7 +6842,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    */
   const fetchEmbeddedSubText = useCallback(async (
     streamIdx: number,
-  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean; frontier: number | null } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean; frontier: number | null }> => {
+  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean; frontier: number | null } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean; frontier: number | null; supplyActive?: boolean }> => {
     const url = streamUrlRef.current;
     const parsed = url ? parseStreamUrl(url) : null;
     if (!parsed) return { error: 'failed', frontier: null };
@@ -6822,10 +6897,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // are still arriving" from "genuinely broken". Parse it on every 204.
         const frontierRaw = resp.headers.get('X-Subs-Frontier');
         const frontier = frontierRaw != null ? Number(frontierRaw) : null;
+        const islandRaw = resp.headers.get('X-Subs-Island-Bytes');
+        const islandBytes = islandRaw != null ? Number(islandRaw) : null;
         return {
           error: resp.headers.get('X-Subs-Partial') === '1' ? 'empty-partial' : 'empty',
           unchanged: resp.headers.get('X-Subs-Unchanged') === '1',
-          frontier: Number.isFinite(frontier) ? frontier : null,
+          // Far seeks grow a sparse island while the contiguous prefix stays
+          // frozen. The island-local count is the relevant progress signal.
+          frontier: Number.isFinite(islandBytes) ? islandBytes
+            : Number.isFinite(frontier) ? frontier : null,
+          supplyActive: resp.headers.get('X-Subs-Island-Filling') === '1',
         };
       }
       if (!resp.ok) {
@@ -7269,15 +7350,8 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     const gen = ++mpegtsRecreationGenRef.current;
     const wasPaused = isPausedRef.current || video.paused;
 
-    // Build the seek URL. BYTE-FORWARD (start_byte) is used ONLY when the
-    // underlying /stream bytes are real MPEG-TS (timed_id3) — the backend
-    // feeds ffmpeg [init_prefix + /stream bytes] via stdin, which avoids the
-    // `-ss`-over-uncached-HTTP failure (logs 4-t/5-t). For MKV/MP4 sources the
-    // /stream bytes are Matroska/ISOBMFF and a mid-file slice on stdin dies
-    // with "Invalid data found" (execution-proven), so those ALWAYS seek with
-    // ffmpeg -ss over the seekable HTTP input. The byte offset uses the same
-    // linear time→byte estimate the proactive reporter uses below; the backend
-    // TS-aligns it and ffmpeg resyncs to the first keyframe.
+    // Build the seek URL. Only real MPEG-TS receives start_byte; Matroska and
+    // ISOBMFF stay on ffmpeg's container-aware -ss HTTP path.
     const _seekDur = mpegtsDurationRef.current || state.current.duration || 0;
     const _seekFileSize = state.current.fileLength;
     const startByteEstimate = computeRemuxSeekStartByte(
@@ -7527,6 +7601,48 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         diagLog(`[MPEGTS] Remux seek: play() DEFERRED until buffer populated (align-poll) for ${timeSeconds.toFixed(1)}s`);
       }
 
+      // Decoding/appending does not prove WebView2 actually presented a frame.
+      // Install a post-seek presentation probe so the black-screen report names
+      // whether paint happened and lets the shell clear stale loading layers only
+      // after a real frame is available.
+      const installRemuxPresentationProbe = () => {
+        let settled = false;
+        const finish = (presented: boolean, mediaTime: number | null) => {
+          if (settled) return;
+          if (gen !== mpegtsRecreationGenRef.current) {
+            settled = true;
+            return;
+          }
+          settled = true;
+          const quality = video.getVideoPlaybackQuality?.();
+          const detail = {
+            presented,
+            mediaTime,
+            targetTime: timeSeconds,
+            currentTime: video.currentTime,
+            readyState: video.readyState,
+            paused: video.paused,
+            videoWidth: video.videoWidth,
+            videoHeight: video.videoHeight,
+            decodedFrames: quality?.totalVideoFrames ?? null,
+            droppedFrames: quality?.droppedVideoFrames ?? null,
+          };
+          diagLog(`[MPEGTS] Remux seek presentation: ${JSON.stringify(detail)}`);
+          video.dispatchEvent(new CustomEvent('nobuf:remux-seek-presentation', { detail }));
+        };
+        if (typeof video.requestVideoFrameCallback === 'function') {
+          video.requestVideoFrameCallback((_now, metadata) => finish(true, metadata.mediaTime));
+          window.setTimeout(() => finish(false, null), 3000);
+        } else {
+          const onTime = () => finish(true, video.currentTime);
+          video.addEventListener('timeupdate', onTime, { once: true });
+          window.setTimeout(() => {
+            video.removeEventListener('timeupdate', onTime);
+            finish(false, null);
+          }, 3000);
+        }
+      };
+
       // ── ALIGN POLL (the fix for "prebuffer starts but video won't play") ──
       // ffmpeg's /remux?ss= emits ABSOLUTE-PTS TS (verified by execution: a seek
       // to 60s yields first video PTS ≈59.4s), and _dtsBase=0 passes that through
@@ -7616,6 +7732,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               if (pr && typeof pr.catch === 'function') pr.catch(() => {});
               diagLog(`[MPEGTS] Remux seek: play() started after align snap (ct=${v.currentTime.toFixed(2)}s)`);
             }
+            installRemuxPresentationProbe();
           }
         }, 500);
       }
@@ -7644,16 +7761,27 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           const _linearByte = Math.round((timeSeconds / _dur) * _fileSize);
           const _vbrByte = timeToByte(timeSeconds);
           const seekByte = (_vbrByte >= 0) ? _vbrByte : _linearByte;
+          // For timestamp-seeked MKV/HEVC, the first report is only a
+          // reservation: its byte is an estimate and must not start a second
+          // Telegram downloader. The marked ffmpeg range publishes the real
+          // byte; the next normal playback report then starts proactive there.
+          // TS byte-forward and other formats keep the existing admission path.
+          const isTimestampRemuxSeek = !remuxSourceIsTsRef.current && startByteEstimate == null;
           invoke('cmd_report_playback_position', {
             messageId: _fileId,
             folderId: _folderId,
             currentTimeS: timeSeconds,
             durationS: _dur,
             fileSize: _fileSize,
-            isPlayerDownloading: true,
+            isPlayerDownloading: isTimestampRemuxSeek
+              ? true
+              : remuxSeekReportPlayerDownloading(),
             playbackRate: 1.0,
             byteOffset: seekByte,
           }).catch(() => {});
+          if (isTimestampRemuxSeek) {
+            diagLog(`[MPEGTS] Remux seek: estimate reserved; proactive waits for ffmpeg source range (t=${timeSeconds.toFixed(1)}s)`);
+          }
           diagLog(`[MPEGTS] Remux seek: reported position to proactive (byte ${seekByte}, t=${timeSeconds.toFixed(1)}s`
             + (_vbrByte >= 0
               ? `, VBR delta ${((_vbrByte - _linearByte) / 1048576).toFixed(1)}MiB vs linear, ${byteToTimeTableRef.current.length} anchors)`

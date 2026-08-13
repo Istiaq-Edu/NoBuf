@@ -44,7 +44,8 @@ describe('round 37 proactive and cached-prefix lifecycle wiring', () => {
   });
 
   it('never applies bootstrap skip-poll to cached-prefix readers', () => {
-    expect(server).toContain('should_skip_cache_poll(cached_prefix_stream, cache_missing_or_cold)');
+    expect(server).toContain('pub(crate) fn should_skip_cache_poll(cached_prefix: bool, cache_missing_or_cold: bool)');
+    expect(server).toContain('!cached_prefix && cache_missing_or_cold');
     expect(server).toContain('format!("{}&cached_prefix=true", source)');
     expect(frontend).toContain('window.setInterval(() => { void loadEmbeddedSubTracks(); }, 5_000)');
     expect(frontend).toContain('window.clearInterval(retry)');

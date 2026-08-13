@@ -17,7 +17,8 @@
  * harvested from seeks, bisect probes and the MKV cue index) instead of assuming
  * CBR. These tests use the real file geometry from the log.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
+import { upsertByteTimeAnchor } from '../hooks/useMSEPlayer';
 
 const SIZE = 1_467_894_377;   // Predestination, bytes (19-t)
 const DUR = 5868.869;         // seconds (19-c:29)
@@ -58,6 +59,18 @@ function timeToByte(
 const linearEstimate = (t: number) => Math.floor((t / DUR) * SIZE);
 
 describe('round-19: VBR playhead mapping (Predestination)', () => {
+  it('replaces a guessed same-seek anchor with ffmpeg authoritative byte', () => {
+    const guessed: [number, number][] = [[0, 0], [332_415_542, 1329], [1_467_894_377, 5868.869]];
+    const corrected = upsertByteTimeAnchor(guessed, 345_368_082, 1329);
+    expect(corrected).toContainEqual([345_368_082, 1329]);
+    expect(corrected).not.toContainEqual([332_415_542, 1329]);
+  });
+
+  it('keeps the old anchor if a replacement would violate monotonic time', () => {
+    const current: [number, number][] = [[100, 10], [200, 20], [300, 30]];
+    expect(upsertByteTimeAnchor(current, 350, 20)).toBe(current);
+  });
+
   it('reproduces the logged linear-estimate failure', () => {
     // 19-t:275 — the exact byte the old code sent. The playhead was 1613.385s,
     // not a round 1613: 19-c:131 shows StartupStallJumper snapping to 1613.385

@@ -32,10 +32,10 @@ export default defineConfig(async () => ({
     // crawling src-tauri/target/doc (18K+ Rust doc HTML files → EMFILE).
     entries: ["index.html"],
   },
+  worker: {
+    format: "es",
+  },
   build: {
     sourcemap: false,
-    // dropConsole removes all console.* calls in production builds
-    // console.error and console.warn are kept for error reporting
-    dropConsole: true,
   },
 }));
