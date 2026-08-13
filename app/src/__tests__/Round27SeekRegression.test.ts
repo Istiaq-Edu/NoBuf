@@ -144,11 +144,11 @@ describe('round-27: subtitle repair backoff must not outlive the region', () => 
     expect(shouldAttemptSubRepair(afterSeek, 10_000_000, false, 6)).toBe(false);
   });
 
-  it('preserves the frontier so a genuine "no bytes arrived" verdict survives', () => {
+  it('clears the old region frontier because sparse-island bytes are not comparable', () => {
     let st = emptySubRepairBreakerState();
     st = reduceSubRepairBreaker(st, 'failed', 1_000, 12_345_678);
     const afterSeek = resetSubRepairBreakerForSeek(st);
-    expect(afterSeek.lastFrontierBytes).toBe(12_345_678);
+    expect(afterSeek.lastFrontierBytes).toBeNull();
   });
 
   it('is a no-op for a healthy breaker', () => {

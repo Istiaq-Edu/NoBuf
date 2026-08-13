@@ -47,7 +47,8 @@ describe('decideMkvCaptureStrategy', () => {
   });
 
   it('binary search picks nearest ≤ time, never a later keyframe', () => {
-    expect(decideMkvCaptureStrategy(TS, 29.9, GAP, true)).toEqual({ strategy: 'index', timestamp: 20 });
+    expect(decideMkvCaptureStrategy(TS, 29.9, GAP, false)).toEqual({ strategy: 'index', timestamp: 20 });
+    expect(decideMkvCaptureStrategy(TS, 29.9, GAP, true)).toEqual({ strategy: 'skip' });
   });
 });
 

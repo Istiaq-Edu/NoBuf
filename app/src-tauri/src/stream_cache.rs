@@ -281,6 +281,10 @@ pub struct CacheStatus {
     /// The frontend speed meter samples this and computes a windowed rate —
     /// disk-cache HITs never touch it, so the meter can't count local reads.
     pub session_downloaded_bytes: u64,
+    /// Exact source-container seek anchor learned from ffmpeg's marked Range.
+    pub remux_seek_time_s: Option<f64>,
+    pub remux_seek_estimated_byte: Option<u64>,
+    pub remux_seek_actual_byte: Option<u64>,
 }
 
 /// Manages the disk cache for streamed media
@@ -603,6 +607,9 @@ impl StreamCacheManager {
                 filename: meta.filename.clone(),
                 cached_ranges: meta.cached_ranges.clone(),
                 session_downloaded_bytes: session_dl,
+                remux_seek_time_s: None,
+                remux_seek_estimated_byte: None,
+                remux_seek_actual_byte: None,
             }),
             // Cold start: bytes are already arriving from Telegram (e.g. the
             // remux pipe downloads before any meta sidecar exists). Return a
@@ -617,6 +624,9 @@ impl StreamCacheManager {
                 filename: String::new(),
                 cached_ranges: Vec::new(),
                 session_downloaded_bytes: session_dl,
+                remux_seek_time_s: None,
+                remux_seek_estimated_byte: None,
+                remux_seek_actual_byte: None,
             }),
             None => None,
         }

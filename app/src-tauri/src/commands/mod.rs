@@ -87,6 +87,9 @@ pub struct TelegramState {
     /// (current_byte, duration_s, playback_rate, file_size)
     pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
     pub proactive_generations: Arc<tokio::sync::RwLock<HashMap<i32, u64>>>,
+    /// Latest container-resolved byte from a timestamp-seeked remux input.
+    /// Value: (seek time, frontend estimate, actual source byte).
+    pub remux_seek_anchors: Arc<tokio::sync::RwLock<HashMap<i32, (f64, u64, u64)>>>,
     /// Exact media duration (seconds) as resolved by the /remux ffprobe pass,
     /// keyed by message_id. The /fmp4/metadata endpoint (which the seek bar reads)
     /// otherwise derives duration from Telegram DocumentAttributeVideo → PTS-tail →

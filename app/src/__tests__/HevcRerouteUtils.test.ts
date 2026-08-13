@@ -5,6 +5,7 @@ import {
   hevcMseSupported,
   buildRemuxSeekUrl,
   clampSeekTime,
+  remuxSeekReportPlayerDownloading,
 } from '../hooks/useMSEPlayer';
 
 // Mock Tauri invoke so useMSEPlayer imports cleanly in jsdom.
@@ -60,6 +61,12 @@ describe('isHevcFamilyCodec', () => {
  * return undefined → the seek URL carries only ss= and ffmpeg seeks the
  * seekable HTTP input itself.
  */
+describe('remux seek proactive handoff', () => {
+  it('does not stamp foreground download activity for the remux report', () => {
+    expect(remuxSeekReportPlayerDownloading()).toBe(false);
+  });
+});
+
 describe('computeRemuxSeekStartByte', () => {
   const DUR = 6267.712; // the user's real file
   const SIZE = 1462989388;
@@ -69,10 +76,7 @@ describe('computeRemuxSeekStartByte', () => {
     expect(b).toBe(Math.round((671.68 / DUR) * SIZE));
   });
 
-  it('MKV/MP4 source → ALWAYS undefined, even with valid duration+size', () => {
-    // This kills the latent MKV bug: fileLength+duration are always known for
-    // MKV, so the old code sent start_byte → backend fed mid-file Matroska to
-    // ffmpeg stdin → instant death. Now: ss-only.
+  it('MKV and MP4 sources remain ss-only', () => {
     expect(computeRemuxSeekStartByte(false, 671.68, DUR, SIZE)).toBeUndefined();
     expect(computeRemuxSeekStartByte(false, 5000, DUR, SIZE)).toBeUndefined();
   });

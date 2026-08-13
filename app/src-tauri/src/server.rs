@@ -31,13 +31,13 @@ use std::io::{Write, Seek, SeekFrom, Read};
 /// it can be unit-tested without spinning up a server.
 pub const MIN_STREAMING_WORKERS: usize = 2;
 pub const MAX_STREAMING_WORKERS: usize = 4;
-const STREAMING_CORS_EXPOSED_HEADERS: [&str; 22] = [
+const STREAMING_CORS_EXPOSED_HEADERS: [&str; 24] = [
     "Content-Range", "Content-Length", "Accept-Ranges", "X-Cache", "X-Reason",
     "X-Mime-Type", "X-Video-Codec", "X-Audio-Codec", "X-Segment-Start-Time",
     "X-Segment-Duration", "X-Segment-End-Time", "X-Next-Byte-Offset",
     "X-Total-File-Size", "X-Actual-Start-Time", "X-Partial", "X-Video-Duration",
     "X-Remuxed", "X-Subs-Format", "X-Subs-Partial", "X-Subs-Unchanged",
-    "X-Subs-Coverage", "X-Subs-Frontier",
+    "X-Subs-Coverage", "X-Subs-Frontier", "X-Subs-Island-Bytes", "X-Subs-Island-Filling",
 ];
 
 pub fn streaming_worker_count(available_cores: usize) -> usize {
@@ -364,6 +364,9 @@ pub(crate) struct StreamQuery {
     /// None = backward compatible (cancel any same-message download with
     /// different start_byte, same as the original behaviour).
     pub(crate) source_id: Option<String>,
+    /// Timestamp of the /remux?ss= ffmpeg input. Only that final input URL
+    /// carries this marker; probe requests remain unmarked.
+    pub(crate) remux_seek: Option<f64>,
     /// Maximum bytes to serve for this stream request. When set, clamps
     /// end_byte to min(end_byte, start_byte + max_bytes - 1). Used by the
     /// thumbnail pipeline to limit downloads to ~5MB instead of fetching
@@ -665,6 +668,77 @@ pub(crate) fn should_bootstrap_from_telegram(
 
 pub(crate) fn should_skip_cache_poll(cached_prefix: bool, cache_missing_or_cold: bool) -> bool {
     !cached_prefix && cache_missing_or_cold
+}
+
+const REMUX_SEEK_MIN_RANGE_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn is_authoritative_remux_seek_range(estimated_byte: u64, range_start: u64, range_len: u64, file_size: u64) -> bool {
+    // ffmpeg opens a marked timestamp-seek input with a header/full-file request
+    // at byte zero before issuing the demuxer-resolved seek Range. That bootstrap
+    // request is never evidence for the seek anchor, even for an early seek.
+    if file_size == 0 || range_start == 0 || range_len < REMUX_SEEK_MIN_RANGE_BYTES { return false; }
+    let tolerance = (file_size / 10).max(64 * 1024 * 1024);
+    range_start.abs_diff(estimated_byte) <= tolerance
+}
+
+pub(crate) fn marked_remux_input_source(source: &str, ss_secs: f64, byte_seek: bool) -> String {
+    if byte_seek || !source.starts_with("http") || !ss_secs.is_finite() || ss_secs <= 0.0 { return source.to_owned(); }
+    format!("{}&remux_seek={}", source, ss_secs)
+}
+
+pub(crate) fn apply_remux_seek_correction(requested: u64, estimated_anchor: u64, actual_anchor: u64, file_size: u64) -> u64 {
+    let corrected = if actual_anchor >= estimated_anchor {
+        requested.saturating_add(actual_anchor - estimated_anchor)
+    } else {
+        requested.saturating_sub(estimated_anchor - actual_anchor)
+    };
+    corrected.min(file_size.saturating_sub(1))
+}
+
+pub(crate) fn corrected_playback_report_byte(
+    estimated_byte: u64,
+    has_explicit_byte_offset: bool,
+    current_time_s: f64,
+    anchor: Option<(f64, u64, u64)>,
+    file_size: u64,
+) -> u64 {
+    // Explicit offsets already come from the frontend's VBR-aware timeToByte
+    // table. Applying the stored estimate->actual delta again double-corrects
+    // every periodic MKV report after the authoritative anchor is learned.
+    if has_explicit_byte_offset { return estimated_byte; }
+    match anchor {
+        Some((seek_s, estimated_anchor, actual_anchor))
+            if (current_time_s - seek_s).abs() <= 120.0 =>
+            apply_remux_seek_correction(estimated_byte, estimated_anchor, actual_anchor, file_size),
+        _ => estimated_byte,
+    }
+}
+
+pub(crate) fn authoritative_subs_playhead_byte(requested: Option<u64>, anchor: Option<(u64, u64)>, file_size: u64) -> Option<u64> {
+    match (requested, anchor) {
+        (Some(requested), Some((estimated, actual))) if is_authoritative_remux_seek_range(requested, actual, REMUX_SEEK_MIN_RANGE_BYTES, file_size) => {
+            // timeToByte learns the actual ffmpeg anchor after the first poll.
+            // Do not add the same correction twice once the frontend request is
+            // already closer to the actual anchor than to the old estimate.
+            if requested.abs_diff(actual) <= requested.abs_diff(estimated) {
+                Some(requested)
+            } else {
+                Some(apply_remux_seek_correction(requested, estimated, actual, file_size))
+            }
+        }
+        (requested, _) => requested,
+    }
+}
+
+fn subs_island_progress_bytes(
+    cache: &Option<StreamCacheManager>,
+    message_id: i32,
+    playhead_byte: Option<u64>,
+) -> Option<u64> {
+    let meta = cache.as_ref()?.load_meta(message_id)?;
+    let playhead = playhead_byte?;
+    let (start, end) = pick_subs_island(&meta.cached_ranges, playhead, 0)?;
+    Some(end.saturating_sub(start).saturating_add(1))
 }
 
 /// Round-16: when island mode declines, is the cached PREFIX an acceptable
@@ -991,6 +1065,19 @@ async fn stream_media(
     log::info!("[STREAM-REQ] msg {} incoming range {}-{} ({:.1}MB start, len {}B, partial={}, source_id={})",
         message_id, start_byte, end_byte, start_byte as f64 / 1_048_576.0, content_length, is_partial,
         query.source_id.as_deref().unwrap_or("-"));
+
+    // Only the final ffmpeg input of /remux?ss= carries remux_seek. Accept a
+    // substantial Range near the frontend estimate, rejecting ffprobe tail and
+    // header reads. This is the container demuxer's actual seek byte.
+    if let Some(seek_s) = query.remux_seek.filter(|v| v.is_finite() && *v > 0.0) {
+        let estimate = data.proactive_targets.read().await.get(&message_id).map(|v| v.0);
+        if let Some(estimate) = estimate.filter(|estimate| is_authoritative_remux_seek_range(*estimate, start_byte, content_length, size)) {
+            data.remux_seek_anchors.write().await.insert(message_id, (seek_s, estimate, start_byte));
+            if let Some(target) = data.proactive_targets.write().await.get_mut(&message_id) { target.0 = start_byte; }
+            if let Some(ref cache_mgr) = **cache { cache_mgr.set_playhead_byte(message_id, start_byte); }
+            log::info!("[REMUX-SEEK-AUTH] msg {} ss={:.3}s estimate={} -> authoritative source byte={}", message_id, seek_s, estimate, start_byte);
+        }
+    }
 
     // Round-14 F1: a bisect probe means the user is staring at a spinner. Stamp
     // the clock so PROACTIVE declines to spawn an 893 MB prefetch into the same
@@ -2477,7 +2564,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -3789,6 +3876,7 @@ async fn remux_ts_to_mp4(
         // start_byte takes precedence when both are present.
         let ss_secs = query.ss.unwrap_or(0.0);
         let byte_seek = query.start_byte.filter(|&b| b > 0);
+        let final_input_source = marked_remux_input_source(&input_source, ss_secs, byte_seek.is_some());
         // is_seek drives the audio filter choice (aresample=async=1 vs asetpts):
         // BOTH seek modes need the seek-variant filter (absolute audio PTS), so
         // is_seek is true for a byte-forward seek too.
@@ -3830,7 +3918,7 @@ async fn remux_ts_to_mp4(
         if byte_seek.is_some() {
             cmd.arg("-i").arg("pipe:0");
         } else {
-            cmd.arg("-i").arg(&input_source);
+            cmd.arg("-i").arg(&final_input_source);
         }
         cmd.args([
             // Use ffprobe-resolved stream indices, NOT hardcoded 0:v:0/0:a:0.
@@ -4748,7 +4836,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -6801,7 +6889,7 @@ async fn subtitles_extract_track(
     let folder_key = canonical_folder_key(&folder_id_str);
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
-        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None, playhead_byte: None,
     };
     let resolved_total_size = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
@@ -6919,10 +7007,15 @@ async fn subtitles_extract_track(
     // share subs_input_source and MUST stay unbounded: stream declarations and
     // attachments live in the header region, so an island would hide subtitle
     // tracks from the picker and break font extraction outright.
+    let remux_anchor = data.remux_seek_anchors.read().await.get(&message_id).map(|v| (v.1, v.2));
+    let effective_playhead_byte = authoritative_subs_playhead_byte(query.playhead_byte, remux_anchor, resolved_total_size);
+    if effective_playhead_byte != query.playhead_byte {
+        log::info!("[SUBS-ISLAND] msg {} s{}: frontend byte {:?} -> authoritative remux byte {:?}", message_id, stream_idx, query.playhead_byte, effective_playhead_byte);
+    }
     let island: Option<(std::path::PathBuf, u64, u64)> = if fully_cached {
         None
     } else {
-        query.playhead_byte.and_then(|pb| {
+        effective_playhead_byte.and_then(|pb| {
             build_subs_island_file(&cache, &folder_id_str, message_id, stream_idx, pb)
         })
     };
@@ -6940,15 +7033,24 @@ async fn subtitles_extract_track(
     if island.is_none() && !fully_cached {
         // One cluster of grace: cues legitimately run slightly ahead of the playhead.
         const PREFIX_COVERAGE_GRACE_BYTES: u64 = SUBS_ISLAND_MIN_BYTES;
-        if !prefix_covers_playhead(query.playhead_byte, current_frontier, PREFIX_COVERAGE_GRACE_BYTES) {
+        if !prefix_covers_playhead(effective_playhead_byte, current_frontier, PREFIX_COVERAGE_GRACE_BYTES) {
+            let island_progress = subs_island_progress_bytes(&cache, message_id, effective_playhead_byte);
             log::info!(
                 "[SUBS-ISLAND] msg {} s{}: no usable island and prefix ends at {}B while playhead is {}B \
                  — declining rather than extracting the wrong region",
                 message_id, stream_idx, current_frontier,
-                query.playhead_byte.unwrap_or(0)
+                effective_playhead_byte.unwrap_or(0)
             );
-            return HttpResponse::NoContent()
-                .insert_header(("X-Subs-Partial", "1"))
+            let mut response = HttpResponse::NoContent();
+            response.insert_header(("X-Subs-Partial", "1"));
+            if let Some(bytes) = island_progress {
+                response.insert_header(("X-Subs-Island-Bytes", bytes.to_string()));
+            }
+            if let Some(cache_mgr) = cache.as_ref().as_ref() {
+                if cache_mgr.has_proactive_task(message_id).await {
+                    response.insert_header(("X-Subs-Island-Filling", "1"));
+                }
+            }
                 // Round-17: the frontend's breaker has a growth-reset arm
                 // (useMSEPlayer.ts:912) that was dead code because the call site
                 // passed `null` — it had no byte-accurate frontier to pass. The
@@ -6956,8 +7058,8 @@ async fn subtitles_extract_track(
                 // Emitting it turns "declined" into "declined, and here is how far
                 // the cache had actually got", which is what lets the client tell
                 // "bytes are still arriving" from "genuinely broken".
-                .insert_header(("X-Subs-Frontier", current_frontier.to_string()))
-                .finish();
+            response.insert_header(("X-Subs-Frontier", current_frontier.to_string()));
+            return response.finish();
         }
     }
 
@@ -7223,7 +7325,7 @@ async fn subtitles_font(
     let (folder_id_str, message_id, att_idx) = path.into_inner();
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
-        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None, playhead_byte: None,
     };
     if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
@@ -7326,7 +7428,7 @@ async fn remux_hover_thumb(
     // Token check + media resolve (also gives us total_size).
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
-        source_id: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
+        source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
         audio_idx: None, playhead_byte: None,
     };
     let (_media, total_size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
@@ -7806,6 +7908,8 @@ mod tests {
         assert!(lower.contains("accept-ranges"), "Accept-Ranges must be exposed");
         assert!(lower.contains("x-reason"), "X-Reason must be exposed");
         assert!(lower.contains("x-subs-frontier"), "X-Subs-Frontier must be exposed");
+        assert!(lower.contains("x-subs-island-bytes"), "X-Subs-Island-Bytes must be exposed");
+        assert!(lower.contains("x-subs-island-filling"), "X-Subs-Island-Filling must be exposed");
     }
 
     // ========================================================================
@@ -8527,6 +8631,56 @@ mod tests {
         assert!(super::should_skip_cache_poll(false, true));
         // Numeric shorthand must keep failing loudly, not silently coerce.
         assert!(Query::<super::StreamQuery>::from_query("cached_prefix=1").is_err());
+    }
+
+    #[test]
+    fn timestamp_seek_marks_only_the_final_http_ffmpeg_input() {
+        let source = "http://127.0.0.1:14201/stream/home/108?token=t";
+        assert_eq!(super::marked_remux_input_source(source, 1322.469, false), format!("{source}&remux_seek=1322.469"));
+        assert_eq!(super::marked_remux_input_source(source, 1322.469, true), source);
+        assert_eq!(super::marked_remux_input_source(source, 0.0, false), source);
+        assert_eq!(super::marked_remux_input_source("C:/cached.mkv", 1322.469, false), "C:/cached.mkv");
+        let source = include_str!("server.rs");
+        let remux_fn = source.split("async fn remux_ts_to_mp4").nth(1).unwrap();
+        assert!(remux_fn.contains("cmd.arg(\"-i\").arg(&final_input_source)"));
+    }
+
+    #[test]
+    fn remux_seek_range_filter_accepts_real_demux_ranges_not_probe_noise() {
+        let size = 1_467_894_377;
+        assert!(super::is_authoritative_remux_seek_range(330_769_921, 343_265_633, 1_124_628_744, size));
+        // A marked ffmpeg input first asks from byte zero for container headers.
+        // Even near the opening that is not the demuxer-resolved seek Range.
+        assert!(!super::is_authoritative_remux_seek_range(20_000_000, 0, size, size));
+        assert!(!super::is_authoritative_remux_seek_range(330_769_921, 1_467_863_021, 31_356, size));
+        assert!(!super::is_authoritative_remux_seek_range(330_769_921, 787_299, 1_467_107_078, size));
+        assert!(super::is_authoritative_remux_seek_range(1_059_780_245, 1_112_709_729, 355_184_648, size));
+    }
+
+    #[test]
+    fn explicit_vbr_playback_report_is_not_corrected_twice() {
+        let size = 1_467_894_377;
+        let anchor = Some((1329.0, 332_415_542, 345_368_082));
+        assert_eq!(
+            super::corrected_playback_report_byte(345_900_000, true, 1331.0, anchor, size),
+            345_900_000,
+        );
+        assert_eq!(
+            super::corrected_playback_report_byte(332_947_460, false, 1331.0, anchor, size),
+            345_900_000,
+        );
+    }
+
+    #[test]
+    fn subtitle_island_prefers_near_authoritative_remux_anchor_only() {
+        let size = 1_467_894_377;
+        assert_eq!(super::authoritative_subs_playhead_byte(Some(331_124_494), Some((330_769_921, 343_265_633)), size), Some(343_620_206));
+        // 5-t: the frontend has already learned the actual anchor. Applying the
+        // +2,042,560 correction again produced the wrong 241,522,694 byte.
+        assert_eq!(super::authoritative_subs_playhead_byte(Some(239_480_134), Some((236_969_495, 239_012_055)), size), Some(239_480_134));
+        assert_eq!(super::authoritative_subs_playhead_byte(Some(237_320_974), Some((236_969_495, 239_012_055)), size), Some(239_363_534));
+        assert_eq!(super::authoritative_subs_playhead_byte(Some(1_060_136_781), Some((330_769_921, 343_265_633)), size), Some(1_060_136_781));
+        assert_eq!(super::authoritative_subs_playhead_byte(None, Some((330_769_921, 343_265_633)), size), None);
     }
 
     /// Font attachment detection: mimetype first, extension fallback for

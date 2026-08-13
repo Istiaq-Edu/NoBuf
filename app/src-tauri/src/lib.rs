@@ -263,6 +263,7 @@ pub fn run() {
                 seek_critical_read_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 proactive_generations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                remux_seek_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 probed_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 audio_tracks_json: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 sub_tracks_json: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

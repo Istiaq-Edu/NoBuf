@@ -24,6 +24,7 @@ import {
   shouldAttemptSubRepair,
   emptySubRepairBreakerState,
   computeSubRepairBackoffMs,
+  resetSubRepairBreakerForSeek,
   SUB_REPAIR_MAX_DEFERS,
   SUB_REPAIR_DEFER_RETRY_MS,
   SUB_REPAIR_FAILURE_THRESHOLD,
@@ -50,6 +51,13 @@ describe('round-17: 204 decline classification', () => {
       undefined, null, null,
       FRONTIER_AT_DECLINE, FRONTIER_AT_DECLINE,
     )).toBe('failed');
+  });
+
+  it('stays deferred while the target island is actively filling between commits', () => {
+    expect(classifySubRepairOutcome(
+      null, null, 949, true, false, undefined, null, null,
+      1_636_137, 1_636_137, null, null, null, null, true,
+    )).toBe('deferred');
   });
 
   it('treats the first partial frontier as DEFERRED when bytes exist', () => {
@@ -92,17 +100,33 @@ describe('round-17: 204 decline classification', () => {
     )).toBe('ok');
   });
 
-  it('does not disturb the non-error paths', () => {
-    // A successful ASS extraction is still `progress`, frontier notwithstanding.
+  it('does not let frontier growth override ASS cue coverage', () => {
+    // The extraction is successful, but the returned dialogue is earlier than
+    // the playhead. Cache growth cannot turn unrelated content into success.
     expect(classifySubRepairOutcome(
       null, null, 3238, false, false,
       undefined, 100, 956,
       FRONTIER_AT_DECLINE, FRONTIER_LATER,
-    )).toBe('progress');
+      null, null,
+      [{ startTime: 1000, endTime: 1010 }], 0,
+    )).toBe('progress-uncovered');
   });
 });
 
 describe('round-17: deferred spends no failure or attempt budget', () => {
+  it('new seek region clears the previous region byte baseline', () => {
+    const reset = resetSubRepairBreakerForSeek({
+      ...emptySubRepairBreakerState(),
+      lastFrontierBytes: 7 * 1024 * 1024,
+      consecutiveFailures: 1,
+    });
+    expect(reset.lastFrontierBytes).toBeNull();
+    expect(classifySubRepairOutcome(
+      null, null, 949, true, false, undefined, null, null,
+      reset.lastFrontierBytes, 1_636_137,
+    )).toBe('deferred');
+  });
+
   it('leaves failures and attempts untouched, and cannot open the breaker', () => {
     let st = emptySubRepairBreakerState();
     st = { ...st, lastFrontierBytes: FRONTIER_AT_DECLINE };
