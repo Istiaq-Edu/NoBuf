@@ -23,8 +23,31 @@ import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
 
 export function subRepairRegionRetryDelay(outcome: SubRepairOutcome): number | null {
   if (outcome === 'progress' || outcome === 'progress-uncovered') return 5_000;
-  if (outcome === 'deferred') return 0;
+  if (outcome === 'deferred') return 1_000;
   return null;
+}
+
+export interface SubRepairRetrySchedule {
+  regionKey: string;
+  delayMs: number;
+  generation: number;
+  timers: Map<string, number>;
+  attemptedRegions: Set<string>;
+  currentGeneration: () => number;
+  currentPlayhead: () => number;
+  retry: (playheadS: number) => void;
+}
+
+export function scheduleSubRepairRegionRetry(schedule: SubRepairRetrySchedule): void {
+  const existingTimer = schedule.timers.get(schedule.regionKey);
+  if (existingTimer != null) window.clearTimeout(existingTimer);
+  const timer = window.setTimeout(() => {
+    schedule.timers.delete(schedule.regionKey);
+    if (schedule.currentGeneration() !== schedule.generation) return;
+    schedule.attemptedRegions.delete(schedule.regionKey);
+    schedule.retry(schedule.currentPlayhead());
+  }, schedule.delayMs);
+  schedule.timers.set(schedule.regionKey, timer);
 }
 
 export function shouldStagePendingPartialSubTrack(
@@ -1053,12 +1076,8 @@ interface FastStreamPlayerProps {
         ranges.push([v.buffered.start(i), v.buffered.end(i)]);
       }
       setBufferedRanges(ranges);
-      // Round-10 P1-2: repair stale subtitle coverage automatically. Nothing in
-      // the app re-extracted after a seek, so cues for 0-196s stayed on screen
-      // (i.e. blank) while the viewer watched at 4500s. Checked on the existing
-      // timeupdate tick — no new timer, no new I/O — and only fires when an
-      // ACTIVE track's cues have genuinely fallen behind the playhead.
-      // maybeRepairSubCoverage self-throttles and no-ops while a fetch is live.
+      // Repair is normally driven by timeupdate. Deferred/progress outcomes also
+      // schedule a bounded retry so paused playback cannot strand a usable island.
       maybeRepairSubCoverageRef.current?.(ct);
     };
     const onPlay = () => {
@@ -1626,6 +1645,7 @@ interface FastStreamPlayerProps {
       subs.activateTrack(existing.track);
       persistSubTrack(fileKey, idx);
     }
+    const selectionVersionAtStart = subs.getSelectionVersion();
     try {
       const res = await msePlayer.fetchEmbeddedSubText(idx);
       // File switched while extracting: the reset effect already cleared the
@@ -1633,7 +1653,11 @@ interface FastStreamPlayerProps {
       // A's cues to file B; the finally must not clobber B's state either).
       if (embeddedSubFileGenRef.current !== genAtStart) return;
       if ('error' in res) {
-        if (origin === 'user' && shouldStagePendingPartialSubTrack(res.error, !!existing)) {
+        if (
+          origin === 'user'
+          && shouldStagePendingPartialSubTrack(res.error, !!existing)
+          && subs.getSelectionVersion() === selectionVersionAtStart
+        ) {
           const track = new SubtitleTrack(label, language || null);
           embeddedSubTracksRef.current.set(idx, { track, partial: true });
           subs.activateTrack(subs.addTrack(track));
@@ -1704,17 +1728,19 @@ interface FastStreamPlayerProps {
           existing.track.format = scratch.format;
         }
         existing.partial = res.partial;
-        // Re-activate to force the renderer to re-read the cue list.
-        subs.deactivateTrack(existing.track);
-        subs.activateTrack(existing.track);
-        setSubtitleRevision((revision) => revision + 1);
+        if (subs.isTrackActive(existing.track)) {
+          setSubtitleRevision((revision) => revision + 1);
+        }
         return;
       }
       const track = new SubtitleTrack(label, language || null);
       track.loadText(res.text);
       embeddedSubTracksRef.current.set(idx, { track, partial: res.partial });
-      subs.activateTrack(subs.addTrack(track));
-      persistSubTrack(fileKey, idx);
+      const added = subs.addTrack(track);
+      if (subs.getSelectionVersion() === selectionVersionAtStart) {
+        subs.activateTrack(added);
+        persistSubTrack(fileKey, idx);
+      }
     } finally {
       if (embeddedSubFileGenRef.current === genAtStart) {
         embeddedSubLoadingIdxRef.current = null;
@@ -1732,7 +1758,8 @@ interface FastStreamPlayerProps {
   // when an ACTIVE track's cues fall behind the playhead, re-extract against the
   // island around the viewer and swap the cues in place.
   //
-  // Driven by the existing timeupdate tick (no new timer, no polling). Guards:
+  // Normally driven by timeupdate; deferred and still-uncovered outcomes schedule
+  // their own bounded retry so repair also progresses while playback is paused.
   //   - only for an ACTIVE embedded track (never resurrects a disabled one)
   //   - coverage judged from the cue list, so ASS/jassub tracks (cues stay empty)
   //     report unknown coverage and are left alone
@@ -1740,6 +1767,7 @@ interface FastStreamPlayerProps {
   //   - skipped while any extraction is in flight, and generation-guarded so a
   //     file switch mid-fetch discards the result
   const subRepairAttemptedRef = useRef<Set<string>>(new Set());
+  const subRepairRetryTimersRef = useRef<Map<string, number>>(new Map());
   // Breaker state is per (file, track, 120-second region). A failed or deferred
   // opening-prefix extraction is evidence about that region only; it must not
   // spend the attempt ceiling for a later seek where a usable island exists.
@@ -1816,6 +1844,7 @@ interface FastStreamPlayerProps {
     const assBeforeLen = entry.track.isASS ? (entry.track.assContent?.length ?? 0) : null;
     const assBeforeCount = entry.track.isASS ? assDialogueIntervals(entry.track.assContent).length : null;
     const stBefore = getBreaker(bkey);
+    const selectionVersionAtStart = subs.getSelectionVersion();
     const attemptNo = stBefore.attempts + 1;
     let hadError = false;
     let after: number | null = before;
@@ -1859,10 +1888,12 @@ interface FastStreamPlayerProps {
         }
         entry.partial = res.partial;
         after = lastCueEnd(entry.track.cues);
-        // Re-activate so the renderer re-reads the cue list.
-        subs.deactivateTrack(entry.track);
-        subs.activateTrack(entry.track);
-        setSubtitleRevision((revision) => revision + 1);
+        if (
+          subs.getSelectionVersion() === selectionVersionAtStart
+          && subs.isTrackActive(entry.track)
+        ) {
+          setSubtitleRevision((revision) => revision + 1);
+        }
       }
     } catch {
       hadError = true;
@@ -1891,15 +1922,16 @@ interface FastStreamPlayerProps {
     setBreaker(bkey, stAfter);
     const retryDelay = subRepairRegionRetryDelay(outcome);
     if (regionKey && retryDelay != null) {
-      if (retryDelay === 0) {
-        subRepairAttemptedRef.current.delete(regionKey);
-      } else {
-        setTimeout(() => {
-          if (embeddedSubFileGenRef.current === genAtStart) {
-            subRepairAttemptedRef.current.delete(regionKey);
-          }
-        }, retryDelay);
-      }
+      scheduleSubRepairRegionRetry({
+        regionKey,
+        delayMs: retryDelay,
+        generation: genAtStart,
+        timers: subRepairRetryTimersRef.current,
+        attemptedRegions: subRepairAttemptedRef.current,
+        currentGeneration: () => embeddedSubFileGenRef.current,
+        currentPlayhead: () => vidRef.current?.currentTime ?? playheadS,
+        retry: (currentTime) => maybeRepairSubCoverageRef.current?.(currentTime),
+      });
     }
     const elapsed = Date.now() - startedAt;
     // Round-10b: 12-t.md had 444 identical lines with no counter, so the runaway
@@ -1932,7 +1964,17 @@ interface FastStreamPlayerProps {
   // Reset the per-region repair ledger when the file changes. The BREAKER map
   // deliberately survives: a file known to be unrepairable must stay known.
   useEffect(() => {
+    for (const timer of subRepairRetryTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    subRepairRetryTimersRef.current.clear();
     subRepairAttemptedRef.current.clear();
+    return () => {
+      for (const timer of subRepairRetryTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      subRepairRetryTimersRef.current.clear();
+    };
   }, [file.id]);
 
   // Re-apply the persisted embedded-subtitle choice when the track list for
@@ -2211,7 +2253,7 @@ interface FastStreamPlayerProps {
           </button>
           {subMenu && (
             <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
-              <button onClick={() => { subs.activeTracks.forEach(subs.deactivateTrack); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
+              <button onClick={() => { subs.deactivateAll(); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
               {subs.tracks.map((t, i) => (
                 <button key={i} onClick={() => subs.toggleTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
                   {t.label || t.language || `Track ${i + 1}`}{t.isASS ? ' (ASS)' : ''}

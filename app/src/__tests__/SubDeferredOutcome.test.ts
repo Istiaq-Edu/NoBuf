@@ -26,6 +26,7 @@ import {
   computeSubRepairBackoffMs,
   resetSubRepairBreakerForSeek,
   SUB_REPAIR_MAX_DEFERS,
+  SUB_REPAIR_DEFER_BUDGET_MS,
   SUB_REPAIR_DEFER_RETRY_MS,
   SUB_REPAIR_FAILURE_THRESHOLD,
   SUB_REPAIR_MAX_ATTEMPTS,
@@ -182,7 +183,13 @@ describe('round-17: deferred spends no failure or attempt budget', () => {
 });
 
 describe('round-17: deferred retries in seconds, not minutes', () => {
-  it('waits ~5s after a defer instead of the 150s failure base', () => {
+  it('preserves a full minute of supply-active retry patience', () => {
+    expect(SUB_REPAIR_DEFER_BUDGET_MS).toBe(60_000);
+    expect(SUB_REPAIR_MAX_DEFERS * SUB_REPAIR_DEFER_RETRY_MS).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('waits 1s after a defer instead of adding a fixed 5s subtitle gap', () => {
+    expect(SUB_REPAIR_DEFER_RETRY_MS).toBe(1_000);
     const deferred: SubRepairBreakerState = {
       ...emptySubRepairBreakerState(),
       consecutiveDefers: 1,
@@ -194,8 +201,8 @@ describe('round-17: deferred retries in seconds, not minutes', () => {
     // ...and allowed once it elapses.
     expect(shouldAttemptSubRepair(deferred, SUB_REPAIR_DEFER_RETRY_MS, false)).toBe(true);
 
-    // The logged recovery was 7s. Under the OLD scoring that attempt was still
-    // 143s away; under the new one it is allowed.
+    // The logged recovery was 7s. Under the old 5s poll the usable island could
+    // wait almost another full interval; the 1s poll admits it promptly.
     const SEVEN_SECONDS = 7_000;
     expect(shouldAttemptSubRepair(deferred, SEVEN_SECONDS, false)).toBe(true);
 

@@ -212,6 +212,68 @@ export function shouldSkipRemuxPositionReport(
   return needsRemuxSeek && (userSeekInProgress === true || currentTime < 1);
 }
 
+export interface ProactivePositionReporterOptions {
+  report: () => void | Promise<void>;
+  intervalMs?: number;
+}
+
+export interface MpegtsProactiveReportDecisionInput {
+  eager: boolean;
+  hasVideo: boolean;
+  videoPaused: boolean;
+  videoEnded: boolean;
+  needsRemuxSeek: boolean;
+  userSeekInProgress: boolean;
+  currentTime: number;
+  playerDownloading: boolean;
+}
+
+export interface MpegtsProactiveReportDecision {
+  report: boolean;
+  playerDownloading: boolean;
+}
+
+/** Decide whether a MPEGTS position tick is valid and whether it must yield to
+ * the foreground loader. The eager byte-zero seed establishes the proactive
+ * producer before /stream's fallback, so it deliberately reports the player as
+ * idle; later ticks preserve the real IOController state. */
+export function decideMpegtsProactiveReport({
+  eager,
+  hasVideo,
+  videoPaused,
+  videoEnded,
+  needsRemuxSeek,
+  userSeekInProgress,
+  currentTime,
+  playerDownloading,
+}: MpegtsProactiveReportDecisionInput): MpegtsProactiveReportDecision {
+  if (!hasVideo || videoPaused || videoEnded) {
+    return { report: false, playerDownloading };
+  }
+  if (!eager && shouldSkipRemuxPositionReport(
+    needsRemuxSeek,
+    userSeekInProgress,
+    currentTime,
+  )) {
+    return { report: false, playerDownloading };
+  }
+  return {
+    report: true,
+    playerDownloading: eager ? false : playerDownloading,
+  };
+}
+
+/** Run one proactive report immediately, then keep the existing cadence.
+ * Keeping eager + periodic dispatch behind one scheduler makes cold startup
+ * testable without mounting the 11k-line player hook. */
+export function startProactivePositionReporter({
+  report,
+  intervalMs = 10_000,
+}: ProactivePositionReporterOptions): ReturnType<typeof setInterval> {
+  void report();
+  return setInterval(report, intervalMs);
+}
+
 /**
  * Was this player already fetching from the /remux tier? Used as the loop
  * guard for the TS-HEVC fatal-error recovery: a failure ON the /remux tier
@@ -858,15 +920,68 @@ export const SUB_REPAIR_FAILURE_THRESHOLD = 3;
  *
  * Derived from the logged recovery, not chosen for roundness: 17-t.md:213
  * declined at 12:02:51 and :217 served a usable island at 12:02:58 — SEVEN
- * seconds. At the ~5s defer retry that is 1-2 defers for a normal far seek.
- * 12 gives ~60s of patience, an order of magnitude over the observed case,
- * while still terminating for a download that will never reach the playhead.
+ * seconds. At the 1s defer retry that is about 7 defers for a normal far seek.
+ * The explicit 60s budget preserves the previous patience window while the
+ * shorter interval removes the avoidable post-seek subtitle gap.
  */
-export const SUB_REPAIR_MAX_DEFERS = 12;
+export const SUB_REPAIR_DEFER_BUDGET_MS = 60_000;
 /** Retry delay after a `deferred` verdict. Short by design: the whole point is
  *  that bytes ARE arriving, so the next attempt should ride the next few MB in.
  *  Compare SUB_REPAIR_BACKOFF_BASE_MS (150s) which is for a stuck extractor. */
-export const SUB_REPAIR_DEFER_RETRY_MS = 5_000;
+export const SUB_REPAIR_DEFER_RETRY_MS = 1_000;
+export const SUB_REPAIR_MAX_DEFERS = Math.ceil(
+  SUB_REPAIR_DEFER_BUDGET_MS / SUB_REPAIR_DEFER_RETRY_MS,
+);
+
+export interface EmbeddedSubInventoryScheduleOptions {
+  initPollMs?: number;
+  fallbackMs?: number;
+  retryMs?: number;
+}
+
+export function scheduleEmbeddedSubInventory(
+  load: () => void,
+  isInitialized: () => boolean,
+  options: EmbeddedSubInventoryScheduleOptions = {},
+): () => void {
+  const initPollMs = options.initPollMs ?? 250;
+  const fallbackMs = options.fallbackMs ?? 20_000;
+  const retryMs = options.retryMs ?? 5_000;
+  let stopped = false;
+  let started = false;
+  let retry: number | null = null;
+  let waitForInit: number | null = null;
+  let fallback: number | null = null;
+
+  const start = () => {
+    if (stopped || started) return;
+    started = true;
+    if (waitForInit != null) {
+      window.clearInterval(waitForInit);
+      waitForInit = null;
+    }
+    if (fallback != null) {
+      window.clearTimeout(fallback);
+      fallback = null;
+    }
+    load();
+    retry = window.setInterval(load, retryMs);
+  };
+
+  waitForInit = window.setInterval(() => {
+    if (isInitialized()) start();
+  }, initPollMs);
+  if (isInitialized()) start();
+  if (!started) fallback = window.setTimeout(start, fallbackMs);
+
+  return () => {
+    stopped = true;
+    if (waitForInit != null) window.clearInterval(waitForInit);
+    if (fallback != null) window.clearTimeout(fallback);
+    if (retry != null) window.clearInterval(retry);
+  };
+}
+
 /** > the backend's 120s extraction timeout, so even a worst-case hang cannot
  *  sustain a 100% duty cycle (the 120s timeout vs 120s region resonance). */
 export const SUB_REPAIR_BACKOFF_BASE_MS = 150_000;
@@ -1215,7 +1330,9 @@ export function shouldAttemptSubRepair(
   if (isManual) return true;
   if (state.open) return false;
   if (state.attempts >= maxAttempts) return false;
-  // Round-17: `deferred` retries immediately (within ~5s), not on the failure ladder.
+  // A deferred request does no ffmpeg work: the target island is still below
+  // the 2 MiB admission floor. Recheck quickly so subtitles resume as soon as
+  // that island becomes usable, rather than adding a fixed five-second blind gap.
   const d = state.consecutiveDefers ?? 0;
   const waitMs = d > 0 ? deferRetryMs : computeSubRepairBackoffMs(state.consecutiveFailures);
   return nowMs - state.lastAttemptStartedAtMs >= waitMs;
@@ -5268,29 +5385,37 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       // pause/resume via lazyLoad and SourceBuffer cleanup via autoCleanup.
       diagLog('[MPEGTS] Pipeline initialized: custom chunk loader, lazyLoad max=180s recover=120s, autoCleanup behind=60s');
 
-      // Start periodic position reporting for proactive prebuffer (TS files).
-      // Reports every 10s so the backend prebuffer slides its window ahead
-      // of the playhead. is_player_downloading is set based on whether the
-      // IOController is actively fetching (buffer not full).
+      // Report immediately after pipeline init, then every 10s. The old
+      // interval-only scheduler left a deterministic 10s producer gap: a remux
+      // stream drained the cached 6 MiB prefix, /stream waited 5s, then opened a
+      // second Telegram reader before this reporter ever fired. The FIRST report
+      // is the cold-start seed: byte 0 is the correct target and must fire before
+      // /stream's 5s no-producer fallback, so it is exempt from the remux guard.
       const _fileIdForProactive = file?.id;
       const _folderIdForProactive = activeFolderId; // null = "home" (Saved Messages) — backend accepts Option
       const _fileSizeForProactive = state.current.fileLength;
       if (_fileIdForProactive && _fileSizeForProactive && !isPausedRef.current) {
         proactivePrebufferMsgIdRef.current = _fileIdForProactive;
-        const proactiveInterval = setInterval(async () => {
+        let firstReport = true;
+        const reportProactivePosition = async () => {
+          const eager = firstReport;
           const v = videoRef.current;
-          if (!v || v.paused || v.ended) return;
-          // Remux transient guard (see shouldSkipRemuxPositionReport): skip only the
-          // recreation / pre-first-frame window where a report would stomp the proactive
-          // target to byte 0. Normal remux playback still reports so prebuffer keeps running.
-          if (shouldSkipRemuxPositionReport(
-                needsRemuxSeekRef.current, (window as any).__nobuf_userSeekInProgress === true, v.currentTime)) return;
           const eng = (mpegtsPlayerRef.current as any)?._player_engine;
-          // is_player_downloading: true when IOController is actively fetching
-          // (buffer not full, player needs more data). This tells the prebuffer
-          // to yield so /stream gets 100% of the rate limiter budget.
           const ioctl = eng?._ioctl;
-          const isDownloading = ioctl ? !ioctl.paused : false;
+          const playerDownloading = ioctl ? !ioctl.paused : false;
+          const decision = decideMpegtsProactiveReport({
+            eager,
+            hasVideo: v !== null,
+            videoPaused: v?.paused ?? true,
+            videoEnded: v?.ended ?? false,
+            needsRemuxSeek: needsRemuxSeekRef.current,
+            userSeekInProgress: (window as any).__nobuf_userSeekInProgress === true,
+            currentTime: v?.currentTime ?? 0,
+            playerDownloading,
+          });
+          if (!decision.report || !v) return;
+          // Consume the startup exemption only when a report can actually be sent.
+          firstReport = false;
           try {
             await invoke('cmd_report_playback_position', {
               messageId: _fileIdForProactive,
@@ -5298,16 +5423,18 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
               currentTimeS: v.currentTime,
               durationS: mpegtsDurationRef.current || v.duration || 0,
               fileSize: _fileSizeForProactive,
-              isPlayerDownloading: isDownloading,
+              isPlayerDownloading: decision.playerDownloading,
               playbackRate: v.playbackRate || 1.0,
               byteOffset: null, // periodic reports use linear estimate
             });
           } catch { /* ignore */ }
-        }, 10000); // 10s interval
+        };
+        const proactiveInterval = startProactivePositionReporter({
+          report: reportProactivePosition,
+        });
         // Store interval ID for cleanup
         proactiveIntervalRef.current = proactiveInterval;
       }
-
       return true;
 
     } catch (e: any) {
@@ -6948,18 +7075,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     );
   }, [embeddedSubFonts]);
 
-  // Fire the per-file embedded-subtitle inventory fetch. Deferred 1.5s so the
-  // header probe never competes with cold-start init for the Telegram pipe —
-  // by then the container header is in the disk cache and the probe is a
-  // near-free local read (P11); the backend memoizes per message anyway.
+  // Fire the per-file embedded-subtitle inventory fetch after playback init.
+  // A fixed 1.5s delay was not an ordering guarantee: on a cold MKV open the
+  // player can still be growing its 6 MiB format/probe prefix, so ffprobe then
+  // competes with the exact I/O needed to present the first frame. Keep a
+  // bounded fallback so a failed/slow player init cannot hide the captions menu.
   useEffect(() => {
     if (!streamUrl) return;
-    const t = window.setTimeout(() => { void loadEmbeddedSubTracks(); }, 1500);
-    const retry = window.setInterval(() => { void loadEmbeddedSubTracks(); }, 5_000);
-    return () => {
-      window.clearTimeout(t);
-      window.clearInterval(retry);
-    };
+    return scheduleEmbeddedSubInventory(
+      () => { void loadEmbeddedSubTracks(); },
+      () => state.current.initialized,
+    );
   }, [streamUrl, mp4ReinitNonce, loadEmbeddedSubTracks]);
 
   /**
