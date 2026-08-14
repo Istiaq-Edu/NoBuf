@@ -21,10 +21,12 @@ describe('early embedded subtitle selection', () => {
     const start = source.indexOf('const toggleEmbeddedSub = useCallback');
     const end = source.indexOf('// Round-10 P1-2: automatic subtitle-coverage repair.', start);
     const toggle = source.slice(start, end);
-    const pendingStart = toggle.indexOf("origin === 'user' && shouldStagePendingPartialSubTrack(res.error, !!existing)");
+    const pendingStart = toggle.indexOf("origin === 'user'");
     const pendingEnd = toggle.indexOf('// Round-14 F4:', pendingStart);
     const pendingBranch = toggle.slice(pendingStart, pendingEnd);
     expect(pendingStart).toBeGreaterThanOrEqual(0);
+    expect(pendingBranch).toContain('shouldStagePendingPartialSubTrack(res.error, !!existing)');
+    expect(pendingBranch).toContain('subs.getSelectionVersion() === selectionVersionAtStart');
     expect(pendingBranch).toContain('embeddedSubTracksRef.current.set(idx, { track, partial: true })');
     expect(pendingBranch).toContain('subs.activateTrack(subs.addTrack(track))');
     expect(pendingBranch).toContain('persistSubTrack(fileKey, idx)');

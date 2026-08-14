@@ -7,8 +7,8 @@ describe('subtitle repair region ledger', () => {
     expect(subRepairRegionRetryDelay('progress')).toBe(5_000);
   });
 
-  it('reopens deferred immediately', () => {
-    expect(subRepairRegionRetryDelay('deferred')).toBe(0);
+  it('reopens deferred after the breaker retry delay', () => {
+    expect(subRepairRegionRetryDelay('deferred')).toBe(1_000);
   });
 
   it.each(['ok', 'no-progress', 'failed'] as const)('%s keeps the terminal region spent', (outcome) => {

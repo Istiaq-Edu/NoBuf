@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { classifySubRepairOutcome, emptySubRepairBreakerState, reduceSubRepairBreaker, resetSubRepairBreakerForSeek } from '../hooks/useMSEPlayer';
+import { classifySubRepairOutcome, emptySubRepairBreakerState, reduceSubRepairBreaker, resetSubRepairBreakerForSeek, scheduleEmbeddedSubInventory, SUB_REPAIR_MAX_DEFERS } from '../hooks/useMSEPlayer';
 
 describe('round 37 uncovered subtitle progress', () => {
   it('does not spend the attempt budget when new cues still miss the playhead', () => {
@@ -17,7 +18,7 @@ describe('round 37 uncovered subtitle progress', () => {
 
   it('preserves the defer ceiling across region-ledger resets', () => {
     let state = emptySubRepairBreakerState();
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < SUB_REPAIR_MAX_DEFERS; i++) {
       state = reduceSubRepairBreaker(state, 'progress-uncovered', i * 5_000, null);
       state = resetSubRepairBreakerForSeek(state);
     }
@@ -47,7 +48,48 @@ describe('round 37 proactive and cached-prefix lifecycle wiring', () => {
     expect(server).toContain('pub(crate) fn should_skip_cache_poll(cached_prefix: bool, cache_missing_or_cold: bool)');
     expect(server).toContain('!cached_prefix && cache_missing_or_cold');
     expect(server).toContain('format!("{}&cached_prefix=true", source)');
-    expect(frontend).toContain('window.setInterval(() => { void loadEmbeddedSubTracks(); }, 5_000)');
-    expect(frontend).toContain('window.clearInterval(retry)');
+  });
+});
+
+describe('embedded subtitle inventory scheduling', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('waits for player initialization, then loads and retries', () => {
+    let initialized = false;
+    const load = vi.fn();
+    const stop = scheduleEmbeddedSubInventory(load, () => initialized);
+
+    vi.advanceTimersByTime(1_500);
+    expect(load).not.toHaveBeenCalled();
+
+    initialized = true;
+    vi.advanceTimersByTime(250);
+    expect(load).toHaveBeenCalledOnce();
+
+    vi.advanceTimersByTime(5_000);
+    expect(load).toHaveBeenCalledTimes(2);
+    stop();
+    vi.advanceTimersByTime(20_000);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the bounded fallback when initialization never completes', () => {
+    const load = vi.fn();
+    const stop = scheduleEmbeddedSubInventory(load, () => false);
+
+    vi.advanceTimersByTime(19_999);
+    expect(load).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(load).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it('cancels pending initialization and fallback timers', () => {
+    const load = vi.fn();
+    const stop = scheduleEmbeddedSubInventory(load, () => false);
+    stop();
+    vi.advanceTimersByTime(30_000);
+    expect(load).not.toHaveBeenCalled();
   });
 });
