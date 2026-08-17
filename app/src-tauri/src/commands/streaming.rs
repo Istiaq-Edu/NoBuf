@@ -264,6 +264,37 @@ pub fn should_defer_proactive_spawn(is_player_downloading: bool) -> bool {
     is_player_downloading
 }
 
+/// Should the proactive downloader flush `cached_ranges` metadata after writing
+/// up to `offset`?
+///
+/// The `/remux` poll loop (`server.rs`) discovers downloaded bytes ONLY by
+/// re-reading this metadata, so a chunk that is written but not yet *published*
+/// is invisible to the player — it keeps sleeping `POLL_INTERVAL_MS` even though
+/// the bytes are already on disk. Publishing on a coarse quantum trades that
+/// visibility latency for fewer meta writes.
+///
+/// The steady-state quantum is 1 MiB (2 × 512 KiB chunks) — cheap and frequent
+/// enough for a warm sequential fill. But the FIRST chunk of every gap is
+/// special: right after open the player has just drained the 6 MiB prefix and is
+/// blocked at the frontier, and right after a seek it is blocked at the new
+/// anchor. In both cases the very first freshly-downloaded chunk is the one the
+/// player is actively waiting on, so publishing it immediately (instead of after
+/// a whole MiB) removes ~one 512 KiB/300 ms limiter step — the bulk of the
+/// ~1500 ms first-wait seen at open — without adding a single API call. `first`
+/// is the per-gap first-write flag, NOT a whole-task flag, so every post-seek
+/// gap gets the same fast first reveal.
+///
+/// `at_gap_end` forces a final flush so the gap's tail range is always recorded.
+/// Pure + unit-tested.
+pub fn should_publish_proactive_meta(
+    offset: u64,
+    chunk_size: u64,
+    first: bool,
+    at_gap_end: bool,
+) -> bool {
+    first || at_gap_end || offset % (1024 * 1024) < chunk_size
+}
+
 /// Round-14 F1: how long a `seek-bisect` probe suppresses the PROACTIVE spawn.
 ///
 /// A cue-less MKV seek runs a byte-range bisect (3-7 probes) and then a forward
@@ -576,6 +607,58 @@ mod tests {
         assert!(!player_download_flag_fresh(1_000_000, 0));
         assert!(!should_defer_proactive_spawn(false));
         assert!(should_defer_proactive_spawn(true));
+    }
+
+    // --- Meta publish granularity: the initial-open fetch "drop" fix ---
+    // The /remux poll loop only SEES downloaded bytes when the proactive task
+    // publishes cached_ranges. Publishing on a 1 MiB quantum meant that after
+    // draining the 6 MiB prefix the player waited ~one extra MiB (~1500ms) for
+    // the first reveal. The fix flushes the first write of EVERY gap immediately.
+    const CS: u64 = 512 * 1024; // TELEGRAM_CHUNK_SIZE
+
+    #[test]
+    fn publish_first_chunk_of_a_gap_immediately() {
+        // The very first 512 KiB write of a gap (offset just past a non-MiB
+        // gap_start) must publish even though it is NOT on a 1 MiB boundary —
+        // this is the byte the player is blocked on at open / after a seek.
+        let gap_start = 6 * 1024 * 1024; // the 6 MiB prefix frontier
+        let offset = gap_start + CS; // one chunk in; 6.5 MiB, not a MiB boundary
+        assert_ne!(offset % (1024 * 1024), 0, "test byte must be off the MiB grid");
+        assert!(
+            should_publish_proactive_meta(offset, CS, true, false),
+            "first write of a gap must publish immediately regardless of MiB alignment",
+        );
+    }
+
+    #[test]
+    fn steady_state_still_publishes_only_on_mib_boundaries() {
+        // After the first chunk (first=false), a mid-MiB offset must NOT publish
+        // — otherwise we'd double the meta-write rate for a warm sequential fill.
+        let offset = 8 * 1024 * 1024 + CS; // 8.5 MiB, mid-MiB, not first
+        assert!(
+            !should_publish_proactive_meta(offset, CS, false, false),
+            "a mid-MiB steady write must not publish (keeps the 1 MiB quantum)",
+        );
+        // …but the MiB boundary itself still publishes.
+        assert!(should_publish_proactive_meta(9 * 1024 * 1024, CS, false, false));
+    }
+
+    #[test]
+    fn gap_end_always_publishes_even_mid_mib() {
+        // The tail of a gap must be recorded even if it lands off the MiB grid,
+        // or the last sub-MiB range would stay invisible until the next gap.
+        let offset = 3 * 1024 * 1024 + 7 * CS; // 3.5 MiB, mid-MiB, not first
+        assert!(
+            should_publish_proactive_meta(offset, CS, false, true),
+            "at_gap_end must force a final flush regardless of alignment",
+        );
+    }
+
+    #[test]
+    fn first_chunk_landing_on_mib_boundary_is_not_double_counted() {
+        // Sanity: when the first write happens to land exactly on a MiB boundary
+        // both terms are true; the OR still yields a single publish (idempotent).
+        assert!(should_publish_proactive_meta(1024 * 1024, CS, true, false));
     }
 
     // --- Round-14 F1: seek-critical suppression of the PROACTIVE spawn ---
@@ -2413,6 +2496,11 @@ async fn proactive_prebuffer_download(
             let skip_bytes = gap_start % chunk_size as u64;
             let mut offset = gap_start;
             let mut first_chunk = true;
+            // Distinct from `first_chunk` (which resets on every iterator
+            // recreation, e.g. after a network retry): this is armed ONCE per gap
+            // and cleared after the first meta publish, so a mid-gap retry can't
+            // re-trigger the immediate-flush fast path. See should_publish_proactive_meta.
+            let mut first_chunk_published = true;
             let mut seq_retries = 0u32;
             const MAX_SEQ_RETRIES: u32 = 5;
             let mut need_new_iter = true;
@@ -2556,9 +2644,15 @@ async fn proactive_prebuffer_download(
                         offset += to_write as u64;
                         total_downloaded += to_write as u64;
 
-                        // Update meta every 1MB (2 chunks × 512KB) for faster
-                        // PREBUFFER HIT detection by /stream handler. Was 4MB.
-                        if offset % (1 * 1024 * 1024) < chunk_size as u64 || offset > gap_end {
+                        // Publish cached_ranges so /stream's poll loop can see
+                        // the new bytes. Steady quantum is 1 MiB, but the FIRST
+                        // write of every gap flushes immediately — that first
+                        // chunk is the byte the player is blocked on at open (just
+                        // drained the prefix) or after a seek (blocked at the new
+                        // anchor), so revealing it now removes ~one 512KB/300ms
+                        // limiter step from the wait. See should_publish_proactive_meta.
+                        if should_publish_proactive_meta(offset, chunk_size as u64, first_chunk_published, offset > gap_end) {
+                            first_chunk_published = false;
                             // Round-9 I-3b (meta resurrection): a cache discard
                             // deletes .meta.json while this task drains toward its
                             // next cancellation check; load_meta → None here would

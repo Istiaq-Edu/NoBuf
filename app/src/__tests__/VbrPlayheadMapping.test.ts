@@ -18,7 +18,8 @@
  * CBR. These tests use the real file geometry from the log.
  */
 import { describe, expect, it } from 'vitest';
-import { upsertByteTimeAnchor } from '../hooks/useMSEPlayer';
+import { readFileSync } from 'node:fs';
+import { subtitlePositionQuery, upsertByteTimeAnchor } from '../hooks/useMSEPlayer';
 
 const SIZE = 1_467_894_377;   // Predestination, bytes (19-t)
 const DUR = 5868.869;         // seconds (19-c:29)
@@ -59,6 +60,29 @@ function timeToByte(
 const linearEstimate = (t: number) => Math.floor((t / DUR) * SIZE);
 
 describe('round-19: VBR playhead mapping (Predestination)', () => {
+  it('marks subtitle bytes with the exact remux seek already folded into the table', () => {
+    expect(subtitlePositionQuery(1_029_616_769, 3_895.034)).toBe(
+      '&playhead_byte=1029616769&subs_seek_anchor=3895.034',
+    );
+    expect(subtitlePositionQuery(1_031_263_638, null)).toBe('&playhead_byte=1031263638');
+  });
+
+  it('binds the calibration token to the shipped cache-status and subtitle request paths', () => {
+    const hook = readFileSync(`${process.cwd()}/src/hooks/useMSEPlayer.ts`, 'utf8');
+    const fetchStart = hook.indexOf('const fetchEmbeddedSubText = useCallback');
+    const fetchEnd = hook.indexOf('/** Build the /subtitles font URLs', fetchStart);
+    expect(hook.slice(fetchStart, fetchEnd)).toContain(
+      'subtitlePositionQuery(playheadByte, subtitleRemuxCalibrationRef.current)',
+    );
+
+    const player = readFileSync(`${process.cwd()}/src/components/dashboard/FastStreamPlayer.tsx`, 'utf8');
+    const pollStart = player.indexOf("const status = await invoke<any>('cmd_get_cache_status'");
+    const pollEnd = player.indexOf('await new Promise(r => setTimeout(r, 500))', pollStart);
+    expect(player.slice(pollStart, pollEnd)).toContain(
+      'recordByteTimeAnchor(status.remux_seek_actual_byte, status.remux_seek_time_s, true)',
+    );
+  });
+
   it('replaces a guessed same-seek anchor with ffmpeg authoritative byte', () => {
     const guessed: [number, number][] = [[0, 0], [332_415_542, 1329], [1_467_894_377, 5868.869]];
     const corrected = upsertByteTimeAnchor(guessed, 345_368_082, 1329);

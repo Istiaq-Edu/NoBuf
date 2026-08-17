@@ -22,11 +22,18 @@ import { assDialogueIntervals, classifySubRepairOutcome, mergeAssContent } from 
 const ass = (start: string, end: string, text: string) =>
   `[Script Info]\nScriptType: v4.00+\n[Events]\nDialogue: 0,${start},${end},Default,,0,0,0,,${text}`;
 
-function classifyAss(before: string, after: string, playhead: number) {
+function classifyAss(
+  before: string,
+  after: string,
+  playhead: number,
+  snapshotUnchanged = false,
+  isFullyCovered = false,
+) {
   return classifySubRepairOutcome(
-    null, null, playhead, false, false, undefined,
+    null, null, playhead, false, isFullyCovered, undefined,
     before.length, after.length, null, null, null, null,
     assDialogueIntervals(after), assDialogueIntervals(before).length,
+    false, snapshotUnchanged,
   );
 }
 
@@ -48,8 +55,34 @@ describe('classifySubRepairOutcome — ASS/SSA tracks (no cue list)', () => {
     expect(classifyAss(content, content, 2005)).toBe('deferred');
   });
 
-  it('still reports no-progress when ASS extraction returns nothing', () => {
-    expect(classifyAss(ass('0:10:00.00', '0:10:10.00', 'old'), '[Events]', 2005)).toBe('no-progress');
+  it('defers an unchanged PARTIAL 200 snapshot even when old dialogue is near the playhead', () => {
+    // Regression: the backend memo replay returned HTTP 200 + X-Subs-Unchanged,
+    // but the frontend dropped the header. The nearby old cue made the stale body
+    // classify `ok`; the breaker reset while the region ledger stayed latched, so
+    // later cache growth was invisible until the user seeked.
+    const stale = ass('0:33:00.00', '0:33:10.00', 'nearby-old-island');
+    expect(classifyAss(stale, stale, 2050, true, false)).toBe('deferred');
+  });
+
+  it('does not retry an unchanged FULL artifact', () => {
+    const complete = ass('0:33:00.00', '0:33:10.00', 'complete-track');
+    expect(classifyAss(complete, complete, 2050, true, true)).toBe('ok');
+  });
+
+  it('defers a CHANGED island that adds zero dialogues (19-c/19-t deadlock)', () => {
+    // 19-t: island 8.01 MiB -> 9.06 MiB changed its memo key, so Unchanged=false;
+    // ffmpeg still returned the same 15 dialogues. The old classifier called this
+    // ok because one old cue covered playhead 1000s, then latched the region until seek.
+    const sameDialogues = ass('0:16:35.00', '0:16:45.09', 'last-loaded-cue');
+    expect(classifyAss(sameDialogues, sameDialogues, 1000, false, false)).toBe('deferred');
+  });
+
+  it('defers an empty PARTIAL ASS island so later cache growth can be observed', () => {
+    expect(classifyAss(ass('0:10:00.00', '0:10:10.00', 'old'), '[Events]', 2005)).toBe('deferred');
+  });
+
+  it('keeps an empty FULL ASS artifact terminal', () => {
+    expect(classifyAss('', '[Events]', 2005, false, true)).toBe('no-progress');
   });
 
   it('merges dialogue islands without losing the existing header or cues', () => {
@@ -95,6 +128,18 @@ describe('classifySubRepairOutcome — cue-list tracks are unchanged', () => {
 
   it('SRT coverage that reaches the playhead is ok', () => {
     expect(classifySubRepairOutcome(100, 3500, 3398, false, false)).toBe('ok');
+  });
+
+  it('keeps an unchanged SRT cue terminal when it genuinely spans the playhead', () => {
+    const cues = [{ startTime: 995, endTime: 1005 }];
+    expect(classifySubRepairOutcome(1005, 1005, 1000, false, false, undefined,
+      null, null, null, null, cues, 1)).toBe('ok');
+  });
+
+  it('keeps the same cue set terminal when coverage is known full', () => {
+    const cues = [{ startTime: 995, endTime: 1005 }];
+    expect(classifySubRepairOutcome(1005, 1005, 1000, false, true, undefined,
+      null, null, null, null, cues, 1)).toBe('ok');
   });
 
   it('SRT error is failed', () => {

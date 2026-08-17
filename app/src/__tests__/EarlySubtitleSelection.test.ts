@@ -27,8 +27,36 @@ describe('early embedded subtitle selection', () => {
     expect(pendingStart).toBeGreaterThanOrEqual(0);
     expect(pendingBranch).toContain('shouldStagePendingPartialSubTrack(res.error, !!existing)');
     expect(pendingBranch).toContain('subs.getSelectionVersion() === selectionVersionAtStart');
-    expect(pendingBranch).toContain('embeddedSubTracksRef.current.set(idx, { track, partial: true })');
+    expect(pendingBranch).toContain('embeddedSubTracksRef.current.set(idx, { track, partial: true, localIntervals: null })');
     expect(pendingBranch).toContain('subs.activateTrack(subs.addTrack(track))');
     expect(pendingBranch).toContain('persistSubTrack(fileKey, idx)');
+  });
+
+  it('routes a loaded embedded-track row through coverage-aware re-extraction', () => {
+    const source = readFileSync(`${process.cwd()}/src/components/dashboard/FastStreamPlayer.tsx`, 'utf8');
+    const handlerStart = source.indexOf('const toggleLoadedSubTrack = useCallback');
+    const handlerEnd = source.indexOf('// Round-10 P1-2: automatic subtitle-coverage repair.', handlerStart);
+    const handler = source.slice(handlerStart, handlerEnd);
+    expect(handlerStart).toBeGreaterThanOrEqual(0);
+    expect(handler).toContain('if (entry.track !== track) continue');
+    expect(handler).toContain('void toggleEmbeddedSub(');
+    expect(handler).toContain('subs.toggleTrack(track)');
+
+    const menuStart = source.indexOf('{sidecarTracks.map((t) => (');
+    const menuEnd = source.indexOf('{(msePlayer.embeddedSubTracks.length', menuStart);
+    const loadedTrackMenu = source.slice(menuStart, menuEnd);
+    expect(menuStart).toBeGreaterThanOrEqual(0);
+    expect(loadedTrackMenu).toContain('onClick={() => toggleLoadedSubTrack(t)}');
+    expect(loadedTrackMenu).not.toContain('onClick={() => subs.toggleTrack(t)}');
+
+    // The upper loaded-tracks list must render ONLY sidecar tracks — embedded
+    // tracks are owned by the "Embedded" section below. Listing them in both
+    // places gave the raw toggle row a duplicate that silently reverted the
+    // active track. `sidecarTracks` filters embedded tracks out of `subs.tracks`.
+    const sidecarDef = source.indexOf('const sidecarTracks = subs.tracks.filter');
+    expect(sidecarDef).toBeGreaterThanOrEqual(0);
+    expect(source).toContain('!embeddedTrackObjs.has(t)');
+    // The old bug: the loaded list mapped `subs.tracks` directly.
+    expect(source).not.toContain('{subs.tracks.map(');
   });
 });
