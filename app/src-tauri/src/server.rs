@@ -410,6 +410,10 @@ pub(crate) struct StreamQuery {
     /// file makes that failure structurally impossible.
     /// Absent → the legacy contiguous-prefix behaviour.
     pub(crate) playhead_byte: Option<u64>,
+    /// Exact remux seek timestamp whose authoritative byte has already been
+    /// folded into the frontend's VBR table. A stale timestamp cannot suppress
+    /// correction for a newer seek.
+    pub(crate) subs_seek_anchor: Option<f64>,
 }
 
 /// Telegram download chunk size. Gammers-client enforces a hard cap of
@@ -449,6 +453,18 @@ const AAC_LAYOUT_FILTER: &str = "aformat=channel_layouts=mono|stereo|3.0|4.0|5.0
 pub(crate) fn find_first_mkv_cluster(head: &[u8]) -> Option<usize> {
     const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
     head.windows(4).position(|w| w == CLUSTER_ID)
+}
+
+/// Count MKV `Cluster` element markers (EBML ID `1F 43 B6 75`) in `window`.
+///
+/// Used as the admission test for a subtitle-extraction island: **two** cluster
+/// markers prove at least one FULLY-BOUNDED cluster lies between them, which is
+/// exactly the condition under which ffmpeg emits cues (a lone partial cluster
+/// is discarded on resync — see `SUBS_ISLAND_MIN_BYTES`). This is the direct
+/// measurement the fixed byte floor only approximated.
+pub(crate) fn count_mkv_clusters(window: &[u8]) -> usize {
+    const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+    window.windows(4).filter(|w| *w == CLUSTER_ID).count()
 }
 
 /// Round-10 P1-1: choose the cached range to stitch after the header for a
@@ -512,13 +528,19 @@ pub(crate) const SUBS_ISLAND_MAX_DISTANCE_BYTES: u64 = 8 * 1024 * 1024;
 /// poll. That is the "16 min -> seconds" regression (commit 7b1946a) returning
 /// through a new door.
 ///
-/// 12 MiB = 8 MiB (SUBS_ISLAND_MAX_DISTANCE_BYTES, the furthest an island may
-/// legitimately start from the playhead) + 4 MiB of body, so a window anchored at
-/// the far edge of the admitted distance still carries several whole clusters. It
-/// must stay comfortably above SUBS_ISLAND_MIN_BYTES or every clamped island
-/// would be rejected by the floor immediately afterwards; the ratio is asserted
-/// in tests rather than left to inspection.
-pub(crate) const SUBS_ISLAND_MAX_BYTES: u64 = 12 * 1024 * 1024;
+/// 24 MiB = 8 MiB (SUBS_ISLAND_MAX_DISTANCE_BYTES, the furthest an island may
+/// legitimately start from the playhead) + 16 MiB of body. Round-14(B2): raised
+/// from 12→24 MiB so a straddling island carries ~100 s of runtime instead of
+/// ~50 s (at the logged 176 KB/s: 24 MiB ≈ 143 s of bytes, ~100 s of dialogue
+/// after cluster overhead), roughly halving the "subs run out mid-playback"
+/// gap. Still bounded well below the round-26 regression projection (the
+/// unbounded straddle grew to 400+ MiB); the per-poll `vec![0u8; isl_len]`
+/// allocation is at most 24 MB, and `subs_memo_key` still memoizes each
+/// `(start,end)` so a stable playhead does not re-run ffmpeg. It must stay
+/// comfortably above SUBS_ISLAND_MIN_BYTES or every clamped island would be
+/// rejected by the floor immediately afterwards; the ratio is asserted in tests
+/// rather than left to inspection.
+pub(crate) const SUBS_ISLAND_MAX_BYTES: u64 = 24 * 1024 * 1024;
 
 /// Round-26: clamp an admitted island to `SUBS_ISLAND_MAX_BYTES`, keeping the
 /// playhead inside the returned window.
@@ -676,7 +698,10 @@ pub(crate) fn is_authoritative_remux_seek_range(estimated_byte: u64, range_start
     // ffmpeg opens a marked timestamp-seek input with a header/full-file request
     // at byte zero before issuing the demuxer-resolved seek Range. That bootstrap
     // request is never evidence for the seek anchor, even for an early seek.
-    if file_size == 0 || range_start == 0 || range_len < REMUX_SEEK_MIN_RANGE_BYTES { return false; }
+    // The marked MKV input's first non-zero request starts inside the container
+    // header. The island builder already uses 1 MiB as a conservative MKV-header
+    // scan bound; such a range is bootstrap traffic, never the resolved seek.
+    if file_size == 0 || range_start < REMUX_SEEK_MIN_RANGE_BYTES || range_len < REMUX_SEEK_MIN_RANGE_BYTES { return false; }
     let tolerance = (file_size / 10).max(64 * 1024 * 1024);
     range_start.abs_diff(estimated_byte) <= tolerance
 }
@@ -727,6 +752,23 @@ pub(crate) fn authoritative_subs_playhead_byte(requested: Option<u64>, anchor: O
             }
         }
         (requested, _) => requested,
+    }
+}
+
+pub(crate) fn resolve_authoritative_subs_playhead_byte(
+    requested: Option<u64>,
+    anchor: Option<(f64, u64, u64)>,
+    calibrated_seek_s: Option<f64>,
+    file_size: u64,
+) -> Option<u64> {
+    let Some((seek_s, estimated, actual)) = anchor else { return requested; };
+    let already_calibrated = calibrated_seek_s
+        .filter(|value| value.is_finite())
+        .is_some_and(|value| (value - seek_s).abs() <= 0.001);
+    if already_calibrated {
+        requested
+    } else {
+        authoritative_subs_playhead_byte(requested, Some((estimated, actual)), file_size)
     }
 }
 
@@ -2564,7 +2606,7 @@ async fn fmp4_keyframe_at(
     }
 
     // Resolve media for potential Telegram download
-    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
+    let (media, _) = match resolve_media_from_path(&_folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None, subs_seek_anchor: None }).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -2796,7 +2838,7 @@ fn ts_align_byte(byte: u64, packet_size: u64) -> u64 {
 }
 
 /// Post-input timestamp args that MUST accompany a `-ss` seek so the output PTS
-/// stay ABSOLUTE (e.g. seek to 580s → output PTS ≈581s), which the frontend's
+/// stay ABSOLUTE (e.g. seek to 580s → output PTS ≈580s), which the frontend's
 /// _dtsBase=0 mapping relies on to place video.currentTime correctly. Empty when
 /// not seeking (a from-zero remux needs neither).
 fn build_ss_timestamp_args(ss_secs: f64) -> Vec<String> {
@@ -2814,10 +2856,11 @@ fn build_ss_timestamp_args(ss_secs: f64) -> Vec<String> {
 ///   0). Video also starts at 0 → aligned. Guards against overlapping-PTS AAC
 ///   frames that crash the mpegts muxer. AAC_LAYOUT_FILTER leads (strips the PCE).
 /// - Seek (with `-copyts -start_at_zero`): `asetpts=N/SR/TB` is FATAL — it resets
-///   audio to ~0 while video stays absolute (seek 721s → video 721s, audio 0s).
+///   audio to ~0 while video stays absolute (seek 721s → video ~721s, audio 0s).
 ///   The ~700s A/V desync stops mpegts.js from ever completing MediaInfo, so the
 ///   seek never plays. `aresample=async=1` keeps audio absolute AND monotonic
-///   (proven: seek 30s → audio 31.38s vs video 31.4s, 0 backwards PTS).
+///   (source-bound QSV proof: seek 10s → audio 9.978667s vs video 10.000000s,
+///   with monotonic audio DTS).
 ///
 /// FILTER ORDER MATTERS on the seek path: `aresample` MUST come BEFORE the
 /// AAC_LAYOUT_FILTER, not after. Real files carry layouts like `5.1(side)` that
@@ -2834,6 +2877,25 @@ fn build_remux_audio_filter(is_seek: bool) -> String {
     } else {
         format!("{},asetpts=N/SR/TB", AAC_LAYOUT_FILTER)
     }
+}
+
+/// MPEG-TS output options shared by every `/remux` producer.
+///
+/// FFmpeg's MPEG-TS muxer defaults add a 1.4-second timestamp preload. That is
+/// normally hidden when a player rebases the first DTS to zero, but the remux
+/// seek path deliberately pins mpegts.js `_dtsBase=0` to preserve source-
+/// absolute time. The preload then becomes a real clock error: a seek to 10.0s
+/// presents source frame 10.0 at media time 11.4 while embedded subtitles remain
+/// at their source timestamps. `-muxdelay 0` removes that offset without
+/// changing A/V relative timing (execution-verified with FFmpeg 8.1.1: video
+/// 11.400000 -> 10.000000, audio 11.378667 -> 9.978667). A factorial check
+/// proved `-muxpreload 0` alone leaves both starts unchanged, so it is omitted.
+fn build_mpegts_muxer_args() -> [&'static str; 6] {
+    [
+        "-muxdelay", "0",
+        "-f", "mpegts",
+        "-mpegts_flags", "resend_headers",
+    ]
 }
 
 /// Per-encoder codec args + the pixel format each encoder wants fed to it.
@@ -3749,9 +3811,8 @@ async fn remux_ts_to_mp4(
             // Remap non-standard layouts (e.g. 5.1(side)) so AAC avoids a PCE
             // that Chromium MSE can't parse. See AAC_LAYOUT_FILTER.
             "-af", AAC_LAYOUT_FILTER,
-            "-f", "mpegts",
-            "-mpegts_flags", "resend_headers",
         ]);
+        cmd.args(build_mpegts_muxer_args());
         cmd.arg(&remux_tmp);
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
@@ -3941,14 +4002,15 @@ async fn remux_ts_to_mp4(
         //   The ~700s A/V desync floods ffmpeg's sync queue ("queue head -1 ts N/A")
         //   and mpegts.js can never complete MediaInfo (needs both tracks' DTS close),
         //   so MEDIA_INFO never fires and nothing appends → seek never plays.
-        //   Proven by execution: seek 30s → asetpts gives audio=1.4s vs video=31.4s.
-        //   aresample=async=1 instead keeps audio ABSOLUTE and monotonic (0 backwards
-        //   PTS, audio 31.38s vs video 31.4s) — the correct fix for the seek path.
+        //   Proven by execution: seek 30s → asetpts gives audio near 0 while video
+        //   stays near 30s. aresample=async=1 instead keeps audio ABSOLUTE and
+        //   monotonic (source-bound QSV proof: seek 10s → audio 9.978667s vs video
+        //   10.000000s) — the correct fix for the seek path.
         //   AAC_LAYOUT_FILTER is chained first (single -af only) to avoid the MSE PCE.
         let audio_filter = build_remux_audio_filter(is_seek);
         cmd.args(["-c:a", "aac", "-b:a", "192k", "-af", &audio_filter]);
         // Preserve original timestamps so MSE timeline matches video.currentTime.
-        // Output PTS stay absolute (seek 580s → PTS ≈581s) — verified by execution;
+        // Output PTS stay absolute (seek 580s → PTS ≈580s) — verified by execution;
         // the frontend _dtsBase=0 mapping depends on it. Empty when not seeking.
         // Byte-forward mode also needs -copyts -start_at_zero (normalizes the
         // fed substream's timestamps to start at 0); pass a non-zero sentinel so
@@ -3969,10 +4031,9 @@ async fn remux_ts_to_mp4(
             // Disable interleave check: prevent muxer from rejecting audio packets
             // that arrive slightly out-of-order relative to video DTS
             "-max_interleave_delta", "0",
-            "-f", "mpegts",
-            "-mpegts_flags", "resend_headers",
-            "-",
         ]);
+        cmd.args(build_mpegts_muxer_args());
+        cmd.arg("-");
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         // Byte-forward mode feeds the input through stdin; open the pipe.
@@ -4182,9 +4243,8 @@ async fn remux_ts_to_mp4(
                             // (video/mp2t) and the Strategy A output format. The previous
                             // -f mp4 + -movflags +faststart produced an MP4 file served as
                             // video/mp2t → mpegts.js parse failure on second play.
-                            "-f", "mpegts",
-                            "-mpegts_flags", "resend_headers",
                         ]);
+                        bg_cmd.args(build_mpegts_muxer_args());
                         bg_cmd.arg(&bg_remux_tmp);
                         bg_cmd.stdout(std::process::Stdio::null());
                         bg_cmd.stderr(std::process::Stdio::null());
@@ -4836,7 +4896,7 @@ async fn fmp4_segment(
         if need_own_download || dl_info.is_none() {
             let client_guard = { data.client.lock().await.clone() };
             if let Some(client) = client_guard {
-                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None }).await {
+                let (media, _) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &StreamQuery { token: query.token.clone(), cached_only: Some(false), cached_prefix: None, duration: None, source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None, audio_idx: None, playhead_byte: None, subs_seek_anchor: None }).await {
                     Ok(result) => result,
                     Err(resp) => return resp,
                 };
@@ -6654,14 +6714,40 @@ fn build_subs_island_file(
     if isl_end <= isl_start_raw {
         return None;
     }
-    // An island below one cluster produces a body that CANNOT yield cues.
-    if isl_end - isl_start_raw + 1 < SUBS_ISLAND_MIN_BYTES {
+    // An island must contain at least one FULLY-BOUNDED MKV cluster or ffmpeg
+    // emits zero cues (it discards a lone partial cluster on resync). The 2 MiB
+    // byte floor is a cheap PROXY for that — but it is only a proxy, and it was
+    // rejecting near-miss islands that plainly hold whole clusters (observed:
+    // 1.81 MB and 1.998 MB islands declined, leaving the viewer with NO
+    // subtitles after those seeks). When the span is under the byte floor, fall
+    // back to measuring the real invariant: count cluster markers in the island
+    // window. Two markers bracket at least one complete cluster. The extra read
+    // happens ONLY on the sub-floor branch (rare, and by definition < 2 MiB), so
+    // the main path keeps its zero-I/O fast admit and cannot regress.
+    let span = isl_end - isl_start_raw + 1;
+    if span < SUBS_ISLAND_MIN_BYTES {
+        let probe = {
+            let mut f = std::fs::File::open(&data_path).ok()?;
+            f.seek(SeekFrom::Start(isl_start_raw)).ok()?;
+            use std::io::Read;
+            let mut buf = vec![0u8; span as usize];
+            f.read_exact(&mut buf).ok()?;
+            buf
+        };
+        let clusters = count_mkv_clusters(&probe);
+        if clusters < 2 {
+            log::info!(
+                "[SUBS-ISLAND] msg {} s{}: island {}-{} is {}B < {}B floor and holds {} cluster marker(s) (<2, no whole cluster) — falling back to prefix",
+                message_id, stream_idx, isl_start_raw, isl_end,
+                span, SUBS_ISLAND_MIN_BYTES, clusters
+            );
+            return None;
+        }
         log::info!(
-            "[SUBS-ISLAND] msg {} s{}: island {}-{} is {}B < {}B minimum — falling back to prefix",
+            "[SUBS-ISLAND] msg {} s{}: island {}-{} is {}B < {}B floor but holds {} cluster markers — admitting on the cluster invariant",
             message_id, stream_idx, isl_start_raw, isl_end,
-            isl_end - isl_start_raw + 1, SUBS_ISLAND_MIN_BYTES
+            span, SUBS_ISLAND_MIN_BYTES, clusters
         );
-        return None;
     }
 
     // Snap the island start DOWN to a cluster boundary when one is nearby.
@@ -6890,7 +6976,7 @@ async fn subtitles_extract_track(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None, playhead_byte: None,
+        audio_idx: None, playhead_byte: None, subs_seek_anchor: None,
     };
     let resolved_total_size = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         Ok((_, total_size)) => total_size,
@@ -7007,8 +7093,10 @@ async fn subtitles_extract_track(
     // share subs_input_source and MUST stay unbounded: stream declarations and
     // attachments live in the header region, so an island would hide subtitle
     // tracks from the picker and break font extraction outright.
-    let remux_anchor = data.remux_seek_anchors.read().await.get(&message_id).map(|v| (v.1, v.2));
-    let effective_playhead_byte = authoritative_subs_playhead_byte(query.playhead_byte, remux_anchor, resolved_total_size);
+    let remux_anchor = data.remux_seek_anchors.read().await.get(&message_id).copied();
+    let effective_playhead_byte = resolve_authoritative_subs_playhead_byte(
+        query.playhead_byte, remux_anchor, query.subs_seek_anchor, resolved_total_size,
+    );
     if effective_playhead_byte != query.playhead_byte {
         log::info!("[SUBS-ISLAND] msg {} s{}: frontend byte {:?} -> authoritative remux byte {:?}", message_id, stream_idx, query.playhead_byte, effective_playhead_byte);
     }
@@ -7326,7 +7414,7 @@ async fn subtitles_font(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None, playhead_byte: None,
+        audio_idx: None, playhead_byte: None, subs_seek_anchor: None,
     };
     if let Err(resp) = resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         return resp;
@@ -7429,7 +7517,7 @@ async fn remux_hover_thumb(
     let sq = StreamQuery {
         token: query.token.clone(), cached_only: None, cached_prefix: None, duration: None,
         source_id: None, remux_seek: None, max_bytes: None, ss: None, start_byte: None, hevc_ok: None,
-        audio_idx: None, playhead_byte: None,
+        audio_idx: None, playhead_byte: None, subs_seek_anchor: None,
     };
     let (_media, total_size) = match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &sq).await {
         Ok(r) => r,
@@ -8116,7 +8204,8 @@ mod tests {
     #[test]
     fn ss_timestamp_args_present_only_when_seeking() {
         // A seek MUST carry -copyts -start_at_zero so output PTS stay absolute
-        // (verified: ss=580 → PTS ≈581s), which the frontend _dtsBase=0 relies on.
+        // (verified: ss=580 → PTS ≈580s with the zero-preload muxer args), which
+        // the frontend _dtsBase=0 relies on.
         assert_eq!(
             super::build_ss_timestamp_args(580.0),
             vec!["-copyts".to_string(), "-start_at_zero".to_string()],
@@ -8195,6 +8284,36 @@ mod tests {
         let seek = super::build_remux_audio_filter(true);
         assert!(!seek.contains("asetpts"), "seek filter must not reset PTS: {seek}");
         assert!(seek.contains("aresample=async=1"), "seek needs aresample: {seek}");
+    }
+
+    #[test]
+    fn mpegts_muxer_preserves_source_absolute_timestamps() {
+        let args = super::build_mpegts_muxer_args();
+        assert_eq!(
+            args,
+            [
+                "-muxdelay", "0",
+                "-f", "mpegts",
+                "-mpegts_flags", "resend_headers",
+            ],
+            "the MPEG-TS muxer must not add its default 1.4s preload",
+        );
+    }
+
+    #[test]
+    fn every_remux_producer_uses_the_zero_preload_muxer_args() {
+        let source = include_str!("server.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production.matches(".args(build_mpegts_muxer_args())").count(),
+            3,
+            "live, fully-cached, and background remux producers must share the timestamp invariant",
+        );
+        assert_eq!(
+            production.matches("\"-f\", \"mpegts\"").count(),
+            1,
+            "production MPEG-TS format flags must live only in build_mpegts_muxer_args",
+        );
     }
 
     #[test]
@@ -8658,6 +8777,19 @@ mod tests {
     }
 
     #[test]
+    fn remux_seek_range_filter_rejects_front_header_read_for_early_seek() {
+        let size = 1_467_894_377;
+        // 20-t:279-283: ffmpeg's container bootstrap at 787,299 was latched
+        // for a 559.253s seek before the real demux range arrived.
+        assert!(!super::is_authoritative_remux_seek_range(
+            139_877_827, 787_299, 1_467_107_078, size,
+        ));
+        assert!(super::is_authoritative_remux_seek_range(
+            139_877_827, 143_174_033, 1_324_720_344, size,
+        ));
+    }
+
+    #[test]
     fn explicit_vbr_playback_report_is_not_corrected_twice() {
         let size = 1_467_894_377;
         let anchor = Some((1329.0, 332_415_542, 345_368_082));
@@ -8681,6 +8813,39 @@ mod tests {
         assert_eq!(super::authoritative_subs_playhead_byte(Some(237_320_974), Some((236_969_495, 239_012_055)), size), Some(239_363_534));
         assert_eq!(super::authoritative_subs_playhead_byte(Some(1_060_136_781), Some((330_769_921, 343_265_633)), size), Some(1_060_136_781));
         assert_eq!(super::authoritative_subs_playhead_byte(None, Some((330_769_921, 343_265_633)), size), None);
+    }
+
+    #[test]
+    fn subtitle_anchor_correction_does_not_reapply_after_frontend_converges() {
+        let size = 1_467_894_377;
+        let anchor = Some((3_895.034, 1_031_257_671, 1_029_253_987));
+        // 21-t:1816: the first post-seek request still followed the old estimate.
+        assert_eq!(
+            super::resolve_authoritative_subs_playhead_byte(
+                Some(1_031_263_638), anchor, None, size,
+            ),
+            Some(1_029_259_954),
+        );
+        // 21-t:1839: the frontend learned the authoritative anchor.
+        assert_eq!(
+            super::resolve_authoritative_subs_playhead_byte(
+                Some(1_029_616_769), anchor, Some(3_895.034), size,
+            ),
+            Some(1_029_616_769),
+        );
+        // 21-t:1890: forward playback must not make the stale delta active again.
+        assert_eq!(
+            super::resolve_authoritative_subs_playhead_byte(
+                Some(1_030_470_002), anchor, Some(3_895.034), size,
+            ),
+            Some(1_030_470_002),
+        );
+        assert_eq!(
+            super::resolve_authoritative_subs_playhead_byte(
+                Some(1_031_263_638), anchor, Some(3_710.810), size,
+            ),
+            Some(1_029_259_954),
+        );
     }
 
     /// Font attachment detection: mimetype first, extension fallback for
@@ -8892,6 +9057,48 @@ mod tests {
             super::SUBS_ISLAND_MIN_BYTES > 1_093_994,
             "minimum island must exceed the 1,093,994 B cluster that produced 0 cues"
         );
+    }
+
+    /// The near-miss admission test: an island under the 2 MiB byte floor is now
+    /// admitted when it demonstrably holds a whole cluster (≥2 cluster markers).
+    /// `count_mkv_clusters` is the pure measurement that replaces the byte proxy.
+    #[test]
+    fn count_mkv_clusters_counts_markers() {
+        const CID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+        assert_eq!(super::count_mkv_clusters(&[0xAAu8; 4096]), 0);
+        let mut one = vec![0u8; 1024];
+        one[100..104].copy_from_slice(&CID);
+        assert_eq!(super::count_mkv_clusters(&one), 1);
+        let mut two = vec![0u8; 4096];
+        two[100..104].copy_from_slice(&CID);
+        two[2000..2004].copy_from_slice(&CID);
+        assert_eq!(super::count_mkv_clusters(&two), 2);
+    }
+
+    #[test]
+    fn count_mkv_clusters_handles_tiny_and_empty_windows() {
+        assert_eq!(super::count_mkv_clusters(&[]), 0);
+        assert_eq!(super::count_mkv_clusters(&[0x1F, 0x43, 0xB6]), 0);
+        assert_eq!(super::count_mkv_clusters(&[0x1F, 0x43, 0xB6, 0x75]), 1);
+    }
+
+    /// The admission RULE the fix encodes: <2 markers declines (a lone partial
+    /// cluster yields zero cues), ≥2 markers admits — independent of byte size.
+    /// This is the invariant the observed 1.998 MB decline violated.
+    #[test]
+    fn sub_floor_island_admits_only_with_a_whole_cluster() {
+        const CID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+        let admit = |markers: usize| {
+            let mut buf = vec![0u8; markers.max(1) * 8];
+            for i in 0..markers {
+                buf[i * 8..i * 8 + 4].copy_from_slice(&CID);
+            }
+            super::count_mkv_clusters(&buf) >= 2
+        };
+        assert!(!admit(0), "no clusters must decline");
+        assert!(!admit(1), "a lone partial cluster must decline");
+        assert!(admit(2), "one whole cluster (2 markers) must admit");
+        assert!(admit(5), "several clusters must admit");
     }
 
     /// Round-10b: island selection must still prefer the range containing the

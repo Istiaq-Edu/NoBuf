@@ -1056,6 +1056,17 @@ export function upsertByteTimeAnchor(
   return candidate;
 }
 
+export function subtitlePositionQuery(
+  playheadByte: number | null,
+  calibratedSeekS: number | null,
+): string {
+  let query = playheadByte != null ? `&playhead_byte=${playheadByte}` : '';
+  if (calibratedSeekS != null && Number.isFinite(calibratedSeekS)) {
+    query += `&subs_seek_anchor=${calibratedSeekS}`;
+  }
+  return query;
+}
+
 function parseAssTimestamp(value: string): number | null {
   const match = value.trim().match(/^(\d+):(\d{2}):(\d{2})(?:\.(\d{1,2}))?$/);
   if (!match) return null;
@@ -1137,6 +1148,7 @@ export function classifySubRepairOutcome(
   assIntervalsAfter: readonly AssDialogueInterval[] | null = null,
   assBeforeCount: number | null = null,
   supplyActive: boolean = false,
+  snapshotUnchanged: boolean = false,
 ): SubRepairOutcome {
   if (hadError) {
     if (supplyActive) return 'deferred';
@@ -1150,15 +1162,36 @@ export function classifySubRepairOutcome(
     return 'failed';
   }
 
-  // ASS/SSA: no cue list exists, so judge by extracted content instead.
+  // A non-empty memo replay is HTTP 200, but it contains no new evidence. Calling
+  // an unchanged PARTIAL snapshot `ok` resets the breaker while the progress-gated
+  // region ledger stays latched, so later cache growth can never be observed until
+  // a seek changes the region. Defer through the existing 1 s / 60 s bounded retry
+  // path instead. A full artifact is terminal and must never retry.
+  if (snapshotUnchanged && !isFullyCovered) return 'deferred';
+
+  // ASS/SSA: no cue list exists, so judge by extracted dialogue intervals.
   if (assAfterLen != null) {
     const count = assIntervalsAfter?.length ?? 0;
-    if (count === 0) return 'no-progress';
+    if (count === 0) return isFullyCovered ? 'no-progress' : 'deferred';
+    // Round-23 (19-c/19-t): a CHANGED island key is not proof that subtitle
+    // coverage changed. At playhead 1000s the cached source island grew from
+    // 8.01 MiB to 9.06 MiB, so the backend correctly omitted Unchanged, but
+    // ffmpeg returned the same 15 dialogues (content 1852B -> 1852B). Because an
+    // old cue happened to cover 1000s, the adequacy check below called that `ok`;
+    // `ok` reset the breaker while coverageAdvanced=false kept the region ledger
+    // latched. No request ran again as the proactive cache grew, subtitles ended
+    // at 1005.09s, and stayed blank through 1026s until the next seek.
+    //
+    // For a PARTIAL track, zero dialogue growth is always "not yet", regardless
+    // of whether the old snapshot covers this exact tick. Defer through the
+    // bounded retry so later source-byte growth is observed. A full artifact is
+    // terminal and may legitimately return the same set forever.
+    if (!isFullyCovered && assBeforeCount != null && count <= assBeforeCount) return 'deferred';
     const lastAssEnd = assIntervalsAfter?.reduce<number | null>(
       (latest, cue) => latest == null || cue.endTime > latest ? cue.endTime : latest,
       null,
     ) ?? null;
-    if (!shouldReExtractSub(playheadS, lastAssEnd, false, graceS, assIntervalsAfter)) {
+    if (!shouldReExtractSub(playheadS, lastAssEnd, isFullyCovered, graceS, assIntervalsAfter)) {
       return 'ok';
     }
     if (assBeforeCount != null && count > assBeforeCount) return 'progress-uncovered';
@@ -2624,6 +2657,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   // Built from mp4box.seek() calibration points during initialization.
   // Each entry is [byteOffset, timeSeconds], sorted by byteOffset.
   const byteToTimeTableRef = useRef<[number, number][]>([]);
+  const subtitleRemuxCalibrationRef = useRef<number | null>(null);
 
   /** Parse streamUrl to extract base_url, folder_id, message_id, and token for fMP4 endpoints */
   const parseStreamUrl = useCallback((url: string): { baseUrl: string; folderId: string; messageId: string; token: string } | null => {
@@ -2816,10 +2850,17 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    *  estimate with ground-truth anchors — same idea as the TS keyframe byte-index
    *  (byteOffsetAtOrBeforeTime), but sourced from mediabunny's own seek reads so
    *  the green prebuffer bar lands at the correct spot for VBR MKV. */
-  const recordByteTimeAnchor = useCallback((byteOffset: number, time: number) => {
+  const recordByteTimeAnchor = useCallback((
+    byteOffset: number,
+    time: number,
+    remuxSeek: boolean = false,
+  ) => {
     const current = byteToTimeTableRef.current;
     const next = upsertByteTimeAnchor(current, byteOffset, time);
     if (next !== current) byteToTimeTableRef.current = next;
+    if (remuxSeek && next.some(([byte, at]) => byte === byteOffset && Math.abs(at - time) < 0.001)) {
+      subtitleRemuxCalibrationRef.current = time;
+    }
   }, []);
 
   // (Range reporting to the backend was removed: the backend command
@@ -6969,7 +7010,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
    */
   const fetchEmbeddedSubText = useCallback(async (
     streamIdx: number,
-  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean; frontier: number | null } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean; frontier: number | null; supplyActive?: boolean }> => {
+  ): Promise<{ text: string; format: 'ass' | 'srt'; partial: boolean; unchanged: boolean; frontier: number | null } | { error: 'empty' | 'empty-partial' | 'failed'; unchanged?: boolean; frontier: number | null; supplyActive?: boolean }> => {
     const url = streamUrlRef.current;
     const parsed = url ? parseStreamUrl(url) : null;
     if (!parsed) return { error: 'failed', frontier: null };
@@ -7007,7 +7048,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       );
     }
     const endpoint = `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/track/${streamIdx}?token=${encodeURIComponent(parsed.token)}`
-      + (playheadByte != null ? `&playhead_byte=${playheadByte}` : '');
+      + subtitlePositionQuery(playheadByte, subtitleRemuxCalibrationRef.current);
     try {
       let resp = await fetch(endpoint);
       if (resp.status === 429) {
@@ -7051,11 +7092,16 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       const okFrontierRaw = resp.headers.get('X-Subs-Frontier');
       const okFrontierNum = okFrontierRaw != null ? Number(okFrontierRaw) : null;
       const okFrontier = Number.isFinite(okFrontierNum) ? okFrontierNum : null;
+      // A memoized non-empty partial body is returned as HTTP 200. Preserve the
+      // unchanged marker here too: dropping it made the repair classifier call
+      // the stale snapshot `ok`, reset the breaker, and leave the region ledger
+      // latched forever. The same header was already handled correctly on 204.
+      const unchanged = resp.headers.get('X-Subs-Unchanged') === '1';
       const raw = await resp.text();
       const text = stripControlChars(raw);
-      if (!text.trim()) return { error: partial ? 'empty-partial' : 'empty', frontier: okFrontier };
-      diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${partial ? ', partial' : ''})`);
-      return { text, format, partial, frontier: okFrontier };
+      if (!text.trim()) return { error: partial ? 'empty-partial' : 'empty', unchanged, frontier: okFrontier };
+      diagLog(`[SUBS] track ${streamIdx} extracted: ${text.length} chars (${format}${partial ? ', partial' : ''}${unchanged ? ', unchanged' : ''})`);
+      return { text, format, partial, unchanged, frontier: okFrontier };
     } catch (e: any) {
       diagLog(`[SUBS] track ${streamIdx} fetch error: ${e?.message}`);
       return { error: 'failed', frontier: null };
@@ -10954,6 +11000,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     if (!streamUrl) return;
     tsKeyframeIndexRef.current = [];
     byteTimeSamplesRef.current = [];
+    subtitleRemuxCalibrationRef.current = null;
     // Skip the TS keyframe poll for MKV: mediabunny already parses the MKV Cues
     // into a 419-point VBR byte↔time index (seeded into byteToTimeTableRef at
     // transmuxer init), so this endpoint has nothing to offer — for MKV the

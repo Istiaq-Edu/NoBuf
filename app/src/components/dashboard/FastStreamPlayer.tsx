@@ -21,10 +21,174 @@ import { useSubtitles } from '../../hooks/useSubtitles';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
 
-export function subRepairRegionRetryDelay(outcome: SubRepairOutcome): number | null {
+/**
+ * Lead time (seconds) for `shouldReExtractSubAhead`: re-extract when the playhead
+ * comes within this many seconds of the coverage frontier. Chosen well under the
+ * ~100 s an island covers (so the fetch lands before exhaustion) and well above a
+ * normal inter-cue gap (so ordinary dialogue silences do not trigger it). 20 s.
+ */
+export const SUB_REEXTRACT_LEAD_S = 20;
+
+export type SubCoverageInterval = { startTime: number; endTime: number };
+
+/** Select scheduling evidence without changing the merged render union. */
+export function selectSubRepairCoverageIntervals(
+  mergedIntervals: readonly SubCoverageInterval[],
+  latestIslandIntervals: readonly SubCoverageInterval[] | null,
+  isFullyCovered: boolean,
+): readonly SubCoverageInterval[] {
+  if (isFullyCovered || latestIslandIntervals == null) return mergedIntervals;
+  return latestIslandIntervals;
+}
+
+export function subRepairRegionRetryDelay(
+  outcome: SubRepairOutcome,
+  successfulEmptyPartial: boolean = false,
+): number | null {
   if (outcome === 'progress' || outcome === 'progress-uncovered') return 5_000;
-  if (outcome === 'deferred') return 1_000;
+  if (outcome === 'deferred') return successfulEmptyPartial ? 3_000 : 1_000;
   return null;
+}
+
+/**
+ * Should the per-region one-shot ledger entry be RELEASED after this outcome, so
+ * a later timeupdate can re-extract within the same 120s region?
+ *
+ * The bug this fixes (13-c/13-t): an ASS island extraction that covers the
+ * playhead AT EXTRACTION TIME returns `ok`, which latches the region as "done"
+ * (`subRepairRegionRetryDelay('ok') === null`, so no retry is scheduled and the
+ * ledger entry is never cleared). But an island only carries a few seconds of
+ * cues; as the playhead advances WITHIN the same region it outruns them, and the
+ * one-shot guard (subRepairAttemptedRef) blocks every further attempt until the
+ * viewer seeks or crosses into the next region. Measured: after a seek to 1204s
+ * the delta grew +0.00 → −21.87s over 22s of playback with ZERO repair attempts.
+ *
+ * A still-`partial` track means island mode — coverage is inherently incomplete,
+ * so releasing the ledger lets the NEXT exhaustion re-arm one extraction.
+ *
+ * Round-14(B2) — MUST also require `coverageAdvanced`. Releasing on EVERY
+ * `ok+partial` caused the 15-c storm: a lead-time re-extraction that returned
+ * `ok` WITHOUT extending coverage (same island, content unchanged) released the
+ * ledger, which re-armed the trigger, which fired again next tick — ~4
+ * extractions/second, all `ok 956B→956B`. The breaker cannot stop it because
+ * `ok` is its reset condition. Gating release on real forward progress
+ * (frontier moved for SRT, or ASS content grew) makes a non-extending `ok` keep
+ * the region LATCHED, so the trigger fires again only after the viewer advances
+ * into a new region or seeks — never in a tight loop. When coverage DID advance,
+ * releasing is correct and safe: `shouldReExtractSub`/`shouldReExtractSubAhead`
+ * stay false until the (now-later) frontier is again approached.
+ *
+ * A FULLY-covered `ok` (not partial) keeps the entry latched — nothing left to
+ * extract. Failures/no-progress keep it latched too; the breaker's backoff owns
+ * those. Pure + exported for testing.
+ */
+export function shouldReleaseSubRepairRegion(
+  outcome: SubRepairOutcome,
+  trackStillPartial: boolean,
+  coverageAdvanced: boolean,
+): boolean {
+  return outcome === 'ok' && trackStillPartial && coverageAdvanced;
+}
+
+/**
+ * Lead-time re-extraction trigger (Round-14 B2). Fires when the playhead is
+ * approaching the END of current coverage — `lastCueEndS - playhead < leadS` —
+ * so the next island is fetched BEFORE the visible cues run out, instead of
+ * after (which shows a gap). Complements `shouldReExtractSub`, whose 90 s grace
+ * is deliberately wide (anti-spin on sparse films) and therefore lets coverage
+ * lapse for up to 90 s before re-extracting.
+ *
+ * Storm-safe by construction, in three independent ways:
+ *  1. Returns FALSE when there are no cues yet (`lastCueEndS == null`) — the
+ *     quiet intro before the first dialogue never triggers it (15-c fired ~30×
+ *     in the first 8 s precisely because the old predicate treated "no cue
+ *     nearby" as a hole).
+ *  2. Returns FALSE for a fully-covered track — nothing left to extract.
+ *  3. It is one-shot per 120 s region via the existing `subRepairAttemptedRef`
+ *     ledger, and the ledger is only released after coverage ACTUALLY advances
+ *     (see `shouldReleaseSubRepairRegion`). So a re-extraction that returns `ok`
+ *     without extending the frontier keeps the region latched — it cannot re-arm
+ *     itself in a loop.
+ *
+ * `leadS` should be well under the island's coverage span (≈100 s at 24 MiB) so
+ * the fetch completes before exhaustion, and comfortably above a normal
+ * inter-cue gap so ordinary dialogue silences do not trip it. Pure + exported.
+ */
+export function shouldReExtractSubAhead(
+  playheadS: number,
+  lastCueEndS: number | null,
+  isFullyCovered: boolean,
+  leadS: number = SUB_REEXTRACT_LEAD_S,
+): boolean {
+  if (isFullyCovered) return false;
+  if (lastCueEndS == null) return false;      // no coverage yet → intro, not a hole
+  if (!Number.isFinite(playheadS) || playheadS < 0) return false;
+  // Approaching the coverage frontier: within `leadS` of the last cue's end, or
+  // already past it (coverage exhausted). Playheads comfortably inside coverage
+  // (frontier more than leadS ahead) do NOT trigger.
+  return playheadS > lastCueEndS - leadS;
+}
+
+/**
+ * Round-21 (17-c/17-t) + Round-22 (18-c/18-t): should the one-shot region ledger
+ * be BYPASSED for one more extraction, even though this 120 s region was already
+ * attempted?
+ *
+ * The bug this fixes: an island covers only a few seconds, but the region
+ * ledger latches the whole 120 s region after the island stops growing (a
+ * memo-replay `ok` returns identical bytes → `coverageAdvanced === false` → the
+ * region stays latched by the anti-storm rule). The playhead then walks from the
+ * island's end to the region boundary — up to ~112 s — with the ledger blocking
+ * every re-extraction. Measured (17-t): seek to 982s, island covers to ~990s,
+ * then the playhead advanced to 1024s with ZERO further `[SUBS-ISLAND]` calls and
+ * `active=0` the entire time.
+ *
+ * The `coverageAdvanced` release (round-14) is not enough: it releases only when
+ * an extraction GREW coverage, never when the playhead OUTRAN a frontier that
+ * stopped growing — which is exactly the blank case.
+ *
+ * Round-22: the bypass must fire on the LEAD condition (playhead APPROACHING the
+ * frontier, `playhead > lastCueEnd - graceS`), not only after the playhead has
+ * already PASSED it. 18-t showed the old "must be past frontier + grace" rule
+ * pre-fetched too late: the lead trigger (`shouldReExtractSubAhead`) wanted to
+ * fetch the next island ~20 s before coverage ran out, but the ledger blocked it
+ * until the playhead was 20 s PAST the frontier — so on the 512 KiB proxy the
+ * island download (~10-20 s) started too late and subtitles blanked in the gap
+ * (playhead 1179-1188 s, active=0, until the next extract landed at 1189 s). Firing
+ * on the lead edge closes that gap while playback still has covered runway.
+ *
+ * Storm-safety is unchanged and does NOT rely on the playhead being past the
+ * frontier: the bypass is refused unless the frontier has ADVANCED since the last
+ * bypass in this region (`lastCueEnd > lastBypassFrontierS`). The 15-c storm
+ * re-extracts the SAME island (frontier unchanged) — that is still blocked. Only a
+ * genuine forward step (new cues merged, frontier moved) earns another bypass.
+ * `graceS` (= the lead window) keeps ordinary inter-cue silences from tripping it.
+ * Pure + exported.
+ */
+export function shouldBypassRegionLedger(
+  playheadS: number,
+  lastCueEndS: number | null,
+  isFullyCovered: boolean,
+  lastBypassFrontierS: number | null,
+  graceS: number = SUB_REEXTRACT_LEAD_S,
+): boolean {
+  if (isFullyCovered) return false;
+  if (lastCueEndS == null) return false;      // no coverage yet → intro, handled elsewhere
+  if (!Number.isFinite(playheadS) || playheadS < 0) return false;
+  // Round-22: fire on the LEAD edge — playhead within graceS BEFORE the frontier,
+  // or already past it — so the next island is fetched while covered runway
+  // remains (the 512 KiB proxy needs ~10-20 s to land it). The old rule required
+  // `playhead > lastCueEnd + graceS` (already 20 s past), which pre-fetched too
+  // late and blanked the gap.
+  if (playheadS <= lastCueEndS - graceS) return false;
+  // Storm guard: a memo-replay returns the SAME frontier. Only bypass when the
+  // frontier has ADVANCED since the last bypass in this region — otherwise a
+  // non-growing island (whose `ok` resets the breaker) could bypass every tick.
+  // The first bypass (lastBypassFrontierS == null) is always allowed. This is the
+  // sole storm defense now that the position gate no longer requires being past
+  // the frontier.
+  if (lastBypassFrontierS != null && lastCueEndS <= lastBypassFrontierS) return false;
+  return true;
 }
 
 export interface SubRepairRetrySchedule {
@@ -177,7 +341,11 @@ interface FastStreamPlayerProps {
   // Embedded subtitle bookkeeping: stream idx → loaded SubtitleTrack (so a
   // re-click toggles instead of re-fetching, E18), which idx is mid-fetch
   // (spinner row + double-click guard), and the busy idx as state for renders.
-  const embeddedSubTracksRef = useRef<Map<number, { track: SubtitleTrack; partial: boolean }>>(new Map());
+  const embeddedSubTracksRef = useRef<Map<number, {
+    track: SubtitleTrack;
+    partial: boolean;
+    localIntervals: SubCoverageInterval[] | null;
+  }>>(new Map());
   const embeddedSubLoadingIdxRef = useRef<number | null>(null);
   const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
   const [subtitleRevision, setSubtitleRevision] = useState(0);
@@ -674,7 +842,7 @@ interface FastStreamPlayerProps {
               typeof status.remux_seek_time_s === 'number' &&
               typeof status.remux_seek_actual_byte === 'number'
             ) {
-              recordByteTimeAnchor(status.remux_seek_actual_byte, status.remux_seek_time_s);
+              recordByteTimeAnchor(status.remux_seek_actual_byte, status.remux_seek_time_s, true);
             }
             // Show EVERY cached range. This bar is sourced from the backend disk
             // cache (status.cached_ranges) — every range in it is ON DISK and
@@ -1600,15 +1768,26 @@ interface FastStreamPlayerProps {
     // while it is active.
     const existing = embeddedSubTracksRef.current.get(idx);
     const isActive = existing ? subs.activeTracks.includes(existing.track) : false;
+    // Coverage MUST be read from the real cue source. ASS keeps `cues` empty
+    // (jassub renders `assContent`), so reading `.cues` reported zero coverage
+    // and forced staleForPlayhead=true on EVERY ASS click — killing the plain
+    // toggle branch (an active ASS track could never be turned off) and forcing
+    // a needless re-extract + re-activate that stomps the current selection.
+    // Mirror the repair loop, which already uses assDialogueIntervals.
+    const coverageIntervals = existing
+      ? (existing.track.isASS
+          ? assDialogueIntervals(existing.track.assContent)
+          : existing.track.cues)
+      : [];
     const staleForPlayhead = existing
       ? shouldReExtractSub(
           vidRef.current?.currentTime ?? 0,
-          lastCueEnd(existing.track.cues),
+          lastCueEnd(coverageIntervals),
           !existing.partial,
           undefined,
           // Round-20: pass the cue INTERVALS so a backward seek into a hole
           // between two islands is seen as uncovered.
-          existing.track.cues,
+          coverageIntervals,
         )
       : false;
     // Re-extract only when the cues can't serve the viewer: stale coverage, or a
@@ -1659,7 +1838,7 @@ interface FastStreamPlayerProps {
           && subs.getSelectionVersion() === selectionVersionAtStart
         ) {
           const track = new SubtitleTrack(label, language || null);
-          embeddedSubTracksRef.current.set(idx, { track, partial: true });
+          embeddedSubTracksRef.current.set(idx, { track, partial: true, localIntervals: null });
           subs.activateTrack(subs.addTrack(track));
           persistSubTrack(fileKey, idx);
           setEmbeddedSubUnavailable((prev) => {
@@ -1718,6 +1897,9 @@ interface FastStreamPlayerProps {
         // directly; parse into a scratch track and union the cue lists.
         const scratch = new SubtitleTrack(null, null);
         scratch.loadText(res.text);
+        existing.localIntervals = scratch.isASS
+          ? assDialogueIntervals(scratch.assContent)
+          : scratch.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime }));
         if (scratch.isASS) {
           // Island extraction returns only the current region. Replacing the ASS
           // payload here discarded every previously downloaded region whenever
@@ -1735,7 +1917,13 @@ interface FastStreamPlayerProps {
       }
       const track = new SubtitleTrack(label, language || null);
       track.loadText(res.text);
-      embeddedSubTracksRef.current.set(idx, { track, partial: res.partial });
+      embeddedSubTracksRef.current.set(idx, {
+        track,
+        partial: res.partial,
+        localIntervals: track.isASS
+          ? assDialogueIntervals(track.assContent)
+          : track.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime })),
+      });
       const added = subs.addTrack(track);
       if (subs.getSelectionVersion() === selectionVersionAtStart) {
         subs.activateTrack(added);
@@ -1748,6 +1936,20 @@ interface FastStreamPlayerProps {
       }
     }
   }, [subs, msePlayer, activeFolderId, file.id]);
+
+  const toggleLoadedSubTrack = useCallback((track: SubtitleTrack) => {
+    for (const [idx, entry] of embeddedSubTracksRef.current) {
+      if (entry.track !== track) continue;
+      const info = msePlayer.embeddedSubTracks.find((candidate) => candidate.idx === idx);
+      void toggleEmbeddedSub(
+        idx,
+        info?.label ?? track.label ?? `Track ${idx}`,
+        info?.language ?? track.language ?? '',
+      );
+      return;
+    }
+    subs.toggleTrack(track);
+  }, [msePlayer.embeddedSubTracks, subs, toggleEmbeddedSub]);
 
   // Round-10 P1-2: automatic subtitle-coverage repair.
   //
@@ -1768,6 +1970,10 @@ interface FastStreamPlayerProps {
   //     file switch mid-fetch discards the result
   const subRepairAttemptedRef = useRef<Set<string>>(new Set());
   const subRepairRetryTimersRef = useRef<Map<string, number>>(new Map());
+  // Round-21: last coverage frontier (s) at which we BYPASSED the region ledger,
+  // per region key. Lets `shouldBypassRegionLedger` refuse a repeat bypass at an
+  // unchanged frontier (memo-replay), so the bypass cannot storm.
+  const subRepairBypassFrontierRef = useRef<Map<string, number>>(new Map());
   // Breaker state is per (file, track, 120-second region). A failed or deferred
   // opening-prefix extraction is evidence about that region only; it must not
   // spend the attempt ceiling for a later seek where a usable island exists.
@@ -1797,13 +2003,30 @@ interface FastStreamPlayerProps {
         // Round-20: pass the cue INTERVALS. With only `lastCueEnd` this gate
         // silently skipped every backward seek into a hole between two islands
         // (20-c: 7 consecutive seeks, zero requests reached the backend).
-        const coverageIntervals = entry.track.isASS
+        const mergedCoverageIntervals = entry.track.isASS
           ? assDialogueIntervals(entry.track.assContent)
           : entry.track.cues;
-        if (!shouldReExtractSub(
-          playheadS, lastCueEnd(coverageIntervals), !entry.partial,
-          undefined, coverageIntervals,
-        )) continue;
+        const coverageIntervals = selectSubRepairCoverageIntervals(
+          mergedCoverageIntervals, entry.localIntervals, !entry.partial,
+        );
+        const coverageFrontier = lastCueEnd([...coverageIntervals]);
+        // Fire on EITHER the wide adequacy gate (playhead outran coverage by the
+        // 90 s grace, or fell in a hole) OR the tight lead-time gate (playhead is
+        // within SUB_REEXTRACT_LEAD_S of the coverage frontier — fetch the next
+        // island BEFORE the visible cues run out). The lead gate is what makes
+        // the larger 24 MiB island refresh seamlessly instead of lapsing; it is
+        // storm-safe because the region ledger is only released after coverage
+        // actually advances (Round-14 B2).
+        const emptyPartialSnapshot =
+          entry.partial && entry.localIntervals != null && entry.localIntervals.length === 0;
+        const needsReExtract =
+          emptyPartialSnapshot ||
+          shouldReExtractSub(
+            playheadS, coverageFrontier, !entry.partial,
+            undefined, coverageIntervals,
+          ) ||
+          shouldReExtractSubAhead(playheadS, coverageFrontier, !entry.partial);
+        if (!needsReExtract) continue;
         const regionKey = selectSubRepairBreakerKey(String(file.id), idx, playheadS);
         // Breaker and ledger share the same region key. A deferred retry stays
         // bounded within this region, while a distant seek starts with clean
@@ -1815,7 +2038,22 @@ interface FastStreamPlayerProps {
         }
         // One attempt per ~2-minute region, on top of the breaker: a genuinely
         // uncached region must not re-fetch on every tick.
-        if (subRepairAttemptedRef.current.has(regionKey)) continue;
+        //
+        // Round-21 (17-c/17-t): but an island covers only a few seconds while a
+        // region is 120 s, so once the playhead OUTRUNS a non-growing island the
+        // ledger would otherwise blank subtitles for up to ~112 s. Bypass the
+        // one-shot ledger when the playhead has clearly passed the loaded
+        // coverage frontier — that re-extraction targets a new island (forward
+        // progress), not the 15-c storm (which re-hits the SAME island from
+        // INSIDE its coverage). The breaker (checked above) still bounds it.
+        const bypassLedger = shouldBypassRegionLedger(
+          playheadS, coverageFrontier, !entry.partial,
+          subRepairBypassFrontierRef.current.get(regionKey) ?? null,
+        );
+        if (!bypassLedger && subRepairAttemptedRef.current.has(regionKey)) continue;
+        if (bypassLedger && coverageFrontier != null) {
+          subRepairBypassFrontierRef.current.set(regionKey, coverageFrontier);
+        }
         subRepairAttemptedRef.current.add(regionKey);
         void repairSubCoverage(idx, entry, bkey, playheadS, regionKey);
         return; // one at a time; the backend serialises extractions anyway
@@ -1825,7 +2063,7 @@ interface FastStreamPlayerProps {
 
   const repairSubCoverage = useCallback(async (
     idx: number,
-    entry: { track: SubtitleTrack; partial: boolean },
+    entry: { track: SubtitleTrack; partial: boolean; localIntervals: SubCoverageInterval[] | null },
     bkey: string,
     playheadS: number,
     regionKey?: string,
@@ -1856,6 +2094,10 @@ interface FastStreamPlayerProps {
     // dead code until now because this call site passed a hardcoded `null`.
     let frontierBytes: number | null = null;
     let supplyActive = false;
+    // `X-Subs-Unchanged` can accompany a non-empty HTTP 200 memo replay. It must
+    // survive past the fetch try/finally into outcome classification.
+    let snapshotUnchanged = false;
+    let successfulEmptyPartial = false;
     try {
       const res = await msePlayer.fetchEmbeddedSubText(idx);
       if (embeddedSubFileGenRef.current !== genAtStart) return; // file switched
@@ -1863,7 +2105,12 @@ interface FastStreamPlayerProps {
       if ('error' in res) {
         hadError = true;
         supplyActive = res.supplyActive === true;
+        // A 204 empty-partial response is local evidence about THIS island. Do
+        // not retain a previous seek's future intervals: the bounded retry would
+        // otherwise consult stale coverage and suppress the very recheck it scheduled.
+        if (res.error === 'empty-partial') entry.localIntervals = [];
       } else {
+        snapshotUnchanged = res.unchanged;
         // Round-15 R-3: MERGE, never clobber. The old code did
         // `entry.track.cues = []; entry.track.loadText(res.text)` — a blind
         // replace that destroyed coverage whenever a later island-mode
@@ -1878,6 +2125,10 @@ interface FastStreamPlayerProps {
         // needs the replacement content verbatim.
         const scratch = new SubtitleTrack(null, null);
         scratch.loadText(res.text);
+        entry.localIntervals = scratch.isASS
+          ? assDialogueIntervals(scratch.assContent)
+          : scratch.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime }));
+        successfulEmptyPartial = res.partial && entry.localIntervals.length === 0;
         if (scratch.isASS) {
           entry.track.loadText(mergeAssContent(entry.track.assContent, res.text));
           assAfterLen = entry.track.assContent?.length ?? 0;
@@ -1917,10 +2168,32 @@ interface FastStreamPlayerProps {
       entry.track.cues, cuesBeforeCount,
       assIntervalsAfter, assBeforeCount,
       supplyActive,
+      // Preserve X-Subs-Unchanged on HTTP 200 memo replays. Without this, the
+      // stale partial snapshot is misclassified `ok` and the region never reopens
+      // to observe a later, larger cached island.
+      snapshotUnchanged,
     );
     const stAfter = reduceSubRepairBreaker(stBefore, outcome, startedAt, frontierBytes);
     setBreaker(bkey, stAfter);
-    const retryDelay = subRepairRegionRetryDelay(outcome);
+    // Release the one-shot region ledger after a successful-but-PARTIAL island
+    // extraction that ACTUALLY EXTENDED coverage, so forward playback within the
+    // same 120s region can re-extract once the playhead outruns the cues. Without
+    // this the region latches on the first `ok` and subtitles freeze until the
+    // next seek (13-c: delta grew to −21.87s, zero repairs).
+    //
+    // Round-14(B2): the release MUST require forward progress. An `ok` that did
+    // not extend the frontier (same island re-extracted, content unchanged) must
+    // keep the region LATCHED, or the lead-time trigger re-arms and fires every
+    // tick — the 15-c storm (~4 `ok 956B→956B`/s, which the breaker cannot stop
+    // because `ok` is its reset condition). Progress = SRT frontier advanced
+    // (`after > before`) OR ASS content grew (`assAfterLen > assBeforeLen`).
+    const coverageAdvanced =
+      (after != null && (before == null || after > before)) ||
+      (assAfterLen != null && (assBeforeLen == null || assAfterLen > assBeforeLen));
+    if (regionKey && shouldReleaseSubRepairRegion(outcome, entry.partial, coverageAdvanced)) {
+      subRepairAttemptedRef.current.delete(regionKey);
+    }
+    const retryDelay = subRepairRegionRetryDelay(outcome, successfulEmptyPartial);
     if (regionKey && retryDelay != null) {
       scheduleSubRepairRegionRetry({
         regionKey,
@@ -1969,6 +2242,7 @@ interface FastStreamPlayerProps {
     }
     subRepairRetryTimersRef.current.clear();
     subRepairAttemptedRef.current.clear();
+    subRepairBypassFrontierRef.current.clear();
     return () => {
       for (const timer of subRepairRetryTimersRef.current.values()) {
         window.clearTimeout(timer);
@@ -2234,6 +2508,19 @@ interface FastStreamPlayerProps {
   // immediately. Does NOT touch the seek bar / time readout.
   const barDur = dur || (window as any).__nobuf_ptsDuration || (window as any).__nobuf_estimateDuration || 0;
 
+  // The captions menu has a dedicated "Embedded" section (below) that owns every
+  // embedded MKV track. Embedded tracks are ALSO pushed into `subs.tracks` (so
+  // the overlay and `activeTracks` can see them), which made them appear a
+  // SECOND time in the generic loaded-tracks list — and that duplicate row was
+  // wired to a raw single-active swap with no extraction/coverage/persistence.
+  // Selecting a new embedded track grew this list, reflowed the rows, and a
+  // stray click on the duplicate silently reverted the active track. Show only
+  // genuine sidecar tracks here; embedded tracks are rendered once, below.
+  const embeddedTrackObjs = new Set(
+    [...embeddedSubTracksRef.current.values()].map((e) => e.track),
+  );
+  const sidecarTracks = subs.tracks.filter((t) => !embeddedTrackObjs.has(t));
+
   // Chip registry: id → button JSX. Each movable control lives here once and is
   // placed by the persisted layout into left/right/tray zones.
   const chipButton = (id: string): { el: React.ReactNode; label: string } => {
@@ -2254,9 +2541,9 @@ interface FastStreamPlayerProps {
           {subMenu && (
             <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
               <button onClick={() => { subs.deactivateAll(); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
-              {subs.tracks.map((t, i) => (
-                <button key={i} onClick={() => subs.toggleTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
-                  {t.label || t.language || `Track ${i + 1}`}{t.isASS ? ' (ASS)' : ''}
+              {sidecarTracks.map((t) => (
+                <button key={`${t.label ?? ''}:${t.language ?? ''}`} onClick={() => toggleLoadedSubTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
+                  {t.label || t.language || 'Subtitle'}{t.isASS ? ' (ASS)' : ''}
                 </button>
               ))}
               {(msePlayer.embeddedSubTracks.length > 0 || msePlayer.embeddedSubsLoading) && (

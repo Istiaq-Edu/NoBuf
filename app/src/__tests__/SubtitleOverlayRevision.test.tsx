@@ -192,7 +192,7 @@ describe('SubtitleOverlay', () => {
     ));
     const instance = jassubMock.instances[0];
     expect(videoRef.current?.parentElement?.querySelector('canvas.JASSUB')).toBeNull();
-    expect(result.container.textContent).toContain('Fallback Hello');
+    await waitFor(() => expect(result.container.textContent).toContain('Fallback Hello'));
     await waitFor(() => expect(instance.terminate).toHaveBeenCalledTimes(1));
     result.unmount();
     expect(instance.destroy).not.toHaveBeenCalled();
