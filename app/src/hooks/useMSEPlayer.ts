@@ -274,6 +274,96 @@ export function startProactivePositionReporter({
   return setInterval(report, intervalMs);
 }
 
+export interface ColdStartOverlayArmInput {
+  /** A stream URL is present and this is a fresh per-file init. */
+  streamOpen: boolean;
+  /** detectFormat has run (route is known). */
+  formatDetected: boolean;
+  /** This file fell back to the native <video> element. */
+  useNative: boolean;
+  /** The active tier reported its player ready (MEDIA_INFO / mp4box onReady). */
+  playerReady: boolean;
+}
+
+export interface ColdStartOverlayArmDecision {
+  armed: boolean;
+  phase: ColdStartPhase;
+}
+
+/**
+ * Should the cold-start overlay be armed right now?
+ *
+ * The overlay used to arm only at the post-detection route branches, all of
+ * which sit behind the blocking MKV header prefetch — so a click at 15:44:20
+ * produced a branded overlay at 15:44:28 (8s of bare generic spinner). Arming
+ * is therefore decided at the OPEN boundary instead.
+ *
+ * Two constraints are load-bearing:
+ *  - `'buffering'` is never returned. That phase drives the byte-progress
+ *    poller, which reads a shadow cache created after detection and measures
+ *    COLD_START_TIMEOUT_MS from arm time; arming it at open would shorten the
+ *    real TS cold-start gate.
+ *  - `useNative` dismisses. Several routes bail to native playback with a bare
+ *    return, which would otherwise strand the overlay over working video until
+ *    the 45s safety timeout.
+ *
+ * Pure + exported for testing.
+ */
+export function decideColdStartOverlayArm({
+  streamOpen,
+  useNative,
+  playerReady,
+}: ColdStartOverlayArmInput): ColdStartOverlayArmDecision {
+  if (!streamOpen || useNative || playerReady) {
+    return { armed: false, phase: 'none' };
+  }
+  // One stable phase for the whole pre-ready window: a phase change on a live
+  // overlay reads to the user as a second overlay appearing.
+  return { armed: true, phase: 'fetching_metadata' };
+}
+
+export interface RemuxColdStartSeedInput {
+  fileId: number | undefined;
+  fileSize: number;
+  paused: boolean;
+}
+
+export interface RemuxColdStartSeedDecision {
+  seed: boolean;
+  byteOffset: number | null;
+  isPlayerDownloading: boolean;
+}
+
+/**
+ * Decide the ONE eager proactive seed dispatched at the /remux routing seam.
+ *
+ * The periodic reporter is the ongoing owner, but it is installed after
+ * `await MEDIA_INFO` → `await coldStartDeferred` → `await player.play()`, so on
+ * a cold HEVC-MKV start it cannot fire until the cached header prefix has
+ * already drained. /stream is in cached_prefix mode there and is structurally
+ * forbidden from falling back to Telegram, so it merely waits — no producer
+ * exists, the backend byte counter freezes, and the speed meter's sliding
+ * window decays to a hard zero before the producer appears.
+ *
+ * Two protocol details the backend enforces:
+ *  - `isPlayerDownloading` must be false, or should_defer_proactive_spawn
+ *    returns early and the seed defeats itself.
+ *  - `byteOffset` must be an explicit number; a null offset hits the
+ *    "/stream bootstrap still running" defer while the cache has no ranges yet.
+ *
+ * Pure + exported for testing.
+ */
+export function decideRemuxColdStartSeed({
+  fileId,
+  fileSize,
+  paused,
+}: RemuxColdStartSeedInput): RemuxColdStartSeedDecision {
+  if (!fileId || fileSize <= 0 || paused) {
+    return { seed: false, byteOffset: null, isPlayerDownloading: false };
+  }
+  return { seed: true, byteOffset: 0, isPlayerDownloading: false };
+}
+
 /**
  * Was this player already fetching from the /remux tier? Used as the loop
  * guard for the TS-HEVC fatal-error recovery: a failure ON the /remux tier
@@ -2424,6 +2514,28 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   });
   // Deferred promise resolved when the first 5MB is in the shadow cache (or timeout).
   const coldStartDeferredRef = useRef<{ resolve: () => void; promise: Promise<void> } | null>(null);
+  /** Apply a cold-start overlay arm/dismiss decision. Every route that ends the
+   *  startup path (including the native bail-outs, which used to return bare and
+   *  strand the overlay for 45s) funnels through here. */
+  const applyColdStartOverlayArm = (input: Partial<ColdStartOverlayArmInput>) => {
+    const decision = decideColdStartOverlayArm({
+      streamOpen: true,
+      formatDetected: false,
+      useNative: false,
+      playerReady: false,
+      ...input,
+    });
+    if (decision.armed) {
+      setIsColdStartBuffering(true);
+      setColdStartPhase(decision.phase);
+      setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate until a tier owns it
+    } else {
+      coldStartDeferredRef.current?.resolve();
+      coldStartDeferredRef.current = null;
+      setIsColdStartBuffering(false);
+      setColdStartPhase('none');
+    }
+  };
   const isCompleteRef = useRef(false);
   // Once the download loop reaches fileLength, the backend has all data cached.
   // This ref never resets — even if a backward seek resets isComplete=false,
@@ -2955,6 +3067,15 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       setEmbeddedSubFonts([]);
       setEmbeddedSubsLoading(false);
       embeddedSubsFetchedForRef.current = null;
+      // Arm the cold-start overlay HERE — at the open boundary, before the
+      // MediaSource, the HEAD, format detection and the blocking MKV header
+      // prefetch. Every tier used to arm it only after that work, so a click
+      // showed the bare generic spinner for ~8s on a cold HEVC-MKV start and
+      // the branded overlay appeared just before playback. Guarded by the
+      // per-file discriminator: the MP4 audio switch re-runs this effect via
+      // mp4ReinitNonce on the SAME streamUrl and must not flash the overlay
+      // mid-playback.
+      applyColdStartOverlayArm({ streamOpen: true });
     }
 
     // Swallow the known-benign promise rejections that mediabunny's source
@@ -3082,12 +3203,14 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // Truly timed out — no transmuxer init in progress or max timeout reached
         console.error(`[MSE] Initialization timeout (${timeoutElapsed / 1000}s) — falling back to native playback`);
         setError('MSE initialization timeout');
+        applyColdStartOverlayArm({ useNative: true });
         setUseNative(true);
         initTimeoutRef.current = null;
       };
       initTimeoutRef.current = window.setTimeout(checkInitTimeout, MSE_INIT_TIMEOUT_MS);
     } catch (e) {
       setError('MediaSource not supported');
+      applyColdStartOverlayArm({ useNative: true });
       setUseNative(true);
     }
 
@@ -3995,6 +4118,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
       mp4box.onError = (e: any) => {
         console.error('[MSE] mp4box error:', e);
         if (!cancelledRef.current) {
+          applyColdStartOverlayArm({ useNative: true });
           setUseNative(true);
         }
       };
@@ -4060,6 +4184,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
 
       if (format === 'unknown') {
         diagLog('[MSE] Unknown format — falling back to native playback');
+        applyColdStartOverlayArm({ useNative: true });
         setUseNative(true);
         return;
       }
@@ -4220,6 +4345,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // native <video> element instead.
         if (format === 'webm') {
           diagLog('[MSE] webm — using native playback (WebView2 plays VP8/VP9/Opus natively)');
+          applyColdStartOverlayArm({ useNative: true });
           setUseNative(true);
           return;
         }
@@ -4289,6 +4415,38 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
           setColdStartPhase('initializing_player');
           setColdStartProgress({ bytes: 0, targetBytes: 0 }); // indeterminate for remux
 
+          // PRODUCER HANDOFF SEED. The periodic reporter installed inside
+          // _initMpegtsPlayer is the ongoing owner, but it sits behind
+          // `await MEDIA_INFO` → `await coldStartDeferred` → `await player.play()`,
+          // so on a cold start it cannot fire until ~10s after the click. By
+          // then ffmpeg has already consumed the cached 6 MiB header prefix and
+          // /stream — in cached_prefix mode, which is structurally forbidden
+          // from falling back to Telegram — is merely waiting on the cache.
+          // With no producer, session_downloaded_bytes freezes and the speed
+          // meter's 3s window decays to a hard zero, which is the visible
+          // "speed drops to none, then climbs again" hitch. Seeding one report
+          // here starts the proactive producer BEFORE the prefix drains.
+          // has_proactive_task dedupes against the periodic owner.
+          const seed = decideRemuxColdStartSeed({
+            fileId: file?.id,
+            fileSize: state.current.fileLength,
+            paused: isPausedRef.current,
+          });
+          if (seed.seed) {
+            proactivePrebufferMsgIdRef.current = file!.id;
+            diagLog(`[MSE] mkv (${mkvCodec}) — seeding proactive producer at byte ${seed.byteOffset} before remux init`);
+            invoke('cmd_report_playback_position', {
+              messageId: file!.id,
+              folderId: activeFolderId,
+              currentTimeS: 0,
+              durationS: file?.duration ?? 0,
+              fileSize: state.current.fileLength,
+              isPlayerDownloading: seed.isPlayerDownloading,
+              playbackRate: 1.0,
+              byteOffset: seed.byteOffset,
+            }).catch(() => { /* periodic reporter retries */ });
+          }
+
           await _initMpegtsPlayer(remuxUrl, mediaSource, blobUrl, parsed);
           return;
         }
@@ -4297,6 +4455,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
         // fallback. WebView2 can play VP9/AV1 MKV natively; H.264 MKV would fail
         // natively, but if detection failed we have no better option.
         diagLog(`[MSE] mkv (${mkvCodec ?? 'unknown'}) — not transmuxable/remuxable, using native playback`);
+        applyColdStartOverlayArm({ useNative: true });
         setUseNative(true);
         return;
       }

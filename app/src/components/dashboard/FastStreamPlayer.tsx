@@ -2833,7 +2833,7 @@ interface FastStreamPlayerProps {
         {!err && (
           <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} revision={subtitleRevision} assFonts={msePlayer.getEmbeddedSubFontUrls()} />
         )}
-        {load && !err && (
+        {load && !err && !showColdStartOverlay && !isRemuxLoading && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
