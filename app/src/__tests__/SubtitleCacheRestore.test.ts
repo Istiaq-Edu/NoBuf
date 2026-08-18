@@ -21,7 +21,6 @@ import {
   readCachedSub,
   persistCachedSub,
   subtitleLabel,
-  SUB_CACHE_STORE_KEY,
 } from '../hooks/useMSEPlayer';
 
 const VTT = `WEBVTT
@@ -110,17 +109,17 @@ describe('a restored cached subtitle is reachable in the captions menu', () => {
     expect(track.language).toBeNull();
   });
 
-  it('a corrupt cached payload does not throw the restore path', () => {
+  it('a payload that is not valid WebVTT does not throw the restore path', () => {
     // The restore is wrapped in try/catch; prove the failure mode is a no-cue track
     // or a caught throw, never an unhandled exception that breaks the file switch.
-    localStorage.setItem(SUB_CACHE_STORE_KEY, JSON.stringify({
-      '7:3': { text: 'not a subtitle at all', label: 'junk', language: 'en' },
-    }));
-    const c = readCachedSub('7:3')!;
+    // Injected through the WRITER — the cache is in memory now, so localStorage
+    // cannot seed a bad record.
+    persistCachedSub('7:3', { text: 'not a subtitle at all', label: 'junk', language: 'en' });
+    const c = readCachedSub('7:3');
     expect(c).not.toBeNull();
     expect(() => {
-      const t = new SubtitleTrack(c.label, c.language || null);
-      try { t.loadText(c.text); } catch { /* mirrored by the shipped try/catch */ }
+      const t = new SubtitleTrack(c!.label, c!.language || null);
+      try { t.loadText(c!.text); } catch { /* mirrored by the shipped try/catch */ }
     }).not.toThrow();
   });
 });

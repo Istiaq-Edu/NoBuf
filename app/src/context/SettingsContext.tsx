@@ -46,7 +46,14 @@ export function formatSpeedLimitCompact(kbPerSec: SpeedLimitValue): string {
     return `↓${kbPerSec}K`;
 }
 
-/** Clamp a persisted numeric setting into range, falling back when non-finite. */
+/**
+ * Clamp a persisted numeric setting into range, falling back when non-finite.
+ *
+ * Retained as a general-purpose sanitizer for numeric settings: the subtitle
+ * size/position values that originally used it are now session-only state, but the
+ * next persisted number wants the same NaN/out-of-range guard rather than a fresh
+ * copy of it.
+ */
 export function clampSetting(
     value: number | undefined,
     min: number,
@@ -154,8 +161,6 @@ export interface Settings {
     playerAutoHideDelay: AutoHideDelay;
     playerShowPinButton: boolean;   // show pin button on control bar; when off, controls never auto-hide
     playerSettingsWidth: number;    // px width of the video settings side panel (resizable + persisted)
-    playerSubtitleFontScale: number;   // subtitle size multiplier, 0.5–3.0 (1 = 5% of picture height)
-    playerSubtitleOffsetPct: number;   // subtitle vertical offset, -40–40 (% of picture height; + up, − down)
     openSubtitlesApiKey: string;       // user's own OpenSubtitles.com API key (free signup); never bundled
     openSubtitlesLanguage: string;     // preferred subtitle language for online search (ISO 639-1)
     openSubtitlesQuota: { remaining: number; resetAtMs: number } | null; // last reported daily download quota (free tier = 5/day)
@@ -180,8 +185,6 @@ const defaultSettings: Settings = {
     playerAutoHideDelay: 3,
     playerShowPinButton: false,
     playerSettingsWidth: 336,
-    playerSubtitleFontScale: 1,
-    playerSubtitleOffsetPct: 0,
     openSubtitlesApiKey: '',
     openSubtitlesLanguage: 'en',
     openSubtitlesQuota: null,
@@ -220,10 +223,6 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
                     // the overlay's inline styles. A corrupt or out-of-range stored
                     // value must not reach it: a NaN px style is dropped silently by
                     // CSSOM, which renders no subtitles at all with no error.
-                    cleaned.playerSubtitleFontScale = clampSetting(
-                        cleaned.playerSubtitleFontScale, 0.5, 3, defaultSettings.playerSubtitleFontScale);
-                    cleaned.playerSubtitleOffsetPct = clampSetting(
-                        cleaned.playerSubtitleOffsetPct, -40, 40, defaultSettings.playerSubtitleOffsetPct);
                     // The API key and language are STRINGS consumed by `.trim()` in the
                     // search panel and passed to a Rust command. A non-string from a
                     // hand-edited settings.json would throw on `.trim()` and take the

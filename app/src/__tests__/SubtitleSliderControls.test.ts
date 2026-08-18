@@ -57,14 +57,14 @@ describe('Task 9.2 — double-click resets each slider to its default', () => {
   it('Size resets to 1 (100%)', () => {
     const block = appearanceBlock();
     expect(block).toContain(
-      "onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleFontScale', 1); }}",
+      'onDoubleClick={(e) => { e.stopPropagation(); setSubFontScale(1); }}',
     );
   });
 
   it('Position resets to 0 (Default)', () => {
     const block = appearanceBlock();
     expect(block).toContain(
-      "onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleOffsetPct', 0); }}",
+      'onDoubleClick={(e) => { e.stopPropagation(); setSubOffsetPct(0); }}',
     );
   });
 

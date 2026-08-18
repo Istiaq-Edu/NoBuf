@@ -727,8 +727,6 @@ export function persistSubTrack(fileKey: string, streamIdx: number): void {
  * Delay is per FILE because a 2.5s offset for one release is wrong for every other,
  * unlike size/position which are per-taste and live in settings.json.
  */
-export const SUB_DELAY_STORE_KEY = 'nobuf-sub-delay';
-const SUB_DELAY_STORE_CAP = 200;
 /** Matches SUB_DELAY_MAX_S in subtitles/subtitleLayout.ts. */
 export const SUB_DELAY_LIMIT_S = 10;
 
@@ -753,27 +751,6 @@ export function clampSubDelay(seconds: number): number {
   return Math.min(Math.max(seconds, -SUB_DELAY_LIMIT_S), SUB_DELAY_LIMIT_S);
 }
 
-export function readPersistedSubDelay(fileKey: string): number {
-  try {
-    const map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY) ?? '{}');
-    const v = map[fileKey];
-    return typeof v === 'number' ? clampSubDelay(v) : 0;
-  } catch { return 0; }
-}
-
-export function persistSubDelay(fileKey: string, seconds: number): void {
-  try {
-    let map: Record<string, number>;
-    try { map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY) ?? '{}') ?? {}; }
-    catch { map = {}; }
-    delete map[fileKey]; // re-insert → newest position
-    map[fileKey] = clampSubDelay(seconds);
-    const keys = Object.keys(map);
-    for (let i = 0; i < keys.length - SUB_DELAY_STORE_CAP; i++) delete map[keys[i]];
-    localStorage.setItem(SUB_DELAY_STORE_KEY, JSON.stringify(map));
-  } catch { /* storage full/unavailable — non-fatal */ }
-}
-
 // ---- Downloaded-subtitle cache -------------------------------------------
 //
 // Why this exists: `clearTracks()` runs on every file change
@@ -784,7 +761,6 @@ export function persistSubDelay(fileKey: string, seconds: number): void {
 //
 // Keyed by fileKey (`folderId:messageId`), the same key the sync-delay store uses.
 
-export const SUB_CACHE_STORE_KEY = 'nobuf-sub-cache';
 /**
  * Total budget for cached subtitle text.
  *
@@ -816,24 +792,32 @@ function isCachedSub(v: unknown): v is CachedSub {
     && typeof c.language === 'string';
 }
 
+/**
+ * In-memory cache of downloaded subtitle text, keyed by fileKey.
+ *
+ * SESSION-ONLY BY DESIGN. This used to write `localStorage`, which meant a growing
+ * on-disk blob (up to SUB_CACHE_MAX_BYTES) that survived restarts. It is now a plain
+ * module-level Map: re-opening a file within the SAME session still reuses the
+ * subtitle (so switching away and back does not re-spend one of the 5 daily
+ * downloads), but nothing is written to disk and a restart starts clean.
+ *
+ * The byte budget and eviction are kept: a long session can still download many
+ * subtitles, and an unbounded Map would hold every one of them in memory.
+ */
+const subCache = new Map<string, CachedSub>();
+
 function readSubCacheMap(): SubCacheMap {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SUB_CACHE_STORE_KEY) ?? '{}');
-    if (!raw || typeof raw !== 'object') return {};
-    // Drop malformed entries rather than failing the whole read: one bad record
-    // written by an older build must not lose the rest of the cache.
-    const out: SubCacheMap = {};
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (isCachedSub(v)) out[k] = v;
-    }
-    return out;
-  } catch { return {}; }
+  // Object view for the pure eviction helper below (insertion order preserved).
+  const out: SubCacheMap = {};
+  for (const [k, v] of subCache) out[k] = v;
+  return out;
 }
 
 /** Cached subtitle for a file, or null when absent/unusable. */
 export function readCachedSub(fileKey: string): CachedSub | null {
   if (!fileKey) return null;
-  return readSubCacheMap()[fileKey] ?? null;
+  const hit = subCache.get(fileKey);
+  return hit && isCachedSub(hit) ? hit : null;
 }
 
 /**
@@ -857,19 +841,24 @@ export function evictSubCache(map: SubCacheMap, maxBytes: number): SubCacheMap {
 }
 
 /**
- * Cache a downloaded subtitle. Silently does nothing when it cannot help:
- * an oversized payload is skipped rather than evicting the whole cache for it.
+ * Cache a downloaded subtitle for the rest of this session. Silently does nothing
+ * when it cannot help: an oversized payload is skipped rather than evicting the whole
+ * cache for it.
  */
 export function persistCachedSub(fileKey: string, entry: CachedSub): void {
   if (!fileKey || !entry?.text) return;
   if (entry.text.length > SUB_CACHE_MAX_ENTRY_BYTES) return;
-  try {
-    const map = readSubCacheMap();
-    delete map[fileKey]; // re-insert → newest position
-    map[fileKey] = { text: entry.text, label: entry.label, language: entry.language };
-    const trimmed = evictSubCache(map, SUB_CACHE_MAX_BYTES);
-    localStorage.setItem(SUB_CACHE_STORE_KEY, JSON.stringify(trimmed));
-  } catch { /* quota exceeded / unavailable — the download still worked */ }
+  subCache.delete(fileKey); // re-insert → newest position
+  subCache.set(fileKey, { text: entry.text, label: entry.label, language: entry.language });
+  const trimmed = evictSubCache(readSubCacheMap(), SUB_CACHE_MAX_BYTES);
+  for (const k of [...subCache.keys()]) {
+    if (!(k in trimmed)) subCache.delete(k);
+  }
+}
+
+/** Test seam: drop every cached subtitle. */
+export function clearSubCache(): void {
+  subCache.clear();
 }
 
 /**

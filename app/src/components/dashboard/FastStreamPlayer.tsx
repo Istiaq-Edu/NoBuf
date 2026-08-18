@@ -12,7 +12,7 @@ import { useMSEPlayer, readPersistedSubTrack, persistSubTrack, shouldReExtractSu
   classifySubRepairOutcome, reduceSubRepairBreaker, shouldAttemptSubRepair,
   emptySubRepairBreakerState, computeSubRepairBackoffMs, selectSubRepairBreakerKey,
   SUB_REPAIR_MAX_ATTEMPTS, type SubRepairBreakerState, type SubRepairOutcome } from '../../hooks/useMSEPlayer';
-import { readPersistedSubDelay, persistSubDelay, clampSubDelay, SUB_DELAY_LIMIT_S, readCachedSub, persistCachedSub, subtitleLabel } from '../../hooks/useMSEPlayer';
+import { clampSubDelay, SUB_DELAY_LIMIT_S, readCachedSub, persistCachedSub, subtitleLabel } from '../../hooks/useMSEPlayer';
 import { subtitleLayout, SUB_SCALE_MIN, SUB_SCALE_MAX, SUB_OFFSET_MAX_PCT, SUB_OFFSET_MIN_PCT, type SubFit } from '../../lib/faststream/subtitles/subtitleLayout';
 import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
@@ -2663,13 +2663,22 @@ interface FastStreamPlayerProps {
   // cue times — coverage repair merges freshly extracted cues into live tracks and
   // would silently half-revert a destructively shifted track.
   const subFileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+  // SESSION-ONLY. Sync delay is deliberately NOT persisted: it reset per file anyway,
+  // and keeping a growing per-file map on disk is not worth the storage. Switching
+  // files inside one session still clears it, matching the old behaviour for a file
+  // that had no stored offset.
   const [subDelay, setSubDelay] = useState(0);
-  useEffect(() => { setSubDelay(readPersistedSubDelay(subFileKey)); }, [subFileKey]);
+  useEffect(() => { setSubDelay(0); }, [subFileKey]);
   const applySubDelay = useCallback((seconds: number) => {
-    const next = clampSubDelay(seconds);
-    setSubDelay(next);
-    persistSubDelay(subFileKey, next);
-  }, [subFileKey]);
+    setSubDelay(clampSubDelay(seconds));
+  }, []);
+
+  // Subtitle SIZE and POSITION are session-only: they reset to the defaults every
+  // launch rather than being written to settings.json. Kept as component state (not
+  // `settings`) so nothing subtitle-appearance-related touches disk. The API key and
+  // language DO persist — retyping a credential every launch is not acceptable.
+  const [subFontScale, setSubFontScale] = useState(1);
+  const [subOffsetPct, setSubOffsetPct] = useState(0);
 
   // Horizontal reserve so the settings panel never covers subtitles. The panel is
   // `position:absolute` on the OUTER box, so it does NOT shrink videobox — no
@@ -2699,14 +2708,14 @@ interface FastStreamPlayerProps {
     controlsContentH: subGeom.ctrlH,
     dlOverlayH: dlOverlayVisible ? DL_OVERLAY_RESERVE_PX : 0,
     panelReserveRight,
-    fontScale: settings.playerSubtitleFontScale,
-    offsetPct: settings.playerSubtitleOffsetPct,
+    fontScale: subFontScale,
+    offsetPct: subOffsetPct,
   }), [
     subGeom.boxW, subGeom.boxH, subGeom.ctrlH,
     videoResolution?.w, videoResolution?.h,
     settings.playerVideoFit, rotation,
     dlOverlayVisible, panelReserveRight,
-    settings.playerSubtitleFontScale, settings.playerSubtitleOffsetPct,
+    subFontScale, subOffsetPct,
   ]);
 
 
@@ -2809,15 +2818,15 @@ interface FastStreamPlayerProps {
                 <div>
                   <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
                     <span>Size</span>
-                    <span className="font-mono text-white/80">{Math.round(settings.playerSubtitleFontScale * 100)}%</span>
+                    <span className="font-mono text-white/80">{Math.round(subFontScale * 100)}%</span>
                   </div>
                   <input
                     type="range"
                     min={SUB_SCALE_MIN} max={SUB_SCALE_MAX} step={0.05}
-                    value={settings.playerSubtitleFontScale}
-                    onChange={(e) => updateSetting('playerSubtitleFontScale', parseFloat(e.target.value))}
+                    value={subFontScale}
+                    onChange={(e) => setSubFontScale(parseFloat(e.target.value))}
                     onClick={(e) => e.stopPropagation()}
-                    onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleFontScale', 1); }}
+                    onDoubleClick={(e) => { e.stopPropagation(); setSubFontScale(1); }}
                     className="w-full h-1 accent-nobuf-primary cursor-pointer"
                     aria-label="Subtitle size"
                     title="Double-click to reset to 100%"
@@ -2827,18 +2836,18 @@ interface FastStreamPlayerProps {
                   <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
                     <span>Position</span>
                     <span className="font-mono text-white/80">
-                      {settings.playerSubtitleOffsetPct === 0
+                      {subOffsetPct === 0
                         ? 'Default'
-                        : `${settings.playerSubtitleOffsetPct > 0 ? '+' : '−'}${Math.abs(settings.playerSubtitleOffsetPct)}%`}
+                        : `${subOffsetPct > 0 ? '+' : '−'}${Math.abs(subOffsetPct)}%`}
                     </span>
                   </div>
                   <input
                     type="range"
                     min={SUB_OFFSET_MIN_PCT} max={SUB_OFFSET_MAX_PCT} step={1}
-                    value={settings.playerSubtitleOffsetPct}
-                    onChange={(e) => updateSetting('playerSubtitleOffsetPct', parseInt(e.target.value, 10))}
+                    value={subOffsetPct}
+                    onChange={(e) => setSubOffsetPct(parseInt(e.target.value, 10))}
                     onClick={(e) => e.stopPropagation()}
-                    onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleOffsetPct', 0); }}
+                    onDoubleClick={(e) => { e.stopPropagation(); setSubOffsetPct(0); }}
                     className="w-full h-1 accent-nobuf-primary cursor-pointer"
                     aria-label="Subtitle vertical position"
                     title="Double-click to reset to default"
@@ -3445,7 +3454,12 @@ interface FastStreamPlayerProps {
           onDragOver={(e) => { if (dragKind) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; const s = sideFromX(e.clientX); setDropSide(s); setDropIndex(dragKind === 'chip' ? indexFromX(s, e.clientX) : null); } }}
           onDrop={onRowDrop}
         >
-          <div className="flex items-center gap-1 relative z-10">
+          {/* z-40, not z-10: popovers opened from a chip must paint ABOVE the seek
+              bar's internal layers (cached-range green z-20, thumbnail-coverage
+              yellow z-30). The seek-bar track is a SIBLING of this row, so at z-10
+              those bars outranked every popover rendered inside here no matter what
+              the popover's own z-index said. */}
+          <div className="flex items-center gap-1 relative z-40">
             {/* Play/Pause — fixed anchor, larger for visual weight + centering */}
             <button onClick={toggle} className="p-1 hover:bg-white/10 rounded text-white transition-transform active:scale-90 flex items-center justify-center" title="Play/Pause (Space)">
               <svg className="w-7 h-7 block" fill="currentColor" viewBox="0 0 24 24">
@@ -3471,7 +3485,12 @@ interface FastStreamPlayerProps {
 
             <span className="text-white text-xs font-mono leading-none ml-1">{fmt(time)} / {fmt(dur)}</span>
           </div>
-          <div className="flex items-center gap-1 relative z-10">
+          {/* z-40, not z-10: popovers opened from a chip must paint ABOVE the seek
+              bar's internal layers (cached-range green z-20, thumbnail-coverage
+              yellow z-30). The seek-bar track is a SIBLING of this row, so at z-10
+              those bars outranked every popover rendered inside here no matter what
+              the popover's own z-index said. */}
+          <div className="flex items-center gap-1 relative z-40">
 
             {(() => {
               const vid = vidRef.current;
