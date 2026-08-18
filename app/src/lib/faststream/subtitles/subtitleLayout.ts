@@ -67,10 +67,19 @@ export const SUB_OFFSET_MAX_PCT = 40;
 export const SUB_OFFSET_MIN_PCT = -40;
 /** Max absolute sync delay in seconds. */
 export const SUB_DELAY_MAX_S = 10;
-/** Max cue line width as a fraction of picture width — BBC online, landscape 16:9. */
-export const SUB_LINE_WIDTH_16_9 = 0.68;
+/**
+ * Max cue line width as a fraction of picture width.
+ *
+ * This is a CEILING for very long lines, not a target: the cue box is
+ * width-fit-content and takes only the space its text needs, so short lines stay
+ * short and only a genuinely long line wraps. An earlier 0.68 (BBC's editorial
+ * guideline for authored broadcast subtitles) made every cue look boxed into a narrow
+ * centred column, which is wrong for arbitrary downloaded tracks — desktop players
+ * let the line breathe and wrap near the picture edge instead.
+ */
+export const SUB_LINE_WIDTH_16_9 = 0.92;
 /** Same, for non-16:9 (4:3, 1:1, 9:16) pictures. */
-export const SUB_LINE_WIDTH_OTHER = 0.90;
+export const SUB_LINE_WIDTH_OTHER = 0.94;
 /** Absorbs ±1px drift from fractional getBoundingClientRect at 125%/150% DPI. */
 export const SUB_SAFE_PX = 2;
 /** BBC absolute ceiling on simultaneous subtitle lines. */

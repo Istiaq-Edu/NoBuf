@@ -54,20 +54,6 @@ export function subGeomChanged(prev: SubGeom, next: SubGeom): boolean {
 }
 
 /**
- * Horizontal reserve so the open settings panel never covers subtitles.
- *
- * The panel is `position:absolute` on the OUTER box, so it does NOT shrink videobox
- * — no ResizeObserver can see it and no vertical offset helps. Its `maxWidth:'70%'`
- * resolves against the OUTER box, which is why the cap is a fraction of `outerW`.
- */
-export function panelReserve(open: boolean, requestedW: number, outerW: number): number {
-  if (!open) return 0;
-  const w = Number.isFinite(requestedW) ? requestedW : 0;
-  const outer = Number.isFinite(outerW) && outerW > 0 ? outerW : 0;
-  return Math.max(0, Math.min(w, 0.70 * outer));
-}
-
-/**
  * Vertical space the download progress overlay occupies above the control bar's
  * real content, used to lift subtitles clear of it while it is visible.
  *
@@ -2680,18 +2666,12 @@ interface FastStreamPlayerProps {
   const [subFontScale, setSubFontScale] = useState(1);
   const [subOffsetPct, setSubOffsetPct] = useState(0);
 
-  // Horizontal reserve so the settings panel never covers subtitles. The panel is
-  // `position:absolute` on the OUTER box, so it does NOT shrink videobox — no
-  // ResizeObserver can see it and no vertical offset can help. Its `maxWidth:'70%'`
-  // resolves against the outer box, which is why the cap uses boxRef's width.
-  const panelReserveRight = useMemo(
-    () => panelReserve(
-      settingsOpen,
-      panelDragWidth ?? settings.playerSettingsWidth,
-      boxRef.current?.getBoundingClientRect().width ?? subGeom.boxW,
-    ),
-    [settingsOpen, panelDragWidth, settings.playerSettingsWidth, subGeom.boxW],
-  );
+  // Subtitles are NOT reserved away from the settings panel. The panel is z-50 and
+  // the overlay is z-20, so the panel simply draws on top — which is the desired
+  // behaviour ("the settings panel should get on top of the subtitle"). Squeezing the
+  // cue box horizontally while the panel is open reflowed the text mid-playback for
+  // no benefit, so the reserve is fixed at 0.
+  const panelReserveRight = 0;
 
   // All subtitle geometry, computed once per geometry change rather than per frame.
   // Deps are PRIMITIVES on purpose: setVideoResolution allocates a new {w,h} object
@@ -3301,17 +3281,37 @@ interface FastStreamPlayerProps {
         </div>
       )}
 
+      {/* Control-bar scrim. Carries the gradient that used to live on the bar itself.
+          z-10 keeps it BELOW the subtitle overlay (z-20), so it darkens the video
+          behind the buttons without washing over cue text — the bar is z-40 for
+          popover stacking, and a gradient at that level tinted the lower subtitle
+          lines. Geometry mirrors the bar (bottom-anchored, pt-16 worth of height);
+          opacity/transform follow `vis` so it fades with the controls. */}
+      <div
+        data-controls-scrim
+        aria-hidden
+        className="absolute bottom-0 left-0 right-0 z-10 pointer-events-none bg-gradient-to-t from-black/90 via-black/50 to-transparent"
+        style={{
+          height: (subGeom.ctrlH || 0) + 64,
+          opacity: vis ? 1 : 0,
+          transform: vis ? 'translateY(0)' : 'translateY(20px)',
+          transition: 'opacity 300ms ease-out, transform 300ms ease-out',
+        }}
+      />
+
       {/* Controls - FastStream-style.
-          z-40 puts the whole bar (and every popover inside it) ABOVE the subtitle
-          overlay's z-20. Without it the bar is a sibling with NO z-index, so the
-          overlay wins on DOM order and cues paint over the captions/speed/audio
-          menus — and the popover's own z-50 cannot escape, because the chip
-          wrapper's `hover:-translate-y-0.5` transform makes each chip a containing
-          block that traps its descendants' stacking. */}
+          The bar is z-40 so popovers opened from a chip are never covered by
+          subtitles (overlay is z-20) or by the seek bar's own indicators.
+
+          But the bar itself must stay TRANSPARENT: its `bg-gradient-to-t
+          from-black/90 … pt-16` is a 64px dark wash, and at z-40 that wash paints
+          OVER subtitle text, visibly darkening the lower cue lines. The gradient now
+          lives in a sibling scrim rendered BELOW the overlay, so it still darkens the
+          video behind the buttons without tinting the cues. */}
       <div
         ref={controlsRef}
         data-controls-root
-        className={`absolute bottom-0 left-0 right-0 z-40 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
+        className={`absolute bottom-0 left-0 right-0 z-40 pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
         style={{
           opacity: vis ? 1 : 0,
           transform: vis ? 'translateY(0)' : 'translateY(20px)',

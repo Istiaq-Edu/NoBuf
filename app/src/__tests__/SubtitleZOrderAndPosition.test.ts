@@ -59,6 +59,38 @@ describe('subtitles never render above a popup menu', () => {
     for (const z of rows) expect(z).toBeGreaterThan(30);
   });
 
+  it('the control bar carries NO gradient — it would darken cue text', () => {
+    // REPORTED: "the lower font looks a bit darker". Cause: raising the bar to z-40
+    // put its own `bg-gradient-to-t from-black/90 … pt-16` (a 64px dark wash) ON TOP
+    // of the subtitle overlay, tinting the bottom of the text. Fonts were never
+    // touched. The gradient moved to a scrim below the overlay.
+    const attr = player.indexOf('        data-controls-root');
+    expect(attr).toBeGreaterThan(-1);
+    const bar = player.slice(attr, attr + 600);
+    expect(bar).toContain('z-40');
+    expect(bar).not.toContain('bg-gradient-to-t');
+    expect(bar).not.toContain('from-black/90');
+  });
+
+  it('the scrim keeps the gradient BELOW the subtitle overlay', () => {
+    const scrim = player.indexOf('data-controls-scrim');
+    expect(scrim).toBeGreaterThan(-1);
+    const block = player.slice(scrim, scrim + 700);
+    expect(block).toContain('bg-gradient-to-t from-black/90 via-black/50 to-transparent');
+    // z-10 < the overlay's z-20, so the wash never reaches the text.
+    expect(block).toContain('z-10');
+    // Must not eat clicks meant for the video.
+    expect(block).toContain('pointer-events-none');
+    // Fades with the controls rather than lingering after they hide.
+    expect(block).toContain('opacity: vis ? 1 : 0');
+  });
+
+  it('the scrim renders BEFORE the control bar in DOM order', () => {
+    // Same stacking parent, so source order is the tie-breaker if z ever matches.
+    expect(player.indexOf('data-controls-scrim'))
+      .toBeLessThan(player.indexOf('        data-controls-root'));
+  });
+
   it('the settings panel stays above the raised control bar', () => {
     // The panel is a later sibling; leaving it at z-30 would put the bar on top of it.
     const panel = player.slice(player.indexOf('animate-[settingsIn_180ms_ease-out]') - 300);
