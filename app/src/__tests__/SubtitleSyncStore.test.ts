@@ -9,17 +9,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
-  SUB_DELAY_STORE_KEY,
   SUB_DELAY_LIMIT_S,
   clampSubDelay,
-  readPersistedSubDelay,
-  persistSubDelay,
-  SUB_CACHE_STORE_KEY,
   SUB_CACHE_MAX_BYTES,
   SUB_CACHE_MAX_ENTRY_BYTES,
   readCachedSub,
   persistCachedSub,
+  clearSubCache,
   evictSubCache,
 } from '../hooks/useMSEPlayer';
 import { clampSetting, sanitizeApiKey, sanitizeLangCode, parseQuotaResetAt, liveQuota, formatResetIn } from '../context/SettingsContext';
@@ -48,77 +47,39 @@ describe('clampSubDelay', () => {
   });
 });
 
-describe('per-file sync delay persistence', () => {
-  it('round-trips a delay for a file key', () => {
-    persistSubDelay('f:1', 2.5);
-    expect(readPersistedSubDelay('f:1')).toBe(2.5);
+describe('sync delay is SESSION-ONLY (deliberately not persisted)', () => {
+  it('exports no delay store key or writer', async () => {
+    // The per-file delay used to live in localStorage under 'nobuf-sub-delay'.
+    // It is now plain component state: nothing subtitle-related writes to disk.
+    const mod = await import('../hooks/useMSEPlayer');
+    expect('SUB_DELAY_STORE_KEY' in mod).toBe(false);
+    expect('persistSubDelay' in mod).toBe(false);
+    expect('readPersistedSubDelay' in mod).toBe(false);
   });
 
-  it('keeps delays independent per file', () => {
-    persistSubDelay('f:1', 2.5);
-    persistSubDelay('f:2', -1.25);
-    expect(readPersistedSubDelay('f:1')).toBe(2.5);
-    expect(readPersistedSubDelay('f:2')).toBe(-1.25);
+  it('leaves no delay entry in localStorage', () => {
+    // Guard against a reintroduced write under the old (or any) key.
+    expect(localStorage.getItem('nobuf-sub-delay')).toBeNull();
   });
 
-  it('returns 0 for an unknown key', () => {
-    expect(readPersistedSubDelay('never-seen')).toBe(0);
+  it('the player resets the delay to 0 on every file change', () => {
+    const player = readFileSync(
+      join(__dirname, '..', 'components/dashboard/FastStreamPlayer.tsx'),
+      'utf8',
+    );
+    expect(player).toContain('useEffect(() => { setSubDelay(0); }, [subFileKey]);');
+    // …and the setter must not persist anything.
+    const applyStart = player.indexOf('const applySubDelay =');
+    const apply = player.slice(applyStart, player.indexOf('}, [', applyStart));
+    expect(apply).toContain('setSubDelay(clampSubDelay(seconds))');
+    expect(apply).not.toContain('persistSubDelay');
   });
 
-  it('clamps on write and on read', () => {
-    persistSubDelay('f:1', 999);
-    expect(readPersistedSubDelay('f:1')).toBe(SUB_DELAY_LIMIT_S);
-    // A value written out-of-range by an older build must still read back clamped.
-    localStorage.setItem(SUB_DELAY_STORE_KEY, JSON.stringify({ 'f:2': -500 }));
-    expect(readPersistedSubDelay('f:2')).toBe(-SUB_DELAY_LIMIT_S);
-  });
-
-  it('never throws and never returns NaN on corrupt storage', () => {
-    for (const junk of ['not json', '[]', 'null', '{"f:1":"abc"}', '{"f:1":null}']) {
-      localStorage.setItem(SUB_DELAY_STORE_KEY, junk);
-      const got = readPersistedSubDelay('f:1');
-      expect(Number.isFinite(got)).toBe(true);
-      expect(got).toBe(0);
-    }
-  });
-
-  it('writing a non-finite delay stores 0 rather than corrupting the map', () => {
-    persistSubDelay('f:1', NaN);
-    expect(readPersistedSubDelay('f:1')).toBe(0);
-    expect(JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY)!)['f:1']).toBe(0);
-  });
-
-  it('evicts oldest entries past the 200-key cap', () => {
-    for (let i = 0; i < 205; i++) persistSubDelay(`f:${i}`, i % 7);
-    const map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY)!);
-    expect(Object.keys(map).length).toBeLessThanOrEqual(200);
-    expect(map['f:0']).toBeUndefined();   // evicted
-    expect(map['f:204']).toBeDefined();   // newest kept
-  });
-
-  it('re-writing a key refreshes its recency so it survives eviction', () => {
-    // The refresh is `delete map[k]` before re-inserting: without it the key keeps
-    // its ORIGINAL insertion position and is evicted first, because eviction walks
-    // Object.keys() in insertion order.
-    // Fill to the cap, touch the oldest key, then overflow by enough that the
-    // untouched-oldest window is provably evicted while the touched key survives.
-    for (let i = 0; i < 200; i++) persistSubDelay(`f:${i}`, 1);
-    persistSubDelay('f:0', 3);                 // touch the OLDEST → must move to newest
-    for (let i = 0; i < 5; i++) persistSubDelay(`f:new${i}`, 4); // force 5 evictions
-
-    const map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY)!);
-    expect(Object.keys(map).length).toBeLessThanOrEqual(200);
-    // f:0 was re-inserted at the newest position, so the 5 evictions took
-    // f:1..f:5 instead of f:0.
-    expect(map['f:0']).toBe(3);
-    for (let i = 1; i <= 5; i++) expect(map[`f:${i}`]).toBeUndefined();
-    expect(map['f:6']).toBeDefined();
-  });
-
-  it('is independent of the sub-TRACK store (separate localStorage keys)', () => {
-    persistSubDelay('f:1', 2.5);
-    expect(localStorage.getItem('nobuf-sub-track')).toBeNull();
-    expect(SUB_DELAY_STORE_KEY).not.toBe('nobuf-sub-track');
+  it('clampSubDelay is still applied so the slider cannot exceed its bounds', () => {
+    // The clamp survives the persistence removal — it guards the live value.
+    expect(clampSubDelay(999)).toBe(SUB_DELAY_LIMIT_S);
+    expect(clampSubDelay(-999)).toBe(-SUB_DELAY_LIMIT_S);
+    expect(clampSubDelay(NaN)).toBe(0);
   });
 });
 
@@ -304,8 +265,8 @@ describe('formatResetIn', () => {
   });
 });
 
-describe('downloaded-subtitle cache (5 downloads/day makes a re-open expensive)', () => {
-  beforeEach(() => localStorage.clear());
+describe('downloaded-subtitle cache — SESSION-ONLY, in memory (never on disk)', () => {
+  beforeEach(() => { clearSubCache(); localStorage.clear(); });
 
   const VTT = 'WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nhello\n';
   const entry = { text: VTT, label: 'Inception.2010.DVDRip', language: 'en' };
@@ -330,8 +291,9 @@ describe('downloaded-subtitle cache (5 downloads/day makes a re-open expensive)'
     persistCachedSub('7:1', { ...entry, label: 'old' });
     persistCachedSub('7:1', { ...entry, label: 'new' });
     expect(readCachedSub('7:1')!.label).toBe('new');
-    const map = JSON.parse(localStorage.getItem(SUB_CACHE_STORE_KEY)!);
-    expect(Object.keys(map)).toHaveLength(1);
+    // One logical entry: the old label must be gone, not shadowed.
+    expect(readCachedSub('7:1')!.label).toBe('new');
+    expect(readCachedSub('7:1')!.text).toBe(VTT);
   });
 
   it('ignores an empty key or empty text', () => {
@@ -350,12 +312,19 @@ describe('downloaded-subtitle cache (5 downloads/day makes a re-open expensive)'
     expect(readCachedSub('7:keep')).toEqual(entry);
   });
 
-  it('survives corrupt storage without losing good entries', () => {
-    localStorage.setItem(SUB_CACHE_STORE_KEY, '{not json');
-    expect(readCachedSub('7:1')).toBeNull();
-    // A write recovers rather than throwing.
+  it('writes NOTHING to localStorage — this is the whole point', () => {
     persistCachedSub('7:1', entry);
     expect(readCachedSub('7:1')).toEqual(entry);
+    // No key, old or new, may appear on disk.
+    expect(localStorage.getItem('nobuf-sub-cache')).toBeNull();
+    expect(localStorage.length).toBe(0);
+  });
+
+  it('a fresh session starts empty (restart semantics)', () => {
+    persistCachedSub('7:1', entry);
+    expect(readCachedSub('7:1')).not.toBeNull();
+    clearSubCache(); // stands in for a process restart
+    expect(readCachedSub('7:1')).toBeNull();
   });
 
   // ---- Mutation-driven gap closers ------------------------------------
@@ -369,13 +338,18 @@ describe('downloaded-subtitle cache (5 downloads/day makes a re-open expensive)'
     for (let i = 0; i < 20; i++) {
       persistCachedSub(`f:${i}`, { text: big, label: `L${i}`, language: 'en' });
     }
-    const stored = localStorage.getItem(SUB_CACHE_STORE_KEY)!;
-    expect(stored.length).toBeLessThanOrEqual(SUB_CACHE_MAX_BYTES + 64 * 1024);
-    const map = JSON.parse(stored);
-    expect(Object.keys(map).length).toBeLessThan(20);
-    // Newest survives, oldest is gone.
-    expect(map['f:19']).toBeDefined();
-    expect(map['f:0']).toBeUndefined();
+    // Count what SURVIVED through the public reader.
+    let kept = 0;
+    let bytes = 0;
+    for (let i = 0; i < 20; i++) {
+      const hit = readCachedSub(`f:${i}`);
+      if (hit) { kept += 1; bytes += hit.text.length; }
+    }
+    expect(bytes).toBeLessThanOrEqual(SUB_CACHE_MAX_BYTES);
+    expect(kept).toBeLessThan(20);
+    // Newest survives, oldest is evicted.
+    expect(readCachedSub('f:19')).not.toBeNull();
+    expect(readCachedSub('f:0')).toBeNull();
   });
 
   it('re-saving a file REFRESHES its LRU position so it is not evicted next', () => {
@@ -385,40 +359,47 @@ describe('downloaded-subtitle cache (5 downloads/day makes a re-open expensive)'
     persistCachedSub('f:b', { text: big, label: 'b', language: 'en' });
     // Touch 'a' again — it must now be NEWER than 'b'.
     persistCachedSub('f:a', { text: big, label: 'a2', language: 'en' });
-    const order = Object.keys(JSON.parse(localStorage.getItem(SUB_CACHE_STORE_KEY)!));
-    expect(order.indexOf('f:a')).toBeGreaterThan(order.indexOf('f:b'));
+    // 'a' was touched last, so it must outlive 'b' once the budget forces eviction.
+    // 9 fills is the exact count that pushes past the 2MB budget by ONE entry: the
+    // eviction walks oldest-first and must stop after removing 'b'. (10 fills evicts
+    // both and proves nothing about ordering; 8 evicts neither.)
+    const big2 = 'y'.repeat(200 * 1024);
+    for (let i = 0; i < 9; i++) {
+      persistCachedSub(`f:fill${i}`, { text: big2, label: 'x', language: 'en' });
+    }
+    expect(readCachedSub('f:b')).toBeNull();
     expect(readCachedSub('f:a')!.label).toBe('a2');
   });
 
   it('never stores an entry with empty text', () => {
     // C7: without this, `{text:''}` was written and read back as a usable track.
     persistCachedSub('f:empty', { text: '', label: 'L', language: 'en' });
-    const raw = localStorage.getItem(SUB_CACHE_STORE_KEY);
-    expect(raw === null || JSON.parse(raw)['f:empty'] === undefined).toBe(true);
     expect(readCachedSub('f:empty')).toBeNull();
+    expect(localStorage.getItem('nobuf-sub-cache')).toBeNull();
   });
 
-  it('rejects a stored entry whose text is an empty string', () => {
-    // C9: an empty-text record must not read back as a cache HIT — loadText('')
-    // yields a track with zero cues, i.e. subtitles that silently never appear.
-    localStorage.setItem(SUB_CACHE_STORE_KEY, JSON.stringify({
-      'f:1': { text: '', label: 'L', language: 'en' },
-    }));
+  it('an empty-text entry never becomes a cache HIT', () => {
+    // C9: loadText('') yields a track with zero cues — subtitles that silently never
+    // appear. The writer rejects it, so a read can never observe one.
+    persistCachedSub('f:1', { text: '', label: 'L', language: 'en' });
     expect(readCachedSub('f:1')).toBeNull();
+    // …and a whitespace-only payload is still text, so it IS stored (parsing it is
+    // the parser's job, not the cache's).
+    persistCachedSub('f:2', { text: ' ', label: 'L', language: 'en' });
+    expect(readCachedSub('f:2')).not.toBeNull();
   });
 
-  it('drops individually malformed records but keeps valid neighbours', () => {
-    localStorage.setItem(SUB_CACHE_STORE_KEY, JSON.stringify({
-      'bad:1': 42,
-      'bad:2': { text: 123, label: 'x', language: 'en' },
-      'bad:3': { label: 'no text', language: 'en' },
-      'bad:4': null,
-      'good:1': entry,
-    }));
+  it('a malformed entry cannot be injected through the writer', () => {
+    // The old localStorage store could be hand-edited, so the reader validated each
+    // record. In memory the writer is the only door: prove it rejects junk and that
+    // valid neighbours are untouched.
+    persistCachedSub('good:1', entry);
+    persistCachedSub('bad:1', { text: '', label: 'x', language: 'en' });
+    persistCachedSub('', entry);
+    // @ts-expect-error deliberately wrong shape at the boundary
+    persistCachedSub('bad:2', { label: 'no text', language: 'en' });
     expect(readCachedSub('bad:1')).toBeNull();
     expect(readCachedSub('bad:2')).toBeNull();
-    expect(readCachedSub('bad:3')).toBeNull();
-    expect(readCachedSub('bad:4')).toBeNull();
     expect(readCachedSub('good:1')).toEqual(entry);
   });
 });

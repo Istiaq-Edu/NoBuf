@@ -43,6 +43,22 @@ describe('subtitles never render above a popup menu', () => {
     expect(overlay).not.toContain('z-50');
   });
 
+  it('popovers outrank the seek bar indicators (green prebuffer, yellow coverage)', () => {
+    // REPORTED BUG: the green cached-range bar painted OVER the open captions menu.
+    // The buttons row was `relative z-10` while the seek-bar track is a SIBLING whose
+    // children are z-20 (green) and z-30 (yellow) — so every popover inside the row
+    // lost, no matter its own z-index. Both rows are now z-40.
+    const rows = [...player.matchAll(/className="flex items-center gap-1 relative z-(\d+)"/g)]
+      .map((m) => Number(m[1]));
+    expect(rows.length).toBe(2); // left zone + right zone
+    for (const z of rows) expect(z).toBeGreaterThanOrEqual(40);
+
+    // The indicators they must outrank.
+    expect(player).toContain('bg-green-400/70 rounded-full z-20');
+    expect(player).toContain('bg-yellow-400/70 rounded-full z-30');
+    for (const z of rows) expect(z).toBeGreaterThan(30);
+  });
+
   it('the settings panel stays above the raised control bar', () => {
     // The panel is a later sibling; leaving it at z-30 would put the bar on top of it.
     const panel = player.slice(player.indexOf('animate-[settingsIn_180ms_ease-out]') - 300);
@@ -136,17 +152,21 @@ describe('position slider is bidirectional with a midpoint default', () => {
     const block = player.slice(start - 1200, start + 600);
     expect(block).toContain('min={SUB_OFFSET_MIN_PCT} max={SUB_OFFSET_MAX_PCT}');
     // Sign-aware readout: a negative value must not render as "+-20%".
-    expect(block).toContain("settings.playerSubtitleOffsetPct > 0 ? '+' : '−'");
-    expect(block).toContain('Math.abs(settings.playerSubtitleOffsetPct)');
+    expect(block).toContain("subOffsetPct > 0 ? '+' : '−'");
+    expect(block).toContain('Math.abs(subOffsetPct)');
     // Direction labels so the midpoint default is self-explanatory.
     expect(block).toContain('lower');
     expect(block).toContain('raise');
   });
 
-  it('the persisted-settings sanitizer accepts the negative half', () => {
+  it('size and position are SESSION-ONLY, not persisted to settings.json', () => {
+    // They used to be settings keys sanitized on load. Now they are component state,
+    // so settings.json must carry no trace of them at all.
     const settings = readFileSync(join(__dirname, '..', 'context/SettingsContext.tsx'), 'utf8');
-    expect(settings).toContain('cleaned.playerSubtitleOffsetPct, -40, 40');
-    // Default stays at the midpoint.
-    expect(settings).toContain('playerSubtitleOffsetPct: 0,');
+    expect(settings).not.toContain('playerSubtitleOffsetPct');
+    expect(settings).not.toContain('playerSubtitleFontScale');
+    // The player holds them locally, defaulting to the midpoint / 100%.
+    expect(player).toContain('const [subFontScale, setSubFontScale] = useState(1);');
+    expect(player).toContain('const [subOffsetPct, setSubOffsetPct] = useState(0);');
   });
 });
