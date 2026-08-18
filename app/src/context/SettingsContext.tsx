@@ -46,6 +46,98 @@ export function formatSpeedLimitCompact(kbPerSec: SpeedLimitValue): string {
     return `↓${kbPerSec}K`;
 }
 
+/** Clamp a persisted numeric setting into range, falling back when non-finite. */
+export function clampSetting(
+    value: number | undefined,
+    min: number,
+    max: number,
+    fallback: number,
+): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+    return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * Coerce a persisted OpenSubtitles API key to a safe string.
+ *
+ * The key is consumed by `.trim()` in the search panel and handed to a Rust command.
+ * A hand-edited settings.json holding a number, object or null would throw on
+ * `.trim()` and take the whole captions menu down with it — so a bad value becomes
+ * the empty default (which the UI already handles as "no key yet").
+ */
+export function sanitizeApiKey(value: unknown, fallback: string): string {
+    if (typeof value !== 'string') return fallback;
+    // Keys are alphanumeric; stray whitespace from a copy-paste is trimmed, and a
+    // value that could smuggle a header/newline is rejected outright.
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    return /^[A-Za-z0-9]+$/.test(trimmed) ? trimmed : fallback;
+}
+
+/** Coerce a persisted language code to a valid ISO 639-1 pair, else the fallback. */
+export function sanitizeLangCode(value: unknown, fallback: string): string {
+    if (typeof value !== 'string') return fallback;
+    const lower = value.trim().toLowerCase();
+    return /^[a-z]{2}$/.test(lower) ? lower : fallback;
+}
+
+/**
+ * Absolute epoch-ms when the OpenSubtitles daily quota resets.
+ *
+ * The API reports this as PROSE, not a timestamp — verified live:
+ * `reset_time: "09 hours and 10 minutes"` (and the `message` field carries a UTC
+ * wall-clock string in a different format). Storing the prose would be useless
+ * across restarts, so it is converted to an absolute deadline at write time.
+ *
+ * Returns null when nothing parseable is found, which the caller treats as
+ * "unknown" rather than "already expired" — guessing a reset time wrong in the
+ * optimistic direction would re-enable download buttons that the API will reject.
+ */
+export function parseQuotaResetAt(resetTime: string, nowMs: number): number | null {
+    if (typeof resetTime !== 'string' || !resetTime.trim()) return null;
+    const hours = resetTime.match(/(\d+)\s*hour/i);
+    const mins = resetTime.match(/(\d+)\s*min/i);
+    if (!hours && !mins) return null;
+    const h = hours ? parseInt(hours[1], 10) : 0;
+    const m = mins ? parseInt(mins[1], 10) : 0;
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+    const deltaMs = (h * 60 + m) * 60_000;
+    // A reported window longer than a day means we misread the format; treat it as
+    // unknown instead of locking the UI out for a week.
+    if (deltaMs <= 0 || deltaMs > 25 * 60 * 60_000) return null;
+    return nowMs + deltaMs;
+}
+
+/**
+ * The quota to display, or null when it should no longer be trusted.
+ *
+ * Quota is per-day, so a value persisted from yesterday must NOT keep the download
+ * buttons disabled — past its reset it is dropped and the UI goes back to "unknown"
+ * until the next download reports a fresh number.
+ */
+export function liveQuota(
+    stored: { remaining: number; resetAtMs: number } | null | undefined,
+    nowMs: number,
+): { remaining: number; resetAtMs: number } | null {
+    if (!stored || typeof stored !== 'object') return null;
+    const { remaining, resetAtMs } = stored as { remaining: unknown; resetAtMs: unknown };
+    if (typeof remaining !== 'number' || !Number.isFinite(remaining)) return null;
+    if (typeof resetAtMs !== 'number' || !Number.isFinite(resetAtMs)) return null;
+    if (nowMs >= resetAtMs) return null; // expired → unknown, not "0 left"
+    return { remaining: Math.max(0, Math.floor(remaining)), resetAtMs };
+}
+
+/** Human "in 3h 20m" style remaining-time label for a reset deadline. */
+export function formatResetIn(resetAtMs: number, nowMs: number): string {
+    const ms = resetAtMs - nowMs;
+    if (!Number.isFinite(ms) || ms <= 0) return '';
+    const totalMin = Math.ceil(ms / 60_000);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    return `${m}m`;
+}
+
 export interface Settings {
     viewMode: 'grid' | 'list';
     autoUpdate: boolean;
@@ -62,6 +154,11 @@ export interface Settings {
     playerAutoHideDelay: AutoHideDelay;
     playerShowPinButton: boolean;   // show pin button on control bar; when off, controls never auto-hide
     playerSettingsWidth: number;    // px width of the video settings side panel (resizable + persisted)
+    playerSubtitleFontScale: number;   // subtitle size multiplier, 0.5–3.0 (1 = 5% of picture height)
+    playerSubtitleOffsetPct: number;   // subtitle vertical offset, -40–40 (% of picture height; + up, − down)
+    openSubtitlesApiKey: string;       // user's own OpenSubtitles.com API key (free signup); never bundled
+    openSubtitlesLanguage: string;     // preferred subtitle language for online search (ISO 639-1)
+    openSubtitlesQuota: { remaining: number; resetAtMs: number } | null; // last reported daily download quota (free tier = 5/day)
     playerBarLayout: { left: string[]; right: string[]; tray: string[] }; // customizable control-bar chip placement (incl. '__tray__' token for the ⋯ trigger)
     prebufferSpeedLimit: SpeedLimitValue;  // KB/s, 0 = unlimited
     downloadSpeedLimit: SpeedLimitValue;   // KB/s, 0 = unlimited
@@ -83,6 +180,11 @@ const defaultSettings: Settings = {
     playerAutoHideDelay: 3,
     playerShowPinButton: false,
     playerSettingsWidth: 336,
+    playerSubtitleFontScale: 1,
+    playerSubtitleOffsetPct: 0,
+    openSubtitlesApiKey: '',
+    openSubtitlesLanguage: 'en',
+    openSubtitlesQuota: null,
     playerBarLayout: { left: ['skipBack', 'skipFwd'], right: ['captions', 'speed', 'download', 'settings', 'pin', 'fullscreen', '__tray__'], tray: ['loop', 'pip'] },
     prebufferSpeedLimit: 0,
     downloadSpeedLimit: 0,
@@ -114,6 +216,25 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
                     ) as Partial<Settings>;
                     // Never restore playerSpeed from disk: each video starts at 1x
                     delete cleaned.playerSpeed;
+                    // Subtitle size/position are numeric ranges consumed directly by
+                    // the overlay's inline styles. A corrupt or out-of-range stored
+                    // value must not reach it: a NaN px style is dropped silently by
+                    // CSSOM, which renders no subtitles at all with no error.
+                    cleaned.playerSubtitleFontScale = clampSetting(
+                        cleaned.playerSubtitleFontScale, 0.5, 3, defaultSettings.playerSubtitleFontScale);
+                    cleaned.playerSubtitleOffsetPct = clampSetting(
+                        cleaned.playerSubtitleOffsetPct, -40, 40, defaultSettings.playerSubtitleOffsetPct);
+                    // The API key and language are STRINGS consumed by `.trim()` in the
+                    // search panel and passed to a Rust command. A non-string from a
+                    // hand-edited settings.json would throw on `.trim()` and take the
+                    // whole captions menu down, so coerce rather than trust.
+                    cleaned.openSubtitlesApiKey = sanitizeApiKey(
+                        cleaned.openSubtitlesApiKey, defaultSettings.openSubtitlesApiKey);
+                    cleaned.openSubtitlesLanguage = sanitizeLangCode(
+                        cleaned.openSubtitlesLanguage, defaultSettings.openSubtitlesLanguage);
+                    // A corrupt or already-expired quota must not keep the download
+                    // buttons disabled: liveQuota returns null, i.e. "unknown".
+                    cleaned.openSubtitlesQuota = liveQuota(cleaned.openSubtitlesQuota, Date.now());
                     setSettings({ ...defaultSettings, ...cleaned });
                 }
             } catch {

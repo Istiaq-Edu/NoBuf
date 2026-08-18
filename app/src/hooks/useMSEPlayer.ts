@@ -717,6 +717,162 @@ export function persistSubTrack(fileKey: string, streamIdx: number): void {
 }
 
 /**
+ * Per-file subtitle sync delay, in seconds. Mirrors the sub-track LRU above.
+ *
+ * Applied at cue-READ time (activeCues(cues, t - delay)), never by mutating cue
+ * times: SubtitleTrack.shift() is destructive, and coverage repair merges freshly
+ * extracted cues into live tracks, which would silently half-revert a shifted track.
+ * A read-time offset survives seeks, re-extraction, and merges for free.
+ *
+ * Delay is per FILE because a 2.5s offset for one release is wrong for every other,
+ * unlike size/position which are per-taste and live in settings.json.
+ */
+export const SUB_DELAY_STORE_KEY = 'nobuf-sub-delay';
+const SUB_DELAY_STORE_CAP = 200;
+/** Matches SUB_DELAY_MAX_S in subtitles/subtitleLayout.ts. */
+export const SUB_DELAY_LIMIT_S = 10;
+
+/**
+ * Trim a subtitle-file extension from a track label, and nothing else.
+ *
+ * NOT the blind `/\.[^.]+$/` used for picked FILES: release names from the API are
+ * dot-separated and usually carry no extension, so that regex eats a meaningful
+ * segment — `Breaking.Bad.S05E14.720p.WEB-DL.x264-PAREE` lost its `.x264-PAREE`
+ * group, and `Inception.2010.DVDRip` became `Inception.2010`, dropping the source
+ * that distinguishes one release from another.
+ */
+export function subtitleLabel(name: string): string {
+  const trimmed = (name ?? '').trim();
+  const stripped = trimmed.replace(/\.(webvtt|vtt|srt|ass|ssa|sub|sbv|txt)$/i, '');
+  return stripped || trimmed;
+}
+
+/** Clamp to ±SUB_DELAY_LIMIT_S; anything non-finite becomes 0 (no delay). */
+export function clampSubDelay(seconds: number): number {
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.min(Math.max(seconds, -SUB_DELAY_LIMIT_S), SUB_DELAY_LIMIT_S);
+}
+
+export function readPersistedSubDelay(fileKey: string): number {
+  try {
+    const map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY) ?? '{}');
+    const v = map[fileKey];
+    return typeof v === 'number' ? clampSubDelay(v) : 0;
+  } catch { return 0; }
+}
+
+export function persistSubDelay(fileKey: string, seconds: number): void {
+  try {
+    let map: Record<string, number>;
+    try { map = JSON.parse(localStorage.getItem(SUB_DELAY_STORE_KEY) ?? '{}') ?? {}; }
+    catch { map = {}; }
+    delete map[fileKey]; // re-insert → newest position
+    map[fileKey] = clampSubDelay(seconds);
+    const keys = Object.keys(map);
+    for (let i = 0; i < keys.length - SUB_DELAY_STORE_CAP; i++) delete map[keys[i]];
+    localStorage.setItem(SUB_DELAY_STORE_KEY, JSON.stringify(map));
+  } catch { /* storage full/unavailable — non-fatal */ }
+}
+
+// ---- Downloaded-subtitle cache -------------------------------------------
+//
+// Why this exists: `clearTracks()` runs on every file change
+// (FastStreamPlayer.tsx), so a subtitle fetched from OpenSubtitles is discarded
+// when the video closes. The free tier allows only **5 downloads per day**, so
+// reopening the same file would silently burn another one. Caching the TEXT makes a
+// re-open free.
+//
+// Keyed by fileKey (`folderId:messageId`), the same key the sync-delay store uses.
+
+export const SUB_CACHE_STORE_KEY = 'nobuf-sub-cache';
+/**
+ * Total budget for cached subtitle text.
+ *
+ * Byte-capped rather than entry-capped: a real WebVTT download measured 127,277
+ * bytes (Inception, 1742 cues), so a 200-ENTRY cap like the delay store's would
+ * allow ~25 MB and blow the ~5 MB localStorage quota. 2 MB holds roughly 15 typical
+ * subtitles, which comfortably covers "the things I am currently watching".
+ */
+export const SUB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+/** Hard ceiling per entry: a pathological file must not evict everything else. */
+export const SUB_CACHE_MAX_ENTRY_BYTES = 512 * 1024;
+
+export interface CachedSub {
+  /** Subtitle payload as downloaded (WebVTT). */
+  text: string;
+  /** Track label shown in the captions menu. */
+  label: string;
+  /** ISO 639-1 code, or '' when the source did not report one. */
+  language: string;
+}
+
+type SubCacheMap = Record<string, CachedSub>;
+
+function isCachedSub(v: unknown): v is CachedSub {
+  if (!v || typeof v !== 'object') return false;
+  const c = v as Partial<CachedSub>;
+  return typeof c.text === 'string' && c.text.length > 0
+    && typeof c.label === 'string'
+    && typeof c.language === 'string';
+}
+
+function readSubCacheMap(): SubCacheMap {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SUB_CACHE_STORE_KEY) ?? '{}');
+    if (!raw || typeof raw !== 'object') return {};
+    // Drop malformed entries rather than failing the whole read: one bad record
+    // written by an older build must not lose the rest of the cache.
+    const out: SubCacheMap = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (isCachedSub(v)) out[k] = v;
+    }
+    return out;
+  } catch { return {}; }
+}
+
+/** Cached subtitle for a file, or null when absent/unusable. */
+export function readCachedSub(fileKey: string): CachedSub | null {
+  if (!fileKey) return null;
+  return readSubCacheMap()[fileKey] ?? null;
+}
+
+/**
+ * Evict oldest-first until the map fits the byte budget.
+ *
+ * Insertion order IS the LRU order here: `persistCachedSub` deletes before
+ * re-inserting, so `Object.keys` is oldest→newest (ES2015 string-key ordering).
+ * Exported for tests — the eviction arithmetic is the part that silently corrupts a
+ * cache when wrong.
+ */
+export function evictSubCache(map: SubCacheMap, maxBytes: number): SubCacheMap {
+  const out: SubCacheMap = { ...map };
+  const size = (k: string) => k.length + out[k].text.length + out[k].label.length;
+  let total = Object.keys(out).reduce((n, k) => n + size(k), 0);
+  for (const k of Object.keys(out)) {
+    if (total <= maxBytes) break;
+    total -= size(k);
+    delete out[k];
+  }
+  return out;
+}
+
+/**
+ * Cache a downloaded subtitle. Silently does nothing when it cannot help:
+ * an oversized payload is skipped rather than evicting the whole cache for it.
+ */
+export function persistCachedSub(fileKey: string, entry: CachedSub): void {
+  if (!fileKey || !entry?.text) return;
+  if (entry.text.length > SUB_CACHE_MAX_ENTRY_BYTES) return;
+  try {
+    const map = readSubCacheMap();
+    delete map[fileKey]; // re-insert → newest position
+    map[fileKey] = { text: entry.text, label: entry.label, language: entry.language };
+    const trimmed = evictSubCache(map, SUB_CACHE_MAX_BYTES);
+    localStorage.setItem(SUB_CACHE_STORE_KEY, JSON.stringify(trimmed));
+  } catch { /* quota exceeded / unavailable — the download still worked */ }
+}
+
+/**
  * Normalize the backend /subtitles list JSON into EmbeddedSubTrack[] +
  * EmbeddedSubFont[]. Defensive against missing fields (backend contract is
  * new). Pure + exported for testing.
@@ -7100,6 +7256,48 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
   };
 
   /**
+   * OpenSubtitles moviehash for the CURRENT file, from the backend.
+   *
+   * Identifies the release by its BYTES rather than its name, which is what makes
+   * online subtitle search usable at all here: Telegram filenames are frequently
+   * `video_2024-01-15_12-34-56.mp4`, and a text query on that finds nothing.
+   *
+   * Returns null on any failure — the hash is an enhancement, never a prerequisite,
+   * and the search falls back to a filename query.
+   */
+  const fetchMovieHash = useCallback(async (): Promise<{ hash: string; size: number } | null> => {
+    const url = streamUrlRef.current;
+    const parsed = url ? parseStreamUrl(url) : null;
+    if (!parsed) return null;
+    const msgAtRequest = parsed.messageId;
+    try {
+      const resp = await fetch(
+        `${parsed.baseUrl}/subtitles/${parsed.folderId}/${parsed.messageId}/moviehash?token=${encodeURIComponent(parsed.token)}`
+      );
+      // Stale guard: the user may have switched files while the ranges downloaded.
+      const live = streamUrlRef.current ? parseStreamUrl(streamUrlRef.current) : null;
+      if (!live || live.messageId !== msgAtRequest) {
+        diagLog('[SUBS] moviehash response is for a previous file — discarded');
+        return null;
+      }
+      if (!resp.ok) {
+        diagLog(`[SUBS] moviehash failed: HTTP ${resp.status}`);
+        return null;
+      }
+      const json = await resp.json();
+      if (typeof json?.hash !== 'string' || !/^[0-9a-f]{16}$/.test(json.hash)) {
+        diagLog('[SUBS] moviehash response malformed — ignoring');
+        return null;
+      }
+      diagLog(`[SUBS] moviehash=${json.hash} size=${json.size}`);
+      return { hash: json.hash, size: Number(json.size) || 0 };
+    } catch (e) {
+      diagLog(`[SUBS] moviehash error: ${e}`);
+      return null;
+    }
+  }, []);
+
+  /**
    * Load the embedded subtitle inventory for the CURRENT file from the backend
    * /subtitles list endpoint (memoized server-side, container-level →
    * tier-independent, plan §2.1). Stale-response-guarded by messageId (E17).
@@ -11250,6 +11448,7 @@ export function useMSEPlayer(streamUrl: string | null, file: TelegramFile | null
     embeddedSubsLoading,
     fetchEmbeddedSubText,
     getEmbeddedSubFontUrls,
+    fetchMovieHash,
 
     unsupportedCodec,
     prefetchedBytes,

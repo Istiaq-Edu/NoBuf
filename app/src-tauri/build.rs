@@ -77,6 +77,9 @@ fn main() {
                                 "cmd_forward_to_folder",
                                 "cmd_update_nb_pub_sync",
                                 "cmd_sync_public_channels",
+                                "cmd_opensubtitles_validate_key",
+                                "cmd_opensubtitles_search",
+                                "cmd_opensubtitles_download",
                             ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");
