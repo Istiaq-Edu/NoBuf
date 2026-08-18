@@ -4,6 +4,7 @@ import {
   pickDefaultAudioTrack,
   planAudioSwitch,
   withAudioIdx,
+  mapAudioTrackToRemuxIdx,
   readPersistedAudioTrack,
   persistAudioTrack,
   AUDIO_TRACK_STORE_KEY,
@@ -111,6 +112,21 @@ describe('planAudioSwitch', () => {
       isTypeSupportedFn: () => false,
     })).toBe('reroute-remux');
   });
+  it('video-only SB (Layer-2 birth) → ANY mkv switch reroutes via remux (B4)', () => {
+    expect(planAudioSwitch({ tier: 'mkv', targetPlayable: true, sbHasAudio: false }))
+      .toBe('reroute-remux');
+    // even when mimes match and MSE supports the codec — the SB track SET is pinned
+    expect(planAudioSwitch({
+      tier: 'mkv', targetPlayable: true, sbHasAudio: false,
+      currentMime: 'video/mp4; codecs="avc1.64001f"',
+      newMime: 'video/mp4; codecs="avc1.64001f, mp4a.40.2"',
+      isTypeSupportedFn: () => true,
+    })).toBe('reroute-remux');
+  });
+  it('sbHasAudio undefined/true → existing behavior unchanged (26-test matrix intact)', () => {
+    expect(planAudioSwitch({ tier: 'mkv', targetPlayable: true, sbHasAudio: true }))
+      .toBe('rebuild');
+  });
 });
 
 describe('withAudioIdx', () => {
@@ -146,6 +162,27 @@ describe('withAudioIdx', () => {
       .toBe('/remux/home/84?token=abc&audio_idx=2');
     expect(withAudioIdx('/remux/home/84?token=abc&audio_idx=1', null))
       .toBe('/remux/home/84?token=abc');
+  });
+});
+
+describe('mapAudioTrackToRemuxIdx', () => {
+  const mkv = [track({ id: 2 }), track({ id: 3 }), track({ id: 5 })]; // Matroska TrackNumbers
+  const ff = [{ id: 1 }, { id: 2 }, { id: 4 }];                       // ffprobe absolute indices
+
+  it('maps by position among audio tracks (MKV order ↔ ffprobe order)', () => {
+    expect(mapAudioTrackToRemuxIdx(mkv, 2, ff)).toBe(1);
+    expect(mapAudioTrackToRemuxIdx(mkv, 3, ff)).toBe(2);
+    expect(mapAudioTrackToRemuxIdx(mkv, 5, ff)).toBe(4);
+  });
+  it('unknown MKV id → null (server falls back to default track)', () => {
+    expect(mapAudioTrackToRemuxIdx(mkv, 99, ff)).toBeNull();
+  });
+  it('ffprobe list shorter than position → null (never sends a fabricated idx)', () => {
+    expect(mapAudioTrackToRemuxIdx(mkv, 5, [{ id: 1 }])).toBeNull();
+  });
+  it('empty inputs → null', () => {
+    expect(mapAudioTrackToRemuxIdx([], 1, ff)).toBeNull();
+    expect(mapAudioTrackToRemuxIdx(mkv, 2, [])).toBeNull();
   });
 });
 

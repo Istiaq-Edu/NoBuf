@@ -18,4 +18,6 @@ CompiledApps/
 *.log
 Error.html
 **/LatestError.html
-1-t.md
+# Round test logs (console/terminal captures handed back for forensics).
+# A literal `1-t.md` did NOT match `15-t.md` — keep this as a wildcard.
+[0-9]*-[ct].md
