@@ -1005,7 +1005,7 @@ async fn spawn_targeted_download_and_wait(
                     let mut meta = cache_mgr_clone.load_meta(message_id).unwrap_or_else(|| {
                         crate::stream_cache::CacheMeta {
                             message_id,
-                            folder_id: 0,
+                            folder_id: i64::MIN,
                             total_size: layout_file_size,
                             filename: String::new(),
                             cached_ranges: Vec::new(),

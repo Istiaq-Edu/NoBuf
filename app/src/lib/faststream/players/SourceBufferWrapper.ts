@@ -277,6 +277,31 @@ export class SourceBufferWrapper {
     });
   }
 
+  /** Clear stale seek operations without blocking on removal of the old timeline. */
+  resetForSeekNonBlocking(): Promise<void> {
+    if (this.fatalError) return Promise.resolve();
+    this.queue = [];
+    if (this.processing || this.sourceBuffer.updating) {
+      try { this.sourceBuffer.abort(); } catch (_) {}
+    }
+    this.processing = false;
+    return Promise.resolve();
+  }
+
+  /** Queue removal of every buffered island that does not contain `keepTime`. */
+  pruneBufferedRangesExcept(keepTime: number): void {
+    if (this.fatalError || !Number.isFinite(keepTime)) return;
+    try {
+      const buffered = this.sourceBuffer.buffered;
+      for (let i = 0; i < buffered.length; i++) {
+        const start = buffered.start(i);
+        const end = buffered.end(i);
+        if (keepTime < start || keepTime > end) this.queue.push({ type: 'remove', start, end });
+      }
+      this.processQueue();
+    } catch (_) { /* detached SourceBuffer */ }
+  }
+
   /** Remove all buffered data — for seeking to unbuffered positions.
    *  Does NOT set timestampOffset because mp4box produces absolute timestamps. */
   resetForSeek(): Promise<void> {

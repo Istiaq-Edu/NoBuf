@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
-import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, ExternalLink, QrCode, Cloud, Play, HardDrive } from "lucide-react";
+import { Phone, Key, Lock, ArrowRight, Settings, ShieldCheck, Sun, Moon, ExternalLink, QrCode, Cloud, Play, HardDrive, CheckCircle2 } from "lucide-react";
 import { load } from '@tauri-apps/plugin-store';
 import { useTheme } from '../context/ThemeContext';
 import { QRCodeSVG } from 'qrcode.react';
@@ -259,6 +259,11 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     const [loginMethod, setLoginMethod] = useState<'phone' | 'qr'>('phone');
     const [qrUrl, setQrUrl] = useState<string | null>(null);
     const [qrPolling, setQrPolling] = useState(false);
+    // True once the poll reports the QR was actually scanned (auth
+    // succeeded, or 2FA is now required). Only these two states truthfully
+    // mean the scan landed — the plain "waiting" poll result cannot tell
+    // "not scanned yet" apart from "scanned, still finalizing".
+    const [qrConfirming, setQrConfirming] = useState(false);
     const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const [selectedCountry, setSelectedCountry] = useDetectedCountry();
     const [phoneInput, setPhoneInput] = useState("");
@@ -344,6 +349,14 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         }
     };
 
+    // Persist api_id then signal login success. MUST be used by EVERY
+    // login-success path (QR, auto-extract, phone code, 2FA) so the
+    // saved api_id survives restart — App.tsx gates startup on it.
+    const finishLogin = async () => {
+        await saveCredentials();
+        onLogin();
+    };
+
     const handleSetupSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         if (apiId.includes(' ') || apiHash.includes(' ')) {
@@ -375,13 +388,15 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
     const handleQrLogin = async () => {
         setError(null);
+        setQrConfirming(false);
         setLoading(true);
         try {
             const idInt = parseInt(apiId, 10);
             if (isNaN(idInt)) throw new Error("API ID must be a number");
             const url = await invoke<string>("cmd_auth_qr_login", { apiId: idInt, apiHash: apiHash });
             if (url === "__authorized__") {
-                onLogin();
+                setQrConfirming(true);
+                await finishLogin();
                 return;
             }
             setQrUrl(url);
@@ -402,15 +417,19 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
             try {
                 const res = await invoke<{ success: boolean; next_step?: string; error?: string }>("cmd_auth_qr_poll");
                 if (res.success) {
+                    // Scan confirmed — acknowledge before the dashboard mounts.
+                    setQrConfirming(true);
                     setQrPolling(false);
-                    if (res.next_step === "password") { setStep("password"); } else { onLogin(); }
+                    if (res.next_step === "password") { setStep("password"); } else { await finishLogin(); }
                 } else if (res.next_step === "expired") {
                     // QR token expired — stop polling, show refresh prompt
                     setQrPolling(false);
+                    setQrConfirming(false);
                     setQrUrl(null);
                     if (res.error) setError(res.error);
                 } else if (res.next_step === "password") {
-                    // 2FA required after QR scan
+                    // 2FA required after QR scan — scan landed, acknowledge it.
+                    setQrConfirming(true);
                     setQrPolling(false);
                     setStep("password");
                 }
@@ -457,7 +476,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         try {
             const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_sign_in", { code });
-            if (res.success) { onLogin(); }
+            if (res.success) { await finishLogin(); }
             else if (res.next_step === "password") { setStep("password"); }
             else { setError("Unknown error"); }
         } catch (err: unknown) { setError(err instanceof Error ? err.message : String(err)); }
@@ -470,7 +489,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         try {
             const res = await invoke<{ success: boolean; next_step?: string }>("cmd_auth_check_password", { password });
-            if (res.success) { onLogin(); } else { setError("Password verification failed."); }
+            if (res.success) { await finishLogin(); } else { setError("Password verification failed."); }
         } catch (err: unknown) { setError(err instanceof Error ? err.message : String(err)); }
         finally { setLoading(false); }
     };
@@ -628,6 +647,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                             setLoginMethod={setLoginMethod}
                                             setQrUrl={setQrUrl}
                                             setQrPolling={setQrPolling}
+                                            setQrConfirming={setQrConfirming}
                                             setError={setError}
                                             handleQrLogin={handleQrLogin}
                                         />
@@ -668,8 +688,9 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                 loading={loading}
                                                 qrUrl={qrUrl}
                                                 qrPolling={qrPolling}
+                                                qrConfirming={qrConfirming}
                                                 onRefresh={handleQrLogin}
-                                                onBack={() => { setStep("setup"); setQrPolling(false); }}
+                                                onBack={() => { setStep("setup"); setQrPolling(false); setQrConfirming(false); }}
                                             />
                                         )}
                                     </div>
@@ -815,11 +836,12 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
 /* ── Sub-components ──────────────────────────── */
 
-function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, setError, handleQrLogin }: {
+function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, setQrConfirming, setError, handleQrLogin }: {
     loginMethod: 'phone' | 'qr';
     setLoginMethod: (m: 'phone' | 'qr') => void;
     setQrUrl: (u: string | null) => void;
     setQrPolling: (p: boolean) => void;
+    setQrConfirming: (c: boolean) => void;
     setError: (e: string | null) => void;
     handleQrLogin: () => void;
 }) {
@@ -827,7 +849,7 @@ function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, se
         <div className="flex rounded-xl overflow-hidden border border-nobuf-border">
             <button
                 type="button"
-                onClick={() => { setLoginMethod('phone'); setQrUrl(null); setQrPolling(false); setError(null); }}
+                onClick={() => { setLoginMethod('phone'); setQrUrl(null); setQrPolling(false); setQrConfirming(false); setError(null); }}
                 className={`flex-1 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-all ${
                     loginMethod === 'phone'
                         ? 'bg-nobuf-primary/15 text-nobuf-text'
@@ -851,43 +873,57 @@ function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, se
     );
 }
 
-function QrLoginPanel({ loading, qrUrl, qrPolling, onRefresh, onBack }: {
+function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, onRefresh, onBack }: {
     loading: boolean;
     qrUrl: string | null;
     qrPolling: boolean;
+    qrConfirming: boolean;
     onRefresh: () => void;
     onBack: () => void;
 }) {
     return (
         <div className="flex flex-col items-center gap-5">
-            {loading && !qrUrl && (
-                <div className="w-52 h-52 rounded-2xl bg-nobuf-primary/5 flex items-center justify-center">
-                    <div className="w-8 h-8 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+            {qrConfirming ? (
+                <div className="w-52 h-52 rounded-2xl bg-nobuf-primary/5 flex flex-col items-center justify-center gap-3">
+                    <CheckCircle2 className="w-12 h-12 text-nobuf-primary" />
+                    <div className="flex items-center gap-2 text-sm text-nobuf-text">
+                        <div className="w-4 h-4 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                        Signing you in…
+                    </div>
+                    <p className="text-xs text-nobuf-subtext">QR code scanned</p>
                 </div>
-            )}
-            {qrUrl && (
+            ) : (
                 <>
-                    <div className="p-4 bg-white rounded-2xl shadow-xl">
-                        <QRCodeSVG value={qrUrl} size={200} level="M" bgColor="#ffffff" fgColor="#013718" />
-                    </div>
-                    <div className="text-center space-y-1">
-                        <p className="text-sm text-nobuf-text">Scan with your Telegram app</p>
-                        <p className="text-xs text-nobuf-subtext">Settings &gt; Devices &gt; Link Desktop Device</p>
-                    </div>
-                    {qrPolling && (
-                        <div className="flex items-center gap-2 text-xs text-nobuf-primary">
-                            <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
-                            Waiting for scan...
+                    {loading && !qrUrl && (
+                        <div className="w-52 h-52 rounded-2xl bg-nobuf-primary/5 flex items-center justify-center">
+                            <div className="w-8 h-8 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
                         </div>
                     )}
-                    <button type="button" onClick={onRefresh} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors">
-                        Refresh QR Code
+                    {qrUrl && (
+                        <>
+                            <div className="p-4 bg-white rounded-2xl shadow-xl">
+                                <QRCodeSVG value={qrUrl} size={200} level="M" bgColor="#ffffff" fgColor="#013718" />
+                            </div>
+                            <div className="text-center space-y-1">
+                                <p className="text-sm text-nobuf-text">Scan with your Telegram app</p>
+                                <p className="text-xs text-nobuf-subtext">Settings &gt; Devices &gt; Link Desktop Device</p>
+                            </div>
+                            {qrPolling && (
+                                <div className="flex items-center gap-2 text-xs text-nobuf-primary">
+                                    <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                                    Waiting for scan…
+                                </div>
+                            )}
+                            <button type="button" onClick={onRefresh} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors">
+                                Refresh QR Code
+                            </button>
+                        </>
+                    )}
+                    <button type="button" onClick={onBack} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
+                        Back to Configuration
                     </button>
                 </>
             )}
-            <button type="button" onClick={onBack} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors py-2">
-                Back to Configuration
-            </button>
         </div>
     );
 }
