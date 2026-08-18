@@ -12,14 +12,75 @@ import { useMSEPlayer, readPersistedSubTrack, persistSubTrack, shouldReExtractSu
   classifySubRepairOutcome, reduceSubRepairBreaker, shouldAttemptSubRepair,
   emptySubRepairBreakerState, computeSubRepairBackoffMs, selectSubRepairBreakerKey,
   SUB_REPAIR_MAX_ATTEMPTS, type SubRepairBreakerState, type SubRepairOutcome } from '../../hooks/useMSEPlayer';
+import { readPersistedSubDelay, persistSubDelay, clampSubDelay, SUB_DELAY_LIMIT_S, readCachedSub, persistCachedSub, subtitleLabel } from '../../hooks/useMSEPlayer';
+import { subtitleLayout, SUB_SCALE_MIN, SUB_SCALE_MAX, SUB_OFFSET_MAX_PCT, SUB_OFFSET_MIN_PCT, type SubFit } from '../../lib/faststream/subtitles/subtitleLayout';
 import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact, liveQuota, parseQuotaResetAt } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 import { useSubtitles } from '../../hooks/useSubtitles';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
+import { OpenSubtitlesPanel } from './OpenSubtitlesPanel';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
+
+/** Absorbs ±1px drift from fractional getBoundingClientRect at 125%/150% DPI. */
+const SUB_GEOM_EPSILON_PX = 0.5;
+
+export interface SubGeom { boxW: number; boxH: number; ctrlH: number }
+
+/**
+ * The control bar's REAL interactive height: its border box minus the transparent
+ * `pt-16` gradient pad, which is not clickable and must not push subtitles up.
+ *
+ * NOT the same quantity as the existing `controlsHeight` state, which is
+ * `contentRect.height` — the CONTENT box, already excluding pt-16 AND pb-2 (Resize
+ * Observer §2.3). Subtracting the 64px pad from THAT would double-count it and
+ * float subtitles 64px too high; the download overlay depends on the existing
+ * semantics, so this is a separate derivation rather than a redefinition.
+ */
+export function controlsInteractiveHeight(borderBoxH: number, paddingTop: number): number {
+  const h = Number.isFinite(borderBoxH) ? borderBoxH : 0;
+  const pad = Number.isFinite(paddingTop) ? paddingTop : 0;
+  return Math.max(0, h - pad);
+}
+
+/** True when a new measurement differs enough to be worth a re-render. */
+export function subGeomChanged(prev: SubGeom, next: SubGeom): boolean {
+  return Math.abs(prev.boxW - next.boxW) >= SUB_GEOM_EPSILON_PX
+    || Math.abs(prev.boxH - next.boxH) >= SUB_GEOM_EPSILON_PX
+    || Math.abs(prev.ctrlH - next.ctrlH) >= SUB_GEOM_EPSILON_PX;
+}
+
+/**
+ * Horizontal reserve so the open settings panel never covers subtitles.
+ *
+ * The panel is `position:absolute` on the OUTER box, so it does NOT shrink videobox
+ * — no ResizeObserver can see it and no vertical offset helps. Its `maxWidth:'70%'`
+ * resolves against the OUTER box, which is why the cap is a fraction of `outerW`.
+ */
+export function panelReserve(open: boolean, requestedW: number, outerW: number): number {
+  if (!open) return 0;
+  const w = Number.isFinite(requestedW) ? requestedW : 0;
+  const outer = Number.isFinite(outerW) && outerW > 0 ? outerW : 0;
+  return Math.max(0, Math.min(w, 0.70 * outer));
+}
+
+/**
+ * Vertical space the download progress overlay occupies above the control bar's
+ * real content, used to lift subtitles clear of it while it is visible.
+ *
+ * Derived from its own markup rather than measured, to avoid a third
+ * ResizeObserver on an element that only exists while a download runs:
+ *   px-3 py-2 row  → 8 + 8 vertical padding
+ *   tallest child  → the cancel button (p-1 + w-4 h-4 svg) = 24px
+ *   ⇒ ~40px tall
+ * It is positioned at `bottom: controlsHeight + 12` where controlsHeight is the
+ * CONTENT box (excludes pb-2), so relative to our border-box-minus-pt-16 measure it
+ * sits ~4px lower. 40 + 4 + a 12px breathing gap ⇒ 56.
+ */
+const DL_OVERLAY_RESERVE_PX = 56;
 
 /**
  * Lead time (seconds) for `shouldReExtractSubAhead`: re-extract when the playhead
@@ -332,6 +393,7 @@ interface FastStreamPlayerProps {
   export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
+  const videoBoxRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
   const subFileInputRef = useRef<HTMLInputElement>(null);
@@ -381,6 +443,23 @@ interface FastStreamPlayerProps {
     setEmbeddedSubBusyIdx(null);
     setEmbeddedSubUnavailable(new Set()); // round-14 F4: per-file, never durable
     embeddedSubFileGenRef.current++; // invalidate any in-flight extraction
+    // Re-attach a previously downloaded online subtitle for THIS file. Done here,
+    // immediately after the clear, so ordering is guaranteed — a separate effect
+    // could run before it and have its track wiped. NOT auto-activated: the user
+    // picks it from the captions menu, matching how embedded tracks behave.
+    const cached = readCachedSub(`${activeFolderId ?? 'pub'}:${file.id}`);
+    if (cached) {
+      try {
+        const track = new SubtitleTrack(
+          subtitleLabel(cached.label),
+          cached.language || null,
+        );
+        track.loadText(cached.text);
+        subs.addTrack(track);
+      } catch (e) {
+        console.error('[Subtitles] cached subtitle failed to parse:', e);
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.id]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
@@ -394,6 +473,8 @@ interface FastStreamPlayerProps {
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
   const [subMenu, setSubMenu] = useState(false);
+  /** OpenSubtitles search modal. Separate from subMenu: it is a dialog, not a popover. */
+  const [osPanel, setOsPanel] = useState(false);
   const [audioMenu, setAudioMenu] = useState(false);
   const [audioSwitching, setAudioSwitching] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
@@ -1643,6 +1724,57 @@ interface FastStreamPlayerProps {
     return () => observer.disconnect();
   }, []);
 
+  // Subtitle geometry inputs. Deliberately SEPARATE from `controlsHeight` above:
+  // that value is `contentRect.height` (the CONTENT box, which per Resize Observer
+  // §2.3 excludes pt-16/pb-2) and the download overlay at the bottom of this file
+  // is positioned against it — redefining it would shift that overlay by ~72px.
+  //
+  // Observe videobox rather than <video>: videobox always exists (the `err` branch
+  // unmounts the video mid-playback), and since <video> is `w-full h-full` with no
+  // padding/border, their content boxes are identical anyway.
+  //
+  // Both reads use the rect/contentRect family, never offsetHeight — mixing
+  // fractional rects with rounded offsets drifts ±1px under 125%/150% Windows
+  // scaling, which is enough to put a cue one pixel inside the control bar.
+  const [subGeom, setSubGeom] = useState({ boxW: 0, boxH: 0, ctrlH: 0 });
+  const commitSubGeom = useCallback((next: { boxW: number; boxH: number; ctrlH: number }) => {
+    // Identical reference when nothing moved → React skips the re-render.
+    setSubGeom((prev) => (subGeomChanged(prev, next) ? next : prev));
+  }, []);
+  const subGeomRef = useRef(subGeom);
+  subGeomRef.current = subGeom;
+
+  useEffect(() => {
+    const box = videoBoxRef.current;
+    const controls = controlsRef.current;
+    if (!box) return;
+
+    const measure = () => {
+      const boxRect = box.getBoundingClientRect();
+      // videobox is `flex-1 min-h-0`, so it is legitimately 0x0 for a frame during
+      // mount. Never commit that: a cached 0 yields fontSize 0 and never recovers.
+      if (!(boxRect.width > 0) || !(boxRect.height > 0)) return;
+      let ctrlH = subGeomRef.current.ctrlH;
+      if (controls) {
+        // getComputedStyle is free here: a ResizeObserver callback already runs
+        // post-layout, so this cannot trigger an extra reflow.
+        const rect = controls.getBoundingClientRect();
+        const padTop = parseFloat(getComputedStyle(controls).paddingTop) || 0;
+        ctrlH = controlsInteractiveHeight(rect.height, padTop);
+      }
+      commitSubGeom({ boxW: boxRect.width, boxH: boxRect.height, ctrlH });
+    };
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(box);
+    // Observing the controls too: wrapping the chip row on a narrow window changes
+    // its height, and subtitles must move with it. Safe from the ResizeObserver
+    // feedback loop because neither element's size depends on subtitle content.
+    if (controls) observer.observe(controls);
+    measure();
+    return () => observer.disconnect();
+  }, [commitSubGeom]);
+
   const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; if (videoEndedRef.current) { replay(); } else { v.paused ? v.play().catch(() => {}) : v.pause(); } }, [replay]);
   const seek = useCallback((s: number) => {
     const v = vidRef.current;
@@ -1735,6 +1867,24 @@ interface FastStreamPlayerProps {
       console.error('[Subtitles] sidecar load failed:', e);
     }
   }, [subs]);
+
+  // Accept a subtitle downloaded from OpenSubtitles. Deliberately the SAME path a
+  // sidecar file takes (loadText → addTrack → activateTrack): the payload is plain
+  // WebVTT, so it needs a new source, not a new renderer.
+  const acceptOnlineSub = useCallback((text: string, label: string, language: string) => {
+    try {
+      const track = new SubtitleTrack(subtitleLabel(label), language || null);
+      track.loadText(text);
+      subs.activateTrack(subs.addTrack(track));
+      // Cache the TEXT: clearTracks() drops the track when the file closes, and with
+      // only 5 downloads a day a re-open must not spend another one.
+      persistCachedSub(`${activeFolderId ?? 'pub'}:${file.id}`, { text, label, language });
+      toast.success(`Loaded subtitles: ${label}`);
+    } catch (e) {
+      toast.error('Failed to load downloaded subtitles');
+      console.error('[Subtitles] OpenSubtitles load failed:', e);
+    }
+  }, [subs, activeFolderId, file.id]);
 
   // Toggle an EMBEDDED subtitle track (captions menu → Embedded section).
   // First click extracts via the backend (spinner row while running) and
@@ -2508,6 +2658,58 @@ interface FastStreamPlayerProps {
   // immediately. Does NOT touch the seek bar / time readout.
   const barDur = dur || (window as any).__nobuf_ptsDuration || (window as any).__nobuf_estimateDuration || 0;
 
+  // Subtitle sync delay, in seconds, persisted per FILE (a 2.5s offset for one
+  // release is wrong for every other). Applied at cue-READ time, never by mutating
+  // cue times — coverage repair merges freshly extracted cues into live tracks and
+  // would silently half-revert a destructively shifted track.
+  const subFileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+  const [subDelay, setSubDelay] = useState(0);
+  useEffect(() => { setSubDelay(readPersistedSubDelay(subFileKey)); }, [subFileKey]);
+  const applySubDelay = useCallback((seconds: number) => {
+    const next = clampSubDelay(seconds);
+    setSubDelay(next);
+    persistSubDelay(subFileKey, next);
+  }, [subFileKey]);
+
+  // Horizontal reserve so the settings panel never covers subtitles. The panel is
+  // `position:absolute` on the OUTER box, so it does NOT shrink videobox — no
+  // ResizeObserver can see it and no vertical offset can help. Its `maxWidth:'70%'`
+  // resolves against the outer box, which is why the cap uses boxRef's width.
+  const panelReserveRight = useMemo(
+    () => panelReserve(
+      settingsOpen,
+      panelDragWidth ?? settings.playerSettingsWidth,
+      boxRef.current?.getBoundingClientRect().width ?? subGeom.boxW,
+    ),
+    [settingsOpen, panelDragWidth, settings.playerSettingsWidth, subGeom.boxW],
+  );
+
+  // All subtitle geometry, computed once per geometry change rather than per frame.
+  // Deps are PRIMITIVES on purpose: setVideoResolution allocates a new {w,h} object
+  // on every onMeta, so an object dep would invalidate this memo even when the
+  // numbers are identical. Nothing here may read getBoundingClientRect — `time`
+  // re-renders this component ~4x/second.
+  const subLayout = useMemo(() => subtitleLayout({
+    boxW: subGeom.boxW,
+    boxH: subGeom.boxH,
+    videoW: videoResolution?.w ?? null,
+    videoH: videoResolution?.h ?? null,
+    fit: (settings.playerVideoFit === 'original' ? 'none' : settings.playerVideoFit) as SubFit,
+    rotation: (rotation === 90 || rotation === 180 || rotation === 270 ? rotation : 0) as 0 | 90 | 180 | 270,
+    controlsContentH: subGeom.ctrlH,
+    dlOverlayH: dlOverlayVisible ? DL_OVERLAY_RESERVE_PX : 0,
+    panelReserveRight,
+    fontScale: settings.playerSubtitleFontScale,
+    offsetPct: settings.playerSubtitleOffsetPct,
+  }), [
+    subGeom.boxW, subGeom.boxH, subGeom.ctrlH,
+    videoResolution?.w, videoResolution?.h,
+    settings.playerVideoFit, rotation,
+    dlOverlayVisible, panelReserveRight,
+    settings.playerSubtitleFontScale, settings.playerSubtitleOffsetPct,
+  ]);
+
+
   // The captions menu has a dedicated "Embedded" section (below) that owns every
   // embedded MKV track. Embedded tracks are ALSO pushed into `subs.tracks` (so
   // the overlay and `activeTracks` can see them), which made them appear a
@@ -2539,7 +2741,10 @@ interface FastStreamPlayerProps {
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 12h4v2H4v-2zm10 6H4v-2h10v2zm6 0h-4v-2h4v2zm0-4H10v-2h10v2z"/></svg>
           </button>
           {subMenu && (
-            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg z-50 shadow-2xl flex items-stretch max-h-80 w-[520px] max-w-[92vw]" onClick={e => e.stopPropagation()}>
+              {/* LEFT column — track selection. Scrolls independently so a file with
+                  many embedded tracks can't push the sliders out of reach. */}
+              <div className="flex-1 min-w-0 overflow-y-auto py-1">
               <button onClick={() => { subs.deactivateAll(); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
               {sidecarTracks.map((t) => (
                 <button key={`${t.label ?? ''}:${t.language ?? ''}`} onClick={() => toggleLoadedSubTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
@@ -2589,7 +2794,137 @@ interface FastStreamPlayerProps {
               )}
               <div className="border-t border-white/10 mt-1 pt-1">
                 <button onClick={() => { setSubMenu(false); subFileInputRef.current?.click(); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Load subtitle file…</button>
+                <button onClick={() => { setSubMenu(false); setOsPanel(true); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Search online…</button>
               </div>
+              </div>
+              {/* RIGHT column — appearance + sync. Sliders are native range inputs
+                  (the no-native-<select> rule targets dropdowns; a range has no popup
+                  list). Size/position live in settings.json (per-taste, all files);
+                  the sync delay is per-FILE, because an offset that fixes one release
+                  is wrong for every other.
+                  Gated on there being at least one track (D13): subtitle appearance
+                  controls on a file with no subtitles are dead UI. */}
+              {(subs.tracks.length > 0 || msePlayer.embeddedSubTracks.length > 0) && (
+              <div className="w-[248px] shrink-0 border-l border-white/10 overflow-y-auto px-3 py-2 space-y-2">
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Size</span>
+                    <span className="font-mono text-white/80">{Math.round(settings.playerSubtitleFontScale * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={SUB_SCALE_MIN} max={SUB_SCALE_MAX} step={0.05}
+                    value={settings.playerSubtitleFontScale}
+                    onChange={(e) => updateSetting('playerSubtitleFontScale', parseFloat(e.target.value))}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleFontScale', 1); }}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle size"
+                    title="Double-click to reset to 100%"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Position</span>
+                    <span className="font-mono text-white/80">
+                      {settings.playerSubtitleOffsetPct === 0
+                        ? 'Default'
+                        : `${settings.playerSubtitleOffsetPct > 0 ? '+' : '−'}${Math.abs(settings.playerSubtitleOffsetPct)}%`}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={SUB_OFFSET_MIN_PCT} max={SUB_OFFSET_MAX_PCT} step={1}
+                    value={settings.playerSubtitleOffsetPct}
+                    onChange={(e) => updateSetting('playerSubtitleOffsetPct', parseInt(e.target.value, 10))}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); updateSetting('playerSubtitleOffsetPct', 0); }}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle vertical position"
+                    title="Double-click to reset to default"
+                  />
+                  <div className="flex items-center justify-between text-[10px] text-white/35 leading-none mt-0.5">
+                    <span>lower</span>
+                    <span>raise</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Sync</span>
+                    <span className="font-mono text-white/80">{subDelay === 0 ? '0.00s' : `${subDelay > 0 ? '+' : ''}${subDelay.toFixed(2)}s`}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-SUB_DELAY_LIMIT_S} max={SUB_DELAY_LIMIT_S} step={0.05}
+                    value={subDelay}
+                    onChange={(e) => applySubDelay(parseFloat(e.target.value))}
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle sync delay"
+                  />
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="text-[10px] text-white/40 leading-none">Subtitles {subDelay < 0 ? 'earlier' : 'later'}</span>
+                    <div className="flex items-center gap-1.5">
+                      {/* ±0.1s nudges: dragging a 0.05-step range to a precise offset
+                          is fiddly, and fine sync correction is exactly the case
+                          where the user knows the number they want. */}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(subDelay - 0.1); }}
+                        disabled={subDelay <= -SUB_DELAY_LIMIT_S}
+                        className="px-1 text-[10px] font-mono text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                        title="0.1s earlier"
+                      >
+                        −0.1
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(subDelay + 0.1); }}
+                        disabled={subDelay >= SUB_DELAY_LIMIT_S}
+                        className="px-1 text-[10px] font-mono text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                        title="0.1s later"
+                      >
+                        +0.1
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(0); }}
+                        disabled={subDelay === 0}
+                        className="text-[10px] text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                {/* OpenSubtitles key. Lives here so everything subtitle-related is in
+                    one place. type=password because it is a credential; the API only
+                    ever leaves via the Rust commands, never a renderer fetch. */}
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>OpenSubtitles key</span>
+                    {settings.openSubtitlesApiKey ? (
+                      <span className="text-[10px] text-nobuf-primary leading-none">saved</span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); void openUrl('https://www.opensubtitles.com/en/consumers'); }}
+                        className="text-[10px] text-white/50 hover:text-white leading-none underline"
+                      >
+                        get one free
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    type="password"
+                    value={settings.openSubtitlesApiKey}
+                    onChange={(e) => updateSetting('openSubtitlesApiKey', e.target.value.trim())}
+                    onClick={(e) => e.stopPropagation()}
+                    placeholder="Paste API key"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full px-2 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 focus:border-nobuf-primary focus:outline-none placeholder-white/25"
+                    aria-label="OpenSubtitles API key"
+                  />
+                </div>
+              </div>
+              )}
             </div>
           )}
         </div> };
@@ -2681,11 +3016,27 @@ interface FastStreamPlayerProps {
     if (id === TRAY) return renderTray();
     const { el, label } = chipButton(id);
     if (!el) return null;
+    // A chip whose popover is OPEN must not be draggable. WebView2 hands a nested
+    // drag to the OUTERMOST draggable ancestor, so dragging a slider inside the
+    // captions/settings popover started a CHIP drag instead: the insertion bar
+    // appeared, the bar-layout logic armed, and the range input never got its
+    // pointer stream. Same class as the tray fix (a draggable must never CONTAIN
+    // other interactive children) — but the tray solved it by moving `draggable`
+    // onto its button, which does not work here because the popover is rendered by
+    // `chipButton` inside the same relative wrapper. Disabling the drag while the
+    // menu is open is the surgical equivalent: the chip is still draggable whenever
+    // its menu is closed, which is the only time you would want to move it.
+    const menuOpen =
+      (id === 'captions' && subMenu) ||
+      (id === 'speed' && menu) ||
+      (id === 'audio' && audioMenu);
+    const isDraggable = !menuOpen;
     return (
       <div
         key={id}
-        draggable
+        draggable={isDraggable}
         onDragStart={(e) => {
+          if (!isDraggable) { e.preventDefault(); return; }
           markDragStart();
           setDragChip(id);
           setDragKind('chip');
@@ -2698,9 +3049,9 @@ interface FastStreamPlayerProps {
           e.dataTransfer.setData('text/plain', id); // required or the webview aborts the drag
         }}
         onDragEnd={() => { markDragEnd(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }}
-        title={`${label} — drag to move`}
+        title={isDraggable ? `${label} — drag to move` : label}
         data-chip-id={id}
-        className={`transition-all duration-150 cursor-grab active:cursor-grabbing ${dragChip === id ? 'opacity-30 scale-90' : 'opacity-100 hover:-translate-y-0.5'}`}
+        className={`transition-all duration-150 ${isDraggable ? 'cursor-grab active:cursor-grabbing' : ''} ${dragChip === id ? 'opacity-30 scale-90' : 'opacity-100 hover:-translate-y-0.5'}`}
       >
         {el}
       </div>
@@ -2801,8 +3152,29 @@ interface FastStreamPlayerProps {
         className="hidden"
         onChange={(e) => { loadSubFile(e.target.files); e.target.value = ''; }}
       />
+      {/* OpenSubtitles search. Rendered here (a sibling of the video box) rather than
+          inside the captions popover: it is a modal with its own backdrop. */}
+      {osPanel && (
+        <OpenSubtitlesPanel
+          filename={file.name}
+          apiKey={settings.openSubtitlesApiKey}
+          language={settings.openSubtitlesLanguage}
+          onLanguageChange={(code) => updateSetting('openSubtitlesLanguage', code)}
+          quota={liveQuota(settings.openSubtitlesQuota, Date.now())}
+          onQuotaReported={(remaining, resetTime) => {
+            // reset_time is PROSE ("09 hours and 10 minutes"), so convert it to an
+            // absolute deadline; without one the stored quota could never expire.
+            const resetAtMs = parseQuotaResetAt(resetTime, Date.now());
+            updateSetting('openSubtitlesQuota', resetAtMs ? { remaining, resetAtMs } : null);
+          }}
+          fetchMovieHash={msePlayer.fetchMovieHash}
+          onPicked={acceptOnlineSub}
+          onClose={() => setOsPanel(false)}
+          onGetKey={() => { void openUrl('https://www.opensubtitles.com/en/consumers'); }}
+        />
+      )}
       {/* Video - FastStream's DirectVideoPlayer approach */}
-      <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
+      <div ref={videoBoxRef} className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
         {err ? (
           <div className="text-center px-8">
             <div className="text-amber-400 text-lg mb-2">{err}</div>
@@ -2831,7 +3203,7 @@ interface FastStreamPlayerProps {
           />
         )}
         {!err && (
-          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} revision={subtitleRevision} assFonts={msePlayer.getEmbeddedSubFontUrls()} />
+          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} revision={subtitleRevision} assFonts={msePlayer.getEmbeddedSubFontUrls()} layout={subLayout} delaySec={subDelay} />
         )}
         {load && !err && !showColdStartOverlay && !isRemuxLoading && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -2920,11 +3292,17 @@ interface FastStreamPlayerProps {
         </div>
       )}
 
-      {/* Controls - FastStream-style */}
+      {/* Controls - FastStream-style.
+          z-40 puts the whole bar (and every popover inside it) ABOVE the subtitle
+          overlay's z-20. Without it the bar is a sibling with NO z-index, so the
+          overlay wins on DOM order and cues paint over the captions/speed/audio
+          menus — and the popover's own z-50 cannot escape, because the chip
+          wrapper's `hover:-translate-y-0.5` transform makes each chip a containing
+          block that traps its descendants' stacking. */}
       <div
         ref={controlsRef}
         data-controls-root
-        className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
+        className={`absolute bottom-0 left-0 right-0 z-40 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
         style={{
           opacity: vis ? 1 : 0,
           transform: vis ? 'translateY(0)' : 'translateY(20px)',
@@ -3187,7 +3565,7 @@ interface FastStreamPlayerProps {
       {/* Settings overlay panel */}
       {settingsOpen && (
         <div
-          className="absolute right-0 top-0 bottom-0 z-30 bg-gradient-to-b from-black/80 to-black/70 backdrop-blur-2xl border-l border-white/10 overflow-y-auto shadow-2xl shadow-black/50 animate-[settingsIn_180ms_ease-out]"
+          className="absolute right-0 top-0 bottom-0 z-50 bg-gradient-to-b from-black/80 to-black/70 backdrop-blur-2xl border-l border-white/10 overflow-y-auto shadow-2xl shadow-black/50 animate-[settingsIn_180ms_ease-out]"
           onClick={(e) => e.stopPropagation()}
           style={{ width: panelDragWidth ?? settings.playerSettingsWidth, maxWidth: '70%', scrollbarWidth: 'thin', transition: panelDragWidth == null ? 'width 120ms ease' : 'none' }}
         >

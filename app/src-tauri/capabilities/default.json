@@ -88,6 +88,9 @@
     "allow-cmd-remove-public-channel",
     "allow-cmd-forward-to-folder",
     "allow-cmd-update-nb-pub-sync",
-    "allow-cmd-sync-public-channels"
+    "allow-cmd-sync-public-channels",
+    "allow-cmd-opensubtitles-validate-key",
+    "allow-cmd-opensubtitles-search",
+    "allow-cmd-opensubtitles-download"
   ]
 }

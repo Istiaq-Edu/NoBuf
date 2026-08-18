@@ -6945,6 +6945,92 @@ async fn subtitles_list(
     }
 }
 
+/// OpenSubtitles "moviehash" of a Telegram-hosted file.
+///
+/// `GET /subtitles/{folder}/{message}/moviehash?token=..`
+/// → `{ "hash": "aadb7fe9e2ac6a4f", "size": 9465305 }`
+/// → 422 when the file is empty (nothing to identify)
+///
+/// Why this exists: OpenSubtitles matches releases by the bytes of the file, not its
+/// name, and Telegram filenames are frequently `video_2024-01-15_12-34-56.mp4` — a
+/// text search on that returns nothing useful. The hash needs only the FIRST and
+/// LAST 64 KiB.
+///
+/// Cost: it goes through `download_and_cache_range`, which serves from the disk
+/// cache when the bytes are already present. The head 64 KiB is the init segment
+/// every playback tier reads first, so on a file that has started playing this is
+/// usually free; the 64 KiB tail may be a real fetch on tiers that never read it.
+/// Either way it is ~128 KiB worst case, and the ranges land in the shared cache
+/// where playback can reuse them.
+#[get("/subtitles/{folder_id}/{message_id}/moviehash")]
+async fn subtitles_moviehash(
+    path: web::Path<(String, i32)>,
+    query: web::Query<StreamQuery>,
+    data: web::Data<Arc<TelegramState>>,
+    token_data: web::Data<StreamTokenData>,
+    cache: web::Data<Option<StreamCacheManager>>,
+) -> impl Responder {
+    let (folder_id_str, message_id) = path.into_inner();
+    let (media, total_size) =
+        match resolve_media_from_path(&folder_id_str, message_id, &data, &token_data, &query).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+
+    let Some((head_off, tail_off, len)) =
+        crate::commands::opensubtitles::movie_hash_ranges(total_size)
+    else {
+        return HttpResponse::UnprocessableEntity().body("empty file has no moviehash");
+    };
+
+    let Some(cache_mgr) = cache.get_ref().as_ref() else {
+        return HttpResponse::ServiceUnavailable().body("stream cache unavailable");
+    };
+
+    // Two ranges, sequential rather than concurrent: download_and_cache_range holds
+    // the session semaphore, and issuing both at once would contend with playback.
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(2);
+    for offset in [head_off, tail_off] {
+        let end = offset + len as u64 - 1;
+        match download_and_cache_range(
+            message_id,
+            offset,
+            end,
+            total_size,
+            &media,
+            cache_mgr,
+            &data,
+        )
+        .await
+        {
+            Ok(bytes) => chunks.push(bytes),
+            Err(e) => {
+                log::warn!(
+                    "[MOVIEHASH] msg {} range {}..{} failed: {}",
+                    message_id,
+                    offset,
+                    end,
+                    e
+                );
+                return HttpResponse::BadGateway().body(format!("range fetch failed: {}", e));
+            }
+        }
+    }
+
+    let hash = crate::commands::opensubtitles::movie_hash(total_size, &chunks[0], &chunks[1]);
+    log::info!(
+        "[MOVIEHASH] msg {} size={} hash={} (head {} B + tail {} B)",
+        message_id,
+        total_size,
+        hash,
+        chunks[0].len(),
+        chunks[1].len()
+    );
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(format!("{{\"hash\":\"{}\",\"size\":{}}}", hash, total_size))
+}
+
 /// Extract ONE embedded text subtitle track as SRT (or byte-faithful ASS).
 ///
 /// `GET /subtitles/{folder}/{message}/track/{stream_idx}?token=..`
@@ -7716,6 +7802,7 @@ pub async fn start_streaming_server(
             .service(remux_hover_thumb)
             .service(audio_tracks_list)
             .service(subtitles_list)
+            .service(subtitles_moviehash)
             .service(subtitles_extract_track)
             .service(subtitles_font)
             .configure(hls::configure_hls)

@@ -1,0 +1,77 @@
+// @vitest-environment node
+/**
+ * Every `#[tauri::command]` must be declared in THREE places or it fails at RUNTIME
+ * with "<cmd> not allowed" — which is exactly how the OpenSubtitles search shipped
+ * broken: the commands existed, were registered in `generate_handler!`, compiled
+ * clean, and passed 1043 tests, but were missing from `build.rs`'s app manifest, so
+ * Tauri never generated their permissions and the capability could not reference them.
+ *
+ * tsc and cargo both pass in that state. Only this test catches it.
+ */
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const TAURI = join(__dirname, '..', '..', 'src-tauri');
+const buildRs = readFileSync(join(TAURI, 'build.rs'), 'utf8');
+const libRs = readFileSync(join(TAURI, 'src', 'lib.rs'), 'utf8');
+const capability = readFileSync(join(TAURI, 'capabilities', 'default.json'), 'utf8');
+
+/** `cmd_opensubtitles_search` → `allow-cmd-opensubtitles-search` */
+function permissionName(cmd: string): string {
+  return `allow-${cmd.replace(/_/g, '-')}`;
+}
+
+const OPENSUBTITLES_COMMANDS = [
+  'cmd_opensubtitles_validate_key',
+  'cmd_opensubtitles_search',
+  'cmd_opensubtitles_download',
+];
+
+describe('OpenSubtitles commands are invokable from the frontend', () => {
+  for (const cmd of OPENSUBTITLES_COMMANDS) {
+    describe(cmd, () => {
+      it('is registered in generate_handler!', () => {
+        expect(libRs).toContain(`commands::${cmd}`);
+      });
+
+      it('is declared in build.rs app_manifest (generates its permission)', () => {
+        // THE MISSED STEP. Without it Tauri emits no permission file, the capability
+        // reference fails to resolve, and the invoke is rejected at runtime.
+        expect(buildRs).toContain(`"${cmd}"`);
+      });
+
+      it('is allowlisted in capabilities/default.json', () => {
+        expect(JSON.parse(capability).permissions).toContain(permissionName(cmd));
+      });
+    });
+  }
+
+  it('capability permissions and build.rs manifest agree for every cmd_*', () => {
+    // Catches the inverse error too: a capability naming a permission that build.rs
+    // never generates fails the BUILD with "Permission ... not found".
+    const declared = new Set(
+      [...buildRs.matchAll(/"(cmd_[a-z0-9_]+)"/g)].map((m) => m[1]),
+    );
+    const referenced: string[] = JSON.parse(capability).permissions
+      .filter((p: string) => p.startsWith('allow-cmd-'));
+    const missing = referenced.filter((p) => {
+      const cmd = p.replace(/^allow-/, '').replace(/-/g, '_');
+      return !declared.has(cmd);
+    });
+    expect(missing).toEqual([]);
+  });
+
+  it('every generate_handler command has a build.rs manifest entry', () => {
+    const handlerStart = libRs.indexOf('generate_handler!');
+    expect(handlerStart).toBeGreaterThan(-1);
+    const handler = libRs.slice(handlerStart, libRs.indexOf('])', handlerStart));
+    const handled = [...handler.matchAll(/commands::(cmd_[a-z0-9_]+)/g)].map((m) => m[1]);
+    expect(handled.length).toBeGreaterThan(50);
+    const declared = new Set(
+      [...buildRs.matchAll(/"(cmd_[a-z0-9_]+)"/g)].map((m) => m[1]),
+    );
+    // A handled-but-undeclared command is invokable in code and rejected at runtime.
+    expect(handled.filter((c) => !declared.has(c))).toEqual([]);
+  });
+});
