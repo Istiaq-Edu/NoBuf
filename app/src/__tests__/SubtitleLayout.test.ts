@@ -383,21 +383,33 @@ describe('subtitleLayout — top anchor, width, panel, totality', () => {
     expect(l.topPx).toBeCloseTo(475 + SUB_BOTTOM_RATIO * 450, 6);
   });
 
-  it('caps line width at 68% of picture width for 16:9 and 90% otherwise', () => {
+  it('caps line width near the picture edge, and never boxes cues into a column', () => {
     // Asserted against LITERALS, not the exported constants: comparing to
     // SUB_LINE_WIDTH_16_9 would move with any change to it, so the assertion
     // would survive a mutation of the value it exists to pin (it did).
+    //
+    // These are CEILINGS for long lines, not target widths — the cue box is
+    // fit-content, so a short line stays short. An earlier 0.68 (a BBC editorial
+    // guideline for authored broadcast subs) made every cue read as a narrow centred
+    // column on arbitrary downloaded tracks.
     const wide = subtitleLayout(input({ boxW: 1920, boxH: 1080, videoW: 1920, videoH: 1080 }));
-    expect(wide.maxWidthPx).toBeCloseTo(1305.6, 1); // 1920 * 0.68 — BBC online 16:9
+    expect(wide.maxWidthPx).toBeCloseTo(1766.4, 1); // 1920 * 0.92
     const four3 = subtitleLayout(input({ boxW: 1000, boxH: 1000, videoW: 640, videoH: 480 }));
-    expect(four3.maxWidthPx).toBeCloseTo(900, 1); // 1000 * 0.90 — non-16:9
-    // And the two ratios must stay distinct, or the 16:9 cap is doing nothing.
+    expect(four3.maxWidthPx).toBeCloseTo(940, 1);   // 1000 * 0.94
+    // The two ratios stay distinct (16:9 lines are longer, so they wrap slightly
+    // earlier), and both must leave the text room to breathe.
     expect(SUB_LINE_WIDTH_16_9).toBeLessThan(SUB_LINE_WIDTH_OTHER);
-    expect(SUB_LINE_WIDTH_16_9).toBeCloseTo(0.68, 6);
-    expect(SUB_LINE_WIDTH_OTHER).toBeCloseTo(0.90, 6);
+    expect(SUB_LINE_WIDTH_16_9).toBeCloseTo(0.92, 6);
+    expect(SUB_LINE_WIDTH_OTHER).toBeCloseTo(0.94, 6);
+    // Regression guard: a cue must never be capped to a narrow centred column.
+    expect(SUB_LINE_WIDTH_16_9).toBeGreaterThan(0.85);
   });
 
-  it('reserves horizontal space for the settings panel and narrows the text', () => {
+  it('still honours a horizontal reserve when one is passed (contract kept)', () => {
+    // The PLAYER now always passes 0 — the settings panel is z-50 and simply draws on
+    // top of subtitles instead of squeezing them (squeezing reflowed the text
+    // mid-playback). The parameter itself stays functional so a future overlay that
+    // genuinely must not be covered can use it.
     const closed = subtitleLayout(input({ boxW: 1920, boxH: 1080, panelReserveRight: 0 }));
     const open = subtitleLayout(input({ boxW: 1920, boxH: 1080, panelReserveRight: 336 }));
     expect(closed.rightPx).toBe(0);

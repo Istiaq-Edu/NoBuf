@@ -12,10 +12,11 @@
  * are pure numbers in, numbers out.
  */
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   controlsInteractiveHeight,
   subGeomChanged,
-  panelReserve,
 } from '../components/dashboard/FastStreamPlayer';
 
 describe('controlsInteractiveHeight', () => {
@@ -87,33 +88,23 @@ describe('subGeomChanged', () => {
   });
 });
 
-describe('panelReserve', () => {
-  it('is zero while the settings panel is closed', () => {
-    expect(panelReserve(false, 336, 1920)).toBe(0);
+describe('the settings panel does NOT reserve space from subtitles', () => {
+  const player = () => readFileSync(
+    join(__dirname, '..', 'components/dashboard/FastStreamPlayer.tsx'),
+    'utf8',
+  );
+
+  it('panelReserve() is gone — the panel draws OVER cues instead', () => {
+    // Removed deliberately: the panel is z-50 and the overlay z-20, so it already
+    // covers subtitles. Reserving width as well shrank the cue box and reflowed the
+    // text every time the panel opened. Structural, because the fn no longer exists.
+    expect(player()).not.toContain('export function panelReserve');
+    expect(player()).toContain('const panelReserveRight = 0;');
   });
 
-  it('reserves the panel width when open', () => {
-    expect(panelReserve(true, 336, 1920)).toBe(336);
-  });
-
-  it('caps at 70% of the OUTER box, matching the panel maxWidth', () => {
-    // The panel's own CSS is maxWidth:'70%' against the outer box, so the reserve
-    // must use the same ceiling or it would over-reserve on a narrow window.
-    expect(panelReserve(true, 9999, 1000)).toBe(700);
-    expect(panelReserve(true, 336, 400)).toBe(280); // 70% of 400
-  });
-
-  it('prefers the live drag width over the persisted one (caller passes it)', () => {
-    // The caller resolves panelDragWidth ?? persisted; both must survive the cap.
-    expect(panelReserve(true, 500, 1920)).toBe(500);
-    expect(panelReserve(true, 500, 600)).toBe(420);
-  });
-
-  it('never returns a negative or non-finite reserve', () => {
-    for (const [w, outer] of [[NaN, 1920], [336, NaN], [-100, 1920], [336, 0], [NaN, NaN]] as const) {
-      const got = panelReserve(true, w, outer);
-      expect(Number.isFinite(got)).toBe(true);
-      expect(got).toBeGreaterThanOrEqual(0);
-    }
+  it('the panel outranks the overlay so it visibly covers cues', () => {
+    const p = player();
+    const panel = p.slice(p.indexOf('animate-[settingsIn_180ms_ease-out]') - 300);
+    expect(panel.slice(0, 400)).toContain('z-50');
   });
 });
