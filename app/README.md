@@ -1,7 +1,14 @@
-# Tauri + React + Typescript
+# NoBuf — app
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Application source. See the [root README](../README.md) for what NoBuf is and how to
+install it.
 
-## Recommended IDE Setup
+```bash
+npm install
+npm run tauri dev      # run in development
+npm run tauri build    # production build
+npm test               # unit tests
+npx tsc --noEmit       # typecheck
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+`npm test` and `npx tsc --noEmit` are what CI runs on every push and PR.
