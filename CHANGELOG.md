@@ -12,6 +12,7 @@ All notable changes to NoBuf will be documented in this file.
 ### Documentation
 
 - Update CHANGELOG.md for v1.0.0
+- Update CHANGELOG.md for v1.0.0
 
 ### Features
 
