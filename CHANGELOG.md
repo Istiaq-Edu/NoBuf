@@ -2,6 +2,36 @@
 
 All notable changes to NoBuf will be documented in this file.
 
+## [1.0.0] - 2026-07-27
+
+### Bug Fixes
+
+- Fix seek deadlock from stale buffer islands
+- Fix playback issues: seek dispatch, stale guard, landing time, and zombie cancel
+
+### Features
+
+- Add subtitle support with sidecar loading & jassub ASS rendering
+- Add ffmpeg resolution module with on-demand download
+- Create TS_PIPELINE_ASSESSMENT_2026-07-17.md
+- Create TS_PIPELINE_CROSSVALIDATION_FINAL_2026-07-17.md
+- Implement universal transcode tier for HEVC MKV
+- Add byte-accounting probe for seek operations
+- Add seek-to-play probe and SBW op-timing fix
+- Add byte-forward remux seeks (start_byte)
+- Add proactive keyframe index for instant hover thumbnails
+
+### Other
+
+- Refresh README; fix /remux MPEG-TS mismatch
+- Apply 2MB seek-backoff to reported byte
+- Interrupt in-flight seeks; warmer yield
+
+### Performance
+
+- Optimize keyframe search & memoize duration lookups
+- Improve keyframe logging and thumbnail seeking
+
 ## [0.9.0] - 2026-07-12
 
 ### Bug Fixes
@@ -38,6 +68,7 @@ All notable changes to NoBuf will be documented in this file.
 
 - Add design spec + implementation plan for public channel browsing
 - Verification, validation & optimization plan for public channel feature
+- Update CHANGELOG.md for v0.9.0
 
 ### Features
 
