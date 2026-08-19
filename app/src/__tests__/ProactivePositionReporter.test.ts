@@ -93,9 +93,17 @@ describe('startProactivePositionReporter', () => {
   });
 
   it('is the scheduler and decision helper used by the shipped MPEGTS pipeline', () => {
-    const source = readFileSync(`${process.cwd()}/src/hooks/useMSEPlayer.ts`, 'utf8');
+    // Normalize EOL: `initEnd`'s needle spans a line break, so on a Windows
+    // checkout (core.autocrlf=true) it resolved to -1 and slice(initStart, -1)
+    // silently widened the scope to nearly the whole 580KB file — the asserts
+    // below then passed against unrelated code. Normalize, then prove the
+    // scope actually bounded before trusting what it contains.
+    const source = readFileSync(`${process.cwd()}/src/hooks/useMSEPlayer.ts`, 'utf8')
+      .replace(/\r\n/g, '\n');
     const initStart = source.indexOf('const _initMpegtsPlayer = async (');
     const initEnd = source.indexOf('/**\n   * TS-HEVC fatal-error recovery', initStart);
+    expect(initStart, '_initMpegtsPlayer not found').toBeGreaterThan(-1);
+    expect(initEnd, 'TS-HEVC recovery boundary not found').toBeGreaterThan(initStart);
     const init = source.slice(initStart, initEnd);
 
     expect(init).toContain('const decision = decideMpegtsProactiveReport({');
