@@ -22,7 +22,12 @@ import path from 'node:path';
 const authWizardSrc = readFileSync(
   path.resolve(process.cwd(), 'src/components/AuthWizard.tsx'),
   'utf8',
-);
+  // Normalize EOL so structural needles that span a line break behave the same
+  // on every runner. AuthWizard.tsx is stored LF but checks out CRLF wherever
+  // core.autocrlf=true (GitHub's windows-latest), and `npm test` runs on
+  // windows + ubuntu + macos — an EOL-sensitive needle can only ever be green
+  // on one of them.
+).replace(/\r\n/g, '\n');
 
 describe('auth credential persistence (login survives restart)', () => {
   it('finishLogin persists credentials before signalling success', () => {
@@ -70,8 +75,8 @@ describe('auth credential persistence (login survives restart)', () => {
   });
 
   it('QR, phone-code and 2FA success handlers all call finishLogin', () => {
-    // QR immediate-authorized path
-    expect(authWizardSrc).toContain('await finishLogin();\r\n                return;');
+    // QR immediate-authorized path (source normalized to LF above)
+    expect(authWizardSrc).toContain('await finishLogin();\n                return;');
     // phone code + 2FA success (both are: if (res.success) { await finishLogin(); })
     const successCalls = authWizardSrc.match(/if \(res\.success\) \{ await finishLogin\(\);/g) ?? [];
     expect(successCalls.length).toBeGreaterThanOrEqual(2);

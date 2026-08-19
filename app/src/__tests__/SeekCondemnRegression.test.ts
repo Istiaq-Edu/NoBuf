@@ -111,10 +111,14 @@ describe('round-25: a caller-condemned source must not break the seek that follo
     // on the file-wide first match compares against init's copy and is
     // meaningless.
     const fs = await import('node:fs');
+    // Normalize EOL: this needle spans a line break, and a Windows checkout
+    // (core.autocrlf=true on GitHub's windows-latest runner) writes CRLF, so a
+    // hardcoded '\n' needle silently resolves to -1 there. Normalizing keeps
+    // the assert about ORDER, not about the checkout's line endings.
     const full = fs.readFileSync(
       new URL('../lib/faststream/players/MediabunnyTransmuxer.ts', import.meta.url),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
     const bodyStart = full.indexOf('async seekTo(');
     expect(bodyStart, 'seekTo not found').toBeGreaterThan(-1);
     const src = full.slice(bodyStart);

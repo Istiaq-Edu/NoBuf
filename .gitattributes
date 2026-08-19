@@ -1,0 +1,68 @@
+# Normalize line endings in the repository.
+#
+# Why this file exists: several tests assert on the STRUCTURE of shipped source
+# (readFileSync + indexOf) to bind a fix to the code that implements it. Any
+# needle spanning a line break is EOL-sensitive, and without this file the
+# checkout decided the line endings:
+#
+#   * GitHub's windows-latest runner has core.autocrlf=true -> CRLF checkout,
+#     so a needle containing '\n' resolved to -1 (indexOf) and the assert
+#     failed, or worse, slice(start, -1) silently widened the scope and the
+#     test passed while checking nothing.
+#   * ubuntu / macos runners check out LF, so a needle containing '\r\n'
+#     could never match there.
+#
+# `npm test` runs on all three platforms in .github/workflows/main.yml, so an
+# EOL-sensitive assert could only ever be green on one of them. Forcing LF in
+# the working tree makes the structural tests platform-independent.
+#
+# Tests should ALSO normalize what they read (.replace(/\r\n/g, '\n')) so they
+# stay correct for contributors whose local git config predates this file.
+
+# Default: let git detect text and normalize to LF in the index.
+* text=auto eol=lf
+
+# Source and config: always LF, on every platform.
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.jsx   text eol=lf
+*.json  text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+
+# Windows-only scripts genuinely need CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binaries: never touch.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.mp4   binary
+*.mkv   binary
+*.webm  binary
+*.wasm  binary
+*.zip   binary
+*.gz    binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
