@@ -2,12 +2,16 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.0.0] - 2026-07-27
+## [1.0.0] - 2026-08-19
 
 ### Bug Fixes
 
 - Fix seek deadlock from stale buffer islands
 - Fix playback issues: seek dispatch, stale guard, landing time, and zombie cancel
+
+### Documentation
+
+- Update CHANGELOG.md for v1.0.0
 
 ### Features
 
