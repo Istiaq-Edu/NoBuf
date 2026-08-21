@@ -16,6 +16,27 @@ interface ProgressPayload {
     speed_bytes_per_sec: number;
 }
 
+/**
+ * QueueItems that may be written to the persistent store.
+ * Staged dropped-file items point at %TEMP%\nobuf_dropped, which the startup sweep
+ * deletes BEFORE restored items are read — persisting them would guarantee an
+ * "Invalid path" failure toast per item on every relaunch. The original file is
+ * still in the user's hands; they simply re-drop it.
+ */
+export function persistableQueueItems(items: QueueItem[]): QueueItem[] {
+    return items.filter(i => !i.stagedTempPath);
+}
+
+/**
+ * Best-effort delete of a staged temp file once its queue item reaches a terminal
+ * state. Silent by design: NotFound means the sweep/another path already got it,
+ * and a locked file must never turn a finished upload into an error toast.
+ */
+export function cleanupStagedTemp(item: Pick<QueueItem, 'stagedTempPath'>): void {
+    if (!item.stagedTempPath) return;
+    invoke('cmd_delete_staged_file', { path: item.stagedTempPath }).catch(() => {});
+}
+
 export function useFileUpload(activeFolderId: number | null, store: Store | null) {
     const queryClient = useQueryClient();
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
@@ -24,6 +45,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const [limitBytes, setLimitBytes] = useState(2_000_000_000);
     useEffect(() => { invoke<number>('cmd_upload_limit').then(setLimitBytes).catch(() => {}); }, []);
     const cancelledRef = useRef<Set<string>>(new Set());
+    // Live mirror of uploadQueue for once-registered/async callbacks (dedupe on drop).
+    const queueMirrorRef = useRef<QueueItem[]>([]);
+    queueMirrorRef.current = uploadQueue;
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -73,7 +97,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     useEffect(() => {
         if (!store || !initialized) return;
-        const pending = uploadQueue.filter(i => i.status === 'pending');
+        const pending = persistableQueueItems(uploadQueue.filter(i => i.status === 'pending'));
         store.set('uploadQueue', pending).then(() => store.save());
     }, [store, uploadQueue, initialized]);
 
@@ -93,14 +117,17 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 // Remote upload from URL
                 await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
             } else {
-                // Local file upload
-                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id });
+                // Local file upload — displayName carries the ORIGINAL dropped-file name
+                // so the Telegram document isn't named after the <id>-prefixed temp file.
+                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
             }
             // Check if cancelled during upload
             if (cancelledRef.current.has(item.id)) {
                 cancelledRef.current.delete(item.id);
+                cleanupStagedTemp(item);
             } else {
                 setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'success', progress: 100 } : i));
+                cleanupStagedTemp(item);
                 queryClient.invalidateQueries({ queryKey: ['files', item.folderId] });
             }
         } catch (e) {
@@ -108,12 +135,15 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 const errMsg = String(e);
                 if (errMsg.includes('Transfer cancelled')) {
                     setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled' } : i));
+                    cleanupStagedTemp(item);
                 } else {
+                    // Terminal error keeps the staged temp file so Retry can re-upload it.
                     setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
-                    toast.error(`Upload failed for ${item.path.split('/').pop()}: ${e}`);
+                    toast.error(`Upload failed for ${item.displayName || item.path.split('/').pop()}: ${e}`);
                 }
             } else {
                 cancelledRef.current.delete(item.id);
+                cleanupStagedTemp(item);
             }
         } finally {
             setProcessing(false);
@@ -220,6 +250,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             }
             // Remove pending items directly
             if (item?.status === 'pending') {
+                cleanupStagedTemp(item);
                 return q.filter(i => i.id !== id);
             }
             return q;
@@ -240,8 +271,19 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         const { stageDroppedFiles } = await import('./useDroppedFileUpload');
         const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder);
         if (items.length > 0) {
-            setUploadQueue(prev => [...prev, ...items]);
-            toast.info(`Queued ${items.length} file(s) for upload`);
+            // Accidental double-drop of the same file(s): skip names already queued
+            // or in flight, so one slip doesn't upload everything twice.
+            const activeNames = new Set(
+                queueMirrorRef.current
+                    .filter(i => i.status === 'pending' || i.status === 'uploading')
+                    .map(i => i.displayName),
+            );
+            const fresh = items.filter(it => !activeNames.has(it.displayName));
+            const skipped = items.length - fresh.length;
+            if (skipped > 0) toast.info(`Skipped ${skipped} duplicate file(s) already queued.`);
+            if (fresh.length === 0) return;
+            setUploadQueue(prev => [...prev, ...fresh]);
+            toast.info(`Queued ${fresh.length} file(s) for upload`);
         }
     };
 

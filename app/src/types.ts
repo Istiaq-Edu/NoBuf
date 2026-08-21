@@ -32,6 +32,8 @@ export interface QueueItem {
     speedBytesPerSec?: number;
     url?: string; // For remote upload from URL
     phase?: 'downloading' | 'uploading'; // For remote upload dual-phase progress
+    stagedTempPath?: string; // Dropped-file staging: %TEMP%\nobuf_dropped path, deleted on terminal states. NEVER persisted to the store (a restart sweeps the dir).
+    displayName?: string; // Dropped-file staging: original name sent to Telegram (the temp filename carries a random <id>- prefix that must not leak)
 }
 
 export interface BandwidthStats {
