@@ -117,6 +117,11 @@ describe('stageDroppedFiles', () => {
         );
         expect(items).toHaveLength(1);
         expect(items[0].displayName).toBe('fine.txt');
+        // Partial staging bytes are discarded immediately, not left for the next sweep.
+        const discardCall = invokeMock.mock.calls.find(c => c[0] === 'cmd_discard_staged_upload');
+        expect(discardCall).toBeDefined();
+        expect(discardCall![1]).toMatchObject({ fileName: 'cursed.dat' });
+        expect(typeof discardCall![1].uploadId).toBe('string');
     });
 });
 

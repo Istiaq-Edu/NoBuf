@@ -384,6 +384,30 @@ pub async fn cmd_delete_staged_file(path: String) -> Result<(), String> {
     }
 }
 
+/// Best-effort delete of a PARTIALLY staged dropped file (stage aborted mid-stream,
+/// e.g. the source vanished or a chunk failed). Derives the same path as
+/// cmd_stage_dropped_file so the frontend never constructs filesystem paths.
+#[tauri::command]
+pub async fn cmd_discard_staged_upload(upload_id: String, file_name: String) -> Result<(), String> {
+    // Mirrors cmd_stage_dropped_file's exact naming so the derived path matches.
+    let safe_name = std::path::Path::new(&file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dropped".to_string());
+    let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if safe_id.is_empty() {
+        return Err("Invalid upload id".to_string());
+    }
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}-{}", safe_id, safe_name));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Resolve the document name an uploaded file gets in Telegram.
 /// Staged dropped files pass their ORIGINAL name here (the temp path carries a
 /// random `<id>-` prefix that must never leak into Telegram). Falls back to the

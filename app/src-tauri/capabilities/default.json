@@ -23,6 +23,7 @@
     "allow-cmd-file-size",
     "allow-cmd-stage-dropped-file",
     "allow-cmd-delete-staged-file",
+    "allow-cmd-discard-staged-upload",
     "allow-cmd-upload-from-url",
     "allow-cmd-connect",
     "allow-cmd-log",
