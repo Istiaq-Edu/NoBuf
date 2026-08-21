@@ -432,6 +432,12 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     setQrConfirming(true);
                     setQrPolling(false);
                     setStep("password");
+                } else if (res.next_step === "waiting") {
+                    // The poll probe rotates the QR token as it nears its ~30s expiry.
+                    // Re-render the QR from the backend's current token so the user is
+                    // always scanning a live code — scanning a stale one can never complete.
+                    const currentUrl = await invoke<string | null>("cmd_auth_qr_current");
+                    if (currentUrl) { setQrUrl((prev) => (prev === currentUrl ? prev : currentUrl)); }
                 }
             } catch {
                 // Polling error — keep trying silently

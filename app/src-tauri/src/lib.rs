@@ -456,6 +456,7 @@ pub fn run() {
             commands::cmd_cancel_transfer,
             commands::cmd_auth_qr_login,
             commands::cmd_auth_qr_poll,
+            commands::cmd_auth_qr_current,
             commands::cmd_open_telegram_auth,
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,
