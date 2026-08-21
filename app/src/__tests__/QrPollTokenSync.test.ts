@@ -44,6 +44,16 @@ describe('QR poll keeps the rendered code in sync with the rotating token', () =
     expect(effectBody).toContain('cmd_auth_qr_current');
   });
 
+  it('poll catch never swallows handler errors silently', () => {
+    // The 2026-08-21 stuck run: handle_2fa failed backend-side, the poll catch
+    // swallowed it, and the UI sat on "Waiting for scan..." with zero signal.
+    const catchStart = authWizardSrc.indexOf('} catch (pollErr) {');
+    expect(catchStart).toBeGreaterThan(-1);
+    const body = authWizardSrc.slice(catchStart, catchStart + 700);
+    expect(body).toContain('console.error');
+    expect(body).toContain('setQrPollError(');
+  });
+
   it('success/expired paths are checked before the waiting-sync branch', () => {
     // Order matters: success and expired must short-circuit before we touch
     // the QR URL, or a completing login could clobber its own state.

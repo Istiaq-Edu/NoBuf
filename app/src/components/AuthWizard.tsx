@@ -447,11 +447,13 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     setQrPollError(res.error ?? null);
                     qrFailCountRef.current = 0;
                 }
-            } catch {
-                // Polling transport error — keep trying, but tell the user after a
-                // few consecutive failures so a dead backend is visible.
+            } catch (pollErr) {
+                // Poll/handler error — keep trying, but NEVER silently: a swallowed
+                // invoke failure here looks identical to "Waiting for scan..." forever.
+                console.error("[qr-poll] invoke failed:", pollErr);
                 qrFailCountRef.current += 1;
-                if (qrFailCountRef.current >= 3) { setQrPollError("Connection issue — retrying…"); }
+                const msg = pollErr instanceof Error ? pollErr.message : String(pollErr);
+                setQrPollError(msg || "Connection issue — retrying…");
             }
         }, 5000);
         return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } };
