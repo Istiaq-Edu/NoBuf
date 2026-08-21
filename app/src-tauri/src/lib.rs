@@ -243,6 +243,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // Single-instance guard: a second instance's startup sweep would delete the
+        // first instance's in-flight staged uploads (nobuf_dropped), silently
+        // corrupting them. With the plugin, a second launch just focuses the first.
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .setup(move |app| {
             app.manage(TelegramState {
                 client: Arc::new(Mutex::new(None)),
@@ -423,6 +427,7 @@ pub fn run() {
             commands::cmd_upload_limit,
             commands::cmd_file_size,
             commands::cmd_stage_dropped_file,
+            commands::cmd_delete_staged_file,
             commands::cmd_upload_from_url,
             commands::cmd_connect,
             commands::cmd_log,

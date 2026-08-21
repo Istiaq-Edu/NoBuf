@@ -133,12 +133,20 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
     const [externalDragActive, setExternalDragActive] = useState(false);
     const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
+    // Re-fetch the Premium-aware limit whenever the Telegram connection (re)establishes,
+    // so a mid-session account change isn't stuck with the stale mount-time value.
     useEffect(() => {
+        if (!isConnected) return;
         invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
-    }, []);
+    }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
     const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; stage: ((f: File[], l: number, hasFolder: boolean) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, stage: null });
+    // Last dragover/drop timestamp for external drags. WebView2 fires NO event when a
+    // drag is cancelled mid-window (Esc key): dragleave carries in-window coordinates
+    // and dragend only fires on the (external) source. The watchdog below uses this to
+    // dismiss the overlay when drags silently die.
+    const lastExternalDragActivityRef = useRef(0);
 
 
     const { data: nbFiles = [], isLoading: nbFilesLoading, error } = useQuery({
@@ -534,6 +542,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const onDragOver = (e: DragEvent) => {
             if (!isExternal(e.dataTransfer)) return;
             e.preventDefault();  // required so 'drop' fires
+            lastExternalDragActivityRef.current = Date.now();
             if (e.dataTransfer) e.dataTransfer.dropEffect = dropCtxRef.current.canUploadHere ? 'copy' : 'none';
             setExternalDragActive(true);
         };
@@ -543,9 +552,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             }
         };
         const onDrop = async (e: DragEvent) => {
-            if (!isExternal(e.dataTransfer)) return;  // internal drops handled by their own targets
+            if (!isExternal(e.dataTransfer)) {
+                // Non-file, non-internal drop (e.g. a link or text dragged in from a
+                // browser) would navigate the whole webview on drop. Block that —
+                // unless the target is an editable field, where text drops are legit.
+                const t = e.dataTransfer ? Array.from(e.dataTransfer.types) : [];
+                const isInternal = t.includes(FILE_ID_MIME) || t.includes(FOLDER_REORDER_MIME);
+                if (!isInternal) {
+                    const el = e.target as HTMLElement | null;
+                    if (!el?.closest?.('input, textarea, [contenteditable="true"]')) e.preventDefault();
+                }
+                return;  // internal drops handled by their own targets
+            }
             e.preventDefault();
             e.stopPropagation();
+            lastExternalDragActivityRef.current = Date.now();
             setExternalDragActive(false);
             const { canUploadHere: canUp, limit, stage } = dropCtxRef.current;
             // Detect folders SYNCHRONOUSLY before any await — the items list is neutralized
@@ -576,6 +597,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             document.removeEventListener('drop', onDrop, true);
         };
     }, []);
+
+    // External-drag overlay dismissal for the cases the DOM never reports:
+    // - Esc key cancels an OS drag mid-window; WebView2 fires no dragleave/dragend
+    // - a drag can silently die (source window destroyed) without any event
+    // While the overlay is up we watch for both: Escape directly, and a dragover
+    // heartbeat that stops arriving. Gated on externalDragActive → zero cost otherwise.
+    useEffect(() => {
+        if (!externalDragActive) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setExternalDragActive(false);
+        };
+        const watchdog = window.setInterval(() => {
+            if (Date.now() - lastExternalDragActivityRef.current > 700) setExternalDragActive(false);
+        }, 150);
+        window.addEventListener('keydown', onKey);
+        return () => {
+            window.clearInterval(watchdog);
+            window.removeEventListener('keydown', onKey);
+        };
+    }, [externalDragActive]);
 
     const previewNeighbors = previewNeighborFiles();
 

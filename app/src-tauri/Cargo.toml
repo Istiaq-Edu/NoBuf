@@ -56,6 +56,7 @@ sqlite = { version = "0.37", features = ["bundled"] }
 rar = "0.4"
 sevenz-rust2 = "0.7"
 url = "2"
+tauri-plugin-single-instance = "2.4.3"
 
 [profile.release]
 opt-level = 3

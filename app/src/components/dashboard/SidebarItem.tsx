@@ -125,6 +125,14 @@ export function SidebarItem({
     // Determine if a drag event is a folder reorder (vs file drop)
     const isReorderDrag = (e: React.DragEvent) => e.dataTransfer.types.includes(FOLDER_REORDER_MIME);
 
+    // External OS file drags carry 'Files' (and neither internal MIME). Their drops are
+    // captured at the document level (Dashboard) and upload to the CURRENT folder —
+    // highlighting this folder would promise a targeted drop that never happens.
+    const isExternalFilesDrag = (e: React.DragEvent) =>
+        e.dataTransfer.types.includes('Files') &&
+        !e.dataTransfer.types.includes('application/x-telegram-file-id') &&
+        !e.dataTransfer.types.includes(FOLDER_REORDER_MIME);
+
     return (
         <>
             {/* Reorder drop indicator line — rendered as a separate element above/below the button */}
@@ -154,8 +162,10 @@ export function SidebarItem({
                 onDragEnter={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // Only highlight for file drops (not reorder — reorder has its own indicator)
-                    if (!isReorderDrag(e)) {
+                    // Highlight only for INTERNAL file drops (not reorder — it has its own
+                    // indicator; not external 'Files' drags — their drop is captured away
+                    // to the current-folder uploader, so a highlight here would lie).
+                    if (!isReorderDrag(e) && !isExternalFilesDrag(e)) {
                         setIsOver(true);
                     }
                 }}

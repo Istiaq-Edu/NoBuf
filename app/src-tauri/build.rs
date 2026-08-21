@@ -10,6 +10,7 @@ fn main() {
                 "cmd_upload_limit",
                 "cmd_file_size",
                 "cmd_stage_dropped_file",
+                "cmd_delete_staged_file",
                 "cmd_upload_from_url",
                 "cmd_connect",
                 "cmd_log",
