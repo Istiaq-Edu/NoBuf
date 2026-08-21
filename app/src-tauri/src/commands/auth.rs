@@ -230,6 +230,7 @@ pub async fn cmd_logout(
         state.stored_api_id.store(0, std::sync::atomic::Ordering::SeqCst);
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
+        state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
     state.cancelled_transfers.write().await.clear();
 
@@ -402,6 +403,7 @@ pub async fn cmd_auth_qr_login(
         state.stored_api_id.store(api_id, std::sync::atomic::Ordering::SeqCst);
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
+        state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Clear any previous QR token
         *state.qr_token.lock().await = None;
@@ -483,6 +485,18 @@ pub async fn cmd_auth_qr_poll(
         guard.as_ref().ok_or("Client not initialized")?.clone()
     };
 
+    // Once the phone accepted the QR and Telegram asked for the cloud password,
+    // stick to the password step: re-probing exportLoginToken re-consumes the
+    // accepted token until AUTH_TOKEN_EXPIRED and can clobber the pending 2FA
+    // handshake (observed live 2026-08-21).
+    if state.qr_2fa_pending.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(AuthResult {
+            success: false,
+            next_step: Some("password".to_string()),
+            error: None,
+        });
+    }
+
     // Check if already finalized
     if state.qr_finalized.load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(AuthResult {
@@ -553,7 +567,7 @@ pub async fn cmd_auth_qr_poll(
                             Err(e) => {
                                 let err_msg = e.to_string();
                                 if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                    return handle_2fa(&client, &state).await;
+                                    return handle_2fa(&client, &state, Some(m.dc_id)).await;
                                 }
                                 log::warn!("QR finalization migration error: {}", e);
                                 state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -580,7 +594,7 @@ pub async fn cmd_auth_qr_poll(
                     Err(e) => {
                         let err_msg = e.to_string();
                         if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                            return handle_2fa(&client, &state).await;
+                            return handle_2fa(&client, &state, None).await;
                         }
                         // Reset and keep waiting
                         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -681,7 +695,7 @@ pub async fn cmd_auth_qr_poll(
                                 Err(e) => {
                                     let err_msg = e.to_string();
                                     if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                        return handle_2fa(&client, &state).await;
+                                        return handle_2fa(&client, &state, Some(m.dc_id)).await;
                                     }
                                     log::warn!("QR poll migration error: {}", e);
                                     return Ok(AuthResult {
@@ -695,7 +709,7 @@ pub async fn cmd_auth_qr_poll(
                         Err(e) => {
                             let err_msg = e.to_string();
                             if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                return handle_2fa(&client, &state).await;
+                                return handle_2fa(&client, &state, None).await;
                             }
                             if err_msg.contains("TOKEN_EXPIRED") || err_msg.contains("token expired") {
                                 log::warn!("QR login: token expired");
@@ -726,7 +740,7 @@ pub async fn cmd_auth_qr_poll(
         Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                return handle_2fa(&client, &state).await;
+                return handle_2fa(&client, &state, None).await;
             }
             if err_msg.contains("TOKEN_EXPIRED") || err_msg.contains("token expired") {
                 log::warn!("QR login: token expired");
@@ -779,11 +793,28 @@ pub async fn cmd_auth_qr_current(
 async fn handle_2fa(
     client: &Client,
     state: &State<'_, TelegramState>,
+    dc_id: Option<i32>,
 ) -> Result<AuthResult, String> {
-    log::info!("QR login: 2FA password required");
-    let password: tl::types::account::Password = match client.invoke(&tl::functions::account::GetPassword {}).await {
-        Ok(p) => p.into(),
-        Err(pe) => return Err(format!("2FA required but failed to get password info: {}", pe)),
+    // Fetch password info from the SAME DC that reported SESSION_PASSWORD_NEEDED.
+    // When the QR token was accepted via loginTokenMigrateTo (DC mismatch), the
+    // requirement is raised on THAT DC; asking the home DC can fail and leave the
+    // UI stuck on "Waiting for scan..." forever (observed 2026-08-21).
+    log::info!("QR login: 2FA password required (dc={:?})", dc_id);
+    state.qr_2fa_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+    let get_password = tl::functions::account::GetPassword {};
+    let result = match dc_id {
+        Some(dc) => client.invoke_in_dc(dc, &get_password).await,
+        None => client.invoke(&get_password).await,
+    };
+    let password: tl::types::account::Password = match result {
+        Ok(p) => {
+            log::info!("QR login: account.GetPassword ok");
+            p.into()
+        }
+        Err(pe) => {
+            log::error!("QR login: account.GetPassword failed: {}", pe);
+            return Err(format!("2FA required but failed to get password info: {}", pe));
+        }
     };
     *state.password_token.lock().await = Some(grammers_client::types::PasswordToken::new(password));
     Ok(AuthResult {
@@ -1180,6 +1211,47 @@ mod qr_login_url_tests {
     /// (the poll loop needs a live Telegram client) while re-serving a stale
     /// QR forever — the original "stuck on Waiting for scan" bug. This
     /// source-level assert is the only gate that sees that seam.
+    /// Pins the 2FA latch: once handle_2fa runs, every subsequent poll must
+    /// return the password step WITHOUT re-probing exportLoginToken (which
+    /// re-consumes the accepted token until AUTH_TOKEN_EXPIRED — observed
+    /// live 2026-08-21). All four sides must exist together.
+    #[test]
+    fn qr_2fa_latch_is_set_checked_and_reset() {
+        let src = include_str!("auth.rs");
+
+        // handle_2fa SETS the latch before any fallible work
+        let h = src.find("async fn handle_2fa").expect("handle_2fa missing");
+        let hbody = &src[h..h + 900];
+        assert!(
+            hbody.contains("state.qr_2fa_pending.store(true,"),
+            "handle_2fa no longer sets the 2FA latch"
+        );
+
+        // cmd_auth_qr_poll CHECKS the latch before probing (early return)
+        let p = src.find("pub async fn cmd_auth_qr_poll").expect("cmd_auth_qr_poll missing");
+        let pbody = &src[p..p + 1200];
+        assert!(
+            pbody.contains("if state.qr_2fa_pending.load(") && pbody.contains("\"password\".to_string()"),
+            "cmd_auth_qr_poll no longer short-circuits to the password step while 2FA is pending"
+        );
+
+        // Fresh QR login RESETS the latch
+        let l = src.find("pub async fn cmd_auth_qr_login").expect("cmd_auth_qr_login missing");
+        let lbody = &src[l..l + 1200];
+        assert!(
+            lbody.contains("state.qr_2fa_pending.store(false,"),
+            "cmd_auth_qr_login no longer resets the 2FA latch"
+        );
+
+        // Logout RESETS the latch
+        let lo = src.find("pub async fn cmd_logout").expect("cmd_logout missing");
+        let lobody = &src[lo..lo + 2600];
+        assert!(
+            lobody.contains("state.qr_2fa_pending.store(false,"),
+            "cmd_logout no longer resets the 2FA latch"
+        );
+    }
+
     #[test]
     fn poll_probe_stores_rotated_token_for_cmd_auth_qr_current() {
         let src = include_str!("auth.rs");

@@ -144,7 +144,7 @@ pub struct TelegramState {
     /// Stored API id for QR poll finalization
     pub stored_api_id: Arc<std::sync::atomic::AtomicI32>,
     /// Whether we've already called exportLoginToken to finalize QR login
-        pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,
+        pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,        pub qr_2fa_pending: Arc<std::sync::atomic::AtomicBool>,
         /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
         /// Used to throttle calls to every ~15 seconds to avoid flood waits.
         pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
