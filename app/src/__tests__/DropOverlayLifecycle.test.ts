@@ -112,6 +112,23 @@ describe('staged temp files are excluded from store persistence', () => {
         expect(catchBody).not.toContain('cleanupStagedTemp');
     });
 
+    it('drop is rejected while disconnected from Telegram', () => {
+        // Without this gate, a drop while offline stages GBs to %TEMP%, fails with a
+        // network error, and quitting loses the queue item entirely (staged items are
+        // never persisted) — orphaning the temp until the next sweep.
+        const s = src('src/components/Dashboard.tsx');
+        expect(s).toContain('!dropCtxRef.current.connected');
+        expect(s).toContain('Not connected to Telegram');
+    });
+
+    it('staging progress rows render above queued items in the uploads tab', () => {
+        const s = src('src/components/dashboard/TransferPanel.tsx');
+        expect(s).toContain('stagingItems.map');
+        expect(s).toContain('preparing');
+        // Empty-state must not show while files are still staging.
+        expect(s).toContain('items.length === 0 && stagingItems.length === 0');
+    });
+
     it('single-instance callback focuses the existing window (plugin does NOT auto-focus)', () => {
         const rust = src('src-tauri/src/lib.rs');
         // Exactly one registration, and it must be the FIRST plugin on the builder
