@@ -37,6 +37,7 @@ fn main() {
                 "cmd_cancel_transfer",
                 "cmd_auth_qr_login",
                 "cmd_auth_qr_poll",
+                "cmd_auth_qr_current",
                 "cmd_open_telegram_auth",
                 "cmd_get_api_settings",
                 "cmd_update_api_settings",

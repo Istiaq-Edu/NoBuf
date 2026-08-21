@@ -372,6 +372,13 @@ pub async fn cmd_auth_check_password(
     }
 }
 
+/// Encodes a raw login token into the `tg://login?token=...` URL that the
+/// frontend renders as a QR code. Shared by cmd_auth_qr_login and
+/// cmd_auth_qr_current so both produce identical URLs for the same token.
+fn qr_login_url(token: &[u8]) -> String {
+    format!("tg://login?token={}", URL_SAFE_NO_PAD.encode(token))
+}
+
 /// QR Login -- Step 1: Export a login token and return the `tg://login?token=...` URL.
 /// The frontend renders this as a QR code for the user to scan with their phone.
 #[tauri::command]
@@ -409,12 +416,10 @@ pub async fn cmd_auth_qr_login(
 
     match result {
         tl::enums::auth::LoginToken::Token(t) => {
-            let encoded = URL_SAFE_NO_PAD.encode(&t.token);
-            let url = format!("tg://login?token={}", encoded);
             log::info!("QR login URL generated, expires at {}", t.expires);
             // Store the token so cmd_auth_qr_poll can call importLoginToken with it
             *state.qr_token.lock().await = Some(t.token.clone());
-            Ok(url)
+            Ok(qr_login_url(&t.token))
         }
         tl::enums::auth::LoginToken::Success(_s) => {
             // Already authorized (e.g. from a previous session)
@@ -435,11 +440,9 @@ pub async fn cmd_auth_qr_login(
 
             match import_result {
                 Ok(tl::enums::auth::LoginToken::Token(t)) => {
-                    let encoded = URL_SAFE_NO_PAD.encode(&t.token);
-                    let url = format!("tg://login?token={}", encoded);
                     log::info!("QR login URL generated after DC migration, expires at {}", t.expires);
                     *state.qr_token.lock().await = Some(t.token.clone());
-                    Ok(url)
+                    Ok(qr_login_url(&t.token))
                 }
                 Ok(tl::enums::auth::LoginToken::Success(_s)) => {
                     log::info!("QR login: already authorized after DC migration");
@@ -744,6 +747,26 @@ pub async fn cmd_auth_qr_poll(
             });
         }
     }
+}
+
+/// QR Login -- Step 3: Return the CURRENT login-token URL without exporting
+/// a new one.
+///
+/// The QR token Telegram issues expires in ~30 seconds, and per the qr-login
+/// spec (core.telegram.org/api/qr-login) the polling client must re-call
+/// exportLoginToken and re-render a fresh QR automatically. cmd_auth_qr_poll
+/// performs exactly that rotation while waiting (it stores every refreshed
+/// token in state.qr_token), but the rotated URL never reached the UI: the
+/// displayed QR kept showing the ORIGINAL token, so scanning it long after
+/// expiry could never complete and the panel stayed on "Waiting for scan..."
+/// forever. This command exposes the current token so the poll handler can
+/// keep the rendered QR in sync with what the backend is actually probing.
+#[tauri::command]
+pub async fn cmd_auth_qr_current(
+    state: State<'_, TelegramState>,
+) -> Result<Option<String>, String> {
+    let guard = state.qr_token.lock().await;
+    Ok(guard.as_ref().map(|t| qr_login_url(t)))
 }
 
 /// Handle 2FA password requirement after QR scan
@@ -1107,4 +1130,60 @@ pub async fn cmd_open_telegram_auth(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod qr_login_url_tests {
+    use super::*;
+
+    /// Regression guard for the "stuck on Waiting for scan" bug: the QR token
+    /// Telegram issues expires in ~30s and cmd_auth_qr_poll rotates it, but the
+    /// rotated URL never reached the UI. cmd_auth_qr_current + the frontend poll
+    /// handler now re-render the live token; this pins the shared encoder so the
+    /// exported and re-served URLs stay byte-identical for the same token.
+    #[test]
+    fn encodes_token_as_url_safe_base64_without_padding() {
+        // 0xFB 0xFF -> "+/" in standard base64, "-" "_" in URL_SAFE
+        let url = qr_login_url(&[0x04, 0x08, 0x10, 0x20, 0xFB, 0xFF]);
+        assert!(url.starts_with("tg://login?token="));
+        let encoded = &url["tg://login?token=".len()..];
+        assert_eq!(encoded, "BAgQIPv_"); // URL-safe alphabet, no '=' padding
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
+    }
+
+    #[test]
+    fn matches_the_url_cmd_auth_qr_login_builds() {
+        // The exact expression cmd_auth_qr_login used before the helper was
+        // extracted; both paths must stay identical.
+        let token: Vec<u8> = (0u8..=64).collect();
+        let expected = format!("tg://login?token={}", URL_SAFE_NO_PAD.encode(&token));
+        assert_eq!(qr_login_url(&token), expected);
+    }
+
+    #[test]
+    fn empty_token_yields_empty_credentials_segment() {
+        assert_eq!(qr_login_url(&[]), "tg://login?token=");
+    }
+
+    /// Structural guard binding cmd_auth_qr_poll to cmd_auth_qr_current: the
+    /// waiting-probe MUST persist every refreshed token into state.qr_token,
+    /// because cmd_auth_qr_current serves THAT stored token back to the UI.
+    /// Deleting the store line compiles clean and passes every behavioral test
+    /// (the poll loop needs a live Telegram client) while re-serving a stale
+    /// QR forever — the original "stuck on Waiting for scan" bug. This
+    /// source-level assert is the only gate that sees that seam.
+    #[test]
+    fn poll_probe_stores_rotated_token_for_cmd_auth_qr_current() {
+        let src = include_str!("auth.rs");
+        let start = src
+            .find("// Same or refreshed token")
+            .expect("probe Token arm comment missing from auth.rs");
+        let body = &src[start..start + 400];
+        assert!(
+            body.contains("*state.qr_token.lock().await = Some(t.token.clone());"),
+            "poll probe no longer stores the rotated QR token; the UI would re-render a stale code forever"
+        );
+    }
 }

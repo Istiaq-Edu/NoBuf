@@ -16,6 +16,7 @@
     "allow-cmd-auth-request-code",
     "allow-cmd-auth-sign-in",
     "allow-cmd-auth-check-password",
+  "allow-cmd-auth-qr-current",
     "allow-cmd-get-files",
     "allow-cmd-upload-file",
     "allow-cmd-upload-limit",
