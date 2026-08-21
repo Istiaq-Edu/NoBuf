@@ -107,6 +107,11 @@ export async function stageDroppedFiles(
             }
         } catch (e) {
             toast.error(`Couldn't read ${f.name}: ${e}`);
+            // Chunks before the failure already wrote partial bytes to disk.
+            // Delete them NOW via the id+name-derived path — without this, a
+            // mid-stream staging failure orphans the partial temp file until
+            // the next launch's startup sweep.
+            invoke('cmd_discard_staged_upload', { uploadId: id, fileName: f.name }).catch(() => {});
         }
     }
     return items;
