@@ -235,6 +235,15 @@ pub fn run() {
         let builder = tauri::Builder::default();
 
         builder
+        // Single-instance MUST be the first plugin (its docs: registration order
+        // decides when the instance mutex is taken). A second launch exits here and
+        // this callback focuses the existing window — the plugin does NOT do it for you.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
@@ -243,10 +252,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        // Single-instance guard: a second instance's startup sweep would delete the
-        // first instance's in-flight staged uploads (nobuf_dropped), silently
-        // corrupting them. With the plugin, a second launch just focuses the first.
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .setup(move |app| {
             app.manage(TelegramState {
                 client: Arc::new(Mutex::new(None)),
