@@ -339,6 +339,34 @@ pub async fn cmd_stage_dropped_file(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "dropped".to_string());
+    // Windows caps a single filename component at 255 UTF-16 units; the temp name
+    // also carries "<id>-" and lives under %TEMP%\nobuf_dropped. Truncate the STEM
+    // (never the extension) so the file stays recognizable and openable.
+    let max_name_units = 200u16 as usize;
+    let safe_name = {
+        let units: usize = safe_name.chars().map(|c| c.len_utf16()).sum();
+        if units > max_name_units {
+            let stem = std::path::Path::new(&safe_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let ext = std::path::Path::new(&safe_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            // Budget: keep extension + separator, truncate stem to fit.
+            let stem_budget = max_name_units.saturating_sub(ext.chars().map(|c| c.len_utf16()).sum::<usize>() + 1);
+            let mut truncated: String = String::new();
+            for c in stem.chars() {
+                if truncated.chars().map(|x| x.len_utf16()).sum::<usize>() + c.len_utf16() > stem_budget { break; }
+                truncated.push(c);
+            }
+            if truncated.is_empty() { truncated.push('f'); }
+            if ext.is_empty() { truncated } else { format!("{}.{}", truncated, ext) }
+        } else {
+            safe_name
+        }
+    };
     let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if safe_id.is_empty() {
         return Err("Invalid upload id".to_string());
@@ -1756,5 +1784,25 @@ mod staged_drop_tests {
         assert_eq!(effective_document_name(&dn, "C:\\tmp\\ab12cd34-real.pdf"), "ab12cd34-real.pdf");
         let dn2 = Some(".".to_string());
         assert_eq!(effective_document_name(&dn2, "C:\\tmp\\xy-file.bin"), "xy-file.bin");
+    }
+
+    #[tokio::test]
+    async fn stage_truncates_overlong_filenames_but_keeps_extension() {
+        // Windows caps a filename component at 255 UTF-16 units; without truncation
+        // a 300-char name fails CreateFileW with a cryptic Os error mid-drop.
+        let long_stem = "x".repeat(300);
+        let name = format!("{}.pdf", long_stem);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"z");
+        let full = cmd_stage_dropped_file(
+            format!("t{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()),
+            name, 0, true, b64,
+        ).await.expect("staging with an overlong name must succeed");
+        let base = std::path::Path::new(&full)
+            .file_name()
+            .unwrap()
+            .to_string_lossy().to_string();
+        assert!(base.ends_with(".pdf"), "extension preserved: {}", base);
+        assert!(base.chars().map(|c| c.len_utf16()).sum::<usize>() <= 255, "component <= 255 units: {}", base.len());
+        let _ = std::fs::remove_file(&full);
     }
 }

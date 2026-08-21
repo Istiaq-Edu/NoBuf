@@ -284,13 +284,14 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder, onStagingProgress);
         if (items.length > 0) {
             // Accidental double-drop of the same file(s): skip names already queued
-            // or in flight, so one slip doesn't upload everything twice.
-            const activeNames = new Set(
+            // or in flight FOR THE SAME DESTINATION. The same file into a different
+            // folder is a legitimate second upload, not a duplicate.
+            const activeKeys = new Set(
                 queueMirrorRef.current
                     .filter(i => i.status === 'pending' || i.status === 'uploading')
-                    .map(i => i.displayName),
+                    .map(i => `${i.folderId ?? 'root'}::${i.displayName}`),
             );
-            const fresh = items.filter(it => !activeNames.has(it.displayName));
+            const fresh = items.filter(it => !activeKeys.has(`${it.folderId ?? 'root'}::${it.displayName}`));
             const skipped = items.length - fresh.length;
             if (skipped > 0) toast.info(`Skipped ${skipped} duplicate file(s) already queued.`);
             if (fresh.length === 0) return;

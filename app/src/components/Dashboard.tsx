@@ -12,6 +12,7 @@ import { Sidebar } from './dashboard/Sidebar';
 import { TopBar } from './dashboard/TopBar';
 import { FileExplorer } from './dashboard/FileExplorer';
 import { TransferPanel } from './dashboard/TransferPanel';
+import { cancelStaging } from '../hooks/useDroppedFileUpload';
 import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
@@ -818,6 +819,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}
+                onCancelStaging={name => {
+                    cancelStaging(name);
+                    // Remove the preparing row immediately; the staging loop's
+                    // StagingCancelledError path discards partial bytes + toasts.
+                    setStagingItems(prev => prev.filter(i => i.name !== name));
+                }}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
                 onCancelAllUploads={cancelUploads}
                 onCancelUploadItem={cancelUploadItem}

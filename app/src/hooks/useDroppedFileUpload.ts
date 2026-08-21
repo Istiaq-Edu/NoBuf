@@ -27,12 +27,24 @@ function bytesToBase64(bytes: Uint8Array): string {
     return btoa(binary);
 }
 
+// Filenames whose staging the user cancelled from the TransferPanel. Checked
+// between chunks; the in-flight IPC chunk finishes, then no further chunks go out.
+const stagingCancelled = new Set<string>();
+
+/** User intent to stop staging `fileName`. Safe to call for unknown names. */
+export function cancelStaging(fileName: string) {
+    stagingCancelled.add(fileName);
+}
+
 async function stageOne(file: File, id: string, onProgress?: (pct: number) => void): Promise<string> {
     const total = file.size;
     let offset = 0;
     let chunkIndex = 0;
     let tempPath = '';
     do {
+        if (stagingCancelled.has(file.name)) {
+            throw new StagingCancelledError(file.name);
+        }
         const end = Math.min(offset + CHUNK_SIZE, total);
         const buf = new Uint8Array(await file.slice(offset, end).arrayBuffer());
         const isLast = end >= total;
@@ -48,6 +60,14 @@ async function stageOne(file: File, id: string, onProgress?: (pct: number) => vo
         if (onProgress) onProgress(Math.min(100, Math.round((offset / total) * 100)));
     } while (offset < total);
     return tempPath;
+}
+
+/** Thrown when cancelStaging was requested for a file mid-staging. */
+export class StagingCancelledError extends Error {}
+
+/** Cap rejection toasts: first 3 names + "+N more" instead of a wall of text. */
+function summarizeNames(names: string[]): string {
+    return names.slice(0, 3).join(', ') + (names.length > 3 ? ` +${names.length - 3} more` : '');
 }
 
 /**
@@ -92,17 +112,17 @@ export async function stageDroppedFiles(
     }
     if (emptyNames.length > 0) {
         const verb = emptyNames.length === 1 ? 'is' : 'are';
-        toast.error(`${emptyNames.join(', ')} ${verb} empty and can't be uploaded.`);
+        toast.error(`${summarizeNames(emptyNames)} ${verb} empty and can't be uploaded.`);
     }
     if (oversized.length > 0) {
         const gb = Math.round(limitBytes / 1_000_000_000);
         const verb = oversized.length === 1 ? 'exceeds' : 'exceed';
-        toast.error(`${oversized.join(', ')} ${verb} the ${gb} GB limit.`);
+        toast.error(`${summarizeNames(oversized)} ${verb} the ${gb} GB limit.`);
     }
     if (nospace.length > 0) {
         const freeGb = stagingFree !== null ? (stagingFree / 1_000_000_000).toFixed(1) : '?';
         const verb = nospace.length === 1 ? 'needs more space than' : 'need more space than';
-        toast.error(`${nospace.join(', ')} ${verb} available on the temp drive (${freeGb} GB free). Free up space and try again.`);
+        toast.error(`${summarizeNames(nospace)} ${verb} available on the temp drive (${freeGb} GB free). Free up space and try again.`);
     }
     if (valid.length === 0) return [];
 
@@ -125,6 +145,14 @@ export async function stageDroppedFiles(
                 });
             }
         } catch (e) {
+            if (e instanceof StagingCancelledError) {
+                // User cancelled from the TransferPanel: discard partial bytes,
+                // report quietly, no error toast.
+                invoke('cmd_discard_staged_upload', { uploadId: id, fileName: f.name }).catch(() => {});
+                stagingCancelled.delete(f.name);
+                toast.info(`Stopped preparing ${f.name}.`);
+                continue;
+            }
             toast.error(`Couldn't read ${f.name}: ${e}`);
             // Chunks before the failure already wrote partial bytes to disk.
             // Delete them NOW via the id+name-derived path — without this, a

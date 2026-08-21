@@ -19,7 +19,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 const toastError = vi.hoisted(() => vi.fn());
 vi.mock('sonner', () => ({ toast: { error: toastError, info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 
-import { stageDroppedFiles } from '../hooks/useDroppedFileUpload';
+import { stageDroppedFiles, cancelStaging } from '../hooks/useDroppedFileUpload';
 import { persistableQueueItems, cleanupStagedTemp } from '../hooks/useFileUpload';
 import type { QueueItem } from '../types';
 
@@ -196,6 +196,38 @@ describe('staged-item lifecycle', () => {
             );
             expect(items.map(i => i.displayName)).toEqual(['fits.mkv', 'tiny.txt']); // 1KB+256MB < 257MB
             expect(writes.size).toBe(2);
+        });
+    });
+
+    describe('staging cancellation (G1)', () => {
+        it('skips a cancelled file at its first chunk check, quietly, while siblings stage', async () => {
+            const writes = fakeStageBackend(4_000_000_000);
+            // Cancel BEFORE the batch: b.bin's first between-chunk check throws
+            // StagingCancelledError; a.txt stages normally alongside.
+            cancelStaging('b.bin');
+            const items = await stageDroppedFiles(
+                [makeFile([1, 2, 3], 'a.txt'), makeFile([9, 9], 'b.bin')], 7, 2_000_000_000, false,
+            );
+            expect(items.map(i => i.displayName)).toEqual(['a.txt']); // b never enqueued
+            expect([...writes.keys()].every(k => k.endsWith('::a.txt'))).toBe(true); // b wrote nothing
+            expect(toastError).not.toHaveBeenCalled();                // quiet path
+        });
+
+        it('cancel for an unknown name is a harmless no-op', () => {
+            expect(() => cancelStaging('never-staged.txt')).not.toThrow();
+        });
+    });
+
+    describe('batch toast capping (G4)', () => {
+        it('caps rejection lists at 3 names + "+N more"', async () => {
+            const writes = fakeStageBackend(new Error('probe down'));
+            const many = Array.from({ length: 6 }, (_, i) => makeFile([i], `f${i}.txt`));
+            await stageDroppedFiles(many, 7, 0, false); // limit=0 → all oversized
+            const calls = toastError.mock.calls.map(c => String(c[0]));
+            const capped = calls.find(t => t.includes('+3 more'));
+            expect(capped).toBeDefined();
+            expect(capped).toContain('f0.txt, f1.txt, f2.txt');
+            expect(capped).not.toContain('f5.txt');
         });
     });
 });
