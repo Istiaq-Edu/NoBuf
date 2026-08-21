@@ -14,6 +14,8 @@ fn main() {
                 "cmd_connect",
                 "cmd_log",
                 "cmd_ensure_ffmpeg",
+                "cmd_check_dependencies",
+                "cmd_reset_dependency_cache",
                 "cmd_delete_file",
                 "cmd_download_file",
                 "cmd_move_files",

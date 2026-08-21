@@ -25,6 +25,8 @@
     "allow-cmd-connect",
     "allow-cmd-log",
     "allow-cmd-ensure-ffmpeg",
+    "allow-cmd-check-dependencies",
+    "allow-cmd-reset-dependency-cache",
     "allow-cmd-delete-file",
     "allow-cmd-download-file",
     "allow-cmd-move-files",

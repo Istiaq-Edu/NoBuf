@@ -1,5 +1,7 @@
 pub mod models;
 pub mod ffmpeg_util;
+pub mod no_window;
+pub mod deps;
 
 pub mod commands;
 pub mod stream_cache;
@@ -425,6 +427,8 @@ pub fn run() {
             commands::cmd_connect,
             commands::cmd_log,
             commands::cmd_ensure_ffmpeg,
+            commands::cmd_check_dependencies,
+            commands::cmd_reset_dependency_cache,
             commands::cmd_delete_file,
             commands::cmd_download_file,
             commands::cmd_move_files,

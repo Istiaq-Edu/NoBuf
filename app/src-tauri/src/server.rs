@@ -15,6 +15,7 @@ use std::sync::Mutex as StdMutex;
 use std::collections::HashMap;
 use crate::stream_cache::{StreamCacheManager, CacheMeta, merge_ranges, is_range_cached};
 use std::io::{Write, Seek, SeekFrom, Read};
+use crate::no_window::NoWindow;
 
 /// Choose the Actix worker-thread count for the localhost streaming server.
 ///
@@ -2725,6 +2726,7 @@ use crate::ts_demux::strip_m2ts_prefix;
 /// only format conversion — unprobed tuning flags could fail on some drivers.
 fn h264_encoder_probe(ffmpeg_path: &std::path::Path, encoder: &str) -> bool {
     let output = std::process::Command::new(ffmpeg_path)
+        .no_window()
         .args([
             "-hide_banner", "-loglevel", "error",
             "-f", "lavfi", "-i", "color=black:s=64x64:d=1",
@@ -3434,6 +3436,7 @@ async fn run_stream_probe(
     message_id: i32,
 ) -> StreamProbeResult {
     let probe_output = TokioCommand::new(ffprobe_path)
+        .no_window()
         .args([
             "-hide_banner", "-loglevel", "error",
             "-print_format", "json",
@@ -3725,6 +3728,7 @@ async fn remux_ts_to_mp4(
     let mut is_hdr = false;
     if needs_transcode {
         let frame_probe = TokioCommand::new(&ffprobe_path)
+            .no_window()
             .args([
                 "-hide_banner", "-loglevel", "error",
                 "-print_format", "json",
@@ -3781,6 +3785,7 @@ async fn remux_ts_to_mp4(
             }
         };
         let mut cmd = TokioCommand::new(&ffmpeg_path);
+        cmd.no_window();
         // Same capability gate as Strategy B: copy what the player can decode,
         // transcode what it can't (HEVC on stock WebView2). Without this, a
         // fully-cached HEVC file would remux to an HEVC TS that MSE rejects.
@@ -3915,6 +3920,7 @@ async fn remux_ts_to_mp4(
             message_id, needs_transcode, video_enc_args);
 
         let mut cmd = TokioCommand::new(&ffmpeg_path);
+        cmd.no_window();
         // SEEK DIAGNOSTIC (temporary): when this is a seek (ss>0) over the live
         // /stream HTTP input, bump ffmpeg to debug so it logs the protocol/demuxer
         // seek path — we need to see whether it issues an HTTP Range at the target
@@ -4218,6 +4224,7 @@ async fn remux_ts_to_mp4(
                             }
                         };
                         let mut bg_cmd = TokioCommand::new(&bg_ffmpeg_path);
+                        bg_cmd.no_window();
                         let bg_audio_filter = format!("{},asetpts=N/SR/TB", AAC_LAYOUT_FILTER);
                         bg_cmd.args([
                             "-hide_banner", "-loglevel", "warning",
@@ -6503,6 +6510,7 @@ async fn promote_complete_subtitles(
     let input_str = input.to_string_lossy().to_string();
     let ffprobe = crate::ffmpeg_util::ensure_ffprobe().map_err(|e| e.to_string())?;
     let probe = TokioCommand::new(ffprobe)
+        .no_window()
         .args(["-hide_banner", "-loglevel", "error", "-print_format", "json", "-show_streams", &input_str])
         .output().await.map_err(|e| format!("ffprobe spawn failed: {}", e))?;
     if !probe.status.success() {
@@ -6538,6 +6546,7 @@ async fn promote_complete_subtitles(
     }).collect();
     let ffmpeg = crate::ffmpeg_util::ensure_ffmpeg().map_err(|e| e.to_string())?;
     let mut command = TokioCommand::new(ffmpeg);
+    command.no_window();
     command.args(build_all_sub_extract_args(&input_str, &args_tracks))
         .kill_on_drop(true);
     let output = match tokio::time::timeout(
@@ -6865,6 +6874,7 @@ async fn probe_sub_tracks(
     // the MKV Track header / MP4 moov — 5MB budget is enough even on partially
     // cached files (verified P11 in subs-execution-bytecost).
     let probe_output = TokioCommand::new(&ffprobe_path)
+        .no_window()
         .args([
             "-hide_banner", "-loglevel", "error",
             "-print_format", "json",
@@ -7345,6 +7355,7 @@ async fn subtitles_extract_track(
     let output = loop {
         let args = build_sub_extract_args(&input_source, stream_idx, ass, attempt_latin1, &tmp_str);
         let mut cmd = TokioCommand::new(&ffmpeg_path);
+        cmd.no_window();
         cmd.args(args.iter().map(|s| s.as_str()));
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
@@ -7547,6 +7558,7 @@ async fn subtitles_font(
     // over /stream (verified E12/X5). 60s cap covers slow uncached headers.
     let args = build_font_dump_args(&input_source, att_idx, &tmp_str);
     let mut cmd = TokioCommand::new(&ffmpeg_path);
+    cmd.no_window();
     cmd.args(args.iter().map(|s| s.as_str()));
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
@@ -7677,6 +7689,7 @@ async fn remux_hover_thumb(
     };
 
     let mut cmd = TokioCommand::new(&ffmpeg_path);
+    cmd.no_window();
     cmd.args([
         "-hide_banner", "-loglevel", "error",
         "-ss", &format!("{:.3}", t),
