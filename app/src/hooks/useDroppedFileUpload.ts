@@ -70,12 +70,22 @@ export async function stageDroppedFiles(
         return [];
     }
     // 2/3. Filter empty + oversized — rejection messages NAME the offending files (spec §3.3)
+    const STAGING_SAFETY_MARGIN: number = 256 * 1024 * 1024; // headroom for concurrent staging + other apps' writes
+    let stagingFree: number | null = null;
+    try {
+        stagingFree = await invoke<number>('cmd_staging_free_space');
+    } catch {
+        // Probe failed: proceed un-gated — the old behavior (mid-staging disk-full
+        // error) remains the fallback, never a hard block on a flaky probe.
+    }
     const valid: File[] = [];
     const emptyNames: string[] = [];
     const oversized: string[] = [];
+    const nospace: string[] = [];
     for (const f of files) {
         if (f.size === 0) { emptyNames.push(f.name); continue; }
         if (f.size > limitBytes) { oversized.push(f.name); continue; }
+        if (stagingFree !== null && typeof stagingFree === 'number' && f.size + STAGING_SAFETY_MARGIN > stagingFree) { nospace.push(f.name); continue; }
         valid.push(f);
     }
     if (emptyNames.length > 0) {
@@ -86,6 +96,11 @@ export async function stageDroppedFiles(
         const gb = Math.round(limitBytes / 1_000_000_000);
         const verb = oversized.length === 1 ? 'exceeds' : 'exceed';
         toast.error(`${oversized.join(', ')} ${verb} the ${gb} GB limit.`);
+    }
+    if (nospace.length > 0) {
+        const freeGb = stagingFree !== null ? (stagingFree / 1_000_000_000).toFixed(1) : '?';
+        const verb = nospace.length === 1 ? 'needs more space than' : 'need more space than';
+        toast.error(`${nospace.join(', ')} ${verb} available on the temp drive (${freeGb} GB free). Free up space and try again.`);
     }
     if (valid.length === 0) return [];
 

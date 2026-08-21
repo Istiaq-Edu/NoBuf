@@ -21,6 +21,7 @@
     "allow-cmd-upload-file",
     "allow-cmd-upload-limit",
     "allow-cmd-file-size",
+    "allow-cmd-staging-free-space",
     "allow-cmd-stage-dropped-file",
     "allow-cmd-delete-staged-file",
     "allow-cmd-discard-staged-upload",
