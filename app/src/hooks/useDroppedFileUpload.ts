@@ -27,7 +27,7 @@ function bytesToBase64(bytes: Uint8Array): string {
     return btoa(binary);
 }
 
-async function stageOne(file: File, id: string): Promise<string> {
+async function stageOne(file: File, id: string, onProgress?: (pct: number) => void): Promise<string> {
     const total = file.size;
     let offset = 0;
     let chunkIndex = 0;
@@ -45,6 +45,7 @@ async function stageOne(file: File, id: string): Promise<string> {
         });
         offset = end;
         chunkIndex += 1;
+        if (onProgress) onProgress(Math.min(100, Math.round((offset / total) * 100)));
     } while (offset < total);
     return tempPath;
 }
@@ -63,6 +64,7 @@ export async function stageDroppedFiles(
     activeFolderId: number | null,
     limitBytes: number,
     hasFolder: boolean,
+    onStagingProgress?: (fileName: string, pct: number) => void,
 ): Promise<QueueItem[]> {
     // 1. All-or-nothing folder rejection
     if (hasFolder) {
@@ -109,7 +111,9 @@ export async function stageDroppedFiles(
     for (const f of valid) {
         const id = Math.random().toString(36).slice(2, 11);
         try {
-            const tempPath = await stageOne(f, id);
+            if (onStagingProgress) onStagingProgress(f.name, 0);
+            const tempPath = await stageOne(f, id, pct => onStagingProgress?.(f.name, pct));
+            if (onStagingProgress) onStagingProgress(f.name, 100);
             if (tempPath) {
                 items.push({
                     id,

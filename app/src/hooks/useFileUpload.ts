@@ -278,9 +278,10 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const { isDragging } = useFileDrop();
 
-    const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean) => {
+    const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
+        onStagingProgress?: (fileName: string, pct: number) => void) => {
         const { stageDroppedFiles } = await import('./useDroppedFileUpload');
-        const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder);
+        const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder, onStagingProgress);
         if (items.length > 0) {
             // Accidental double-drop of the same file(s): skip names already queued
             // or in flight, so one slip doesn't upload everything twice.

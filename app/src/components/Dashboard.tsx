@@ -141,7 +141,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
-    const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; stage: ((f: File[], l: number, hasFolder: boolean) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, stage: null });
+    // Staging-in-progress rows (dropped files being copied to %TEMP% before they
+    // enter the upload queue). Keyed by name; cleared when its batch finishes.
+    const [stagingItems, setStagingItems] = useState<{ name: string; pct: number }[]>([]);
+    const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; connected: boolean; stage: ((f: File[], l: number, hasFolder: boolean, onStagingProgress?: (fileName: string, pct: number) => void) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, connected: false, stage: null });
     // Last dragover/drop timestamp for external drags. WebView2 fires NO event when a
     // drag is cancelled mid-window (Esc key): dragleave carries in-window coordinates
     // and dragend only fires on the (external) source. The watchdog below uses this to
@@ -527,7 +530,20 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     // Keep dropCtxRef current so the document-level listeners (registered once) never
     // read stale state.
-    dropCtxRef.current = { canUploadHere, limit: uploadLimitBytes, stage: stageAndQueue };
+    dropCtxRef.current = {
+        canUploadHere,
+        limit: uploadLimitBytes,
+        stage: stageAndQueue,
+        connected: isConnected,
+    };
+    // Staging progress rows: upsert on each chunk, remove when the batch settles
+    // (item either enters the queue or was rejected/failed).
+    const updateStagingProgress = useCallback((fileName: string, pct: number) => {
+        setStagingItems(prev => {
+            const others = prev.filter(i => i.name !== fileName);
+            return pct < 100 ? [...others, { name: fileName, pct }] : others;
+        });
+    }, []);
 
     // Register native document-level drag/drop listeners in the CAPTURE phase. WebView2
     // delivers external OS file drops here — React's synthetic onDrop on a div does not
@@ -581,12 +597,16 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 }
             }
             const files = e.dataTransfer ? Array.from(e.dataTransfer.files) : [];
+            if (!dropCtxRef.current.connected) {
+                toast.error("Not connected to Telegram — connect first, then drop files.");
+                return;
+            }
             if (!canUp) {
                 toast.error("Can't upload to a public channel — switch to Saved Messages or a folder.");
                 return;
             }
             if (files.length === 0 || !stage) return;
-            await stage(files, limit, hasFolder);
+            await stage(files, limit, hasFolder, updateStagingProgress);
         };
         document.addEventListener('dragover', onDragOver, true);
         document.addEventListener('dragleave', onDragLeave, true);
@@ -797,6 +817,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 isOpen={showTransferPanel}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
+                stagingItems={stagingItems}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
                 onCancelAllUploads={cancelUploads}
                 onCancelUploadItem={cancelUploadItem}
