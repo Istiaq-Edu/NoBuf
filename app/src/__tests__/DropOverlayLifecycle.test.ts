@@ -73,11 +73,14 @@ describe('staged uploads keep their original name end-to-end', () => {
 
     it('double-drop dedupe reads the live queue mirror', () => {
         const s = src('src/hooks/useFileUpload.ts');
-        const start = s.indexOf('const activeNames = new Set(');
+        const start = s.indexOf('const activeKeys = new Set(');
         expect(start).toBeGreaterThan(-1);
-        const body = s.slice(start, start + 300);
+        const body = s.slice(start, start + 400);
         expect(body).toContain('queueMirrorRef.current');
         expect(body).toContain("i.status === 'pending' || i.status === 'uploading'");
+        // Dedupe key includes the DESTINATION: same file into a different folder
+        // is a legitimate second upload, not a duplicate (G3).
+        expect(body).toContain('folderId');
     });
 });
 

@@ -18,6 +18,7 @@ interface TransferPanelProps {
     // Upload props
     uploadItems: QueueItem[];
     stagingItems?: { name: string; pct: number }[];
+    onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
     onCancelUploadItem: (id: string) => void;
@@ -32,7 +33,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -152,6 +153,15 @@ export function TransferPanel({
                             <div className="w-4 h-4 flex-shrink-0 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />
                             <div className="flex-1 text-nobuf-subtext text-xs line-clamp-2 break-all leading-snug">{s.name}</div>
                             <span className="text-[10px] text-nobuf-subtext flex-shrink-0">preparing…</span>
+                            {onCancelStaging && (
+                                <button
+                                    onClick={() => onCancelStaging(s.name)}
+                                    className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0"
+                                    title="Stop preparing this file"
+                                >
+                                    <X className="w-3.5 h-3.5" />
+                                </button>
+                            )}
                         </div>
                         <div className="w-full bg-nobuf-border h-1 mt-1 rounded-full overflow-hidden">
                             <div
