@@ -16,15 +16,22 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock('sonner', () => ({ toast: { error: toastError, info: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 
 import { stageDroppedFiles } from '../hooks/useDroppedFileUpload';
 import { persistableQueueItems, cleanupStagedTemp } from '../hooks/useFileUpload';
 import type { QueueItem } from '../types';
 
-/** Minimal stand-in for the Rust command: returns "" until isLast, then the temp path. */
-function fakeStageBackend() {
+/** Minimal stand-in for the Rust command: returns "" until isLast, then the temp path.
+ *  Optionally serves cmd_staging_free_space (number) or makes it throw (Error instance). */
+function fakeStageBackend(freeSpace?: number | Error) {
     const writes = new Map<string, Uint8Array>();
     invokeMock.mockImplementation(async (_cmd: string, args: any) => {
+        if (_cmd === 'cmd_staging_free_space') {
+            if (freeSpace instanceof Error) throw freeSpace;
+            return freeSpace;
+        }
         if (_cmd !== 'cmd_stage_dropped_file') return undefined;
         const bin = Uint8Array.from(atob(args.bytesB64), c => c.charCodeAt(0));
         const key = `${args.uploadId}::${args.fileName}`;
@@ -46,6 +53,7 @@ function makeFile(bytes: number[], name: string): File {
 
 beforeEach(() => {
     invokeMock.mockReset();
+    toastError.mockClear();
 });
 
 describe('stageDroppedFiles', () => {
@@ -55,8 +63,9 @@ describe('stageDroppedFiles', () => {
         const items = await stageDroppedFiles(
             [makeFile(payload, 'রিপোর্ট.pdf')], 7, 2_000_000_000, false,
         );
-        expect(invokeMock).toHaveBeenCalledTimes(1);
-        const args = invokeMock.mock.calls[0][1];
+        // 1 free-space probe + 1 staging chunk
+        expect(invokeMock).toHaveBeenCalledTimes(2);
+        const args = invokeMock.mock.calls.find(c => c[0] === 'cmd_stage_dropped_file')![1];
         expect(args.chunkIndex).toBe(0);
         expect(args.isLast).toBe(true);
         // base64 round-trip: what arrived backend-side is exactly the file's bytes
@@ -74,11 +83,14 @@ describe('stageDroppedFiles', () => {
         const big = new Array(total);
         for (let i = 0; i < big.length; i++) big[i] = (i * 7) % 256;
         const items = await stageDroppedFiles([makeFile(big, 'big.bin')], null, 4_000_000_000, false);
-        expect(invokeMock).toHaveBeenCalledTimes(2);
-        expect(invokeMock.mock.calls[0][1].isLast).toBe(false);
-        expect(invokeMock.mock.calls[1][1].chunkIndex).toBe(1);
-        expect(invokeMock.mock.calls[1][1].isLast).toBe(true);
-        const staged = writes.get(`${invokeMock.mock.calls[0][1].uploadId}::big.bin`)!;
+        // 1 free-space probe + 2 staging chunks; chunks are calls [1] and [2]
+        expect(invokeMock).toHaveBeenCalledTimes(3);
+        const stageCalls = invokeMock.mock.calls.filter(c => c[0] === 'cmd_stage_dropped_file');
+        expect(stageCalls.length).toBe(2);
+        expect(stageCalls[0][1].isLast).toBe(false);
+        expect(stageCalls[1][1].chunkIndex).toBe(1);
+        expect(stageCalls[1][1].isLast).toBe(true);
+        const staged = writes.get(`${stageCalls[0][1].uploadId}::big.bin`)!;
         expect(staged.length).toBe(total);
         expect(items[0].folderId).toBeNull(); // Saved Messages root passes null through
     }, 30_000);
@@ -144,5 +156,46 @@ describe('staged-item lifecycle', () => {
         const picker: QueueItem = { id: 'b', path: 'D:\\Downloads\\real.zip', folderId: 2, status: 'success' };
         cleanupStagedTemp(picker);
         expect(invokeMock).not.toHaveBeenCalled(); // NEVER delete user's real files
+    });
+
+    describe('staging free-space pre-flight', () => {
+        it('rejects files larger than temp-drive headroom, naming them, and stages the rest', async () => {
+            // Free space must sit BETWEEN small.txt's requirement (1B + 256MB margin)
+            // and big.mkv's (~900KB + margin) so exactly one file is rejected.
+            const writes = fakeStageBackend(268_800_000);
+            const items = await stageDroppedFiles(
+                [makeFile(new Array(900 * 1024).fill(1), 'big.mkv'), makeFile([2], 'small.txt')],
+                7, 2_000_000_000, false,
+            );
+            expect(items.map(i => i.displayName)).toEqual(['small.txt']);
+            expect(writes.size).toBe(1);
+            const call = toastError.mock.calls.find(c => String(c[0]).includes('big.mkv'));
+            expect(call).toBeDefined();
+            expect(String(call![0])).toContain('temp drive');
+            expect(String(call![0])).toContain('0.3 GB free');
+        });
+
+        it('proceeds un-gated when the probe fails', async () => {
+            const writes = fakeStageBackend(new Error('probe down'));
+            const items = await stageDroppedFiles(
+                [makeFile([9, 9, 9], 'fallback.bin')], 7, 2_000_000_000, false,
+            );
+            expect(items).toHaveLength(1);                       // NOT blocked by a dead probe
+            expect([...writes.values()][0].length).toBe(3);      // and actually staged
+            expect(toastError).not.toHaveBeenCalledWith(expect.stringContaining('temp drive'));
+        });
+
+        it('256MB safety margin keeps just-fitting files out of the rejection', async () => {
+            // File (1 KB) + margin (256 MB) must fit under mocked free space.
+            // Scaled-down fixture exercises the same comparison without allocating
+            // hundreds of MB in the suite (a 300 MB array OOMs the full vitest run).
+            const writes = fakeStageBackend(257 * 1024 * 1024);
+            const items = await stageDroppedFiles(
+                [makeFile(new Array(1024).fill(65), 'fits.mkv'), makeFile([1], 'tiny.txt')],
+                7, 2_000_000_000, false,
+            );
+            expect(items.map(i => i.displayName)).toEqual(['fits.mkv', 'tiny.txt']); // 1KB+256MB < 257MB
+            expect(writes.size).toBe(2);
+        });
     });
 });

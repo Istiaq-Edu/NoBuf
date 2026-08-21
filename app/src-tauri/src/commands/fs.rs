@@ -308,6 +308,15 @@ pub async fn cmd_file_size(path: String) -> Result<u64, String> {
     Ok(meta.len())
 }
 
+/// Free bytes available on the drive hosting the staging dir (%TEMP%\nobuf_dropped).
+/// Lets the frontend reject a drop BEFORE copying GBs into a full disk.
+#[tauri::command]
+pub async fn cmd_staging_free_space() -> Result<u64, String> {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs4::free_space(&dir).map_err(|e| e.to_string())
+}
+
 /// Stage bytes of a dropped browser File into a temp file, chunk by chunk.
 /// upload_id: collision-safe id from the frontend (the QueueItem id).
 /// file_name: original name (sanitized here); chunk_index 0 truncates, others append.

@@ -9,6 +9,7 @@ fn main() {
                 "cmd_upload_file",
                 "cmd_upload_limit",
                 "cmd_file_size",
+                "cmd_staging_free_space",
                 "cmd_stage_dropped_file",
                 "cmd_delete_staged_file",
                 "cmd_discard_staged_upload",

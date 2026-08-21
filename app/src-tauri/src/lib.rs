@@ -429,6 +429,7 @@ pub fn run() {
             commands::cmd_upload_file,
             commands::cmd_upload_limit,
             commands::cmd_file_size,
+            commands::cmd_staging_free_space,
             commands::cmd_stage_dropped_file,
             commands::cmd_delete_staged_file,
             commands::cmd_discard_staged_upload,
