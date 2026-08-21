@@ -415,10 +415,11 @@ pub async fn cmd_discard_staged_upload(upload_id: String, file_name: String) -> 
 fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
     if let Some(n) = display_name.as_deref().map(str::trim) {
         if !n.is_empty() {
-            return std::path::Path::new(n)
-                .file_name()
-                .map(|x| x.to_string_lossy().to_string())
-                .unwrap_or_else(|| n.to_string());
+            // Path::new("..") / "." / "/" yield file_name()==None, which would pass
+            // the raw name through — fall back to the source path's basename instead.
+            if let Some(base) = std::path::Path::new(n).file_name() {
+                return base.to_string_lossy().to_string();
+            }
         }
     }
     std::path::Path::new(path)
@@ -1714,5 +1715,37 @@ mod staged_drop_tests {
     async fn delete_inside_staging_dir_is_ok_even_when_already_gone() {
         let ghost = std::env::temp_dir().join("nobuf_dropped").join("ghost-never-existed.bin");
         cmd_delete_staged_file(ghost.to_string_lossy().to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discard_removes_partially_staged_file_and_matches_staging_path() {
+        // The discard command must derive EXACTLY the path cmd_stage_dropped_file
+        // writes, or it would silently delete the wrong file (drift hazard).
+        let id = format!("d{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"partial bytes");
+        cmd_stage_dropped_file(id.clone(), "partial.bin".to_string(), 0, false, b64.clone()).await.unwrap();
+        let full = cmd_stage_dropped_file(id.clone(), "partial.bin".to_string(), 1, true, b64).await.unwrap();
+        assert!(std::path::Path::new(&full).exists());
+        cmd_discard_staged_upload(id.clone(), "partial.bin".to_string()).await.unwrap();
+        assert!(!std::path::Path::new(&full).exists());
+        // Idempotent: discarding again is Ok (NotFound tolerated).
+        cmd_discard_staged_upload(id, "partial.bin".to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discard_rejects_empty_upload_id() {
+        let err = cmd_discard_staged_upload("".to_string(), "a.txt".to_string()).await;
+        assert!(err.unwrap_err().contains("Invalid upload id"));
+    }
+
+    #[test]
+    fn display_name_dot_dot_falls_back_to_path_basename() {
+        // Path::new("..").file_name() == None — the raw ".." must NOT become the
+        // Telegram document name; fall back to the source path's FULL basename
+        // (same rule as the blank-display-name case above).
+        let dn = Some("..".to_string());
+        assert_eq!(effective_document_name(&dn, "C:\\tmp\\ab12cd34-real.pdf"), "ab12cd34-real.pdf");
+        let dn2 = Some(".".to_string());
+        assert_eq!(effective_document_name(&dn2, "C:\\tmp\\xy-file.bin"), "xy-file.bin");
     }
 }

@@ -123,8 +123,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             }
             // Check if cancelled during upload
             if (cancelledRef.current.has(item.id)) {
+                // Cancel keeps the staged temp file: the item stays retryable, and
+                // Retry re-uploads from it. Deleted on success or queue removal.
                 cancelledRef.current.delete(item.id);
-                cleanupStagedTemp(item);
             } else {
                 setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'success', progress: 100 } : i));
                 cleanupStagedTemp(item);
@@ -134,16 +135,16 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             if (!cancelledRef.current.has(item.id)) {
                 const errMsg = String(e);
                 if (errMsg.includes('Transfer cancelled')) {
+                    // Cancelled mid-upload: keep temp (item stays retryable).
                     setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled' } : i));
-                    cleanupStagedTemp(item);
                 } else {
                     // Terminal error keeps the staged temp file so Retry can re-upload it.
                     setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
                     toast.error(`Upload failed for ${item.displayName || item.path.split('/').pop()}: ${e}`);
                 }
             } else {
+                // Cancelled (item marked by cancelItem): keep temp (retryable).
                 cancelledRef.current.delete(item.id);
-                cleanupStagedTemp(item);
             }
         } finally {
             setProcessing(false);
@@ -227,6 +228,12 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     };
 
     const cancelAll = () => {
+        // Bulk-cancel removes pending items permanently (no Retry), so their staged
+        // temp files must go with them — same as cancelItem's pending path.
+        // Read from the mirror OUTSIDE the updater: updaters must stay pure.
+        queueMirrorRef.current
+            .filter(i => i.status === 'pending' && i.stagedTempPath)
+            .forEach(i => cleanupStagedTemp(i));
         setUploadQueue(q => {
             const uploading = q.find(i => i.status === 'uploading');
             if (uploading) {
@@ -253,6 +260,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cleanupStagedTemp(item);
                 return q.filter(i => i.id !== id);
             }
+            // Bulk-cancelled pending items (cancelAll) are removed by its filter,
+            // which must not leave their staged temp files behind either.
             return q;
         });
     };
