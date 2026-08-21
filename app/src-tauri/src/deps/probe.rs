@@ -25,7 +25,7 @@
 //!   with `status.success()` — exactly as `server.rs::h264_encoder_probe`
 //!   already does — never by comparing a numeric code.
 
-use crate::deps::manifest::{Feature, Kind, Requirement, Tier, REQUIREMENTS};
+use crate::deps::manifest::{Feature, Kind, Tier, REQUIREMENTS};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::process::Command;

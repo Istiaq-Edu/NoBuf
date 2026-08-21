@@ -264,6 +264,8 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     // mean the scan landed — the plain "waiting" poll result cannot tell
     // "not scanned yet" apart from "scanned, still finalizing".
     const [qrConfirming, setQrConfirming] = useState(false);
+    const [qrPollError, setQrPollError] = useState<string | null>(null);
+    const qrFailCountRef = useRef(0);
     const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const [selectedCountry, setSelectedCountry] = useDetectedCountry();
     const [phoneInput, setPhoneInput] = useState("");
@@ -388,6 +390,8 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
 
     const handleQrLogin = async () => {
         setError(null);
+        setQrPollError(null);
+        qrFailCountRef.current = 0;
         setQrConfirming(false);
         setLoading(true);
         try {
@@ -438,9 +442,16 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                     // always scanning a live code — scanning a stale one can never complete.
                     const currentUrl = await invoke<string | null>("cmd_auth_qr_current");
                     if (currentUrl) { setQrUrl((prev) => (prev === currentUrl ? prev : currentUrl)); }
+                    // Surface non-fatal probe errors (e.g. FLOOD_WAIT) instead of looping
+                    // silently — "Waiting for scan…" must never be a black box.
+                    setQrPollError(res.error ?? null);
+                    qrFailCountRef.current = 0;
                 }
             } catch {
-                // Polling error — keep trying silently
+                // Polling transport error — keep trying, but tell the user after a
+                // few consecutive failures so a dead backend is visible.
+                qrFailCountRef.current += 1;
+                if (qrFailCountRef.current >= 3) { setQrPollError("Connection issue — retrying…"); }
             }
         }, 5000);
         return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } };
@@ -695,6 +706,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                 qrUrl={qrUrl}
                                                 qrPolling={qrPolling}
                                                 qrConfirming={qrConfirming}
+                                                qrPollError={qrPollError}
                                                 onRefresh={handleQrLogin}
                                                 onBack={() => { setStep("setup"); setQrPolling(false); setQrConfirming(false); }}
                                             />
@@ -879,11 +891,12 @@ function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, se
     );
 }
 
-function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, onRefresh, onBack }: {
+function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, qrPollError, onRefresh, onBack }: {
     loading: boolean;
     qrUrl: string | null;
     qrPolling: boolean;
     qrConfirming: boolean;
+    qrPollError: string | null;
     onRefresh: () => void;
     onBack: () => void;
 }) {
@@ -915,9 +928,14 @@ function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, onRefresh, onBa
                                 <p className="text-xs text-nobuf-subtext">Settings &gt; Devices &gt; Link Desktop Device</p>
                             </div>
                             {qrPolling && (
-                                <div className="flex items-center gap-2 text-xs text-nobuf-primary">
-                                    <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
-                                    Waiting for scan…
+                                <div className="flex flex-col items-center gap-1">
+                                    <div className="flex items-center gap-2 text-xs text-nobuf-primary">
+                                        <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                                        Waiting for scan…
+                                    </div>
+                                    {qrPollError && (
+                                        <div className="text-xs text-amber-500">{qrPollError}</div>
+                                    )}
                                 </div>
                             )}
                             <button type="button" onClick={onRefresh} className="text-xs text-nobuf-subtext hover:text-nobuf-text transition-colors">
