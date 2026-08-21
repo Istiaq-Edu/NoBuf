@@ -39,6 +39,11 @@
 - SidebarItem duplicates Dashboard's isExternal literals — maintainability note for a future shared-constants pass.
 - Watchdog runtime cadence in WebView2 needs one hand-test (static analysis says ≥2× margin).
 
+## Post-review hardening (same round)
+
+- Picker oversized toast now names files (spec §3.3 style, ≤3 names + "+N more") — was listed as cosmetic residual, fixed instead.
+- Mutation battery v2 on the round's own fixes: **4/4 killed RED** (cancelAll cleanup removal, dot-dot pass-through revert, discard derivation drift, single-instance focus removal), all restores hash-verified byte-identical.
+
 ## Final gates (post-fixes)
 
 cargo test **374/374** · cargo build clean · tsc --noEmit clean · vitest **1099/1099** (92 files)

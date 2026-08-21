@@ -111,4 +111,20 @@ describe('staged temp files are excluded from store persistence', () => {
         const catchBody = s.slice(catchStart, catchStart + 400);
         expect(catchBody).not.toContain('cleanupStagedTemp');
     });
+
+    it('single-instance callback focuses the existing window (plugin does NOT auto-focus)', () => {
+        const rust = src('src-tauri/src/lib.rs');
+        // Exactly one registration, and it must be the FIRST plugin on the builder
+        // (mutex timing follows registration order per plugin docs).
+        expect(rust.match(/tauri_plugin_single_instance::init/g)?.length).toBe(1);
+        const firstPluginAt = rust.indexOf('.plugin(');
+        expect(rust.slice(firstPluginAt, firstPluginAt + 120)).toContain('single_instance');
+        // The callback must actively raise the window — an empty closure means a
+        // second launch silently exits with the first window left buried.
+        const cbStart = rust.indexOf('tauri_plugin_single_instance::init(|app');
+        expect(cbStart).toBeGreaterThan(-1);
+        const cbBody = rust.slice(cbStart, cbStart + 300);
+        expect(cbBody).toContain('get_webview_window("main")');
+        expect(cbBody).toContain('set_focus()');
+    });
 });
