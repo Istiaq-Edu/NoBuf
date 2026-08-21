@@ -2,6 +2,7 @@ use tauri::State;
 use crate::commands::streaming::StreamConfig;
 use crate::ffmpeg_util;
 use base64::{Engine as _, engine::general_purpose};
+use crate::no_window::NoWindow;
 
 const SPRITE_COLUMNS: u32 = 10;
 const SPRITE_HEIGHT: u32 = 64;
@@ -37,6 +38,7 @@ fn get_video_duration(ffmpeg_path: &std::path::Path, url: &str) -> Result<f64, S
     };
 
     let output = std::process::Command::new(&ffprobe_path)
+        .no_window()
         .args([
             "-v", "quiet",
             "-print_format", "json",
@@ -106,6 +108,7 @@ pub async fn cmd_generate_sprite_sheet(
         FRAME_INTERVAL as u32, frame_width, SPRITE_HEIGHT, frame_width, SPRITE_HEIGHT, SPRITE_COLUMNS, tile_rows
     );
     let mut cmd = std::process::Command::new(&ffmpeg_path);
+    cmd.no_window();
     cmd.args([
         "-user_agent", "TelegramDrive/1.0",
         "-reconnect", "1",

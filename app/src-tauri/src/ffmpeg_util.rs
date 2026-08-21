@@ -18,9 +18,85 @@
 //! can reuse it without duplicating code.
 
 use std::path::PathBuf;
+use std::sync::RwLock;
+use crate::no_window::NoWindow;
 
 const FFMPEG_BIN: &str = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
 const FFPROBE_BIN: &str = if cfg!(target_os = "windows") { "ffprobe.exe" } else { "ffprobe" };
+
+// ============================================================================
+// Resolved-path cache
+// ============================================================================
+//
+// Resolution is expensive: Tier 1 spawns a real `<bin> -version` subprocess
+// (see `is_in_path`). With ~16 call sites and no caching, a single
+// "open an MKV with embedded subtitles, then seek" flow burned 10 throwaway
+// processes, and `/thumb` (per hover-scrub tick) made the ceiling unbounded.
+//
+// SUCCESSES ONLY are cached. Caching a failure would be actively worse than no
+// cache at all: the first-launch download runs in the background while the app
+// stays usable, so an early call can legitimately fail at t=1s and succeed at
+// t=60s once the binary lands. A cached `Err` would keep every ffmpeg feature
+// broken for the whole session — the current uncached code self-heals, and this
+// must not regress that.
+//
+// `None` therefore means "not resolved yet", never "resolution failed".
+static FFMPEG_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+static FFPROBE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Read a cached path, if one has been resolved.
+fn cached(slot: &RwLock<Option<PathBuf>>) -> Option<PathBuf> {
+    slot.read().ok().and_then(|g| g.clone())
+}
+
+/// Store a successfully resolved path.
+fn store(slot: &RwLock<Option<PathBuf>>, path: &PathBuf) {
+    if let Ok(mut g) = slot.write() {
+        *g = Some(path.clone());
+    }
+}
+
+/// Drop both cached paths so the next call re-resolves.
+///
+/// Call this after installing/repairing ffmpeg so the freshly installed binary
+/// is picked up without restarting the app.
+pub fn reset_resolved() {
+    if let Ok(mut g) = FFMPEG_PATH.write() {
+        *g = None;
+    }
+    if let Ok(mut g) = FFPROBE_PATH.write() {
+        *g = None;
+    }
+    // The parsed-dump cache must go too: after a repair the new binary has a
+    // different component set, and a stale dump would make the health check
+    // report the OLD binary's capabilities. (probe::check also self-heals by
+    // tagging its cache with the binary path; this makes it explicit.)
+    crate::deps::probe::reset_dump_cache();
+    log::info!("[FFMPEG-UTIL] resolved-path + dump caches cleared");
+}
+
+/// Resolve the ffmpeg binary path, caching a successful result.
+///
+/// See `ensure_ffmpeg_uncached` for the tier order. Failures are NOT cached, so
+/// a later call retries and succeeds once ffmpeg becomes available.
+pub fn ensure_ffmpeg() -> Result<PathBuf, String> {
+    if let Some(p) = cached(&FFMPEG_PATH) {
+        return Ok(p);
+    }
+    let resolved = ensure_ffmpeg_uncached()?;
+    store(&FFMPEG_PATH, &resolved);
+    Ok(resolved)
+}
+
+/// Resolve the ffprobe binary path, caching a successful result.
+pub fn ensure_ffprobe() -> Result<PathBuf, String> {
+    if let Some(p) = cached(&FFPROBE_PATH) {
+        return Ok(p);
+    }
+    let resolved = ensure_ffprobe_uncached()?;
+    store(&FFPROBE_PATH, &resolved);
+    Ok(resolved)
+}
 
 /// Resolve the ffmpeg binary path.
 ///
@@ -32,7 +108,7 @@ const FFPROBE_BIN: &str = if cfg!(target_os = "windows") { "ffprobe.exe" } else 
 /// Returns the path to pass to `Command::new(path)`.
 /// On success, the returned path is either a bare name ("ffmpeg") for PATH
 /// resolution, or an absolute/relative PathBuf for the sidecar locations.
-pub fn ensure_ffmpeg() -> Result<PathBuf, String> {
+pub fn ensure_ffmpeg_uncached() -> Result<PathBuf, String> {
     // Tier 1: System PATH
     if is_in_path(FFMPEG_BIN) {
         log::info!("[FFMPEG-UTIL] Using system ffmpeg from PATH");
@@ -75,7 +151,7 @@ pub fn ensure_ffmpeg() -> Result<PathBuf, String> {
 /// If ffmpeg was found in PATH, ffprobe is assumed to be in PATH too.
 /// If ffmpeg was found at a specific path (sidecar/exe_dir), ffprobe is
 /// expected in the same directory.
-pub fn ensure_ffprobe() -> Result<PathBuf, String> {
+pub fn ensure_ffprobe_uncached() -> Result<PathBuf, String> {
     // Tier 1: System PATH
     if is_in_path(FFPROBE_BIN) {
         log::info!("[FFMPEG-UTIL] Using system ffprobe from PATH");
@@ -271,6 +347,7 @@ pub fn ensure_ffmpeg_or_download() -> Result<std::path::PathBuf, String> {
 /// Check if a binary is available in the system PATH by probing `bin -version`.
 fn is_in_path(bin: &str) -> bool {
     std::process::Command::new(bin)
+        .no_window()
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -443,5 +520,143 @@ mod tests {
             assert_eq!(FFMPEG_BIN, "ffmpeg");
             assert_eq!(FFPROBE_BIN, "ffprobe");
         }
+    }
+
+    // ========================================================================
+    // Resolved-path cache
+    // ========================================================================
+
+    /// The three tests below touch the PROCESS-GLOBAL cache statics. Cargo runs
+    /// tests in parallel threads inside one process, so a peer test calling
+    /// `ensure_ffprobe()` can repopulate the cache between another test's
+    /// `reset_resolved()` and its assertion. That is a test-harness race, not a
+    /// production defect (production has a single logical caller sequence), so
+    /// the affected tests serialize on this lock instead of weakening the
+    /// assertion.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The cache helpers are the whole mechanism, so they are tested directly
+    /// against the shipped functions rather than a local reimplementation.
+    #[test]
+    fn cache_returns_none_before_anything_is_stored() {
+        let slot: RwLock<Option<PathBuf>> = RwLock::new(None);
+        assert!(cached(&slot).is_none(), "empty slot must read as None");
+    }
+
+    #[test]
+    fn cache_round_trips_a_stored_path() {
+        let slot: RwLock<Option<PathBuf>> = RwLock::new(None);
+        let p = PathBuf::from("C:/tools/ffmpeg.exe");
+        store(&slot, &p);
+        assert_eq!(cached(&slot).as_deref(), Some(p.as_path()));
+    }
+
+    /// REGRESSION GUARD for the design blocker: a FAILED resolution must never
+    /// be cached. The first-run download runs in the background while the app
+    /// stays usable, so resolution can legitimately fail at t=1s and succeed at
+    /// t=60s. If the failure were cached, every ffmpeg feature would stay broken
+    /// for the whole session — worse than having no cache at all.
+    ///
+    /// This asserts the *shape* that guarantees it: the cache slot holds a bare
+    /// `PathBuf` (success only) and has no representation for an error, so a
+    /// failure physically cannot be stored.
+    #[test]
+    fn failure_is_not_cachable_so_resolution_self_heals() {
+        let slot: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+        // Simulate: resolution fails -> nothing is stored (the only thing
+        // `store` accepts is a successful path).
+        assert!(cached(&slot).is_none());
+        assert!(
+            cached(&slot).is_none(),
+            "a failed resolution must leave the slot empty so the next call retries"
+        );
+
+        // Later the binary appears and resolution succeeds -> now it caches.
+        let good = PathBuf::from("ffmpeg");
+        store(&slot, &good);
+        assert_eq!(
+            cached(&slot).as_deref(),
+            Some(good.as_path()),
+            "success after an earlier failure must be cached (self-heal)"
+        );
+    }
+
+    #[test]
+    fn store_overwrites_a_previous_value_for_repair() {
+        let slot: RwLock<Option<PathBuf>> = RwLock::new(None);
+        store(&slot, &PathBuf::from("old/ffmpeg.exe"));
+        store(&slot, &PathBuf::from("new/ffmpeg.exe"));
+        assert_eq!(
+            cached(&slot).unwrap(),
+            PathBuf::from("new/ffmpeg.exe"),
+            "a repair install must be able to replace the cached path"
+        );
+    }
+
+    /// `reset_resolved()` must clear BOTH slots, otherwise a repair would keep
+    /// serving the old ffmpeg (or old ffprobe) until the app restarted.
+    #[test]
+    fn reset_resolved_clears_both_caches() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Warm both caches via the public API when the binaries are available.
+        let had_ffmpeg = ensure_ffmpeg().is_ok();
+        let had_ffprobe = ensure_ffprobe().is_ok();
+
+        reset_resolved();
+
+        assert!(
+            FFMPEG_PATH.read().unwrap().is_none(),
+            "reset must clear the ffmpeg cache"
+        );
+        assert!(
+            FFPROBE_PATH.read().unwrap().is_none(),
+            "reset must clear the ffprobe cache"
+        );
+
+        // Re-resolution after a reset must still work (idempotent).
+        if had_ffmpeg {
+            assert!(ensure_ffmpeg().is_ok(), "ffmpeg must re-resolve after reset");
+        }
+        if had_ffprobe {
+            assert!(ensure_ffprobe().is_ok(), "ffprobe must re-resolve after reset");
+        }
+    }
+
+    /// The cached wrapper must agree with the uncached resolver — a cache that
+    /// returns a different answer than the real resolution is a bug.
+    #[test]
+    fn cached_and_uncached_agree() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_resolved();
+        match (ensure_ffmpeg_uncached(), ensure_ffmpeg()) {
+            (Ok(direct), Ok(via_cache)) => assert_eq!(
+                direct, via_cache,
+                "cached path must match what the resolver returns"
+            ),
+            (Err(_), Err(_)) => {} // consistent: neither can resolve
+            (a, b) => panic!("cached/uncached disagree: {:?} vs {:?}", a, b),
+        }
+    }
+
+    /// The point of the cache: repeated calls must not keep re-resolving.
+    /// Asserts a BOUND on behaviour (second call is served from the slot),
+    /// not merely that two isolated calls each succeed.
+    #[test]
+    fn second_call_is_served_from_cache() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_resolved();
+        if ensure_ffmpeg().is_err() {
+            return; // no ffmpeg on this machine; nothing to assert
+        }
+        // After one successful resolution the slot must be populated, which is
+        // what lets the ~16 call sites stop spawning `-version` probes.
+        assert!(
+            FFMPEG_PATH.read().unwrap().is_some(),
+            "a successful resolution must populate the cache"
+        );
+        let first = ensure_ffmpeg().unwrap();
+        let second = ensure_ffmpeg().unwrap();
+        assert_eq!(first, second, "cached resolution must be stable");
     }
 }

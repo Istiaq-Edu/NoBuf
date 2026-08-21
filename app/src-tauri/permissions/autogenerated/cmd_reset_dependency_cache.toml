@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-reset-dependency-cache"
+description = "Enables the cmd_reset_dependency_cache command without any pre-configured scope."
+commands.allow = ["cmd_reset_dependency_cache"]
+
+[[permission]]
+identifier = "deny-cmd-reset-dependency-cache"
+description = "Denies the cmd_reset_dependency_cache command without any pre-configured scope."
+commands.deny = ["cmd_reset_dependency_cache"]
