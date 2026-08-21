@@ -168,7 +168,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 }
                 if (oversized.length > 0) {
                     const gb = Math.round(limitBytes / 1_000_000_000);
-                    toast.error(`${oversized.length} file(s) exceed the ${gb} GB limit.`);
+                    // Name the files (spec §3.3 style), matching the drop path's wording.
+                    const names = oversized.slice(0, 3).join(', ') + (oversized.length > 3 ? ` +${oversized.length - 3} more` : '');
+                    toast.error(`${names} ${oversized.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
                 }
                 if (kept.length === 0) return;
                 const newItems: QueueItem[] = kept.map((path: string) => ({

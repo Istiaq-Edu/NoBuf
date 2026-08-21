@@ -225,25 +225,23 @@ pub fn run() {
     let server_handle_for_setup = server_handle.clone();
 
     let app = {
-        // In production: add the localhost plugin so the app runs from
-        // http://localhost:14200 (same-origin with the streaming server).
-        // In dev mode: no plugin needed â€” Vite dev server is already on localhost.
-        #[cfg(not(debug_assertions))]
-        let builder = tauri::Builder::default()
-            .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
-        #[cfg(debug_assertions)]
-        let builder = tauri::Builder::default();
-
-        builder
         // Single-instance MUST be the first plugin (its docs: registration order
-        // decides when the instance mutex is taken). A second launch exits here and
-        // this callback focuses the existing window — the plugin does NOT do it for you.
+        // decides when the instance mutex is taken) — ahead of even
+        // tauri_plugin_localhost in release builds. A second launch exits here and
+        // this callback focuses the existing window — the plugin does NOT do it
+        // for you.
+        let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.unminimize();
                 let _ = win.set_focus();
             }
-        }))
+        }));
+        #[cfg(not(debug_assertions))]
+        // In production: run the app from http://localhost:14200 (same-origin with
+        // the streaming server). In dev mode: not needed — Vite is already localhost.
+        let builder = builder.plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
+        let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
@@ -513,8 +511,9 @@ pub fn run() {
         })
 
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-    };
+        .expect("error while building tauri application");
+    builder
+};
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
