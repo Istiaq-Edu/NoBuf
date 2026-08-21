@@ -642,7 +642,13 @@ pub async fn cmd_auth_qr_poll(
                         }
                         Ok(tl::enums::auth::LoginToken::Token(t)) => {
                             // Same or refreshed token — still waiting
-                            *state.qr_token.lock().await = Some(t.token.clone());
+                            let rotated = {
+                                let mut qr_guard = state.qr_token.lock().await;
+                                let same = qr_guard.as_ref() == Some(&t.token);
+                                *qr_guard = Some(t.token.clone());
+                                !same
+                            };
+                            log::info!("QR poll probe: token received (rotated={}, len={})", rotated, t.token.len());
                             return Ok(AuthResult {
                                 success: false,
                                 next_step: Some("waiting".to_string()),
@@ -1181,8 +1187,13 @@ mod qr_login_url_tests {
             .find("// Same or refreshed token")
             .expect("probe Token arm comment missing from auth.rs");
         let body = &src[start..start + 400];
+        // The probe persists each refreshed token through the qr_guard lock so
+        // cmd_auth_qr_current can serve the live URL back to the UI. Deleting
+        // the store compiles clean and passes every behavioral test while
+        // re-serving a stale QR forever — this source-level assert is the
+        // only gate that sees that seam.
         assert!(
-            body.contains("*state.qr_token.lock().await = Some(t.token.clone());"),
+            body.contains("*qr_guard = Some(t.token.clone());"),
             "poll probe no longer stores the rotated QR token; the UI would re-render a stale code forever"
         );
     }
