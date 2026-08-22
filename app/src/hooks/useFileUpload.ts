@@ -6,6 +6,11 @@ import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { forgetLiveDrop, cancelDropStream, retryDropStream } from './useDropStreamUpload';
 import { QueueItem } from '../types';
+
+/** True when a queue item is a stream-direct drop (never touches cmd_upload_file). */
+export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
+    return item.path.startsWith('nobuf-drop-stream://');
+}
 import { useFileDrop } from './useFileDrop';
 import type { Store } from '@tauri-apps/plugin-store';
 
@@ -122,13 +127,20 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 ...i,
                 status: status as QueueItem['status'],
                 progress: status === 'success' ? 100 : undefined,
+                // Drop the stale byte counters too — otherwise error/cancel rows
+                // keep showing a frozen "X / Y" from the last progress event.
+                uploadedBytes: status === 'success' ? i.uploadedBytes : undefined,
+                totalBytes: status === 'success' ? i.totalBytes : undefined,
+                speedBytesPerSec: undefined,
                 error,
             } : i));
             const item = queueMirrorRef.current.find(i => i.id === id);
             if (status === 'success') {
                 queryClient.invalidateQueries({ queryKey: ['files', item?.folderId] });
             }
-            forgetLiveDrop(id);
+            // Keep the File handle for error/cancel: Retry re-streams from it.
+            // Only success retires it.
+            if (status === 'success') forgetLiveDrop(id);
         };
         window.addEventListener('nobuf-drop-done', onDropDone);
         return () => window.removeEventListener('nobuf-drop-done', onDropDone);
@@ -137,7 +149,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const processItem = async (item: QueueItem) => {
         // Stream-direct drops manage their own lifecycle (XHR + server events);
         // they enter the queue as 'uploading' and must never hit cmd_upload_file.
-        if (item.path.startsWith('nobuf-drop-stream://')) return;
+        if (isDropStreamItem(item)) return;
         setProcessing(true);
         setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i));
         try {
@@ -264,6 +276,11 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         queueMirrorRef.current
             .filter(i => i.status === 'pending' && i.stagedTempPath)
             .forEach(i => cleanupStagedTemp(i));
+        // Stream-direct drops abort via their XHRs; every marker must be hit or
+        // its upload keeps streaming and resurrects the row on completion.
+        queueMirrorRef.current
+            .filter(i => i.status === 'uploading' && isDropStreamItem(i))
+            .forEach(i => cancelDropStream(i.id));
         setUploadQueue(q => {
             const uploading = q.find(i => i.status === 'uploading');
             if (uploading) {
@@ -304,7 +321,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const retryItem = (id: string) => {
         // Stream-direct drops retry from their retained in-memory File handle.
         const item = queueMirrorRef.current.find(i => i.id === id);
-        if (item?.path.startsWith('nobuf-drop-stream://')) {
+        if (item && isDropStreamItem(item)) {
+            // retryDropStream returns false when the handle is gone — then leave
+            // the row as-is (error state) instead of creating a phantom upload.
             if (!retryDropStream(item)) return;
             setUploadQueue(q => q.map(i =>
                 i.id === id ? { ...i, status: 'uploading' as const, progress: 0, error: undefined } : i
@@ -328,18 +347,18 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         // (server down / route absent).
         try {
             const { streamDroppedFiles } = await import('./useDropStreamUpload');
-            // Throws when the server route is unavailable → legacy staging below.
-            const items = await streamDroppedFiles(files, activeFolderId, limitBytes, hasFolder);
+            // Dedupe keys computed BEFORE the call: streamDroppedFiles skips
+            // duplicates pre-XHR (a skipped file must not become an orphaned
+            // upload) and throws when the server route is unavailable → legacy
+            // staging below.
+            const activeKeys = new Set(
+                queueMirrorRef.current
+                    .filter(i => i.status === 'pending' || i.status === 'uploading')
+                    .map(i => `${i.folderId ?? 'root'}::${i.displayName}`),
+            );
+            const items = await streamDroppedFiles(files, activeFolderId, limitBytes, hasFolder, activeKeys);
             if (items.length > 0) {
-                const activeKeys = new Set(
-                    queueMirrorRef.current
-                        .filter(i => i.status === 'pending' || i.status === 'uploading')
-                        .map(i => `${i.folderId ?? 'root'}::${i.displayName}`),
-                );
-                const fresh = items.filter(it => !activeKeys.has(`${it.folderId ?? 'root'}::${it.displayName}`));
-                const skipped = items.length - fresh.length;
-                if (skipped > 0) toast.info(`Skipped ${skipped} duplicate file(s) already queued.`);
-                if (fresh.length > 0) setUploadQueue(prev => [...prev, ...fresh]);
+                setUploadQueue(prev => [...prev, ...items]);
             }
             return;
         } catch (e) {

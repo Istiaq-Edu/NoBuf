@@ -54,6 +54,8 @@ export async function streamDroppedFiles(
     activeFolderId: number | null,
     limitBytes: number,
     hasFolder: boolean,
+    /** Names already queued/uploading for THIS destination (dedupe, pre-XHR). */
+    activeNames?: ReadonlySet<string>,
 ): Promise<QueueItem[]> {
     // 1. All-or-nothing folder rejection (same as staging path)
     if (hasFolder) {
@@ -82,14 +84,29 @@ export async function streamDroppedFiles(
     }
     if (valid.length === 0) return [];
 
+    // Dedupe BEFORE any XHR starts: a skipped duplicate must not become an
+    // invisible orphaned upload. Caller passes the live queue's active keys.
+    const deduped: File[] = [];
+    const dupeNames: string[] = [];
+    for (const f of valid) {
+        const key = `${activeFolderId ?? 'root'}::${f.name}`;
+        if (activeNames?.has(key)) { dupeNames.push(f.name); continue; }
+        deduped.push(f);
+    }
+    if (dupeNames.length > 0) {
+        toast.info(`Skipped ${dupeNames.length} duplicate file(s) already queued.`);
+    }
+    if (deduped.length === 0) return [];
+
     // Server availability probe BEFORE committing to stream-direct: if the actix
     // route isn't there (old binary, server failed to start), the caller falls
     // back to legacy %TEMP% staging instead of every drop failing.
     try {
         const info = await getStreamInfo();
         const probe = await fetch(`${info.base_url}/upload-drop`, { method: 'HEAD' }).catch(() => null);
-        // 405 = route exists but wrong method (expected); connection refused = absent.
-        if (!probe) throw new Error('streaming server unreachable');
+        // 405 = route exists, wrong method (expected). 404 = old binary without
+        // the route — must fall back too. null = connection failure.
+        if (!probe || probe.status === 404) throw new Error('streaming server route unavailable');
     } catch (e) {
         console.warn('[drop] stream-direct unavailable, falling back to staging:', e);
         throw e; // stageAndQueue catches this and uses the staging path
@@ -100,7 +117,7 @@ export async function streamDroppedFiles(
     // useFileUpload. The QueueItem.path is a synthetic marker; cmd_upload_file is
     // never called for these items (processItem must skip them — see marker below).
     const items: QueueItem[] = [];
-    for (const f of valid) {
+    for (const f of deduped) {
         const id = `drop-${Math.random().toString(36).slice(2, 11)}`;
         liveDrops.set(id, { file: f, folderId: activeFolderId, displayName: f.name });
         items.push({
@@ -119,6 +136,9 @@ export async function streamDroppedFiles(
 async function startOne(id: string) {
     const entry = liveDrops.get(id);
     if (!entry) return;
+    // Double-retry guard: a second XHR with the same tid would duplicate the
+    // Telegram document, and activeXhrs.set overwrite would orphan the first.
+    if (activeXhrs.has(id)) return;
     const { file, folderId, displayName } = entry;
 
     try {
