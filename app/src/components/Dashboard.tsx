@@ -38,6 +38,7 @@ import { useSettings } from '../context/SettingsContext';
 import { useCacheSession } from '../context/CacheSessionContext';
 import { useResponsive } from '../hooks/useResponsive';
 import { useVault, VaultKind } from '../context/VaultContext';
+import { filterHidden } from '../context/VaultContext';
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const queryClient = useQueryClient();
@@ -62,10 +63,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // (reorder/sync payloads) — filtering at any writer would silently
         // delete vaulted folders from the store.
         const visibleFolders = vault.ready
-            ? folders.filter(f => !vault.hiddenFolderIds.has(f.id))
+            ? filterHidden(folders, f => f.id, vault.hiddenFolderIds)
             : folders; // vault state unresolved: render nothing-hidden yet (locked-assumed, no leak — hidden ids unknown while locked)
         const visiblePublicChannels = vault.ready
-            ? publicChannels.filter(c => !vault.hiddenPublicIds.has(c.channel_id))
+            ? filterHidden(publicChannels, c => c.channel_id, vault.hiddenPublicIds)
             : publicChannels;
 
         // Hide helper for Phase 3 entry points (context menu / drop).
