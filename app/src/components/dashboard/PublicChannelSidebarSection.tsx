@@ -11,11 +11,12 @@ interface Props {
     onSelect: (channelId: number) => void;
     onRemoved: () => void;
     onRemove?: (channelId: number) => void;
+    onHideInVault?: (channelId: number) => void;
     expanded?: boolean;
     onToggleExpand?: () => void;
 }
 
-export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, expanded = true, onToggleExpand }: Props) {
+export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, onHideInVault, expanded = true, onToggleExpand }: Props) {
     const [showAddModal, setShowAddModal] = useState(false);
     const activeChannelId = activeView.type === 'public' ? activeView.channelId : null;
 
@@ -77,6 +78,7 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                                                 onRemove(channel.channel_id);
                                             }
                                         }}
+                                        onHideInVault={onHideInVault ? () => onHideInVault(channel.channel_id) : undefined}
                                     />
                                 ))}
                                 {!collapsed && channels.length === 0 && (

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { HardDrive, Folder, Plus, PanelLeftClose, PanelLeftOpen, Check, ChevronDown, ChevronRight } from 'lucide-react';
+import { HardDrive, Folder, Plus, PanelLeftClose, PanelLeftOpen, Check, ChevronDown, ChevronRight, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { SidebarItem } from './SidebarItem';
 import { BandwidthWidget } from './BandwidthWidget';
@@ -27,6 +27,17 @@ interface SidebarProps {
     onSelectPublicChannel: (channelId: number) => void;
     onPublicChannelsChanged: () => void;
     onRemovePublicChannel?: (channelId: number) => void;
+    // ---- Vault (spec §4.2) ----
+    /** Navigate to the vault view (lock screen shows if locked). */
+    onOpenVault: () => void;
+    /** Hide a folder/public channel (D16 gating handled upstream). */
+    onHideInVault: (kind: 'folder' | 'public_channel', id: number) => void;
+    /** Reject an external file drop that landed on the vault item. */
+    onVaultRejectFileDrop: () => void;
+    /** Pinned vault entry visibility (D3 settings toggle). */
+    vaultEntryVisible: boolean;
+    /** Total hidden count for the badge (D15; hidden at 0). */
+    vaultCount: number;
 }
 
 /**
@@ -40,7 +51,8 @@ export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
-    activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel
+    activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel,
+    onOpenVault, onHideInVault, onVaultRejectFileDrop, vaultEntryVisible, vaultCount
 }: SidebarProps) {
     const [showNewFolderInput, setShowNewFolderInput] = useState(false);
     const [newFolderName, setNewFolderName] = useState("");
@@ -228,12 +240,38 @@ export function Sidebar({
                             <SidebarItem
                                 icon={HardDrive}
                                 label="Saved Messages"
-                                active={activeFolderId === null}
+                                active={activeFolderId === null && activeView.type !== 'vault'}
                                 onClick={() => setActiveFolderId(null)}
                                 onDrop={(e: React.DragEvent) => onDrop(e, null)}
                                 folderId={null}
                                 collapsed={collapsed}
                             />
+
+                            {/* Vault — pinned below Saved Messages (D3). Accepts folder +
+                                public-channel drags as HIDE actions; rejects file drops
+                                with a toast via onVaultRejectFileDrop (D10). */}
+                            {vaultEntryVisible && (
+                                <SidebarItem
+                                    icon={Lock}
+                                    label="Vault"
+                                    active={activeView.type === 'vault'}
+                                    onClick={onOpenVault}
+                                    onDrop={(e: React.DragEvent) => {
+                                        // Only non-channel drags reach here — channel/folder
+                                        // drags are consumed by Priority 0 inside SidebarItem.
+                                        // External file drops land at document level, but an
+                                        // explicit drop on the vault item is rejected (D10).
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        onVaultRejectFileDrop();
+                                    }}
+                                    onVaultDropFolder={(fid) => onHideInVault('folder', fid)}
+                                    onVaultDropPublicChannel={(cid) => onHideInVault('public_channel', cid)}
+                                    badgeCount={vaultCount}
+                                    folderId={null}
+                                    collapsed={collapsed}
+                                />
+                            )}
 
                             {/* Private Channels section header — collapsible */}
                             {!collapsed && (
@@ -274,6 +312,7 @@ export function Sidebar({
                                                                         }}
                                                                         onDelete={() => onDelete(folder.id, folder.name)}
                                                                         onRename={(newName: string) => onRename(folder.id, newName)}
+                                                                        onHideInVault={() => onHideInVault('folder', folder.id)}
                                                                         onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
                                                                         currentGroupId={folderGroupMap[folder.id]?.id ?? null}
                                                                         groupColor={folderGroupMap[folder.id]?.color ?? null}
@@ -303,6 +342,7 @@ export function Sidebar({
                                 onSelect={onSelectPublicChannel}
                                 onRemoved={onPublicChannelsChanged}
                                 onRemove={onRemovePublicChannel}
+                                onHideInVault={(cid) => onHideInVault('public_channel', cid)}
                                 expanded={pubExpanded}
                                 onToggleExpand={() => setPubExpanded(e => !e)}
                             />

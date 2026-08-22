@@ -14,6 +14,7 @@ import { ConfirmProvider } from "./context/ConfirmContext";
 import { CacheSessionProvider } from "./context/CacheSessionContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { SettingsProvider } from "./context/SettingsContext";
+import { VaultProvider } from "./context/VaultContext";
 import { DropZoneProvider } from "./contexts/DropZoneContext";
 
 const queryClient = new QueryClient();
@@ -152,7 +153,9 @@ function App() {
             <CacheSessionProvider>
               <SettingsProvider>
                 <DropZoneProvider>
-                  <AppContent />
+                  <VaultProvider>
+                    <AppContent />
+                  </VaultProvider>
                 </DropZoneProvider>
               </SettingsProvider>
             </CacheSessionProvider>
