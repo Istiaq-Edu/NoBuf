@@ -645,4 +645,37 @@ mod tests {
         let guards = src.matches("if !vault::search_result_keeps(&hidden, folder_id) {").count();
         assert_eq!(guards, 2, "cmd_search_global must guard every result push with the vault filter");
     }
+
+    #[test]
+    fn wipe_ids_command_body_does_not_touch_passcode_fields() {
+        // Contract of cmd_vault_wipe_ids (spec rev 4): logout clears BOTH
+        // hidden-ID lists but MUST keep the passcode — a flaky-network logout
+        // must never silently destroy it. Source-level guard: the wipe body
+        // must contain no passcode/salt mutation (reset is the ONLY command
+        // allowed to clear them). Catches copy-paste of reset's body into wipe.
+        let src = include_str!("vault.rs");
+        let start = src.find("pub async fn cmd_vault_wipe_ids").expect("wipe_ids exists");
+        let end = src[start..]
+            .find("#[tauri::command]")
+            .map(|i| start + i)
+            .expect("a following command exists");
+        let body = &src[start..end];
+        assert!(!body.contains("passcode_hash"), "wipe_ids must not mutate passcode_hash");
+        assert!(!body.contains("store.salt"), "wipe_ids must not mutate salt");
+    }
+
+    #[test]
+    fn reset_is_still_allowed_to_clear_passcode() {
+        // Sanity bound on the guard above: the RESET body DOES clear the
+        // passcode (D8 recovery). Proves the source-scan test can detect
+        // passcode mutations when they legitimately exist.
+        let src = include_str!("vault.rs");
+        let start = src.find("pub async fn cmd_vault_reset").expect("reset exists");
+        let end = src[start..]
+            .find("/// Logout hygiene")
+            .map(|i| start + i)
+            .expect("wipe docs follow reset");
+        let body = &src[start..end];
+        assert!(body.contains("passcode_hash = None"), "reset must clear passcode");
+    }
 }

@@ -5,6 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
 import { TelegramFolder, ScanResult } from '../types';
+import { diffRemovedPublicIds } from '../context/VaultContext';
 import { useNetworkStatus } from './useNetworkStatus';
 
 export function useTelegramConnection(onLogoutParent: () => void) {
@@ -67,13 +68,12 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 }
                 // Sync public channels from [NB-PUB]
                 try {
-                    const prevPublicIds = new Set((await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id));
+                    const prevPublicIds = (await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id);
                     await invoke('cmd_sync_public_channels');
                     // Public-channel pruning: SQLite sync deletes dead rows but
                     // never tells the vault — diff previous vs new and prune.
                     const nextPublic = await invoke<any[]>('cmd_get_public_channels');
-                    const nextIds = new Set(nextPublic.map((c: any) => c.channel_id));
-                    const gone = [...prevPublicIds].filter(id => !nextIds.has(id));
+                    const gone = diffRemovedPublicIds(prevPublicIds, nextPublic.map((c: any) => c.channel_id));
                     if (gone.length > 0) {
                         try {
                             await invoke('cmd_vault_prune', { kind: 'public_channel', ids: gone });
