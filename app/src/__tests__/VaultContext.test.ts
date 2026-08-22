@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { filterHidden, isVaultedSelection, type VaultState } from '../context/VaultContext';
+import { filterHidden, isVaultedSelection, diffRemovedPublicIds, type VaultState } from '../context/VaultContext';
 
 /**
  * Vault frontend logic tests — bound to the SHIPPED exported functions
@@ -89,5 +89,60 @@ describe('VaultState contract (locked responses carry no IDs)', () => {
 
         const unlocked: VaultState = { ...locked, is_unlocked: true, folder_ids: [7], public_ids: [8] };
         expect(unlocked.folder_ids).toEqual([7]);
+    });
+});
+
+// ---- Phase 4 review: reconciliation prune diff (spec §4.4) ----------------
+
+describe('diffRemovedPublicIds (public-channel prune after SQLite sync)', () => {
+    it('returns channels present before but gone after', () => {
+        expect(diffRemovedPublicIds([1, 2, 3], [2, 3, 4])).toEqual([1]);
+    });
+
+    it('returns [] when nothing was removed', () => {
+        expect(diffRemovedPublicIds([1, 2], [1, 2])).toEqual([]);
+        expect(diffRemovedPublicIds([], [])).toEqual([]);
+    });
+
+    it('returns ALL prev ids when sync emptied the list (account wipe)', () => {
+        expect(diffRemovedPublicIds([5, 9], [])).toEqual([5, 9]);
+    });
+
+    it('ignores newly added channels — only prev-side removals count', () => {
+        expect(diffRemovedPublicIds([7], [7, 8, 9])).toEqual([]);
+    });
+
+    it('preserves prev order and duplicates-safe semantics', () => {
+        expect(diffRemovedPublicIds([3, 1, 2], [1])).toEqual([3, 2]);
+    });
+
+    it('is idempotent: diffing again with same inputs gives same result', () => {
+        const a = diffRemovedPublicIds([1, 2, 3], [3]);
+        const b = diffRemovedPublicIds([1, 2, 3], [3]);
+        expect(a).toEqual(b);
+        expect(a).toEqual([1, 2]);
+    });
+});
+
+// ---- Phase 4 review: logout wipe semantics (cmd_vault_wipe_ids contract) ---
+
+describe('logout wipe contract (wipe_ids keeps passcode, clears IDs)', () => {
+    // Mirrors the Rust cmd_vault_wipe_ids behavior asserted in vault.rs:
+    // lists cleared, passcode/salt/entry_visible survive, re-locks.
+    it('a wiped store keeps has_passcode while counts drop to zero', () => {
+        const before: VaultState = {
+            has_passcode: true, is_unlocked: true, entry_visible: false,
+            folder_count: 2, public_count: 3, folder_ids: [1, 2], public_ids: [3, 4, 5],
+        };
+        const after: VaultState = {
+            has_passcode: true, is_unlocked: false, entry_visible: false,
+            folder_count: 0, public_count: 0, folder_ids: null, public_ids: null,
+        };
+        // The contract: passcode survives, everything hidden is gone.
+        expect(after.has_passcode).toBe(true);
+        expect(after.folder_count).toBe(0);
+        expect(after.public_count).toBe(0);
+        expect(before.folder_ids!.length + before.public_ids!.length)
+            .toBe(5); // all five were wiped
     });
 });

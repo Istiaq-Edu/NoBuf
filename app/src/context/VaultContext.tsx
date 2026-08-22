@@ -61,6 +61,18 @@ export function isVaultedSelection(
     return hiddenFolderIds.has(id) || hiddenPublicIds.has(id);
 }
 
+/**
+ * Public-channel prune diff (spec §4.4): channels present BEFORE a sync but
+ * gone AFTER it were deleted from SQLite by the sync — they must be pruned
+ * from the vault too, because nothing else tells vault.json about the delete.
+ * Order-stable, idempotent, returns [] when nothing died.
+ */
+export function diffRemovedPublicIds(prevIds: number[], nextIds: number[]): number[] {
+    const next = new Set(nextIds);
+    return prevIds.filter(id => !next.has(id));
+}
+
+
 
 function applyState(
     state: VaultState,
