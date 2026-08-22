@@ -54,11 +54,18 @@ jobs:
       - name: Create Release
         id: create-release
         uses: actions/github-script@v7
+        env:
+          # Passed via env instead of ${{ }} interpolation INTO the script:
+          # interpolated text is parsed as JavaScript, so any backtick in a
+          # commit message (changelog) or odd character in the version string
+          # becomes a SyntaxError at runtime. Env vars arrive as plain strings.
+          RELEASE_VERSION: ${{ steps.get_version.outputs.VERSION }}
+          RELEASE_CHANGELOG: ${{ steps.git-cliff.outputs.content }}
         with:
           script: |
-            const version = `${{ steps.get_version.outputs.VERSION }}`;
+            const version = process.env.RELEASE_VERSION;
             const isBeta = version.includes('beta') || version.includes('alpha');
-            const changelog = `${{ steps.git-cliff.outputs.content }}` || 'See commit history for changes in this release.';
+            const changelog = process.env.RELEASE_CHANGELOG || 'See commit history for changes in this release.';
             const intro = `NoBuf v${version} — ${isBeta ? 'Pre-release for testing and feedback.' : 'Stable release of NoBuf.'}\n\n${isBeta ? '**Note:** This is a beta release. Some features may be incomplete or unstable. Please report any issues.' : ''}`;
             const body = `${intro}\n\n---\n\n## What Changed\n\n${changelog}\n\nSee the assets below to download and install.`;
             const { data } = await github.rest.repos.createRelease({
