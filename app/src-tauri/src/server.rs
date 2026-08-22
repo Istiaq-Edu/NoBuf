@@ -1,6 +1,8 @@
 use actix_web::{get, head, web, App, HttpServer, HttpRequest, HttpResponse, Responder};
 use actix_cors::Cors;
 use crate::commands::TelegramState;
+use crate::bandwidth::BandwidthManager;
+use std::sync::Arc as StdArc;
 use crate::commands::utils::resolve_peer;
 use crate::hls;
 use crate::hls::manifest::extract_video_attrs_from_raw_msg;
@@ -7764,10 +7766,15 @@ pub async fn start_streaming_server(
     tg_state: Arc<TelegramState>,
     token: String,
     cache_mgr: Option<StreamCacheManager>,
+    upload_app_handle: Option<tauri::AppHandle>,
+    upload_bw: Option<StdArc<BandwidthManager>>,
 ) -> std::io::Result<actix_web::dev::Server> {
     let token_data = web::Data::new(StreamTokenData { token });
     let tg_data = web::Data::new(tg_state);
     let cache_data = web::Data::new(cache_mgr);
+    // Drop-upload route data (None => route not registered).
+    let upload_app_handle_data = upload_app_handle.map(web::Data::new);
+    let upload_bw_data = upload_bw.map(web::Data::new);
 
     // Create fMP4 caches OUTSIDE the HttpServer::new closure so they are
     // shared across all Actix worker threads (web::Data wraps in Arc,
@@ -7809,6 +7816,14 @@ pub async fn start_streaming_server(
             .app_data(token_data.clone())
             .app_data(tg_data.clone())
             .app_data(cache_data.clone())
+            .configure(|cfg: &mut web::ServiceConfig| {
+                // Drop-upload route: only when lib.rs supplied the AppHandle+BW.
+                if let (Some(h), Some(bw)) = (&upload_app_handle_data, &upload_bw_data) {
+                    cfg.app_data(h.clone())
+                        .app_data(bw.clone())
+                        .service(crate::commands::upload_drop::upload_drop);
+                }
+            })
             .service(stream_media)
             .service(stream_media_head)
             .service(remux_ts_to_mp4)
@@ -7867,7 +7882,7 @@ pub async fn start_server(
     cache_mgr: Option<StreamCacheManager>,
     _api_port: u16,
 ) -> std::io::Result<actix_web::dev::Server> {
-    start_streaming_server(port, tg_state, token, cache_mgr).await
+    start_streaming_server(port, tg_state, token, cache_mgr, None, None).await
 }
 
 #[cfg(test)]

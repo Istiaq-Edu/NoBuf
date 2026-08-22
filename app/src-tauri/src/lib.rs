@@ -289,6 +289,8 @@ pub fn run() {
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
+            let bandwidth_arc = Arc::new(app.state::<bandwidth::BandwidthManager>().inner().clone());
+            app.manage(bandwidth_arc);
             app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
@@ -382,10 +384,19 @@ pub fn run() {
             let state = Arc::new(app.state::<TelegramState>().inner().clone());
             let token_for_server = stream_token.clone();
             let handle_for_thread = server_handle_for_setup.clone();
+            // Drop-upload route needs the AppHandle (progress events) inside the
+            // actix worker threads; the BandwidthManager is swapped out into an
+            // Arc so the daily cap counts stream-direct drops alongside every
+            // other transfer (the managed copy is a fresh, unused instance).
+            let app_handle_for_server = app.handle().clone();
+            // BandwidthManager is now Clone (stats behind Arc) — the actix server
+            // gets its own handle to the SAME shared stats, so stream-direct drops
+            // count toward the daily cap alongside every other transfer.
+            let bw_for_server = app.state::<bandwidth::BandwidthManager>().inner().clone();
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_server(state, STREAM_PORT, token_for_server, cache_mgr, 0).await {
+                    match server::start_streaming_server(STREAM_PORT, state, token_for_server, cache_mgr, Some(app_handle_for_server), Some(std::sync::Arc::new(bw_for_server))).await {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(streaming_server.handle());

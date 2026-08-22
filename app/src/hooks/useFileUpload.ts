@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
+import { forgetLiveDrop, cancelDropStream, retryDropStream } from './useDropStreamUpload';
 import { QueueItem } from '../types';
 import { useFileDrop } from './useFileDrop';
 import type { Store } from '@tauri-apps/plugin-store';
@@ -109,7 +110,34 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         }
     }, [uploadQueue, processing]);
 
+    // Stream-direct drops report their own terminal states (success / cancelled /
+    // error) via the nobuf-drop-done event from useDropStreamUpload. Progress
+    // arrives through the regular upload-progress channel — no extra wiring.
+    useEffect(() => {
+        const onDropDone = (e: Event) => {
+            const { id, status, error } = (e as CustomEvent).detail as {
+                id: string; status: 'success' | 'cancelled' | 'error'; error?: string;
+            };
+            setUploadQueue(q => q.map(i => i.id === id ? {
+                ...i,
+                status: status as QueueItem['status'],
+                progress: status === 'success' ? 100 : undefined,
+                error,
+            } : i));
+            const item = queueMirrorRef.current.find(i => i.id === id);
+            if (status === 'success') {
+                queryClient.invalidateQueries({ queryKey: ['files', item?.folderId] });
+            }
+            forgetLiveDrop(id);
+        };
+        window.addEventListener('nobuf-drop-done', onDropDone);
+        return () => window.removeEventListener('nobuf-drop-done', onDropDone);
+    }, [queryClient]);
+
     const processItem = async (item: QueueItem) => {
+        // Stream-direct drops manage their own lifecycle (XHR + server events);
+        // they enter the queue as 'uploading' and must never hit cmd_upload_file.
+        if (item.path.startsWith('nobuf-drop-stream://')) return;
         setProcessing(true);
         setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i));
         try {
@@ -252,6 +280,11 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const cancelItem = (id: string) => {
         setUploadQueue(q => {
             const item = q.find(i => i.id === id);
+            // Stream-direct drops: abort the XHR; server sees disconnect and stops.
+            if (item?.path.startsWith('nobuf-drop-stream://')) {
+                cancelDropStream(id);
+                return q.map(i => i.id === id ? { ...i, status: 'cancelled' as const } : i);
+            }
             if (item?.status === 'uploading') {
                 cancelledRef.current.add(id);
                 invoke('cmd_cancel_transfer', { transferId: id }).catch(() => {});
@@ -269,6 +302,15 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     };
 
     const retryItem = (id: string) => {
+        // Stream-direct drops retry from their retained in-memory File handle.
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (item?.path.startsWith('nobuf-drop-stream://')) {
+            if (!retryDropStream(item)) return;
+            setUploadQueue(q => q.map(i =>
+                i.id === id ? { ...i, status: 'uploading' as const, progress: 0, error: undefined } : i
+            ));
+            return;
+        }
         setUploadQueue(q => q.map(i =>
             i.id === id && (i.status === 'error' || i.status === 'cancelled')
                 ? { ...i, status: 'pending' as const, error: undefined, progress: undefined, uploadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined }
@@ -280,6 +322,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
+        // B′: dropped files stream DIRECTLY to Telegram over the local actix
+        // server — no %TEMP% staging, no preparing phase. Falls back to the old
+        // staging path when the availability probe in streamDroppedFiles throws
+        // (server down / route absent).
+        try {
+            const { streamDroppedFiles } = await import('./useDropStreamUpload');
+            // Throws when the server route is unavailable → legacy staging below.
+            const items = await streamDroppedFiles(files, activeFolderId, limitBytes, hasFolder);
+            if (items.length > 0) {
+                const activeKeys = new Set(
+                    queueMirrorRef.current
+                        .filter(i => i.status === 'pending' || i.status === 'uploading')
+                        .map(i => `${i.folderId ?? 'root'}::${i.displayName}`),
+                );
+                const fresh = items.filter(it => !activeKeys.has(`${it.folderId ?? 'root'}::${it.displayName}`));
+                const skipped = items.length - fresh.length;
+                if (skipped > 0) toast.info(`Skipped ${skipped} duplicate file(s) already queued.`);
+                if (fresh.length > 0) setUploadQueue(prev => [...prev, ...fresh]);
+            }
+            return;
+        } catch (e) {
+            console.warn('[drop] stream-direct unavailable, falling back to staging:', e);
+            // fall through to legacy staging path below
+        }
         const { stageDroppedFiles } = await import('./useDroppedFileUpload');
         const items = await stageDroppedFiles(files, activeFolderId, limitBytes, hasFolder, onStagingProgress);
         if (items.length > 0) {

@@ -449,7 +449,7 @@ pub async fn cmd_discard_staged_upload(upload_id: String, file_name: String) -> 
 /// Staged dropped files pass their ORIGINAL name here (the temp path carries a
 /// random `<id>-` prefix that must never leak into Telegram). Falls back to the
 /// path basename for picker/zip uploads. Pure - unit-tested below.
-fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
+pub fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
     if let Some(n) = display_name.as_deref().map(str::trim) {
         if !n.is_empty() {
             // Path::new("..") / "." / "/" yield file_name()==None, which would pass
