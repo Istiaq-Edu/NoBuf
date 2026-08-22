@@ -44,6 +44,16 @@ describe('QR poll keeps the rendered code in sync with the rotating token', () =
     expect(effectBody).toContain('cmd_auth_qr_current');
   });
 
+  it('listens for qr-scan-detected and flips to scanned feedback', () => {
+    // Instant feedback fix: backend watcher emits within ~5s of acceptance;
+    // the poll loop alone can leave "Waiting for scan..." showing ~20s.
+    expect(authWizardSrc).toContain('listen<boolean>("qr-scan-detected"');
+    const panelStart = authWizardSrc.indexOf('function QrLoginPanel');
+    const panelBody = authWizardSrc.slice(panelStart);
+    expect(panelBody).toContain('qrScanned ?');
+    expect(panelBody).toContain('QR code scanned \u2014 signing you in…'.replace('\\u2014', '\u2014'));
+  });
+
   it('poll catch never swallows handler errors silently', () => {
     // The 2026-08-21 stuck run: handle_2fa failed backend-side, the poll catch
     // swallowed it, and the UI sat on "Waiting for scan..." with zero signal.

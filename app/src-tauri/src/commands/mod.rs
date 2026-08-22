@@ -145,6 +145,13 @@ pub struct TelegramState {
     pub stored_api_id: Arc<std::sync::atomic::AtomicI32>,
     /// Whether we've already called exportLoginToken to finalize QR login
         pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,        pub qr_2fa_pending: Arc<std::sync::atomic::AtomicBool>,
+        /// SRP challenge DC for the pending QR 2FA handshake (None = home DC).
+        pub password_dc: Arc<tokio::sync::Mutex<Option<i32>>>,
+        /// Shared handle to the SqliteSession so the password step can move the
+        /// client home DC to the challenge DC before invoking auth.CheckPassword.
+        pub sqlite_session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<grammers_session::storages::SqliteSession>>>>,
+        /// Guards single-instance QR scan watcher per login attempt.
+        pub qr_scan_watching: Arc<std::sync::atomic::AtomicBool>,
         /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
         /// Used to throttle calls to every ~15 seconds to avoid flood waits.
         pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
