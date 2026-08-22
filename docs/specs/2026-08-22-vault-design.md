@@ -1,7 +1,7 @@
 # Vault — Hide Channels & Folders Behind a Passcode
 
 **Date:** 2026-08-22 · **Branch:** `feature/vault-hide-channels` (cut from `fix/dragdrop-upload-defects`, which is 8 ahead / 0 behind `origin/dev`)
-**Revision:** 4 — late state-consistency reviewer adjudicated: public-channel pruning mechanism added (sync diff), logout clears vault ID lists (is_member has no false-refresh path — verified), D14 handler duties (selectedIds + modal close), exact cache-key shapes corrected, lock-state truth rules restated. Prior: rev 3 cross-validation (6 amendments), rev 2 adversarial review. Reports: `reports/review-vault-state.md`, `reports/review-vault-crossval.md`, `reports/review-vault-design.md`, `reports/review-vault-security.md`.
+**Revision:** 5 — implementation-start audit found LIVE global search (`cmd_search_global` → results carry source folder_id) that all four reviews missed; backend-side vault filtering specified. Plus state-review rev-4 changes (public-channel pruning, logout vault wipe, D14 handler duties). Reports: `reports/review-vault-state.md`, `reports/review-vault-crossval.md`, `reports/review-vault-design.md`, `reports/review-vault-security.md`.
 
 ---
 
@@ -26,7 +26,7 @@ Security stance (user-confirmed): **soft security at the app-UI level.** All con
 | ActiveView = `{type:'saved'} \| {type:'folder',folderId} \| {type:'public',channelId}`; view ternaries live at Dashboard.tsx:122,525,796,854 | `types.ts:96-99` |
 | folders/publicChannels prop passes: MoveToFolderModal (:661), FolderGroupTabs area (:721), Sidebar (:736), ForwardToFolderModal (:856) | `Dashboard.tsx` |
 | Settings page has established toggle patterns (`settings-toggle-switch on/off`) | `SettingsPage.tsx:583-587` |
-| No global search exists in the app | searched, zero hits |
+| No global search exists in the app | **CORRECTED rev 5:** `cmd_search_global` DOES exist and is LIVE (TopBar input → debounced `handleGlobalSearch`, `Dashboard.tsx:322-337`; backend `fs.rs:1488`) and results carry source `folder_id` from `m.peer_id` (`fs.rs:1531-1537`). It MUST drop vaulted-peer results while locked — enforced backend-side (frontend can't, locked get_state carries no IDs); see §4.3 |
 | Existing hotkeys are Ctrl+A/Ctrl+F/Delete/Escape only; Ctrl+Shift+V free but reserved by WebView2 paste-plain-text → needs preventDefault | `useKeyboardShortcuts.ts:31-60` |
 | forceLogout wipes `api_id/api_hash/folders` from store; SQLite public-channels DB survives logout | `useTelegramConnection.ts:139-149` |
 
@@ -109,6 +109,7 @@ Errors are `Result<_, String>` with stable machine-readable prefixes (`"passcode
 | Case | Behavior |
 |---|---|
 | REST/stream servers | Out of vault's reach by design — documented boundary, §1 |
+| Global search vs vault | `cmd_search_global` skips results whose peer id is in either vaulted list while locked (helper `vault::id_vaulted_and_locked`, called from fs.rs result loops); when unlocked, vaulted results flow normally. Enforced backend because the frontend cannot know vaulted IDs while locked |
 | Plaintext name persistence | Hidden names remain in store `config.json` + `nobuf_groups.db` (existing stores, unchanged by this feature) — documented, §1 |
 | Vaulted folder deleted/kicked on Telegram | Pruned from vault.json via `cmd_vault_prune_folders` after next reconciliation (§4.4) |
 | Different Telegram account logs in | Store `folders` wiped by forceLogout (verified :139-149); SQLite public channels survive. `is_member` is NEVER written to 0 (all inserts hardcode 1, `public_channels.rs:327,462`) — there is NO membership-refresh path, so cross-account stale IDs would be unfixable without account A's passcode (and D8 Reset would destroy that passcode). Therefore: logout ALSO clears both vault ID lists via a prune-style wipe (matching the folders precedent); the passcode hash SURVIVES so re-hiding after re-login uses the same code; reset remains available regardless |
