@@ -516,6 +516,7 @@ pub fn run() {
             commands::cmd_vault_change_passcode,
             commands::cmd_vault_lock,
             commands::cmd_vault_reset,
+            commands::cmd_vault_wipe_ids,
             commands::cmd_vault_prune,
             commands::cmd_vault_set_entry_visible,
         ])

@@ -3,13 +3,14 @@ import { motion } from 'framer-motion';
 import {
     ArrowLeft, Upload, Download, LayoutGrid, FileText, Globe, HardDrive,
     Key, Copy, Check, RefreshCw, Trash2, RotateCcw, Film, Music,
-    ImageIcon, Package, Cpu, Wifi, Network, Activity, Shield, LogOut, Palette, Sparkles, Plus
+    ImageIcon, Package, Cpu, Wifi, Network, Activity, Shield, LogOut, Palette, Sparkles, Plus, Lock
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useSettings } from '../../context/SettingsContext';
 import { useTheme } from '../../context/ThemeContext';
 import { useConfirm } from '../../context/ConfirmContext';
+import { useVault } from '../../context/VaultContext';
 import { CustomTheme, ThemeColorPalette, generateThemeId } from '../../theme/themeEngine';
 import { getDefaultPalette } from '../../theme/presets';
 import { FileCategory, ALL_FILE_CATEGORIES } from '../../utils';
@@ -17,6 +18,8 @@ import { FileCategory, ALL_FILE_CATEGORIES } from '../../utils';
 interface SettingsPageProps {
     onClose: () => void;
     onLogout: () => void;
+    /** D11: opens the vault view (lock screen shows if locked). */
+    onOpenVault?: () => void;
 }
 
 interface ApiSettings {
@@ -34,7 +37,8 @@ const CATEGORY_META: Record<FileCategory, { label: string; icon: typeof Film; co
     misc:       { label: 'Misc',       icon: Package,   color: 'bg-gray-500' },
 };
 
-export function SettingsPage({ onClose, onLogout }: SettingsPageProps) {
+export function SettingsPage({ onClose, onLogout, onOpenVault }: SettingsPageProps) {
+    const vault = useVault();
     const { settings, updateSetting, resetSettings } = useSettings();
     const { theme: _theme, toggleTheme: _toggleTheme, customThemes, activeCustomThemeId, setActiveCustomTheme, addCustomTheme, deleteCustomTheme, updateCustomTheme } = useTheme();
     const { confirm } = useConfirm();
@@ -554,6 +558,53 @@ export function SettingsPage({ onClose, onLogout }: SettingsPageProps) {
                                             </button>
                                         );
                                     })}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* ===== VAULT ===== */}
+                    <div className="settings-category">
+                        <div className="settings-category-header">
+                            <Lock className="w-4 h-4" />
+                            <h3 className="settings-category-title">Vault</h3>
+                            <p className="settings-category-desc">Hide channels behind a passcode</p>
+                        </div>
+                        <div className="settings-category-body space-y-3">
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Show Vault in sidebar</p>
+                                        <p className="settings-card-desc">
+                                            {vault.hasPasscode
+                                                ? `${vault.totalCount} hidden item${vault.totalCount === 1 ? '' : 's'}`
+                                                : 'No passcode set yet — hide a channel to create one'}
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={() => vault.setEntryVisible(!vault.entryVisible)}
+                                        className={`settings-toggle-switch ${vault.entryVisible ? 'on' : 'off'}`}
+                                        title={vault.entryVisible ? 'Hide the Vault entry' : 'Show the Vault entry'}
+                                    >
+                                        <span className="settings-toggle-knob" />
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="settings-card">
+                                <div className="flex items-center gap-3">
+                                    <div className="flex-1 min-w-0">
+                                        <p className="settings-card-title">Open Vault</p>
+                                        <p className="settings-card-desc">
+                                            {vault.isUnlocked ? 'Currently unlocked' : 'Passcode required'} · Ctrl+Shift+V works too
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={() => { onOpenVault?.(); }}
+                                        disabled={!onOpenVault}
+                                        className="px-3 py-1.5 text-xs font-medium text-nobuf-subtext hover:text-nobuf-text bg-nobuf-bg border border-nobuf-border rounded-lg transition-colors disabled:opacity-40"
+                                    >
+                                        Open
+                                    </button>
                                 </div>
                             </div>
                         </div>

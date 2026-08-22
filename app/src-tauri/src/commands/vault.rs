@@ -427,6 +427,23 @@ pub async fn cmd_vault_reset(app: AppHandle) -> Result<VaultStateResponse, Strin
     Ok(state_response(&store, false))
 }
 
+/// Logout hygiene (spec rev 4): clear BOTH hidden-ID lists but KEEP the
+/// passcode, then re-lock. Needed because SQLite public channels survive
+/// logout while `is_member` has no false-refresh path — stale cross-account
+/// IDs could otherwise never be removed without account A's passcode.
+/// Works while locked (reveals nothing; wipes only).
+#[tauri::command]
+pub async fn cmd_vault_wipe_ids(app: AppHandle) -> Result<VaultStateResponse, String> {
+    let lock = app.state::<VaultLock>();
+    let _guard = lock.0.lock().map_err(|e| format!("Vault lock error: {}", e))?;
+    let mut store = load_store(&app);
+    store.vaulted_folder_ids.clear();
+    store.vaulted_public_channel_ids.clear();
+    save_store(&app, &store)?;
+    set_unlocked(&app, false);
+    Ok(state_response(&store, false))
+}
+
 #[tauri::command]
 pub async fn cmd_vault_prune(
     app: AppHandle,

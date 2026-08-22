@@ -94,6 +94,7 @@ fn main() {
                                 "cmd_vault_change_passcode",
                                 "cmd_vault_lock",
                                 "cmd_vault_reset",
+                                "cmd_vault_wipe_ids",
                                 "cmd_vault_prune",
                                 "cmd_vault_set_entry_visible",
                             ])),
