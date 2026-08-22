@@ -96,4 +96,8 @@ export interface ForwardResult {
 export type ActiveView =
     | { type: 'saved' }
     | { type: 'folder'; folderId: number }
-    | { type: 'public'; channelId: number };
+    | { type: 'public'; channelId: number }
+    | { type: 'vault' };
+
+/** Drag MIME marking a dragged public channel (vault-hide source). */
+export const PUBLIC_CHANNEL_DRAG_MIME = 'application/x-nobuf-public-channel';
