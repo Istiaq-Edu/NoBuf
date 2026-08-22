@@ -132,6 +132,15 @@ describe('staged temp files are excluded from store persistence', () => {
         expect(s).toContain('items.length === 0 && stagingItems.length === 0');
     });
 
+    it('cancelled staging names are suppressed against late progress callbacks', () => {
+        // Without the guard, the in-flight 8MB chunk's callback re-adds the row
+        // right after Cancel removes it — the user had to click Cancel twice.
+        const s = src('src/components/Dashboard.tsx');
+        expect(s).toContain('cancelledStagingRef');
+        expect(s).toContain('if (cancelledStagingRef.current.has(fileName)) return;');
+        expect(s).toContain('cancelledStagingRef.current.add(name);');
+    });
+
     it('single-instance callback focuses the existing window (plugin does NOT auto-focus)', () => {
         const rust = src('src-tauri/src/lib.rs');
         // Exactly one registration, and it must be the FIRST plugin on the builder
