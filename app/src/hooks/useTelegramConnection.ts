@@ -56,9 +56,31 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             try {
                 const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
                 applySyncResult(result);
+                // Vault prune (spec §4.4): drop dead folder ids from vault.json.
+                // Works while locked; intersection-only on the backend.
+                if (result.removed.length > 0) {
+                    try {
+                        await invoke('cmd_vault_prune', { kind: 'folder', ids: result.removed });
+                    } catch {
+                        // Non-fatal: stale id survives until next sync.
+                    }
+                }
                 // Sync public channels from [NB-PUB]
                 try {
+                    const prevPublicIds = new Set((await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id));
                     await invoke('cmd_sync_public_channels');
+                    // Public-channel pruning: SQLite sync deletes dead rows but
+                    // never tells the vault — diff previous vs new and prune.
+                    const nextPublic = await invoke<any[]>('cmd_get_public_channels');
+                    const nextIds = new Set(nextPublic.map((c: any) => c.channel_id));
+                    const gone = [...prevPublicIds].filter(id => !nextIds.has(id));
+                    if (gone.length > 0) {
+                        try {
+                            await invoke('cmd_vault_prune', { kind: 'public_channel', ids: gone });
+                        } catch {
+                            // Non-fatal: stale id survives until next sync.
+                        }
+                    }
                 } catch (e) {
                     console.warn('[Public Channels] Sync failed:', e);
                 }
