@@ -85,7 +85,10 @@ async fn upload_drop(
     //     process/browser tab; CORS cannot stop them SENDING, only reading) ------
     match query_param(&req, "token") {
         Some(t) if t == token_data.token => {}
-        _ => return HttpResponse::Unauthorized().body("invalid or missing token"),
+        _ => {
+            log::warn!("[drop] rejected unauthenticated /upload-drop attempt from {}", req.peer_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".into()));
+            return HttpResponse::Unauthorized().body("invalid or missing token");
+        }
     }
     // --- Parameter validation -------------------------------------------------
     let name = match query_param(&req, "name") {
@@ -105,14 +108,17 @@ async fn upload_drop(
 
     // --- Bandwidth gate (same daily cap as every other transfer) ---------------
     if bw_state.can_transfer(size).is_err() {
+        log::warn!("[drop] {name} ({size}B) rejected: daily bandwidth cap");
         return HttpResponse::BadRequest().body("Daily bandwidth limit exceeded");
     }
 
     // --- Client -----------------------------------------------------------------
     let client_opt = { tg_state.client.lock().await.clone() };
     let Some(client) = client_opt else {
+        log::warn!("[drop] {name} rejected: not connected to Telegram");
         return HttpResponse::ServiceUnavailable().body("Not connected to Telegram");
     };
+    log::info!("[drop] streaming '{name}' ({size}B -> folder {folder_id:?}) tid={tid}");
 
     // --- Progress reporter (250ms cadence, mirrors cmd_upload_file) -------------
     let start = Instant::now();
@@ -216,7 +222,10 @@ async fn upload_drop(
                     .body(format!("Upload succeeded but resolve failed: {e}")),
             }
         }
-        Err(e) => HttpResponse::InternalServerError().body(format!("Upload failed: {e}")),
+        Err(e) => {
+            log::warn!("[drop] tid={tid} upload failed after {consumed_bytes}B: {e}");
+            HttpResponse::InternalServerError().body(format!("Upload failed: {e}"))
+        }
     }
 }
 
