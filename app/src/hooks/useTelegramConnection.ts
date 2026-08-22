@@ -162,6 +162,10 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         setIsConnected(false);
         try {
             await invoke('cmd_clean_cache').catch(() => { });
+            // Vault logout hygiene (spec rev 4): clear both hidden-ID lists,
+            // keep the passcode, re-lock. Backend-side because the frontend
+            // cannot know the IDs while locked (by design).
+            try { await invoke('cmd_vault_wipe_ids'); } catch { /* best effort */ }
             if (store) {
                 await store.delete('api_id');
                 await store.delete('api_hash');

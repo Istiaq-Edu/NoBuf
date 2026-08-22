@@ -144,6 +144,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             }
         }, [vault.ready, vault.hiddenFolderIds, vault.hiddenPublicIds, activeFolderId, store]);
 
+        // Ctrl+Shift+V — open Vault (D11). preventDefault: WebView2 reserves
+        // this combo for paste-plain-text. Bound outside the input-guard path
+        // so it works while typing (e.g. from the lock screen passcode field).
+        const handleVaultHotkey = useCallback((e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'v' || e.key === 'V')) {
+                e.preventDefault();
+                e.stopPropagation();
+                setActiveView(prev => prev.type === 'vault' ? prev : { type: 'vault' });
+            }
+        }, []);
+
+        useEffect(() => {
+            window.addEventListener('keydown', handleVaultHotkey, true);
+            return () => window.removeEventListener('keydown', handleVaultHotkey, true);
+        }, [handleVaultHotkey]);
+
+        // ---- D3 edge case: hiding the vault entry while viewing it ----------
+        useEffect(() => {
+            if (vault.ready && vault.entryVisible === false && activeView.type === 'vault') {
+                setActiveView({ type: 'saved' });
+            }
+        }, [vault.ready, vault.entryVisible, activeView.type]);
 
         // Wrapper: updates both activeView and activeFolderId atomically.
         // Sidebar calls this instead of raw setActiveFolderId so that clicking
@@ -951,7 +973,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <AnimatePresence>
                 {showSettings && (
-                    <SettingsPage onClose={() => setShowSettings(false)} onLogout={handleLogout} />
+                    <SettingsPage
+                        onClose={() => setShowSettings(false)}
+                        onLogout={handleLogout}
+                        onOpenVault={() => { setShowSettings(false); setActiveView({ type: 'vault' }); }}
+                    />
                 )}
             </AnimatePresence>
 

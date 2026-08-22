@@ -103,6 +103,7 @@
     "allow-cmd-vault-change-passcode",
     "allow-cmd-vault-lock",
     "allow-cmd-vault-reset",
+    "allow-cmd-vault-wipe-ids",
     "allow-cmd-vault-prune",
     "allow-cmd-vault-set-entry-visible",
     "allow-cmd-opensubtitles-validate-key",
