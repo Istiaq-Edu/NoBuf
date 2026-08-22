@@ -24,6 +24,7 @@ import { SettingsPage } from './dashboard/SettingsPage';
 import { AboutPage } from './dashboard/AboutPage';
 import { ForwardToFolderModal } from './dashboard/ForwardToFolderModal';
 import { VaultPasscodeModal } from './dashboard/VaultPasscodeModal';
+import { VaultView } from './dashboard/VaultView';
 import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
 import { ActiveView } from '../types';
 import { useConfirm } from '../context/ConfirmContext';
@@ -613,7 +614,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     };
 
-    const currentFolderName = activeView.type === 'public'
+    const currentFolderName = activeView.type === 'vault'
+        ? "Vault"
+        : activeView.type === 'public'
         ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
         : activeFolderId === null
             ? "Saved Messages"
@@ -873,6 +876,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         </h2>
                     </div>
                 )}
+                {activeView.type === 'vault' ? (
+                    <VaultView
+                        onOpenFolder={(id) => setActiveView({ type: 'folder', folderId: id })}
+                        onOpenPublicChannel={(id) => setActiveView({ type: 'public', channelId: id })}
+                    />
+                ) : (
                 <FileExplorer
 
                     files={displayedFiles}
@@ -900,6 +909,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     showForwardOption={isReadOnly}
                     onForwardToFolder={() => setShowForwardModal(true)}
                 />
+                )}
             </main>
 
             {previewFile && (
