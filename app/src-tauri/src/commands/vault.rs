@@ -617,4 +617,15 @@ mod tests {
         assert!(search_result_keeps(&unlocked, Some(200)));
         assert!(search_result_keeps(&unlocked, None));
     }
+
+    #[test]
+    fn search_call_site_wraps_both_push_sites_in_fs_source() {
+        // Guards the WIRING, not just the predicate: if either push site in
+        // cmd_search_global loses its `search_result_keeps` guard, the locked
+        // vault leaks via global search and this test fails. Source-level
+        // because the loop bodies are Telegram-mocked and unreachable headless.
+        let src = include_str!("fs.rs");
+        let guards = src.matches("if !vault::search_result_keeps(&hidden, folder_id) {").count();
+        assert_eq!(guards, 2, "cmd_search_global must guard every result push with the vault filter");
+    }
 }
