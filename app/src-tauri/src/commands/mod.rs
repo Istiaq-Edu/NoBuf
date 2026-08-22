@@ -173,6 +173,7 @@ pub mod archive;
 pub mod folder_groups;
 pub mod public_channels;
 pub mod opensubtitles;
+pub mod vault;
 
 pub use auth::*;
 pub use fs::*;
@@ -181,6 +182,7 @@ pub use utils::*;
 pub use network::*;
 pub use streaming::*;
 pub use api_settings::*;
+pub use vault::*;
 pub use archive::*;
 pub use folder_groups::*;
 pub use public_channels::*;
