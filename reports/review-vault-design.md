@@ -77,6 +77,9 @@ Folder IDs and channel IDs are disjoint Telegram spaces but both i64; storing th
 ### R16 · Nit — command surface trimmed
 10 commands → 9: `vault_list` merged into `cmd_vault_get_state` (IDs included only when unlocked — same info-leak rule, fewer round-trips at mount).
 
+### R17 · FYI — upload overlay shows over vault item during external file drags *(late frontend-reviewer transcript)*
+Dashboard renders two drag overlays gated by drag source (`Dashboard.tsx:707-711`): external drags show the accept/reject overlay regardless of hover target. So dragging a FILE over the vault item displays "drop to upload", then the vault's drop handler rejects with the "Only channels can be hidden" toast (§4.2). Mildly contradictory but harmless; suppressing the overlay over the vault would couple vault-hover state into the Dashboard overlay condition for negligible UX gain. Accepted for v1; revisit if it tests badly.
+
 ---
 
 ## What was verified vs assumed
