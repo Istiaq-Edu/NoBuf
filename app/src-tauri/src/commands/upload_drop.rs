@@ -2,9 +2,9 @@
 //!
 //! WebView2 hands the webview a browser File handle with NO filesystem path, which
 //! is why dropped files were previously staged (fully copied) to %TEMP% before
-//! cmd_upload_file could read them. The actix server on localhost:14200 lets the
-//! webview POST the raw bytes instead — this handler pumps them straight into
-//! grammers' upload_stream with no temp file and no preparing phase.
+//! cmd_upload_file could read them. The actix streaming server (127.0.0.1:14201)
+//! lets the webview POST the raw bytes instead — this handler pumps them straight
+//! into grammers' upload_stream with no temp file and no preparing phase.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -177,6 +177,12 @@ async fn upload_drop(
 
     if let Some(t) = progress_task { t.abort(); }
 
+    // Bandwidth accounting on EVERY terminal path: bytes actually consumed count
+    // toward the daily cap whether the transfer succeeded, was cancelled, or died
+    // mid-stream (the old code only counted full successes).
+    let consumed_bytes = consumed.load(std::sync::atomic::Ordering::Relaxed);
+    bw_state.add_up(consumed_bytes);
+
     // Post-upload cancellation check (mirrors cmd_upload_file)
     let was_cancelled = tg_state.cancelled_transfers.read().await.contains(&tid);
     if was_cancelled {
@@ -186,7 +192,14 @@ async fn upload_drop(
     match upload_res {
         Ok(_) if was_cancelled => HttpResponse::BadRequest().body("Transfer cancelled"),
         Ok(uploaded) => {
-            bw_state.add_up(consumed.load(std::sync::atomic::Ordering::Relaxed));
+            // Integrity gate: grammers tolerates a short FINAL part, so a body
+            // that drained before `size` bytes would silently upload a truncated
+            // document. Refuse to send anything incomplete.
+            if consumed_bytes != size {
+                return HttpResponse::InternalServerError().body(format!(
+                    "Incomplete transfer: sent {} of {} bytes", consumed_bytes, size
+                ));
+            }
             let peer = crate::commands::utils::resolve_peer(
                 &client, folder_id, &tg_state.peer_cache,
             ).await;
@@ -204,5 +217,77 @@ async fn upload_drop(
             }
         }
         Err(e) => HttpResponse::InternalServerError().body(format!("Upload failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod body_reader_tests {
+    use super::*;
+    use futures::stream::{self, Stream};
+    use std::pin::Pin;
+    use tokio::io::AsyncReadExt as _;
+
+    /// Drain the whole stream through the adapter; returns byte count.
+    async fn drain(
+        stream: Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>> + Unpin>>,
+        consumed: Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::io::Result<usize> {
+        let mut reader = BodyReader {
+            stream: Box::new(stream),
+            current: web::Bytes::new(),
+            consumed,
+        };
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        Ok(out.len())
+    }
+
+    #[test]
+    fn partial_frames_forward_and_count_consumed() {
+        let s: Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>> + Unpin>> =
+            Box::pin(stream::iter(vec![
+                Ok(web::Bytes::from_static(b"hello")),
+                Ok(web::Bytes::from_static(b" world")),
+            ]));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let n = rt.block_on(drain(s, consumed.clone())).unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(consumed.load(std::sync::atomic::Ordering::Relaxed), 11);
+    }
+
+    #[test]
+    fn body_draining_early_yields_clean_eof_short_read() {
+        // Declared size 100 but only 3 bytes arrive: PartStream's contract needs a
+        // SHORT READ at EOF (not an error, not a hang) so its UnexpectedEof arm
+        // decides. The adapter must end cleanly after the last frame.
+        let s: Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>> + Unpin>> =
+            Box::pin(stream::iter(vec![Ok(web::Bytes::from_static(b"abc"))]));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let n = rt.block_on(drain(s, consumed.clone())).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(consumed.load(std::sync::atomic::Ordering::Relaxed), 3,
+            "EOF must surface as a clean short read of exactly the delivered bytes");
+    }
+
+    #[test]
+    fn payload_error_maps_to_connection_aborted() {
+        let s: Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>> + Unpin>> =
+            Box::pin(stream::iter(vec![Err(actix_web::Error::from(
+                std::io::Error::new(std::io::ErrorKind::Other, "boom"),
+            ))]));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let res = rt.block_on(async {
+            let mut reader = BodyReader {
+                stream: Box::new(Box::pin(s)),
+                current: web::Bytes::new(),
+                consumed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            };
+            let mut buf = [0u8; 16];
+            reader.read(&mut buf).await
+        });
+        let err = res.expect_err("payload error must become an io error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
     }
 }
