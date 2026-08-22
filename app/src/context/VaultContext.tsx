@@ -40,6 +40,28 @@ interface VaultContextValue {
 
 const VaultContext = createContext<VaultContextValue | null>(null);
 
+// ---------------------------------------------------------------------------
+// Pure helpers (exported for tests — bound to shipped code, spec §6)
+// ---------------------------------------------------------------------------
+
+/** Filter items whose id is hidden. Does NOT mutate the input array —
+ *  persistence writers rely on receiving the full unfiltered array. */
+export function filterHidden<T>(items: T[], getId: (item: T) => number, hidden: ReadonlySet<number>): T[] {
+    if (hidden.size === 0) return items;
+    return items.filter(item => !hidden.has(getId(item)));
+}
+
+/** Startup restore gate (spec §4.3): true when the persisted selection
+ *  references a vaulted item in either scope. */
+export function isVaultedSelection(
+    id: number,
+    hiddenFolderIds: ReadonlySet<number>,
+    hiddenPublicIds: ReadonlySet<number>
+): boolean {
+    return hiddenFolderIds.has(id) || hiddenPublicIds.has(id);
+}
+
+
 function applyState(
     state: VaultState,
     queryClient: ReturnType<typeof useQueryClient>
