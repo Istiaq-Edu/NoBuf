@@ -75,7 +75,7 @@ fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
 #[post("/upload-drop")]
 async fn upload_drop(
     req: HttpRequest,
-    mut payload: web::Payload,
+    payload: web::Payload,
     tg_state: web::Data<Arc<TelegramState>>,
     token_data: web::Data<StreamTokenData>,
     app_handle: web::Data<tauri::AppHandle>,
@@ -121,7 +121,6 @@ async fn upload_drop(
     log::info!("[drop] streaming '{name}' ({size}B -> folder {folder_id:?}) tid={tid}");
 
     // --- Progress reporter (250ms cadence, mirrors cmd_upload_file) -------------
-    let start = Instant::now();
     let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress_task = if !tid.is_empty() {
         let counter = consumed.clone();
