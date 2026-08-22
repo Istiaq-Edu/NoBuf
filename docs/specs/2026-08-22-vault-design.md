@@ -1,7 +1,7 @@
 # Vault — Hide Channels & Folders Behind a Passcode
 
 **Date:** 2026-08-22 · **Branch:** `feature/vault-hide-channels` (cut from `fix/dragdrop-upload-defects`, which is 8 ahead / 0 behind `origin/dev`)
-**Revision:** 2 — post adversarial design review (security/state/frontend/robustness). Review reports: `reports/review-vault-security.md`, `reports/review-vault-design.md`.
+**Revision:** 3 — cross-validation pass applied 6 amendments (startup-restore gating, at-keyboard corollary, hide/get_state race, count fixes). Prior: rev 2 post adversarial design review. Review reports: `reports/review-vault-crossval.md`, `reports/review-vault-design.md`, `reports/review-vault-security.md`.
 
 ---
 
@@ -11,7 +11,7 @@ A passcode-gated space in the NoBuf sidebar. The user hides private `[NB]` folde
 
 Security stance (user-confirmed): **soft security at the app-UI level.** All content lives on the user's Telegram account and is untouched by this feature. The passcode gates what NoBuf *reveals*; recovery is always available; nothing is destroyed by a forgotten passcode.
 
-**Hard boundary (security-reviewed):** the vault gates the **GUI only**. It does NOT gate the localhost REST API (`/api/v1/files?folder_id=…`, X-API-Key auth, `api_routes.rs:125-433`) or the streaming server (`/stream/{folder}/{msg}?token=…`, per-launch random token, `server.rs:887-903`) — both serve any folder/channel by id regardless of vault state, for any process holding the API key or stream token. Vaulted names also remain in existing plaintext local stores (tauri store `config.json` folders array, `nobuf_groups.db` public_channels table). Consistent with the threat model — a same-machine attacker can already read the Telegram session and those stores — but stated here so nobody mistakes the passcode for a content boundary. Optional hardening (out of scope v1): REST/stream endpoints return 404 for vaulted ids while locked.
+**Hard boundary (security-reviewed):** the vault gates the **GUI only**. It does NOT gate the localhost REST API (`/api/v1/files?folder_id=…`, X-API-Key auth, `api_routes.rs:125-433`) or the streaming server (`/stream/{folder}/{msg}?token=…`, per-launch random token, `server.rs:887-903`) — both serve any folder/channel by id regardless of vault state, for any process holding the API key or stream token. Vaulted names also remain in existing plaintext local stores (tauri store `config.json` folders array, `nobuf_groups.db` public_channels table). Consistent with the threat model — a same-machine attacker can already read the Telegram session and those stores — but stated here so nobody mistakes the passcode for a content boundary. Optional hardening (out of scope v1): REST/stream endpoints return 404 for vaulted ids while locked. Because reset must always work without the passcode (D8), the vault offers no protection against a person with access to the unlocked desktop — it delays and de-scopes disclosure, it does not conceal from keyboard access.
 
 ## 2. Verified codebase facts this design rests on
 
@@ -73,7 +73,7 @@ Every field carries `#[serde(default)]`: old files load after app updates, missi
 
 Passcode hashing: `pbkdf2` crate (pure-Rust, well-audited) with `pbkdf2::pbkdf2_hmac::<Sha256>()`, 600,000 iterations (OWASP-recommended for PBKDF2-SHA256; measured cost on unlock ≈ tens of ms — imperceptible, raises offline brute-force cost 6× over the originally specced 100k), 16-byte random salt per set/change. Verify uses `constant_time_eq` (already a dependency, `api_settings.rs:90`). Numeric-only keyspace acknowledged: 10⁴–10¹² real-world range; this is D2 soft security and the reset path always exists. Backend enforces `^\d{4,12}$` too. New deps: `pbkdf2`, `hex` (for encode/decode of salt+hash).
 
-Commands (9 — `vault_list` merged into state):
+Commands (10):
 
 | Command | Behavior |
 |---|---|
@@ -93,8 +93,8 @@ Errors are `Result<_, String>` with stable machine-readable prefixes (`"passcode
 ### 4.2 Frontend
 
 - **Types:** add `ActiveView` variant `{ type: 'vault' }`.
-- **VaultContext** (`context/VaultContext.tsx`): mirrors backend truth — `isUnlocked`, `hasPasscode`, `counts`, `entryVisible`, `hiddenFolderIds`, `hiddenPublicIds` (populated from `get_state` when unlocked). Exposes `unlock/lock/hide/unhide/reset/setPasscode/setEntryVisible`.
-- **Filtering rule (load-bearing):** ONE memo in Dashboard derives `visibleFolders` and `visiblePublicChannels`; these flow to ALL FOUR consumers — MoveToFolderModal (:661), group tabs (:721), `<Sidebar>` (:736), ForwardToFolderModal (:856) — plus pickers added later. RAW arrays are used ONLY by: reorder persistence, reconciliation payloads (`cmd_start_auto_sync` local_folders), sync diffing, and the vault view itself. React-query caches for hidden items are invalidated on hide (`queryClient.removeQueries({queryKey:['files', hiddenId]})`, `['publicFiles', hiddenId]`) so navigating away never leaves stale data reachable via back-navigation.
+- **VaultContext** (`context/VaultContext.tsx`): mirrors backend truth — `isUnlocked`, `hasPasscode`, `counts`, `entryVisible`, `hiddenFolderIds`, `hiddenPublicIds` (populated from `get_state` when unlocked). Exposes `unlock/lock/hide/unhide/reset/setPasscode/setEntryVisible`. `hide()` awaits a fresh `cmd_vault_get_state` before choosing create-dialog vs direct-hide (guards against stale `hasPasscode` during early startup).
+- **Filtering rule (load-bearing):** ONE memo in Dashboard derives `visibleFolders` and `visiblePublicChannels`; these flow to ALL FOUR consumers — MoveToFolderModal (:661), `<Sidebar folders=>` (:721), `<Sidebar publicChannels=>` (:736), ForwardToFolderModal (:856) — plus pickers added later. RAW arrays are used ONLY by: reorder persistence, reconciliation payloads (`cmd_start_auto_sync` local_folders), sync diffing, and the vault view itself. React-query caches for hidden items are invalidated on hide (`queryClient.removeQueries({queryKey:['files', hiddenId]})`, `['publicFiles', hiddenId]`) so navigating away never leaves stale data reachable via back-navigation.
 - **Reconciliation pruning (§4.4 detail):** after `ScanResult` lands, Dashboard calls `cmd_vault_prune_folders(result.removed)` — frontend owns orchestration because ScanResult is consumed there today; backend stays passive.
 - **Sidebar:** pinned vault `SidebarItem` under Saved Messages (lock icon; badge = total count, hidden at 0). Drag handling order: reorder MIME → vault-hide branch (consumes + stopPropagation, so a folder dropped on vault NEVER falls through to reorder); NEW `application/x-nobuf-public-channel` drag source on PublicChannelItem → hide branch; external file-drop MIME explicitly ignored with toast "Only channels can be hidden". Nested drop zones follow the WebView2 dragenter/dragleave counting discipline documented in `webview2-html5-drag-pitfalls` so the global upload overlay never fires from a vault drop. Collapsed mode: icon-only w-8 h-8 left-aligned px-4, badge dot preserved.
 - **VaultView:** rendered when `activeView.type === 'vault'`. Locked → unlock screen (passcode input + Reset link w/ confirm dialog). Unlocked → grid/list of hidden items (unhide, open channel, drag-out optional later), change-passcode modal, Lock-now button, empty state.
@@ -123,6 +123,8 @@ Errors are `Result<_, String>` with stable machine-readable prefixes (`"passcode
 | First hide with no passcode | Create-passcode dialog gates the hide (D16) |
 | Hide currently-viewing channel | activeView jumps to Saved + warning toast; query keys derived from activeView follow automatically |
 | Window reload / dev hot-reload | Frontend re-reads lock state from backend on mount — backend owns truth |
+| Startup restore gating | Persisted `activeFolderId` applied ONLY after VaultContext state resolves; if the persisted selection references a vaulted item → reset to Saved Messages AND clear the persisted value (locked OR unlocked). Rationale: current code contains only an INCIDENTAL guard — the `'saved'`-initial sync-effect clobbers the restore because `setActiveFolderId` has unstable identity (`Dashboard.tsx:51,70-78`; `useTelegramConnection.ts:287`) — any memoization refactor would silently expose the hidden folder's contents at startup. Files query `enabled` is additionally gated on vault-state resolution, killing the transient hidden-id fetch |
+| Hiding an already-removed id | Harmless: dead entry visible only inside the unlocked vault view, pruned per §4.4; clicking it surfaces a graceful error toast |
 | Pickers (Move/Forward) | Filtered by lock state (D13); react-query cache for hidden items removed on hide |
 
 ### 4.4 Reconciliation & pruning sequence
@@ -139,6 +141,7 @@ Content encryption (content lives on Telegram), gating REST/stream endpoints (do
 
 - Rust unit tests in `vault.rs` (headless, pure fns): hash/verify round-trip; wrong passcode rejected; 3-digit and 13-digit rejected; 600k iterations actually applied (timing sanity ≥ bound); reset wipes everything; hide/unhide idempotent; prune removes only listed IDs; cross-kind isolation (hide folder X ≠ vaulted public X); corrupt-file recovery; locked state response contains no ID arrays.
 - Vitest: filtering memo excludes hidden IDs at all four consumer sites; first-hide gating; six writer paths unaffected by filtering (full arrays persisted); picker include/exclude by lock state; Ctrl+Shift+V binding + preventDefault; cache removal on hide. Bound to shipped exported functions; mutation-tested (revert → tests fail).
+- Restore-gating behavioral test: simulate persisted vaulted selection + cold start → assert navigation lands on Saved Messages and no `['files', <vaultedId>]` query fires. Mutation check: removing our gate must fail this test EVEN IF the incidental clobber is present (the test asserts our gate, not React timing).
 - Gates before merge: `npx tsc --noEmit`, `npx vitest run`, `cargo test --no-default-features`.
 
 ## 7. Implementation phases
