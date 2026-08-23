@@ -7822,6 +7822,15 @@ pub async fn start_streaming_server(
                     cfg.app_data(h.clone())
                         .app_data(bw.clone())
                         .service(crate::commands::upload_drop::upload_drop);
+                    log::info!("Drop-upload route /upload-drop REGISTERED (handle+bw supplied)");
+                } else {
+                    // Diagnose WHICH side was None — this exact gap produced a
+                    // silent 404 that cost a full debugging session.
+                    log::warn!(
+                        "Drop-upload route /upload-drop SKIPPED: app_handle={}, bandwidth={}",
+                        upload_app_handle_data.is_some(),
+                        upload_bw_data.is_some()
+                    );
                 }
             })
             .service(stream_media)
@@ -7921,6 +7930,15 @@ mod tests {
     fn player_with_tiny_prefix_still_bootstraps() {
         assert!(super::should_bootstrap_from_telegram(524_287, 0, false, MIN_BOOTSTRAP));
     }
+
+    // NOTE: an actix integration test pinning /upload-drop route presence was
+    // attempted here and REMOVED: merely referencing commands::upload_drop from
+    // server.rs's test module made the whole test binary fail to load
+    // (STATUS_ENTRYPOINT_NOT_FOUND, reproducible, cause unresolved). Route
+    // presence is guarded at runtime instead: start_streaming_server logs
+    // "Drop-upload route REGISTERED" or "SKIPPED (app_handle=…, bandwidth=…)"
+    // per worker, and the frontend classifier surfaces a 404 as an explicit
+    // "direct-upload route missing" toast.
 
     #[test]
     fn player_with_enough_prefix_waits_on_cache() {
