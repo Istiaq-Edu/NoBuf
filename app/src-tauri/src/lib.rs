@@ -403,12 +403,19 @@ pub fn run() {
             // gets its own handle to the SAME shared stats, so stream-direct drops
             // count toward the daily cap alongside every other transfer.
             let bw_for_server = app.state::<bandwidth::BandwidthManager>().inner().clone();
+            // Drop-upload handler deps go into the process-global OnceLock BEFORE
+            // the server thread starts — the route registers unconditionally and
+            // reads these at request time.
+            commands::upload_drop::set_upload_deps(commands::upload_drop::UploadDeps {
+                app_handle: Some(app_handle_for_server.clone()),
+                bw: Some(std::sync::Arc::new(bw_for_server)),
+            });
             // The bind-success flag must be reachable from the server thread.
             let running_flag = app.state::<StreamServerRunning>().0.clone();
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_streaming_server(STREAM_PORT, state, token_for_server, cache_mgr, Some(app_handle_for_server), Some(std::sync::Arc::new(bw_for_server))).await {
+                    match server::start_streaming_server(STREAM_PORT, state, token_for_server, cache_mgr).await {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(streaming_server.handle());

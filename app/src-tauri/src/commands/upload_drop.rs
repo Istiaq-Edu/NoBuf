@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-
 use actix_web::{post, web, HttpRequest, HttpResponse, Responder};
 use futures::StreamExt;
 use tauri::Emitter;
@@ -16,6 +15,31 @@ use tauri::Emitter;
 use crate::bandwidth::BandwidthManager;
 use crate::commands::TelegramState;
 use crate::server::StreamTokenData;
+
+/// Process-global dependencies for the drop-upload handler.
+///
+/// WHY GLOBALS: the route used to be registered conditionally on actix
+/// web::Data availability, and in one user session the route silently never
+/// appeared (healthy server, alive=true, 404 on the path — cause never
+/// isolated). Conditional registration was the only moving part left, so it
+/// is GONE: /upload-drop now registers UNCONDITIONALLY and its deps live in a
+/// OnceLock set by lib.rs before the server thread starts. A drop arriving
+/// before set_deps() runs can only happen pre-connect; the handler answers 503.
+#[derive(Clone)]
+pub struct UploadDeps {
+    pub app_handle: Option<tauri::AppHandle>,
+    pub bw: Option<Arc<BandwidthManager>>,
+}
+
+static UPLOAD_DEPS: std::sync::OnceLock<UploadDeps> = std::sync::OnceLock::new();
+
+pub fn set_upload_deps(deps: UploadDeps) {
+    let _ = UPLOAD_DEPS.set(deps);
+}
+
+fn upload_deps() -> UploadDeps {
+    UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None })
+}
 
 const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
 
@@ -78,8 +102,6 @@ async fn upload_drop(
     payload: web::Payload,
     tg_state: web::Data<Arc<TelegramState>>,
     token_data: web::Data<StreamTokenData>,
-    app_handle: web::Data<tauri::AppHandle>,
-    bw_state: web::Data<Arc<BandwidthManager>>,
 ) -> impl Responder {
     // --- Auth: session token required (loopback is shared with every local
     //     process/browser tab; CORS cannot stop them SENDING, only reading) ------
@@ -107,6 +129,7 @@ async fn upload_drop(
     let tid = query_param(&req, "tid").unwrap_or_default();
 
     // --- Bandwidth gate (same daily cap as every other transfer) ---------------
+    let bw_state = upload_deps().bw.expect("upload deps missing bandwidth");
     if bw_state.can_transfer(size).is_err() {
         log::warn!("[drop] {name} ({size}B) rejected: daily bandwidth cap");
         return HttpResponse::BadRequest().body("Daily bandwidth limit exceeded");
@@ -124,7 +147,7 @@ async fn upload_drop(
     let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress_task = if !tid.is_empty() {
         let counter = consumed.clone();
-        let handle = app_handle.get_ref().clone();
+        let handle = upload_deps().app_handle.expect("upload deps missing app_handle");
         let cancelled = tg_state.cancelled_transfers.clone();
         let tid_p = tid.clone();
         let total = size;
@@ -155,9 +178,9 @@ async fn upload_drop(
         None
     };
     if !tid.is_empty() {
-        let _ = app_handle.emit("upload-progress", DropProgressPayload {
+        let _ = upload_deps().app_handle.as_ref().map(|h| h.emit("upload-progress", DropProgressPayload {
             id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: size, speed_bytes_per_sec: 0,
-        });
+        }));
     }
 
     // --- Cancellation pre-check (mirrors cmd_upload_file ordering) --------------
