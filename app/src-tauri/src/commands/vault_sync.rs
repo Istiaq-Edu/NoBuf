@@ -324,10 +324,22 @@ fn vault_path_mtime(app: &AppHandle) -> Result<Option<i64>, String> {
 /// Tauri command wrapper: manual "Sync now" + used at startup after connect.
 #[tauri::command]
 pub async fn cmd_vault_pull_sync(app: AppHandle) -> Result<serde_json::Value, String> {
-    let merged = pull_and_merge(&app).await.unwrap_or(false);
+    // Ok(false) = no sync blob exists yet in Saved Messages. Seed it from
+    // local state so first-time setup propagates without requiring a
+    // mutation on the source PC (review gap #1). The response carries the
+    // post-sync state so the frontend can apply it immediately (gap #2)
+    // instead of waiting for a remount.
+    let seeded = match pull_and_merge(&app).await {
+        Ok(true) => false,
+        Ok(false) => {
+            push_state(&app).await?;
+            true
+        }
+        Err(e) => return Err(e),
+    };
     let store = vault::load_store(&app);
     let resp = vault::state_response_public(&store);
-    Ok(serde_json::json!({ "merged": merged, "state": resp }))
+    Ok(serde_json::json!({ "merged": seeded, "state": resp }))
 }
 
 /// Tauri command wrapper: fire-and-forget push (called post-mutation).

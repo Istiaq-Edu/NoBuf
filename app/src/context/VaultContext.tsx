@@ -113,7 +113,18 @@ export function VaultProvider({ children }: { children: ReactNode }) {
             // Backend unreachable: stay locked-assumed, empty counts.
             setReady(true);
         });
-    }, [refresh]);
+        // Cross-device sync (spec §7): the launch-time pull in
+        // useTelegramConnection broadcasts the post-sync state on this event.
+        // Apply it so hidden channels appear without a restart.
+        const onSyncedState = (e: Event) => {
+            const s = (e as CustomEvent).detail as VaultState | undefined;
+            if (s && typeof s === 'object' && 'is_unlocked' in s) {
+                apply(s);
+            }
+        };
+        window.addEventListener('nobuf-vault-state', onSyncedState);
+        return () => window.removeEventListener('nobuf-vault-state', onSyncedState);
+    }, [refresh, apply]);
 
     const hide = useCallback(async (kind: VaultKind, id: number) => {
         try {
