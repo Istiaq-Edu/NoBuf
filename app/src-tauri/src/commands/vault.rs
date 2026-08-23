@@ -39,6 +39,9 @@ pub struct VaultStore {
     pub vaulted_public_channel_ids: Vec<i64>,
     #[serde(default = "default_true")]
     pub entry_visible: bool,
+    /// Saved Messages message id carrying the sync blob (edit-in-place).
+    #[serde(default)]
+    pub sync_message_id: Option<i32>,
 }
 
 impl Default for VaultStore {
@@ -50,6 +53,7 @@ impl Default for VaultStore {
             vaulted_folder_ids: Vec::new(),
             vaulted_public_channel_ids: Vec::new(),
             entry_visible: true,
+            sync_message_id: None,
         }
     }
 }
