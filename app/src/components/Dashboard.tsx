@@ -62,7 +62,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const pastViewsRef = useRef<ActiveView[]>([]);
         const activeViewRef = useRef<ActiveView>(activeView);
         useEffect(() => { activeViewRef.current = activeView; }, [activeView]);
+        const vaultRef = useRef(vault);
+        useEffect(() => { vaultRef.current = vault; }, [vault]);
         const [canGoBack, setCanGoBack] = useState(false);
+        const navigateToRef = useRef<(v: ActiveView) => void>(() => {});
         const navigateTo = useCallback((next: ActiveView) => {
             const prev = activeViewRef.current;
             const changed = prev.type !== next.type
@@ -75,15 +78,34 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             setActiveView(next);
         }, []);
         const goBack = useCallback(() => {
-            const past = pastViewsRef.current;
-            if (past.length === 0) return;
-            const target = past[past.length - 1];
-            pastViewsRef.current = past.slice(0, -1);
-            setCanGoBack(pastViewsRef.current.length > 0);
-            if (target.type === 'folder') setActiveFolderId(target.folderId);
-            else if (target.type !== 'public') setActiveFolderId(null);
-            setActiveView(target);
+            // Pop until we find a target that is still allowed. Vault-hidden
+            // items are skipped (Finding D): Back must never land on a view
+            // the rest of the feature works to conceal.
+            let past = pastViewsRef.current;
+            while (past.length > 0) {
+                const candidate = past[past.length - 1];
+                const concealed =
+                    (candidate.type === 'folder' && vaultRef.current.hiddenFolderIds.has(candidate.folderId)) ||
+                    (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId));
+                past = past.slice(0, -1);
+                if (!concealed) {
+                    pastViewsRef.current = past;
+                    setCanGoBack(past.length > 0);
+                    if (candidate.type === 'folder') setActiveFolderId(candidate.folderId);
+                    else if (candidate.type !== 'public') setActiveFolderId(null);
+                    setActiveView(candidate);
+                    return;
+                }
+            }
+            // Everything on the stack was concealed: clear it and go home.
+            pastViewsRef.current = [];
+            setCanGoBack(false);
+            setActiveFolderId(null);
+            setActiveView({ type: 'saved' });
         }, [setActiveFolderId]);
+        // Ref mirror so the hotkey's stable callback can navigate without
+        // re-binding the window listener on every render.
+        useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
         const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
@@ -196,7 +218,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'v' || e.key === 'V')) {
                 e.preventDefault();
                 e.stopPropagation();
-                setActiveView(prev => prev.type === 'vault' ? prev : { type: 'vault' });
+                if (activeViewRef.current.type !== 'vault') {
+                    navigateToRef.current({ type: 'vault' });
+                }
             }
         }, []);
 
@@ -1033,7 +1057,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <SettingsPage
                         onClose={() => setShowSettings(false)}
                         onLogout={handleLogout}
-                        onOpenVault={() => { setShowSettings(false); setActiveView({ type: 'vault' }); }}
+                        onOpenVault={() => { setShowSettings(false); navigateTo({ type: 'vault' }); }}
                     />
                 )}
             </AnimatePresence>
