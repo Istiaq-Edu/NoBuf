@@ -28,6 +28,10 @@ VaultView's reset used WebView2's synchronous native dialog while the entire app
 Frontend-state reviewer (transcript-mined after provider 524): two right-click → Hide in Vault actions before any passcode exists both hit `passcode_required`; the second overwrote `pendingHideRef`, and completing the dialog applied only one hide — the other silently dropped.
 **Fix (`88cad64`):** `pendingHideRef` is an ordered queue; all queued items apply in sequence after passcode creation; cancel clears wholesale.
 
+### F4 · Major — stale unlock state across account switch
+Longrun reviewer (transcript-mined after 524): `VaultProvider` sits above the auth switch and never remounts on logout→login; its re-hydrate effect runs once per mount; `forceLogout`'s `cmd_vault_wipe_ids` doesn't notify the frontend. After a forced logout, the context kept account A's unlocked state + hidden IDs — account B would inherit a phantom-unlocked vault showing A's entries.
+**Fix (`a4310be`):** Dashboard re-syncs vault state on every mount (= every login session); backend truth wins.
+
 ## Checked and cleared (highlights)
 
 - **Drop rejection survives merge:** document-capture drop handler is byte-identical to pre-merge; vault hit-test runs before any staging work; repo-wide there is exactly ONE production consumer of dropped OS files — no second ingestion path can bypass the "Only channels can be hidden" toast.
