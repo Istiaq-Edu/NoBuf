@@ -116,11 +116,18 @@ export async function streamDroppedFiles(
         // resolve to ::1 first under some resolver/proxy configurations.
         const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
         const liveness = await headStatus(`${rootUrl}/`);
+        // Cross-check the Rust-side bind flag EVEN when liveness resolved: a
+        // zombie previous instance can hold the port while THIS session's bind
+        // failed — probing the zombie would end in 401s or a misleading
+        // stale-binary toast instead of the real story.
+        const aliveNow = await invoke<{ alive: boolean }>('cmd_get_stream_info');
+        if (!aliveNow.alive) {
+            throw new Error(liveness === null
+                ? `streaming server not reachable (port ${info.base_url.split(':').pop()} did not bind)`
+                : 'streaming port held by another NoBuf instance — close it and restart');
+        }
         if (liveness === null) {
-            const aliveNow = await invoke<{ alive: boolean }>('cmd_get_stream_info');
-            throw new Error(aliveNow.alive
-                ? 'webview blocked local requests'
-                : `streaming server not reachable (port ${info.base_url.split(':').pop()} did not bind)`);
+            throw new Error('webview blocked local requests');
         }
         if ((await headStatus(`${info.base_url}/upload-drop`)) === 404) {
             throw new Error('direct-upload route missing — restart/update NoBuf');
@@ -279,6 +286,8 @@ export function retryDropStream(item: QueueItem): boolean {
         toast.error('Source file handle lost — drop the file again.');
         return true; // handled (as failure)
     }
-    void startOne(item.id);
+    // Route through the gate like a fresh drop — retry must not bypass the
+    // concurrency cap, or a 20-file retry storm reopens the FLOOD_WAIT hole.
+    void enqueueStart(item.id);
     return true;
 }
