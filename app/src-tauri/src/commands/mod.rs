@@ -172,6 +172,7 @@ pub mod auth;
 pub mod fs;
 pub mod preview;
 pub mod utils;
+pub mod upload_drop;
 pub mod network;
 pub mod streaming;
 pub mod api_settings;

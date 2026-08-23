@@ -50,6 +50,12 @@ fn generate_stream_token() -> String {
 /// from the RunEvent::Exit handler for graceful Ctrl+C termination.
 pub struct ActixServerHandle(pub Arc<std::sync::Mutex<Option<actix_web::dev::ServerHandle>>>);
 
+/// Tracks whether the STREAMING server actually bound its port. Bind failures
+/// (zombie instance holding the port, Windows excluded-port ranges that shift
+/// per boot) previously left the app running server-less with no signal beyond
+/// a stderr line — surfaced to the frontend via cmd_get_stream_info.alive.
+pub struct StreamServerRunning(pub Arc<std::sync::atomic::AtomicBool>);
+
 /// Tracks whether the API server is currently running (for the frontend status dot)
 pub struct ApiServerRunning(pub Arc<std::sync::atomic::AtomicBool>);
 
@@ -225,16 +231,23 @@ pub fn run() {
     let server_handle_for_setup = server_handle.clone();
 
     let app = {
-        // In production: add the localhost plugin so the app runs from
-        // http://localhost:14200 (same-origin with the streaming server).
-        // In dev mode: no plugin needed â€” Vite dev server is already on localhost.
-        #[cfg(not(debug_assertions))]
+        // Single-instance MUST be the first plugin (its docs: registration order
+        // decides when the instance mutex is taken) — ahead of even
+        // tauri_plugin_localhost in release builds. A second launch exits here and
+        // this callback focuses the existing window — the plugin does NOT do it
+        // for you.
         let builder = tauri::Builder::default()
-            .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
-        #[cfg(debug_assertions)]
-        let builder = tauri::Builder::default();
-
-        builder
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }));
+        #[cfg(not(debug_assertions))]
+        // In production: run the app from http://localhost:14200 (same-origin with
+        // the streaming server). In dev mode: not needed — Vite is already localhost.
+        let builder = builder.plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PLUGIN_PORT).build());
+        let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
@@ -285,7 +298,13 @@ pub fn run() {
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
-            app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
+            let bandwidth_arc = Arc::new(app.state::<bandwidth::BandwidthManager>().inner().clone());
+            app.manage(bandwidth_arc);
+            // Streaming-server live-bind flag: set true only when the actix bind
+            // succeeds (server thread below); read by cmd_get_stream_info().alive.
+            let stream_server_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.manage(StreamServerRunning(stream_server_running.clone()));
+            app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT, alive: stream_server_running });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
@@ -378,17 +397,42 @@ pub fn run() {
             let state = Arc::new(app.state::<TelegramState>().inner().clone());
             let token_for_server = stream_token.clone();
             let handle_for_thread = server_handle_for_setup.clone();
+            // Drop-upload route needs the AppHandle (progress events) inside the
+            // actix worker threads; the BandwidthManager is swapped out into an
+            // Arc so the daily cap counts stream-direct drops alongside every
+            // other transfer (the managed copy is a fresh, unused instance).
+            let app_handle_for_server = app.handle().clone();
+            // BandwidthManager is now Clone (stats behind Arc) — the actix server
+            // gets its own handle to the SAME shared stats, so stream-direct drops
+            // count toward the daily cap alongside every other transfer.
+            let bw_for_server = app.state::<bandwidth::BandwidthManager>().inner().clone();
+            // Drop-upload handler deps go into the process-global OnceLock BEFORE
+            // the server thread starts — the route registers unconditionally and
+            // reads these at request time.
+            commands::upload_drop::set_upload_deps(commands::upload_drop::UploadDeps {
+                app_handle: Some(app_handle_for_server.clone()),
+                bw: Some(std::sync::Arc::new(bw_for_server)),
+            });
+            // The bind-success flag must be reachable from the server thread.
+            let running_flag = app.state::<StreamServerRunning>().0.clone();
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
-                    match server::start_server(state, STREAM_PORT, token_for_server, cache_mgr, 0).await {
+                    match server::start_streaming_server(STREAM_PORT, state, token_for_server, cache_mgr).await {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(streaming_server.handle());
+                            // Bind succeeded — the frontend may now use stream URLs
+                            // and the drop-upload route (cmd_get_stream_info().alive).
+                            running_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            log::info!("Streaming server bound on port {}", STREAM_PORT);
                             // Now await the server â€” blocks until stopped
                             streaming_server.await.ok();
                         }
-                        Err(e) => log::error!("Streaming server failed: {}", e),
+                        Err(e) => {
+                            running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            log::error!("Streaming server failed to bind port {}: {} — video playback and direct-drop uploads are unavailable this session", STREAM_PORT, e);
+                        }
                     }
                 });
             });
@@ -425,7 +469,10 @@ pub fn run() {
             commands::cmd_upload_file,
             commands::cmd_upload_limit,
             commands::cmd_file_size,
+            commands::cmd_staging_free_space,
             commands::cmd_stage_dropped_file,
+            commands::cmd_delete_staged_file,
+            commands::cmd_discard_staged_upload,
             commands::cmd_upload_from_url,
             commands::cmd_connect,
             commands::cmd_log,
@@ -456,6 +503,7 @@ pub fn run() {
             commands::cmd_clean_cache,
             commands::cmd_get_thumbnail,
             commands::cmd_get_stream_info,
+            commands::streaming::cmd_probe_upload_route,
             commands::cmd_cancel_transfer,
             commands::cmd_auth_qr_login,
             commands::cmd_auth_qr_poll,
@@ -505,8 +553,9 @@ pub fn run() {
         })
 
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-    };
+        .expect("error while building tauri application");
+    builder
+};
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {

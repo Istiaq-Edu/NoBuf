@@ -42,8 +42,8 @@ export function UploadQueue({ items, onClearFinished, onCancelAll, onCancelItem,
                                     item.status === 'cancelled' ? 'bg-gray-500' :
                                         item.status === 'error' ? 'bg-red-500' : 'bg-green-500'
                                 }`} />
-                            <div className="flex-1 truncate text-nobuf-subtext" title={item.path}>
-                                {item.path.split('/').pop()}
+                            <div className="flex-1 truncate text-nobuf-subtext" title={item.displayName || item.path}>
+                                {item.displayName || item.path.split(/[\\/]/).pop()}
                             </div>
                             {item.status === 'uploading' && (
                                 <button onClick={() => onCancelItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Cancel">
