@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-vault-lock"
+description = "Enables the cmd_vault_lock command without any pre-configured scope."
+commands.allow = ["cmd_vault_lock"]
+
+[[permission]]
+identifier = "deny-cmd-vault-lock"
+description = "Denies the cmd_vault_lock command without any pre-configured scope."
+commands.deny = ["cmd_vault_lock"]

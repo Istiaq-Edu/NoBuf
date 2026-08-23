@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-vault-pull-sync"
+description = "Enables the cmd_vault_pull_sync command without any pre-configured scope."
+commands.allow = ["cmd_vault_pull_sync"]
+
+[[permission]]
+identifier = "deny-cmd-vault-pull-sync"
+description = "Denies the cmd_vault_pull_sync command without any pre-configured scope."
+commands.deny = ["cmd_vault_pull_sync"]

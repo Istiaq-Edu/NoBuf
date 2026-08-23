@@ -7,6 +7,7 @@ use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata, ScanResult};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
+use crate::commands::vault;
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta};
 use crate::download_pool::StreamChunk;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1492,6 +1493,7 @@ pub async fn cmd_get_files(
 #[tauri::command]
 pub async fn cmd_search_global(
     query: String,
+    app: tauri::AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<Vec<FileMetadata>, String> {
     let client_opt = { state.client.lock().await.clone() };
@@ -1502,6 +1504,11 @@ pub async fn cmd_search_global(
     let mut files = Vec::new();
     
     log::info!("Searching global for: {}", query);
+
+    // Vault filter: while locked, drop results whose source peer is vaulted
+    // (filenames + source ids would otherwise leak past the passcode).
+    // Unlocked → None → everything flows.
+    let hidden = vault::hidden_ids_if_locked(&app, vault::is_unlocked_public(&app));
 
     let result = client.invoke(&tl::functions::messages::SearchGlobal {
         q: query,
@@ -1536,6 +1543,9 @@ pub async fn cmd_search_global(
                             tl::enums::Peer::User(u) => Some(u.user_id),
                             tl::enums::Peer::Chat(c) => Some(c.chat_id),
                         };
+                        if !vault::search_result_keeps(&hidden, folder_id) {
+                            continue;
+                        }
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
@@ -1563,6 +1573,9 @@ pub async fn cmd_search_global(
                             tl::enums::Peer::User(u) => Some(u.user_id),
                             tl::enums::Peer::Chat(c) => Some(c.chat_id),
                         };
+                        if !vault::search_result_keeps(&hidden, folder_id) {
+                            continue;
+                        }
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
