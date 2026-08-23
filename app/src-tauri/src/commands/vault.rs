@@ -94,7 +94,7 @@ pub fn load_store(app: &AppHandle) -> VaultStore {
 
 /// Atomic write: .tmp → sync_all → rename over target (Windows-safe as shipped
 /// in api_settings.rs:57-68). Caller must hold VaultLock.
-fn save_store(app: &AppHandle, store: &VaultStore) -> Result<(), String> {
+pub(crate) fn save_store(app: &AppHandle, store: &VaultStore) -> Result<(), String> {
     let path = vault_path(app)?;
     let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
     let tmp_path = path.with_extension("json.tmp");
@@ -236,6 +236,11 @@ pub fn parse_kind(kind: &str) -> Result<VaultKind, String> {
         "public_channel" => Ok(VaultKind::PublicChannel),
         _ => Err("kind must be 'folder' or 'public_channel'".to_string()),
     }
+}
+
+/// Public state response for cross-module callers (vault_sync pull result).
+pub fn state_response_public(store: &VaultStore) -> VaultStateResponse {
+    state_response(store, false)
 }
 
 fn state_response(store: &VaultStore, unlocked: bool) -> VaultStateResponse {

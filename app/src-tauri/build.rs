@@ -98,6 +98,8 @@ fn main() {
                                 "cmd_vault_wipe_ids",
                                 "cmd_vault_prune",
                                 "cmd_vault_set_entry_visible",
+                                "cmd_vault_pull_sync",
+                                "cmd_vault_push_sync",
                             ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");

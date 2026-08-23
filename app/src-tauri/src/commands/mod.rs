@@ -182,6 +182,7 @@ pub mod folder_groups;
 pub mod public_channels;
 pub mod opensubtitles;
 pub mod vault;
+pub mod vault_sync;
 
 pub use auth::*;
 pub use fs::*;
@@ -196,3 +197,4 @@ pub use folder_groups::*;
 pub use public_channels::*;
 pub use sprite::*;
 pub use opensubtitles::*;
+pub use vault_sync::*;

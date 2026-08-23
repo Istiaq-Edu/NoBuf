@@ -107,6 +107,8 @@
     "allow-cmd-vault-wipe-ids",
     "allow-cmd-vault-prune",
     "allow-cmd-vault-set-entry-visible",
+    "allow-cmd-vault-pull-sync",
+    "allow-cmd-vault-push-sync",
     "allow-cmd-opensubtitles-validate-key",
     "allow-cmd-opensubtitles-search",
     "allow-cmd-opensubtitles-download"

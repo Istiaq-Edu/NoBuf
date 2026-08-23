@@ -560,6 +560,8 @@ pub fn run() {
             commands::cmd_vault_wipe_ids,
             commands::cmd_vault_prune,
             commands::cmd_vault_set_entry_visible,
+            commands::cmd_vault_pull_sync,
+            commands::cmd_vault_push_sync,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));

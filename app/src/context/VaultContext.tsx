@@ -123,6 +123,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
             throw e;
         }
         await refresh();
+        // Cross-device sync (best-effort, non-fatal).
+        invoke('cmd_vault_push_sync').catch(() => {});
     }, [refresh]);
 
     const unhide = useCallback(async (kind: VaultKind, id: number) => {
@@ -134,6 +136,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
             queryClient.removeQueries({ queryKey: ['publicChannelFiles', id] });
         }
         await refresh();
+        // Cross-device sync (best-effort, non-fatal).
+        invoke('cmd_vault_push_sync').catch(() => {});
     }, [queryClient, refresh]);
 
     const verify = useCallback(async (passcode: string): Promise<boolean> => {
@@ -160,6 +164,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         try {
             const s = await invoke<VaultState>('cmd_vault_change_passcode', { newPasscode });
             apply(s);
+            // Cross-device sync (best-effort, non-fatal).
+            invoke('cmd_vault_push_sync').catch(() => {});
             return true;
         } catch {
             return false;
@@ -174,6 +180,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     const reset = useCallback(async () => {
         const s = await invoke<VaultState>('cmd_vault_reset');
         apply(s);
+        // Cross-device sync (best-effort, non-fatal) — propagate reset to other PCs.
+        invoke('cmd_vault_push_sync').catch(() => {});
     }, [apply]);
 
     const setEntryVisible = useCallback(async (visible: boolean) => {
