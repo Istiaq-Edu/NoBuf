@@ -87,6 +87,13 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 if (result.added.length > 0 || result.updated.length > 0 || result.removed.length > 0) {
                     showSyncSummary(result);
                 }
+                // Vault cross-device sync (spec §7): pull once per launch.
+                // Merges hidden-ID lists + passcode from Saved Messages.
+                try {
+                    await invoke('cmd_vault_pull_sync');
+                } catch {
+                    // Non-fatal: offline / not connected yet.
+                }
             } catch {
                 // Silent failure for auto-sync — don't disrupt user
             } finally {
