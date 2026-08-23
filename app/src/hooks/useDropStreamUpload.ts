@@ -40,6 +40,18 @@ interface LiveDrop {
 const liveDrops = new Map<string, LiveDrop>();
 const activeXhrs = new Map<string, XMLHttpRequest>();
 
+/**
+ * Emit the nobuf-drop-done terminal event. Uses globalThis (not `window`) and
+ * no-ops when CustomEvent is unavailable — this module's tests run in a plain
+ * node vitest environment where neither exists, and an exception escaping
+ * startOne's catch block surfaces as an unhandled rejection that fails CI.
+ */
+function emitDone(detail: { id: string; status: string; error?: string; messageId?: unknown }) {
+    const G = globalThis as { dispatchEvent?: (e: unknown) => void; CustomEvent?: new (t: string, o: unknown) => unknown };
+    if (!G.dispatchEvent || !G.CustomEvent) return;
+    G.dispatchEvent(new G.CustomEvent('nobuf-drop-done', { detail }));
+}
+
 /** Remove a finished/cancelled drop from the live registry (called on terminal state). */
 export function forgetLiveDrop(id: string) {
     liveDrops.delete(id);
@@ -245,30 +257,20 @@ async function startOne(id: string) {
 
         // Terminal state handling mirrors processItem's semantics.
         if (result.ok) {
-            window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
-                detail: { id, status: 'success', messageId: undefined },
-            }));
+            emitDone({ id, status: 'success', messageId: undefined });
         } else if (result.error?.includes('ALREADY_STORED')) {
             // Bytes reached Telegram but the final send/resolve step failed —
             // the document exists server-side. Retrying would duplicate it.
-            window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
-                detail: { id, status: 'error', error: `File was uploaded but delivering it to the folder failed (it may exist in Telegram already). ${result.error}` },
-            }));
+            emitDone({ id, status: 'error', error: `File was uploaded but delivering it to the folder failed (it may exist in Telegram already). ${result.error}` });
             // Retire the handle: retry is intentionally NOT offered for this state.
             forgetLiveDrop(id);
         } else if (result.error?.includes('cancel')) {
-            window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
-                detail: { id, status: 'cancelled', error: result.error },
-            }));
+            emitDone({ id, status: 'cancelled', error: result.error });
         } else {
-            window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
-                detail: { id, status: 'error', error: result.error },
-            }));
+            emitDone({ id, status: 'error', error: result.error });
         }
     } catch (e) {
-        window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
-            detail: { id, status: 'error', error: String(e) },
-        }));
+        emitDone({ id, status: 'error', error: String(e) });
     } finally {
         activeXhrs.delete(id);
     }
