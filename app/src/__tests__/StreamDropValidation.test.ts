@@ -67,13 +67,13 @@ describe('probe fallback', () => {
     it('throws (caller falls back to staging) when the server is unreachable', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('refused'); }));
         await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
-            .rejects.toThrow(/route unavailable/);
+            .rejects.toThrow(/not reachable/);
     });
 
     it('throws on 404 — old binary without the route must fall back too', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
         await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
-            .rejects.toThrow(/route unavailable/);
+            .rejects.toThrow(/route missing/);
     });
 
     it('accepts 405 — route exists, wrong method is the expected probe answer', async () => {

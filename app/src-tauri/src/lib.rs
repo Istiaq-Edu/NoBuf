@@ -50,6 +50,12 @@ fn generate_stream_token() -> String {
 /// from the RunEvent::Exit handler for graceful Ctrl+C termination.
 pub struct ActixServerHandle(pub Arc<std::sync::Mutex<Option<actix_web::dev::ServerHandle>>>);
 
+/// Tracks whether the STREAMING server actually bound its port. Bind failures
+/// (zombie instance holding the port, Windows excluded-port ranges that shift
+/// per boot) previously left the app running server-less with no signal beyond
+/// a stderr line — surfaced to the frontend via cmd_get_stream_info.alive.
+pub struct StreamServerRunning(pub Arc<std::sync::atomic::AtomicBool>);
+
 /// Tracks whether the API server is currently running (for the frontend status dot)
 pub struct ApiServerRunning(pub Arc<std::sync::atomic::AtomicBool>);
 
@@ -291,7 +297,11 @@ pub fn run() {
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
             let bandwidth_arc = Arc::new(app.state::<bandwidth::BandwidthManager>().inner().clone());
             app.manage(bandwidth_arc);
-            app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT });
+            // Streaming-server live-bind flag: set true only when the actix bind
+            // succeeds (server thread below); read by cmd_get_stream_info().alive.
+            let stream_server_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.manage(StreamServerRunning(stream_server_running.clone()));
+            app.manage(StreamConfig { token: stream_token.clone(), port: STREAM_PORT, alive: stream_server_running });
             app.manage(ActixServerHandle(server_handle_for_setup.clone()));
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
@@ -393,6 +403,8 @@ pub fn run() {
             // gets its own handle to the SAME shared stats, so stream-direct drops
             // count toward the daily cap alongside every other transfer.
             let bw_for_server = app.state::<bandwidth::BandwidthManager>().inner().clone();
+            // The bind-success flag must be reachable from the server thread.
+            let running_flag = app.state::<StreamServerRunning>().0.clone();
             std::thread::spawn(move || {
                 let sys = actix_rt::System::new();
                 sys.block_on(async move {
@@ -400,10 +412,17 @@ pub fn run() {
                         Ok(streaming_server) => {
                             // Store the handle so RunEvent::Exit can stop it
                             *handle_for_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(streaming_server.handle());
+                            // Bind succeeded — the frontend may now use stream URLs
+                            // and the drop-upload route (cmd_get_stream_info().alive).
+                            running_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            log::info!("Streaming server bound on port {}", STREAM_PORT);
                             // Now await the server â€” blocks until stopped
                             streaming_server.await.ok();
                         }
-                        Err(e) => log::error!("Streaming server failed: {}", e),
+                        Err(e) => {
+                            running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            log::error!("Streaming server failed to bind port {}: {} — video playback and direct-drop uploads are unavailable this session", STREAM_PORT, e);
+                        }
                     }
                 });
             });
