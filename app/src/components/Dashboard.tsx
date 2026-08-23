@@ -128,6 +128,15 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             setShowCreatePasscode(false);
         }, []);
 
+        // ---- Session-boundary re-sync --------------------------------------
+        // VaultProvider sits ABOVE the auth switch and never remounts across
+        // logout->login. After forceLogout wipes + re-locks server-side, a
+        // stale context would show account A's unlock state/IDs to account B.
+        // Backend owns truth: re-read on every Dashboard mount (= every login).
+        useEffect(() => {
+            vault.refresh().catch(() => { /* unreachable backend: stay locked-assumed */ });
+        }, [vault.refresh]);
+
         // ---- Startup restore gating (spec §4.3) ----------------------------
         // The store restores a persisted activeFolderId before vault state
         // resolves; if that selection references a vaulted item we must NOT
