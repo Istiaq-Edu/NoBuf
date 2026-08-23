@@ -177,8 +177,12 @@ function HiddenRow({ icon: Icon, label, kindLabel, onOpen, onUnhide }: {
     onUnhide: () => void;
 }) {
     return (
-        <div className="group flex items-center gap-3 px-3 py-2.5 rounded-lg bg-nobuf-surface border border-nobuf-border hover:border-nobuf-primary/40 transition-colors">
-            <Icon className="w-4 h-4 shrink-0 text-nobuf-subtext" />
+        <div
+            onClick={onOpen}
+            className="group flex items-center gap-3 px-3 py-2.5 rounded-lg bg-nobuf-surface border border-nobuf-border hover:border-nobuf-primary/40 hover:bg-nobuf-hover/40 cursor-pointer transition-colors"
+            title={`Open ${kindLabel}`}
+        >
+            <Icon className="w-4 h-4 shrink-0 text-nobuf-subtext group-hover:text-nobuf-primary transition-colors" />
             <span className="flex-1 text-sm text-nobuf-text truncate">{label}</span>
             <button
                 onClick={onOpen}
@@ -187,7 +191,7 @@ function HiddenRow({ icon: Icon, label, kindLabel, onOpen, onUnhide }: {
                 Open <ChevronRight className="w-3 h-3" />
             </button>
             <button
-                onClick={onUnhide}
+                onClick={(e) => { e.stopPropagation(); onUnhide(); }}
                 className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-nobuf-subtext hover:text-red-400 rounded-md hover:bg-red-500/10 transition-colors"
                 title={`Remove from Vault — returns to normal ${kindLabel} section`}
             >
