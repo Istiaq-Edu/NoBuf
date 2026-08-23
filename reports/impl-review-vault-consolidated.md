@@ -24,6 +24,10 @@
 VaultView's reset used WebView2's synchronous native dialog while the entire app standardizes on `ConfirmContext`/`useConfirm` styled dialogs (SettingsPage API-key regen, theme delete).
 **Fix:** swapped to `confirm({ title, message, confirmText: 'Reset Vault', variant: 'danger' })`. Consistent theming, no JS-thread-blocking native quirk.
 
+### F3 · Minor — rapid first-hides raced on a single pendingHideRef
+Frontend-state reviewer (transcript-mined after provider 524): two right-click → Hide in Vault actions before any passcode exists both hit `passcode_required`; the second overwrote `pendingHideRef`, and completing the dialog applied only one hide — the other silently dropped.
+**Fix (`88cad64`):** `pendingHideRef` is an ordered queue; all queued items apply in sequence after passcode creation; cancel clears wholesale.
+
 ## Checked and cleared (highlights)
 
 - **Drop rejection survives merge:** document-capture drop handler is byte-identical to pre-merge; vault hit-test runs before any staging work; repo-wide there is exactly ONE production consumer of dropped OS files — no second ingestion path can bypass the "Only channels can be hidden" toast.
