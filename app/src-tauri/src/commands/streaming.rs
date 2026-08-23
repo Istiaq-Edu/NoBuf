@@ -599,6 +599,20 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
     }
 }
 
+/// Self-probe: Rust hits ITS OWN streaming server over loopback and reports
+/// the raw status for `/upload-drop`. This settles the webview-vs-server split:
+/// 405 here (route present) + 404 in the webview = something between them
+/// intercepts; 404 here = the running router genuinely lacks the route.
+#[tauri::command]
+pub fn cmd_probe_upload_route(port: u16) -> Result<String, String> {
+    let url = format!("http://127.0.0.1:{}/upload-drop", port);
+    match ureq::request("HEAD", &url).timeout(std::time::Duration::from_secs(5)).call() {
+        Ok(resp) => Ok(format!("{} via ureq", resp.status())),
+        Err(ureq::Error::Status(code, _)) => Ok(format!("{} via ureq", code)),
+        Err(e) => Err(format!("probe failed: {}", e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

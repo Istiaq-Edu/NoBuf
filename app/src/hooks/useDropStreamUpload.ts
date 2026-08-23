@@ -135,7 +135,18 @@ export async function streamDroppedFiles(
         const routeStatus = await headStatus(`${rootUrl}/upload-drop`);
         console.info(`[drop] probe: HEAD /upload-drop -> ${routeStatus ?? 'no-answer'}`);
         if (routeStatus === 404) {
-            throw new Error('direct-upload route missing — restart/update NoBuf');
+            // Webview saw 404 — cross-check from the Rust side. If RUST also sees
+            // 404, the router genuinely lacks the route. If Rust sees 405, the
+            // webview's requests are being intercepted between it and the server.
+            let rustView = 'probe-failed';
+            try {
+                rustView = await invoke<string>('cmd_probe_upload_route', { port: Number(info.base_url.split(':').pop()) });
+            } catch (pe) { rustView = String(pe); }
+            console.info(`[drop] probe: Rust-side HEAD /upload-drop -> ${rustView}`);
+            throw new Error(
+                rustView.includes('405')
+                    ? 'webview requests intercepted (Rust sees the route, webview gets 404)'
+                    : 'direct-upload route missing — restart/update NoBuf');
         }
     } catch (e) {
         // Visible, not silent: a mystery "Preparing" row with no explanation is
