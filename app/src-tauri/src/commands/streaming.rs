@@ -374,10 +374,13 @@ pub fn should_retarget_proactive(
         previous_target.is_some_and(|previous| is_backward_reanchor(previous, target))
 }
 
-/// Holds the per-session streaming config (token + port)
+/// Holds the per-session streaming config (token + port) plus the live-bind
+/// flag the frontend reads via cmd_get_stream_info().alive.
 pub struct StreamConfig {
     pub token: String,
     pub port: u16,
+    /// Set true only after start_streaming_server's bind succeeds.
+    pub alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-download-task keyframe-indexing context. Carries the lazily-resolved
@@ -561,6 +564,10 @@ pub struct StreamInfo {
     /// Example (Windows): http://nobuf-stream.localhost
     /// Example (macOS/Linux): nobuf-stream://localhost
     pub video_base_url: String,
+    /// True when the streaming server's bind SUCCEEDED. The token/base_url are
+    /// handed out unconditionally, so this flag is what tells the frontend
+    /// whether connecting is even worth attempting.
+    pub alive: bool,
 }
 
 /// Returns the streaming server's session token and base URL to the frontend.
@@ -588,6 +595,7 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
         token: config.token.clone(),
         base_url: format!("http://localhost:{}", config.port),
         video_base_url,
+        alive: config.alive.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -1451,6 +1459,7 @@ mod tests {
         let config = StreamConfig {
             token: "test-token-123".to_string(),
             port: 14201,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         // Simulate what cmd_get_stream_info returns (without Tauri State wrapper)
@@ -1489,10 +1498,12 @@ mod tests {
         let config_port_1 = StreamConfig {
             token: "test".to_string(),
             port: 14201,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let config_port_2 = StreamConfig {
             token: "test".to_string(),
             port: 8080,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let base_url_1 = format!("http://localhost:{}", config_port_1.port);
@@ -1510,6 +1521,7 @@ mod tests {
             token: "abc".to_string(),
             base_url: "http://localhost:14201".to_string(),
             video_base_url: "http://nobuf-stream.localhost".to_string(),
+            alive: true,
         };
 
         assert_eq!(info.token, "abc");

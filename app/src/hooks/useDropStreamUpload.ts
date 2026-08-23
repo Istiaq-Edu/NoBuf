@@ -101,12 +101,30 @@ export async function streamDroppedFiles(
     // Server availability probe BEFORE committing to stream-direct: if the actix
     // route isn't there (old binary, server failed to start), the caller falls
     // back to legacy %TEMP% staging instead of every drop failing.
+    //
+    // Two-step classifier (assessment round 2):
+    //   Step 1 — liveness: HEAD '/' resolves with ANY status => TCP+HTTP up.
+    //     null => server down OR webview blocked it; cmd_get_stream_info().alive
+    //     is the authoritative tiebreaker (Rust-side bind flag).
+    //   Step 2 — route check only if alive: 405 = healthy; 404 = binary without
+    //     the route (needs restart/update); anything else passes.
     try {
         const info = await getStreamInfo();
-        const probe = await fetch(`${info.base_url}/upload-drop`, { method: 'HEAD' }).catch(() => null);
-        // 405 = route exists, wrong method (expected). 404 = old binary without
-        // the route — must fall back too. null = connection failure.
-        if (!probe || probe.status === 404) throw new Error('streaming server route unavailable');
+        const headStatus = (url: string) =>
+            fetch(url, { method: 'HEAD' }).then(r => r.status).catch(() => null);
+        // Normalize to 127.0.0.1: the server binds IPv4-only; 'localhost' can
+        // resolve to ::1 first under some resolver/proxy configurations.
+        const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
+        const liveness = await headStatus(`${rootUrl}/`);
+        if (liveness === null) {
+            const aliveNow = await invoke<{ alive: boolean }>('cmd_get_stream_info');
+            throw new Error(aliveNow.alive
+                ? 'webview blocked local requests'
+                : `streaming server not reachable (port ${info.base_url.split(':').pop()} did not bind)`);
+        }
+        if ((await headStatus(`${info.base_url}/upload-drop`)) === 404) {
+            throw new Error('direct-upload route missing — restart/update NoBuf');
+        }
     } catch (e) {
         // Visible, not silent: a mystery "Preparing" row with no explanation is
         // undiagnosable. This toast names the fallback and its cause.
@@ -132,9 +150,33 @@ export async function streamDroppedFiles(
             progress: 0,
             displayName: f.name,
         });
-        void startOne(id);
+        void enqueueStart(id);
     }
     return items;
+}
+
+/**
+ * Concurrency gate: at most 3 drop uploads stream simultaneously. Each big-file
+ * upload spawns 4 grammers workers on ONE MTProto connection — a 20-file drop
+ * would open 80 RPC workers, near-certainly tripping FLOOD_WAIT (which manifests
+ * as a silent mid-percent stall and costs more throughput than parallelism adds;
+ * Telegram caps per-account upload anyway). Excess items wait in FIFO order.
+ */
+const MAX_PARALLEL_DROPS = 3;
+let activeDrops = 0;
+const pendingDrops: string[] = [];
+
+function enqueueStart(id: string) {
+    if (activeDrops < MAX_PARALLEL_DROPS) {
+        activeDrops++;
+        void startOne(id).finally(() => {
+            activeDrops--;
+            const next = pendingDrops.shift();
+            if (next) enqueueStart(next);
+        });
+    } else {
+        pendingDrops.push(id);
+    }
 }
 
 async function startOne(id: string) {
@@ -167,8 +209,16 @@ async function startOne(id: string) {
                 if (xhr.status === 200) {
                     resolve({ ok: true });
                 } else {
+                    // Server errors are plain text (upload_drop.rs bodies); JSON is
+                    // the fallback, not the rule. Parse must not swallow the real
+                    // reason ("Daily bandwidth limit exceeded" etc).
                     let msg = `Server error ${xhr.status}`;
-                    try { msg = JSON.parse(xhr.responseText)?.error ?? xhr.responseText ?? msg; } catch { /* raw */ }
+                    try {
+                        const parsed = JSON.parse(xhr.responseText);
+                        msg = parsed?.error ?? xhr.responseText ?? msg;
+                    } catch {
+                        msg = xhr.responseText || msg;
+                    }
                     resolve({ ok: false, error: msg });
                 }
             };
