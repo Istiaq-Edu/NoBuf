@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Lock, Unlock, Folder, Radio, RotateCcw, KeyRound, LogOut, ChevronRight } from 'lucide-react';
 import { useVault, type VaultKind } from '../../context/VaultContext';
+import { useConfirm } from '../../context/ConfirmContext';
 
 interface VaultViewProps {
     /** Navigate into a hidden folder/channel (only offered when unlocked). */
@@ -15,6 +16,7 @@ interface VaultViewProps {
  */
 export function VaultView({ onOpenFolder, onOpenPublicChannel }: VaultViewProps) {
     const vault = useVault();
+    const { confirm } = useConfirm();
     const [passcode, setPasscode] = useState('');
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
@@ -31,9 +33,12 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel }: VaultViewProps)
         };
 
         const resetVault = async () => {
-            const confirmed = window.confirm(
-                'Reset the Vault?\n\nThe passcode is cleared and ALL hidden channels return to their normal sections. Your files on Telegram are NOT touched.'
-            );
+            const confirmed = await confirm({
+                title: 'Reset Vault',
+                message: 'The passcode is cleared and ALL hidden channels return to their normal sections. Your files on Telegram are NOT touched.',
+                confirmText: 'Reset Vault',
+                variant: 'danger',
+            });
             if (!confirmed) return;
             setBusy(true);
             await vault.reset();
