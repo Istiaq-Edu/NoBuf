@@ -89,8 +89,12 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 }
                 // Vault cross-device sync (spec §7): pull once per launch.
                 // Merges hidden-ID lists + passcode from Saved Messages.
+                // The response carries the post-sync state — hand it to the
+                // app via a re-emitted event so the UI applies it NOW
+                // (previously the merged state was discarded until restart).
                 try {
-                    await invoke('cmd_vault_pull_sync');
+                    const result = await invoke<{ merged: boolean; state: unknown }>('cmd_vault_pull_sync');
+                    window.dispatchEvent(new CustomEvent('nobuf-vault-state', { detail: result.state }));
                 } catch {
                     // Non-fatal: offline / not connected yet.
                 }
