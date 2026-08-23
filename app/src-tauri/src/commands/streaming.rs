@@ -600,17 +600,28 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
 }
 
 /// Self-probe: Rust hits ITS OWN streaming server over loopback and reports
-/// the raw status for `/upload-drop`. This settles the webview-vs-server split:
-/// 405 here (route present) + 404 in the webview = something between them
-/// intercepts; 404 here = the running router genuinely lacks the route.
+/// the raw status for `/upload-drop` plus the /__whoami identity payload.
+/// whoami returns THIS process's PID + boot stamp — if the probe answer's PID
+/// differs from the caller's, an IMPOSTOR process owns the port.
 #[tauri::command]
 pub fn cmd_probe_upload_route(port: u16) -> Result<String, String> {
-    let url = format!("http://127.0.0.1:{}/upload-drop", port);
-    match ureq::request("HEAD", &url).timeout(std::time::Duration::from_secs(5)).call() {
-        Ok(resp) => Ok(format!("{} via ureq", resp.status())),
-        Err(ureq::Error::Status(code, _)) => Ok(format!("{} via ureq", code)),
-        Err(e) => Err(format!("probe failed: {}", e)),
-    }
+    let timeout = std::time::Duration::from_secs(5);
+    let drop_status = match ureq::request("HEAD", &format!("http://127.0.0.1:{}/upload-drop", port))
+        .timeout(timeout).call()
+    {
+        Ok(r) => r.status().to_string(),
+        Err(ureq::Error::Status(c, _)) => c.to_string(),
+        Err(e) => format!("ERR:{}", e),
+    };
+    let whoami = match ureq::get(&format!("http://127.0.0.1:{}/__whoami", port)).timeout(timeout).call() {
+        Ok(r) => format!("{} [{}]", r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(c, _)) => format!("{} [no body]", c),
+        Err(e) => format!("ERR:{}", e),
+    };
+    Ok(format!(
+        "drop=HEAD:{} whoami={} caller_pid={}",
+        drop_status, whoami, std::process::id()
+    ))
 }
 
 #[cfg(test)]
