@@ -140,7 +140,7 @@ export async function streamDroppedFiles(
             // webview's requests are being intercepted between it and the server.
             let rustView = 'probe-failed';
             try {
-                rustView = await invoke<string>('cmd_probe_upload_route', { port: Number(info.base_url.split(':').pop()) });
+                rustView = String(await invoke<string>('cmd_probe_upload_route', { port: Number(info.base_url.split(':').pop()) }));
             } catch (pe) { rustView = String(pe); }
             console.info(`[drop] probe: Rust-side HEAD /upload-drop -> ${rustView}`);
             throw new Error(
@@ -179,13 +179,13 @@ export async function streamDroppedFiles(
 }
 
 /**
- * Concurrency gate: at most 3 drop uploads stream simultaneously. Each big-file
- * upload spawns 4 grammers workers on ONE MTProto connection — a 20-file drop
- * would open 80 RPC workers, near-certainly tripping FLOOD_WAIT (which manifests
- * as a silent mid-percent stall and costs more throughput than parallelism adds;
- * Telegram caps per-account upload anyway). Excess items wait in FIFO order.
+ * Concurrency gate: ONE drop upload streams at a time, matching the original
+ * upload system's sequential behavior. Parallel drops (each spawning 4
+ * grammers workers) share one MTProto connection — under load a cancel or
+ * network blip cascades os-error-10053 across every in-flight transfer.
+ * Excess items wait in FIFO order and start automatically as slots free up.
  */
-const MAX_PARALLEL_DROPS = 3;
+const MAX_PARALLEL_DROPS = 1;
 let activeDrops = 0;
 const pendingDrops: string[] = [];
 
