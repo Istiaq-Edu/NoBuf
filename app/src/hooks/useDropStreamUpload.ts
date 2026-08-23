@@ -108,6 +108,10 @@ export async function streamDroppedFiles(
         // the route — must fall back too. null = connection failure.
         if (!probe || probe.status === 404) throw new Error('streaming server route unavailable');
     } catch (e) {
+        // Visible, not silent: a mystery "Preparing" row with no explanation is
+        // undiagnosable. This toast names the fallback and its cause.
+        const reason = e instanceof Error ? e.message : String(e);
+        toast.info(`Direct-stream unavailable (${reason}) — using temp-staging upload.`);
         console.warn('[drop] stream-direct unavailable, falling back to staging:', e);
         throw e; // stageAndQueue catches this and uses the staging path
     }
