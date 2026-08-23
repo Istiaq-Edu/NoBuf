@@ -98,12 +98,10 @@ fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
 
 /// Stream-direct drop upload handler.
 ///
-/// NOTE: deliberately NOT wrapped in #[post("/upload-drop")]. The macro
-/// generates a codegen Resource whose registration silently 404'd in one
-/// environment while a sibling cfg.route() in the same configure closure
-/// worked — root cause unresolved after three review rounds. Plain
-/// `web::post().to(...)` registration (see server.rs) is mechanism-identical
-/// to the proven-working /__whoami route and is what production now uses.
+/// Registered method-agnostically (server.rs uses `web::to`) because actix-web
+/// matches HEAD only against GET routes — a POST-only resource answers HEAD
+/// with 404, which made every availability probe a false negative while the
+/// route was live. The handler itself enforces POST before touching anything.
 pub(crate) async fn upload_drop_handler(
     req: HttpRequest,
     payload: web::Payload,
