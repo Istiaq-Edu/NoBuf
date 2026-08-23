@@ -1,7 +1,7 @@
 # Vault — Hide Channels & Folders Behind a Passcode
 
 **Date:** 2026-08-22 · **Branch:** `feature/vault-hide-channels` (cut from `fix/dragdrop-upload-defects`, which is 8 ahead / 0 behind `origin/dev`)
-**Revision:** 5 — implementation-start audit found LIVE global search (`cmd_search_global` → results carry source folder_id) that all four reviews missed; backend-side vault filtering specified. Plus state-review rev-4 changes (public-channel pruning, logout vault wipe, D14 handler duties). Reports: `reports/review-vault-state.md`, `reports/review-vault-crossval.md`, `reports/review-vault-design.md`, `reports/review-vault-security.md`.
+**Revision:** 6 — **CRITICAL design-error correction (user-reported after relaunch testing):** locked `get_state` deliberately withheld hidden-ID lists as an "info-leak guard". That was wrong: the sidebar needs those lists WHILE LOCKED to filter vaulted channels out — without them, vaulted channels REAPPEARED after every relaunch and vanished on unlock. The guard was security theater anyway (vault.json sits in app-data; anyone who could exploit the IDs reads them there). `get_state` now always carries IDs; §4.2's "locked = counts only" claim is void. Search-filter rationale ("frontend can't know IDs while locked") is moot but the backend-side enforcement stays — defense in depth at zero cost. Plus state-review rev-4 changes (public-channel pruning, logout vault wipe, D14 handler duties). Reports: `reports/review-vault-state.md`, `reports/review-vault-crossval.md`, `reports/review-vault-design.md`, `reports/review-vault-security.md`.
 
 ---
 
@@ -140,7 +140,7 @@ Content encryption (content lives on Telegram), gating REST/stream endpoints (do
 
 ## 6. Test plan
 
-- Rust unit tests in `vault.rs` (headless, pure fns): hash/verify round-trip; wrong passcode rejected; 3-digit and 13-digit rejected; 600k iterations actually applied (timing sanity ≥ bound); reset wipes everything; hide/unhide idempotent; prune removes only listed IDs; cross-kind isolation (hide folder X ≠ vaulted public X); corrupt-file recovery; locked state response contains no ID arrays.
+- Rust unit tests in `vault.rs` (headless, pure fns): hash/verify round-trip; wrong passcode rejected; 3-digit and 13-digit rejected; 600k iterations actually applied (timing sanity ≥ bound); reset wipes everything; hide/unhide idempotent; prune removes only listed IDs; cross-kind isolation (hide folder X ≠ vaulted public X); corrupt-file recovery; state response ALWAYS carries ID arrays (**rev 6 correction** — see §4.2a).
 - Vitest: filtering memo excludes hidden IDs at all four consumer sites; first-hide gating; six writer paths unaffected by filtering (full arrays persisted); picker include/exclude by lock state; Ctrl+Shift+V binding + preventDefault; cache removal on hide. Bound to shipped exported functions; mutation-tested (revert → tests fail).
 - Restore-gating behavioral test: simulate persisted vaulted selection + cold start → assert navigation lands on Saved Messages and no `['files', <vaultedId>]` query fires. Mutation check: removing our gate must fail this test EVEN IF the incidental clobber is present (the test asserts our gate, not React timing).
 - Gates before merge: `npx tsc --noEmit`, `npx vitest run`, `cargo test --no-default-features`.
