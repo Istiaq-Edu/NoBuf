@@ -7824,12 +7824,15 @@ pub async fn start_streaming_server(
                             .unwrap_or(0)
                     ))
                 }));
-                // Drop-upload route: plain route registration — mechanism-identical
-                // to the /__whoami route above, which works in the environment
-                // where the #[post] macro-generated Resource silently 404'd.
+                // Drop-upload route: method-AGNOSTIC registration. actix-web
+                // matches HEAD only against GET routes, so a web::post() resource
+                // answers HEAD with 404 — which made every availability probe a
+                // false negative while the route was actually live. With
+                // web::to(any), probes prove presence; the handler itself
+                // enforces POST (405 otherwise).
                 cfg.route(
                     "/upload-drop",
-                    web::post().to(crate::commands::upload_drop::upload_drop_handler),
+                    web::to(crate::commands::upload_drop::upload_drop_handler),
                 );
                 log::info!("Drop-upload route /upload-drop REGISTERED");
             })

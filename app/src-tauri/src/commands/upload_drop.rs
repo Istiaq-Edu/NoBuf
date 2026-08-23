@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use actix_web::{post, web, HttpRequest, HttpResponse, Responder};
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use futures::StreamExt;
 use tauri::Emitter;
 
@@ -110,6 +110,14 @@ pub async fn upload_drop_handler(
     tg_state: web::Data<Arc<TelegramState>>,
     token_data: web::Data<StreamTokenData>,
 ) -> impl Responder {
+    // --- Method gate ------------------------------------------------------------
+    // The route is registered method-agnostically (web::to) because actix-web
+    // matches HEAD only against GET routes — a POST-only resource 404s on HEAD,
+    // which made every availability probe report a false negative. Presence is
+    // now provable with ANY verb; real uploads must still be POST.
+    if req.method() != actix_web::http::Method::POST {
+        return HttpResponse::MethodNotAllowed().body("use POST");
+    }
     // --- Auth: session token required (loopback is shared with every local
     //     process/browser tab; CORS cannot stop them SENDING, only reading) ------
     match query_param(&req, "token") {
