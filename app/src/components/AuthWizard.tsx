@@ -265,6 +265,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     // "not scanned yet" apart from "scanned, still finalizing".
     const [qrConfirming, setQrConfirming] = useState(false);
     const [qrPollError, setQrPollError] = useState<string | null>(null);
+    const [qrScanned, setQrScanned] = useState(false);
     const qrFailCountRef = useRef(0);
     const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const [selectedCountry, setSelectedCountry] = useDetectedCountry();
@@ -392,6 +393,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
         setError(null);
         setQrPollError(null);
         qrFailCountRef.current = 0;
+        setQrScanned(false);
         setQrConfirming(false);
         setLoading(true);
         try {
@@ -415,8 +417,17 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
     useEffect(() => {
         if (!qrPolling) {
             if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; }
+            setQrScanned(false);
             return;
         }
+        // Backend scan-watcher emits this within ~5s of the phone accepting the
+        // token — far earlier than the poll loop can prove finalization — so the
+        // user gets immediate "scanned" feedback instead of a fake waiting spinner.
+        let unlisten: (() => void) | undefined;
+        listen<boolean>("qr-scan-detected", () => setQrScanned(true)).then((off) => {
+            unlisten = off;
+            if (!qrPollRef.current) off(); // polling already stopped — clean up immediately
+        });
         qrPollRef.current = setInterval(async () => {
             try {
                 const res = await invoke<{ success: boolean; next_step?: string; error?: string }>("cmd_auth_qr_poll");
@@ -456,7 +467,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                 setQrPollError(msg || "Connection issue — retrying…");
             }
         }, 5000);
-        return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } };
+        return () => { if (qrPollRef.current) { clearInterval(qrPollRef.current); qrPollRef.current = null; } unlisten?.(); };
     }, [qrPolling, apiId, apiHash, onLogin]);
 
     const handlePhoneSubmit = async (e: React.FormEvent) => {
@@ -709,6 +720,7 @@ export function AuthWizard({ onLogin }: { onLogin: () => void }) {
                                                 qrPolling={qrPolling}
                                                 qrConfirming={qrConfirming}
                                                 qrPollError={qrPollError}
+                                                qrScanned={qrScanned}
                                                 onRefresh={handleQrLogin}
                                                 onBack={() => { setStep("setup"); setQrPolling(false); setQrConfirming(false); }}
                                             />
@@ -893,12 +905,13 @@ function PhoneQrToggle({ loginMethod, setLoginMethod, setQrUrl, setQrPolling, se
     );
 }
 
-function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, qrPollError, onRefresh, onBack }: {
+function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, qrPollError, qrScanned, onRefresh, onBack }: {
     loading: boolean;
     qrUrl: string | null;
     qrPolling: boolean;
     qrConfirming: boolean;
     qrPollError: string | null;
+    qrScanned: boolean;
     onRefresh: () => void;
     onBack: () => void;
 }) {
@@ -932,8 +945,14 @@ function QrLoginPanel({ loading, qrUrl, qrPolling, qrConfirming, qrPollError, on
                             {qrPolling && (
                                 <div className="flex flex-col items-center gap-1">
                                     <div className="flex items-center gap-2 text-xs text-nobuf-primary">
-                                        <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
-                                        Waiting for scan…
+                                        {qrScanned ? (
+                                            <>QR code scanned — signing you in…</>
+                                        ) : (
+                                            <>
+                                                <div className="w-3 h-3 border-2 border-nobuf-primary border-t-transparent rounded-full animate-spin" />
+                                                Waiting for scan…
+                                            </>
+                                        )}
                                     </div>
                                     {qrPollError && (
                                         <div className="text-xs text-amber-500">{qrPollError}</div>
