@@ -80,34 +80,43 @@ beforeEach(() => {
 });
 
 describe('queued-cancel does not resurrect (mutant 1)', () => {
-    it('cancelDropStream on a gate-queued 4th file keeps it dead forever', async () => {
+    it('cancelDropStream on a gate-queued later file keeps it dead forever', async () => {
         const { cancelDropStream } = await import('../hooks/useDropStreamUpload');
         const doneEvents: CustomEvent[] = [];
         const listener = (e: Event) => doneEvents.push(e as CustomEvent);
         window.addEventListener('nobuf-drop-done', listener);
 
-        // MAX_PARALLEL_DROPS = 3: files 0-2 start, file 3 waits in FIFO.
+        // MAX_PARALLEL_DROPS = 1: only a.bin starts; b/c/d wait in FIFO order
+        // — sequential queue, matching the original upload system.
         const items = await drop([
             makeFile(10, 'a.bin'), makeFile(10, 'b.bin'),
             makeFile(10, 'c.bin'), makeFile(10, 'd.bin'),
         ]);
         await Promise.resolve(); let ticks = 20; while (ticks--) await Promise.resolve();
-        expect(sentXhrs).toHaveLength(3); // cap enforced
+        expect(sentXhrs).toHaveLength(1); // cap enforced: strictly sequential
 
         // Cancel d.bin WHILE it is still queued.
         cancelDropStream(items[3].id);
         await Promise.resolve(); let t2 = 20; while (t2--) await Promise.resolve();
-        expect(sentXhrs).toHaveLength(3); // still nothing new started
+        expect(sentXhrs).toHaveLength(1); // still nothing new started
 
-        // Finish a.bin -> gate dequeues... and must SKIP d.bin.
+        // Finish a.bin -> gate dequeues b... and must SKIP d.bin when its turn comes.
         completeAll(200);
         await Promise.resolve(); let t3 = 40; while (t3--) await Promise.resolve();
 
-        expect(sentXhrs).toHaveLength(3); // MUTANT: would be 4 here
+        // a finished, b started, c+d skipped-or-waiting; d must NEVER start.
+        expect(sentXhrs).toHaveLength(2); // MUTANT: would be 3 here (d resurrects)
         const statuses = doneEvents.map(e => (e.detail as { id: string }).id);
         expect(statuses).toContain(items[0].id);
         expect(statuses).not.toContain(items[3].id); // never uploaded, never errored
         window.removeEventListener('nobuf-drop-done', listener);
+
+        // Drain the gate fully so module state is clean for the next test.
+        let guard = 10;
+        while (sentXhrs.some(x => x.onload) && guard--) {
+            completeAll(200);
+            await Promise.resolve(); let t4 = 40; while (t4--) await Promise.resolve();
+        }
     });
 });
 

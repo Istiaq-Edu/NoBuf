@@ -84,8 +84,23 @@ describe('probe fallback (two-step classifier)', () => {
 
     it('throws on 404 — old binary without the route must fall back too', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
+        // Rust-side self-probe agrees: route genuinely absent.
+        invokeMock.mockImplementation(async (cmd: string) =>
+            cmd === 'cmd_get_stream_info' ? BASE
+                : cmd === 'cmd_probe_upload_route' ? 'drop=HEAD:404 whoami=404 [no body] caller_pid=1'
+                : undefined);
         await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
             .rejects.toThrow(/route missing/);
+    });
+
+    it('reports interception when Rust sees 405 but the webview gets 404', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
+        invokeMock.mockImplementation(async (cmd: string) =>
+            cmd === 'cmd_get_stream_info' ? BASE
+                : cmd === 'cmd_probe_upload_route' ? 'drop=HEAD:405 whoami=200 [pid=1] caller_pid=1'
+                : undefined);
+        await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
+            .rejects.toThrow(/intercepted/);
     });
 
     it('throws /webview blocked/ when fetch rejects but the Rust side IS bound', async () => {
