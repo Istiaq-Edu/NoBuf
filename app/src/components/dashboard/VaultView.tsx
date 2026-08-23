@@ -7,6 +7,10 @@ interface VaultViewProps {
     /** Navigate into a hidden folder/channel (only offered when unlocked). */
     onOpenFolder: (id: number) => void;
     onOpenPublicChannel: (id: number) => void;
+    /** Resolve display names from the RAW (unfiltered) lists — hidden items
+     *  never appear in visibleFolders/visiblePublicChannels. */
+    getFolderName: (id: number) => string;
+    getChannelName: (id: number) => string;
 }
 
 /**
@@ -14,7 +18,7 @@ interface VaultViewProps {
  * link with confirm, D8). Unlocked → list of hidden items with unhide /
  * open actions, change-passcode, Lock-now (D12).
  */
-export function VaultView({ onOpenFolder, onOpenPublicChannel }: VaultViewProps) {
+export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, getChannelName }: VaultViewProps) {
     const vault = useVault();
     const { confirm } = useConfirm();
     const [passcode, setPasscode] = useState('');
@@ -126,7 +130,7 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel }: VaultViewProps)
                             <HiddenRow
                                 key={`f-${id}`}
                                 icon={Folder}
-                                label={`Folder #${id}`}
+                                label={getFolderName(id)}
                                 kindLabel="private channel"
                                 onOpen={() => onOpenFolder(id)}
                                 onUnhide={() => vault.unhide('folder' as VaultKind, id)}
@@ -144,7 +148,7 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel }: VaultViewProps)
                             <HiddenRow
                                 key={`p-${id}`}
                                 icon={Radio}
-                                label={`Channel #${id}`}
+                                label={getChannelName(id)}
                                 kindLabel="public channel"
                                 onOpen={() => onOpenPublicChannel(id)}
                                 onUnhide={() => vault.unhide('public_channel' as VaultKind, id)}
