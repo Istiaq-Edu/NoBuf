@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-probe-upload-route"
+description = "Enables the cmd_probe_upload_route command without any pre-configured scope."
+commands.allow = ["cmd_probe_upload_route"]
+
+[[permission]]
+identifier = "deny-cmd-probe-upload-route"
+description = "Denies the cmd_probe_upload_route command without any pre-configured scope."
+commands.deny = ["cmd_probe_upload_route"]

@@ -259,6 +259,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     // Staging-in-progress rows (dropped files being copied to %TEMP% before they
     // enter the upload queue). Keyed by name; cleared when its batch finishes.
     const [stagingItems, setStagingItems] = useState<{ name: string; pct: number }[]>([]);
+    // Names the user cancelled: their in-flight chunk's progress callback must not
+    // resurrect the row after removal (that forced a second cancel click).
+    const cancelledStagingRef = useRef<Set<string>>(new Set());
     const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; connected: boolean; stage: ((f: File[], l: number, hasFolder: boolean, onStagingProgress?: (fileName: string, pct: number) => void) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, connected: false, stage: null });
     // Last dragover/drop timestamp for external drags. WebView2 fires NO event when a
     // drag is cancelled mid-window (Esc key): dragleave carries in-window coordinates
@@ -656,6 +659,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     // Staging progress rows: upsert on each chunk, remove when the batch settles
     // (item either enters the queue or was rejected/failed).
     const updateStagingProgress = useCallback((fileName: string, pct: number) => {
+        // A cancelled name stays suppressed until a FRESH staging starts for it
+        // (pct=0 clears the guard), so late callbacks from its final in-flight
+        // chunk can't bring the row back.
+        if (cancelledStagingRef.current.has(fileName)) return;
         setStagingItems(prev => {
             const others = prev.filter(i => i.name !== fileName);
             return pct < 100 ? [...others, { name: fileName, pct }] : others;
@@ -955,6 +962,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}
                 onCancelStaging={name => {
+                    cancelledStagingRef.current.add(name);
                     cancelStaging(name);
                     // Remove the preparing row immediately; the staging loop's
                     // StagingCancelledError path discards partial bytes + toasts.

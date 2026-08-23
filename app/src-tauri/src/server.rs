@@ -7809,6 +7809,33 @@ pub async fn start_streaming_server(
             .app_data(token_data.clone())
             .app_data(tg_data.clone())
             .app_data(cache_data.clone())
+            .configure(|cfg: &mut web::ServiceConfig| {
+                // Identity endpoint: returns THIS process's PID. If a probe of
+                // 127.0.0.1:port/__whoami shows a different PID than the app the
+                // user is running, an impostor process owns the port — that was
+                // the only theory left after route registration proved correct.
+                cfg.route("/__whoami", web::to(|| async {
+                    HttpResponse::Ok().body(format!(
+                        "pid={} boot={}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    ))
+                }));
+                // Drop-upload route: method-AGNOSTIC registration. actix-web
+                // matches HEAD only against GET routes, so a web::post() resource
+                // answers HEAD with 404 — which made every availability probe a
+                // false negative while the route was actually live. With
+                // web::to(any), probes prove presence; the handler itself
+                // enforces POST (405 otherwise).
+                cfg.route(
+                    "/upload-drop",
+                    web::to(crate::commands::upload_drop::upload_drop_handler),
+                );
+                log::info!("Drop-upload route /upload-drop REGISTERED");
+            })
             .service(stream_media)
             .service(stream_media_head)
             .service(remux_ts_to_mp4)
@@ -7906,6 +7933,15 @@ mod tests {
     fn player_with_tiny_prefix_still_bootstraps() {
         assert!(super::should_bootstrap_from_telegram(524_287, 0, false, MIN_BOOTSTRAP));
     }
+
+    // NOTE: an actix integration test pinning /upload-drop route presence was
+    // attempted here and REMOVED: merely referencing commands::upload_drop from
+    // server.rs's test module made the whole test binary fail to load
+    // (STATUS_ENTRYPOINT_NOT_FOUND, reproducible, cause unresolved). Route
+    // presence is guarded at runtime instead: start_streaming_server logs
+    // "Drop-upload route REGISTERED" or "SKIPPED (app_handle=…, bandwidth=…)"
+    // per worker, and the frontend classifier surfaces a 404 as an explicit
+    // "direct-upload route missing" toast.
 
     #[test]
     fn player_with_enough_prefix_waits_on_cache() {
