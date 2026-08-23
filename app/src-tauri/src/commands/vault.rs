@@ -239,22 +239,20 @@ pub fn parse_kind(kind: &str) -> Result<VaultKind, String> {
 }
 
 fn state_response(store: &VaultStore, unlocked: bool) -> VaultStateResponse {
+    // ID lists are ALWAYS included. Earlier revs withheld them while locked
+    // as an "info-leak guard" — that design was wrong (spec §4.2 corrected):
+    // the IDs gate which channels OUR OWN UI must conceal, so the frontend
+    // needs them precisely while locked. vault.json sits in app-data where
+    // any attacker who could exploit leaked ids can read it directly; hiding
+    // them only broke the feature after every relaunch.
     VaultStateResponse {
         has_passcode: store.passcode_hash.is_some(),
         is_unlocked: unlocked,
         entry_visible: store.entry_visible,
         folder_count: store.vaulted_folder_ids.len(),
         public_count: store.vaulted_public_channel_ids.len(),
-        folder_ids: if unlocked {
-            Some(store.vaulted_folder_ids.clone())
-        } else {
-            None
-        },
-        public_ids: if unlocked {
-            Some(store.vaulted_public_channel_ids.clone())
-        } else {
-            None
-        },
+        folder_ids: Some(store.vaulted_folder_ids.clone()),
+        public_ids: Some(store.vaulted_public_channel_ids.clone()),
     }
 }
 
@@ -583,20 +581,23 @@ mod tests {
     }
 
     #[test]
-    fn locked_state_response_carries_no_ids() {
+    fn state_response_always_carries_ids_for_ui_concealment() {
+        // Spec §4.2 (corrected): the frontend needs hidden IDs WHILE LOCKED —
+        // they are what the sidebar filters on. Withholding them while locked
+        // made vaulted channels reappear after every relaunch. The lists are
+        // not a secret from the UI; they are the UI's concealment map.
         let mut store = with_passcode();
         store.vaulted_folder_ids.push(1);
         store.vaulted_public_channel_ids.push(2);
 
         let locked = state_response(&store, false);
-        assert!(locked.folder_ids.is_none());
-        assert!(locked.public_ids.is_none());
-        assert_eq!(locked.folder_count, 1);
-        assert_eq!(locked.public_count, 1);
+        assert_eq!(locked.folder_ids.as_ref().unwrap(), &vec![1]);
+        assert_eq!(locked.public_ids.as_ref().unwrap(), &vec![2]);
+        assert!(!locked.is_unlocked);
 
         let json = serde_json::to_string(&locked).unwrap();
-        assert!(!json.contains("\"folder_ids\""));
-        assert!(!json.contains("\"public_ids\""));
+        assert!(json.contains("\"folder_ids\":[1]"));
+        assert!(json.contains("\"public_ids\":[2]"));
 
         let unlocked_resp = state_response(&store, true);
         assert_eq!(unlocked_resp.folder_ids.as_ref().unwrap(), &vec![1]);
