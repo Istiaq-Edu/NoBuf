@@ -7810,6 +7810,20 @@ pub async fn start_streaming_server(
             .app_data(tg_data.clone())
             .app_data(cache_data.clone())
             .configure(|cfg: &mut web::ServiceConfig| {
+                // Identity endpoint: returns THIS process's PID. If a probe of
+                // 127.0.0.1:port/__whoami shows a different PID than the app the
+                // user is running, an impostor process owns the port — that was
+                // the only theory left after route registration proved correct.
+                cfg.route("/__whoami", web::to(|| async {
+                    HttpResponse::Ok().body(format!(
+                        "pid={} boot={}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    ))
+                }));
                 // Drop-upload route registers UNCONDITIONALLY — its dependencies
                 // (AppHandle/BandwidthManager) live in the upload_drop OnceLock,
                 // set by lib.rs before this server starts. The previous
