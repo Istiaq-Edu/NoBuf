@@ -12,7 +12,6 @@ use crate::commands::vault::{self, VaultLock};
 use crate::commands::utils::resolve_peer;
 use grammers_client::InputMessage;
 use tauri::{AppHandle, Manager};
-
 /// Marker identifying NoBuf vault-sync messages in Saved Messages.
 pub const SYNC_MARKER: &str = "[NoBuf-Vault-v1]";
 
@@ -20,6 +19,9 @@ pub const SYNC_MARKER: &str = "[NoBuf-Vault-v1]";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VaultSyncBlob {
     pub v: u32,
+    /// Telegram user id of the vault owner. Pull skips blobs whose owner
+    /// differs from the logged-in account (cross-account safety).
+    pub owner_id: i64,
     #[serde(default)]
     pub folder_ids: Vec<i64>,
     #[serde(default)]
@@ -106,9 +108,10 @@ pub fn merge_remote_into_local(
 // ---------------------------------------------------------------------------
 
 /// Build the current local state into a sync blob.
-pub fn blob_from_store(store: &vault::VaultStore) -> VaultSyncBlob {
+pub fn blob_from_store(store: &vault::VaultStore, owner_id: i64) -> VaultSyncBlob {
     VaultSyncBlob {
         v: 1,
+        owner_id,
         folder_ids: store.vaulted_folder_ids.clone(),
         public_ids: store.vaulted_public_channel_ids.clone(),
         salt_hex: hex_of(store.salt.as_ref()),
@@ -190,13 +193,52 @@ pub async fn push_state(app: &AppHandle) -> Result<(), String> {
         state.peer_cache.clone()
     };
     let peer = resolve_peer(&client, None, &peer_cache).await?;
+
+    // Owner id + one-message discipline (review S1/S2): the sync state lives
+    // in a SINGLE Saved Messages message that we EDIT in place. No
+    // accumulation, no plaintext history of hidden IDs.
+    let me = client.get_me().await.map_err(|e| e.to_string())?;
+    let owner_id = me.raw.id();
     let store = vault::load_store(app);
-    let body = encode_sync_message(&blob_from_store(&store))?;
-    client
-        .send_message(&peer, InputMessage::new().text(body))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let body = encode_sync_message(&blob_from_store(&store, owner_id))?;
+
+    match store.sync_message_id {
+        Some(msg_id) => {
+            // Try edit first; if the message was deleted remotely, fall back
+            // to sending a fresh one.
+            match client
+                .edit_message(&peer, msg_id, InputMessage::new().text(body.clone()))
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    let sent = client
+                        .send_message(&peer, InputMessage::new().text(body))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    persist_sync_message_id(app, sent.id())?;
+                    Ok(())
+                }
+            }
+        }
+        None => {
+            let sent = client
+                .send_message(&peer, InputMessage::new().text(body))
+                .await
+                .map_err(|e| e.to_string())?;
+            persist_sync_message_id(app, sent.id())?;
+            Ok(())
+        }
+    }
+}
+
+/// Remember which Saved Messages message carries the vault blob.
+fn persist_sync_message_id(app: &AppHandle, msg_id: i32) -> Result<(), String> {
+    let lock = app.state::<VaultLock>();
+    let _guard = lock.0.lock().map_err(|e| e.to_string())?;
+    let mut store = vault::load_store(app);
+    store.sync_message_id = Some(msg_id);
+    vault::save_store(app, &store)
 }
 
 /// PULL: find the newest sync message in Saved Messages and merge it in.
@@ -231,6 +273,18 @@ pub async fn pull_and_merge(app: &AppHandle) -> Result<bool, String> {
     let Some((msg_secs, remote)) = newest else {
         return Ok(false);
     };
+
+    // Cross-account safety (review S1): a blob owned by a different Telegram
+    // account must never merge into this machine's vault.
+    let me = client.get_me().await.map_err(|e| e.to_string())?;
+    if remote.owner_id != 0 && remote.owner_id != me.raw.id() {
+        log::info!(
+            "[vault-sync] skipping blob from owner {} (logged in as {})",
+            remote.owner_id,
+            me.raw.id()
+        );
+        return Ok(false);
+    }
 
     // Remote-newer test: sync message date vs vault.json mtime.
     let local_mtime = vault_path_mtime(app)?;
@@ -289,6 +343,7 @@ mod tests {
     fn blob(folder_ids: &[i64], public_ids: &[i64], hash_hex: &str) -> VaultSyncBlob {
         VaultSyncBlob {
             v: 1,
+            owner_id: 42,
             folder_ids: folder_ids.to_vec(),
             public_ids: public_ids.to_vec(),
             salt_hex: if hash_hex.is_empty() { String::new() } else { "aabb".into() },
