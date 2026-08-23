@@ -26,6 +26,7 @@
     "allow-cmd-delete-staged-file",
     "allow-cmd-discard-staged-upload",
     "allow-cmd-upload-from-url",
+    "allow-cmd-probe-upload-route",
     "allow-cmd-connect",
     "allow-cmd-log",
     "allow-cmd-ensure-ffmpeg",

@@ -37,6 +37,7 @@ fn main() {
                 "cmd_clean_cache",
                 "cmd_get_thumbnail",
                 "cmd_get_stream_info",
+                "cmd_probe_upload_route",
                 "cmd_cancel_transfer",
                 "cmd_auth_qr_login",
                 "cmd_auth_qr_poll",
