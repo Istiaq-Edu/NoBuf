@@ -1,10 +1,12 @@
 use tauri::State;
 use tauri::Manager;
+use tauri::Emitter;
 use grammers_client::Client;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
+use grammers_session::Session;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -94,6 +96,10 @@ pub async fn ensure_client_initialized(
     }
     
     let session = Arc::new(session);
+    // Stash a handle to the session so the password-verification step can move
+    // the client's home DC to where the SRP challenge was issued (see
+    // cmd_auth_check_password). The client shares this same Arc.
+    *state.sqlite_session.lock().await = Some(Arc::clone(&session));
     let pool = SenderPool::new(session, api_id);
     let client = Client::new(&pool);
     
@@ -231,6 +237,7 @@ pub async fn cmd_logout(
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
         state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        *state.password_dc.lock().await = None;
         crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
     state.cancelled_transfers.write().await.clear();
 
@@ -352,24 +359,68 @@ pub async fn cmd_auth_check_password(
     password: String,
     state: State<'_, TelegramState>,
 ) -> Result<AuthResult, String> {
+    log::info!("Verifying cloud password...");
     let client = {
         let guard = state.client.lock().await;
         guard.as_ref().ok_or("Client not initialized")?.clone()
     };
-    
-    let mut pw_guard = state.password_token.lock().await;
-    let pw_token = pw_guard.take().ok_or("No password session found")?;
+
+    // Non-destructive read: the SRP token survives failed attempts. The old
+    // take() consumed it on the first try, making attempt #2 fail with
+    // "No password session found" regardless of correctness.
+    let pw_token = {
+        let guard = state.password_token.lock().await;
+        guard.as_ref().cloned().ok_or("No password session found")?
+    };
+
+    // Cross-DC verification: when the QR token was accepted via
+    // loginTokenMigrateTo, the SRP challenge was issued by THAT DC and
+    // auth.CheckPassword must be presented there — presenting it on the home
+    // DC fails like a wrong password. Move the client's home DC first (the
+    // invoke path re-reads home_dc_id per call, and grammers applies the same
+    // migration on RPC 303 for its own auth calls). After success the account
+    // genuinely lives on that DC, so the new home stays correct.
+    let pw_dc = *state.password_dc.lock().await;
+    if let Some(dc) = pw_dc {
+        if let Some(session) = state.sqlite_session.lock().await.as_ref() {
+            log::info!("Cloud password check on DC {} (challenge DC)", dc);
+            session.set_home_dc_id(dc);
+        }
+    }
 
     match client.check_password(pw_token, password.as_str()).await {
         Ok(_user) => {
-             log::info!("2FA Success.");
-             Ok(AuthResult {
+            log::info!("2FA Success.");
+            *state.password_dc.lock().await = None;
+            Ok(AuthResult {
                 success: true,
                 next_step: Some("dashboard".to_string()),
                 error: None,
             })
         }
-        Err(e) => Err(format!("2FA Failed: {}", e))
+        Err(e) => {
+            // Log the REAL reason (was previously invisible) and refresh the
+            // SRP challenge for the next attempt — reference clients re-fetch
+            // between tries. The stored token is kept, so the user can simply
+            // try again.
+            log::warn!("2FA verification failed: {}", e);
+            let get_password = tl::functions::account::GetPassword {};
+            let refreshed = match pw_dc {
+                Some(d) => client.invoke_in_dc(d, &get_password).await,
+                None => client.invoke(&get_password).await,
+            };
+            if let Ok(p) = refreshed {
+                let password_info: tl::types::account::Password = p.into();
+                *state.password_token.lock().await =
+                    Some(grammers_client::types::PasswordToken::new(password_info));
+            }
+            let msg = e.to_string();
+            if msg.contains("PASSWORD_HASH_INVALID") {
+                Err("Incorrect password. Please try again.".to_string())
+            } else {
+                Err(format!("2FA Failed: {}", msg))
+            }
+        }
     }
 }
 
@@ -404,6 +455,7 @@ pub async fn cmd_auth_qr_login(
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
         state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        *state.password_dc.lock().await = None;
 
         // Clear any previous QR token
         *state.qr_token.lock().await = None;
@@ -421,6 +473,7 @@ pub async fn cmd_auth_qr_login(
             log::info!("QR login URL generated, expires at {}", t.expires);
             // Store the token so cmd_auth_qr_poll can call importLoginToken with it
             *state.qr_token.lock().await = Some(t.token.clone());
+            spawn_qr_scan_watcher(app_handle.clone(), std::sync::Arc::new(state.inner().clone()));
             Ok(qr_login_url(&t.token))
         }
         tl::enums::auth::LoginToken::Success(_s) => {
@@ -444,6 +497,7 @@ pub async fn cmd_auth_qr_login(
                 Ok(tl::enums::auth::LoginToken::Token(t)) => {
                     log::info!("QR login URL generated after DC migration, expires at {}", t.expires);
                     *state.qr_token.lock().await = Some(t.token.clone());
+                    spawn_qr_scan_watcher(app_handle.clone(), std::sync::Arc::new(state.inner().clone()));
                     Ok(qr_login_url(&t.token))
                 }
                 Ok(tl::enums::auth::LoginToken::Success(_s)) => {
@@ -789,6 +843,79 @@ pub async fn cmd_auth_qr_current(
     Ok(guard.as_ref().map(|t| qr_login_url(t)))
 }
 
+/// QR Login -- Step 4: background scan watcher.
+///
+/// The poll loop only probes exportLoginToken every ~15s (flood protection),
+/// so a scan can sit undetected for up to ~20s while the UI says "Waiting for
+/// scan...". This task probes every 5s purely to DETECT acceptance early and
+/// emit "qr-scan-detected" to the frontend; it never rotates tokens or
+/// mutates auth state. qr_scan_watching guarantees a single instance per
+/// login attempt; the loop exits once authorized, expired, or superseded.
+fn spawn_qr_scan_watcher(app_handle: tauri::AppHandle, state: std::sync::Arc<TelegramState>) {
+    if state.qr_scan_watching.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // a watcher is already running
+    }
+    tauri::async_runtime::spawn(async move {
+        log::info!("QR scan watcher started");
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if !state.qr_scan_watching.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(180) {
+                log::info!("QR scan watcher timed out");
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            // Stop when the poll loop finalized (or the user refreshed)
+            if state.qr_finalized.load(std::sync::atomic::Ordering::SeqCst) {
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+
+            let client_opt = state.client.lock().await.clone();
+            let Some(client) = client_opt else {
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            };
+
+            match client.invoke(&tl::functions::auth::ExportLoginToken {
+                api_id: state.stored_api_id.load(std::sync::atomic::Ordering::SeqCst),
+                api_hash: state.stored_api_hash.lock().await.clone().unwrap_or_default(),
+                except_ids: vec![],
+            }).await {
+                Ok(tl::enums::auth::LoginToken::Success(_)) => {
+                    log::info!("QR scan watcher: acceptance detected — emitting event");
+                    let _ = app_handle.emit("qr-scan-detected", true);
+                    // Let the next poll tick perform finalization through the
+                    // normal, already-tested path.
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Ok(tl::enums::auth::LoginToken::MigrateTo(_)) => {
+                    // Acceptance that requires DC migration — equally final.
+                    log::info!("QR scan watcher: acceptance detected (migrate) — emitting event");
+                    let _ = app_handle.emit("qr-scan-detected", true);
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Ok(tl::enums::auth::LoginToken::Token(_)) => {}
+                Err(ref e)
+                    if e.to_string().contains("AUTH_TOKEN_EXPIRED") || e.to_string().contains("FLOOD_WAIT") =>
+                {
+                    // Token dead or throttled — stop watching quietly; the poll
+                    // loop reports expiry/flood through its own channels.
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Err(_) => {} // transient network noise — keep watching
+            }
+        }
+        log::info!("QR scan watcher stopped");
+    });
+}
+
 /// Handle 2FA password requirement after QR scan
 async fn handle_2fa(
     client: &Client,
@@ -817,6 +944,7 @@ async fn handle_2fa(
         }
     };
     *state.password_token.lock().await = Some(grammers_client::types::PasswordToken::new(password));
+    *state.password_dc.lock().await = dc_id;
     Ok(AuthResult {
         success: false,
         next_step: Some("password".to_string()),
@@ -1249,6 +1377,41 @@ mod qr_login_url_tests {
         assert!(
             lobody.contains("state.qr_2fa_pending.store(false,"),
             "cmd_logout no longer resets the 2FA latch"
+        );
+    }
+
+    /// Pins the cloud-password verification contract (2026-08-22 fixes):
+    /// (1) the SRP token must be read NON-destructively so a wrong password
+    /// doesn't brick attempt #2 ("No password session found"), and (2) when a
+    /// challenge DC is recorded, the client home DC must move there before
+    /// auth.CheckPassword — presenting DC5 SRP proof on another DC fails like
+    /// a wrong password. Also pins the failure-path SRP refresh.
+    #[test]
+    fn password_check_is_retryable_and_cross_dc() {
+        let src = include_str!("auth.rs");
+        let start = src
+            .find("pub async fn cmd_auth_check_password")
+            .expect("cmd_auth_check_password missing");
+        let end = src[start..].find("fn qr_login_url").map(|off| start + off).expect("fn boundary missing");
+        let body = &src[start..end];
+
+        assert!(
+            !body.contains(".take().ok_or(\"No password session found\")"),
+            "password token is consumed on first attempt — retries break"
+        );
+        assert!(
+            body.contains("guard.as_ref().cloned()"),
+            "SRP token no longer read non-destructively"
+        );
+        assert!(
+            body.contains("session.set_home_dc_id(dc);"),
+            "home DC not moved to the SRP challenge DC before CheckPassword"
+        );
+        // Failure path must refresh the stored SRP material for the next try
+        let err_idx = body.find("2FA verification failed").expect("failure log missing");
+        assert!(
+            body[err_idx..].contains("GetPassword"),
+            "failed attempt no longer refreshes the SRP challenge"
         );
     }
 

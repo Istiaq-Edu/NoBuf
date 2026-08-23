@@ -325,6 +325,11 @@ pub async fn cmd_staging_free_space() -> Result<u64, String> {
 /// JSON.stringify, which turns a raw Uint8Array into a ~30-40 MB number array
 /// per 8 MB chunk; base64 keeps it at ~10.7 MB of plain text.
 /// Returns the temp file's absolute path on the final chunk, else "".
+/// Stage bytes of a dropped browser File into a temp file, chunk by chunk.
+/// upload_id: collision-safe id from the frontend (the QueueItem id).
+/// file_name: original name (sanitized here); chunk_index 0 truncates, others append.
+/// Returns the temp file's absolute path on the final chunk, else "".
+/// NOTE: `std::io::Write` is already imported at the top of this file (write_all in scope).
 #[tauri::command]
 pub async fn cmd_stage_dropped_file(
     upload_id: String,
@@ -450,7 +455,7 @@ pub async fn cmd_discard_staged_upload(upload_id: String, file_name: String) -> 
 /// Staged dropped files pass their ORIGINAL name here (the temp path carries a
 /// random `<id>-` prefix that must never leak into Telegram). Falls back to the
 /// path basename for picker/zip uploads. Pure - unit-tested below.
-fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
+pub fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
     if let Some(n) = display_name.as_deref().map(str::trim) {
         if !n.is_empty() {
             // Path::new("..") / "." / "/" yield file_name()==None, which would pass
