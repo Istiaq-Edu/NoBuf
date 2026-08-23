@@ -30,10 +30,16 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, ge
         const submit = async () => {
             if (!/^\d{4,12}$/.test(passcode)) { setError('4-12 digits'); return; }
             setBusy(true);
-            const ok = await vault.verify(passcode);
+            const ok = vault.hasPasscode ? await vault.verify(passcode) : await createPasscode(passcode);
             setBusy(false);
-            if (!ok) setError('Wrong passcode');
+            if (!ok) setError(vault.hasPasscode ? 'Wrong passcode' : 'Could not set passcode');
             else { setPasscode(''); setError(null); }
+        };
+
+        // D16 entry path: no passcode exists yet — the lock screen IS the
+        // creation screen (set_passcode allows first-time set while locked).
+        const createPasscode = async (passcode: string): Promise<boolean> => {
+            return vault.setPasscode(passcode);
         };
 
         const resetVault = async () => {
@@ -55,17 +61,17 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, ge
                     <div className="w-12 h-12 mx-auto rounded-full bg-nobuf-primary/10 flex items-center justify-center">
                         <Lock className="w-6 h-6 text-nobuf-primary" />
                     </div>
-                    <h2 className="text-nobuf-text font-medium">Vault is locked</h2>
+                    <h2 className="text-nobuf-text font-medium">{vault.hasPasscode ? 'Vault is locked' : 'Create Vault passcode'}</h2>
                     <p className="text-xs text-nobuf-subtext">
-                        {vault.totalCount > 0
-                            ? `${vault.totalCount} hidden ${vault.totalCount === 1 ? 'item' : 'items'}`
-                            : 'Nothing hidden yet'}
+                        {vault.hasPasscode
+                            ? (vault.totalCount > 0 ? `${vault.totalCount} hidden ${vault.totalCount === 1 ? 'item' : 'items'}` : 'Nothing hidden yet')
+                            : 'Choose a 4-12 digit passcode to protect hidden channels'}
                     </p>
                     <input
                         autoFocus
                         type="password"
                         inputMode="numeric"
-                        placeholder="Passcode"
+                        placeholder={vault.hasPasscode ? 'Passcode' : 'New passcode (4-12 digits)'}
                         className="w-full bg-nobuf-bg rounded-lg px-3 py-2 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 border border-nobuf-border text-center tracking-widest"
                         value={passcode}
                         onChange={e => { setPasscode(e.target.value.replace(/\D/g, '').slice(0, 12)); setError(null); }}
@@ -78,14 +84,16 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, ge
                         className="w-full flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium bg-nobuf-primary text-nobuf-county-green rounded-lg hover:brightness-110 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                         <Unlock className="w-3.5 h-3.5" />
-                        Unlock
+                        {vault.hasPasscode ? 'Unlock' : 'Create & Unlock'}
                     </button>
-                    <button
-                        onClick={resetVault}
-                        className="text-[11px] text-nobuf-subtext hover:text-red-400 transition-colors underline underline-offset-2"
-                    >
-                        Forgot passcode? Reset Vault
-                    </button>
+                    {vault.hasPasscode && (
+                        <button
+                            onClick={resetVault}
+                            className="text-[11px] text-nobuf-subtext hover:text-red-400 transition-colors underline underline-offset-2"
+                        >
+                            Forgot passcode? Reset Vault
+                        </button>
+                    )}
                 </div>
             </div>
         );
