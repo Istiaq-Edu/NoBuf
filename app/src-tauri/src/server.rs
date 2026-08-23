@@ -7766,15 +7766,10 @@ pub async fn start_streaming_server(
     tg_state: Arc<TelegramState>,
     token: String,
     cache_mgr: Option<StreamCacheManager>,
-    upload_app_handle: Option<tauri::AppHandle>,
-    upload_bw: Option<StdArc<BandwidthManager>>,
 ) -> std::io::Result<actix_web::dev::Server> {
     let token_data = web::Data::new(StreamTokenData { token });
     let tg_data = web::Data::new(tg_state);
     let cache_data = web::Data::new(cache_mgr);
-    // Drop-upload route data (None => route not registered).
-    let upload_app_handle_data = upload_app_handle.map(web::Data::new);
-    let upload_bw_data = upload_bw.map(web::Data::new);
 
     // Create fMP4 caches OUTSIDE the HttpServer::new closure so they are
     // shared across all Actix worker threads (web::Data wraps in Arc,
@@ -7817,21 +7812,13 @@ pub async fn start_streaming_server(
             .app_data(tg_data.clone())
             .app_data(cache_data.clone())
             .configure(|cfg: &mut web::ServiceConfig| {
-                // Drop-upload route: only when lib.rs supplied the AppHandle+BW.
-                if let (Some(h), Some(bw)) = (&upload_app_handle_data, &upload_bw_data) {
-                    cfg.app_data(h.clone())
-                        .app_data(bw.clone())
-                        .service(crate::commands::upload_drop::upload_drop);
-                    log::info!("Drop-upload route /upload-drop REGISTERED (handle+bw supplied)");
-                } else {
-                    // Diagnose WHICH side was None — this exact gap produced a
-                    // silent 404 that cost a full debugging session.
-                    log::warn!(
-                        "Drop-upload route /upload-drop SKIPPED: app_handle={}, bandwidth={}",
-                        upload_app_handle_data.is_some(),
-                        upload_bw_data.is_some()
-                    );
-                }
+                // Drop-upload route registers UNCONDITIONALLY — its dependencies
+                // (AppHandle/BandwidthManager) live in the upload_drop OnceLock,
+                // set by lib.rs before this server starts. The previous
+                // conditional registration silently skipped in one live session
+                // (healthy server + 404), which is exactly what globals prevent.
+                cfg.service(crate::commands::upload_drop::upload_drop);
+                log::info!("Drop-upload route /upload-drop REGISTERED");
             })
             .service(stream_media)
             .service(stream_media_head)
@@ -7891,7 +7878,7 @@ pub async fn start_server(
     cache_mgr: Option<StreamCacheManager>,
     _api_port: u16,
 ) -> std::io::Result<actix_web::dev::Server> {
-    start_streaming_server(port, tg_state, token, cache_mgr, None, None).await
+    start_streaming_server(port, tg_state, token, cache_mgr).await
 }
 
 #[cfg(test)]
