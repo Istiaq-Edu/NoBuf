@@ -7824,12 +7824,13 @@ pub async fn start_streaming_server(
                             .unwrap_or(0)
                     ))
                 }));
-                // Drop-upload route registers UNCONDITIONALLY — its dependencies
-                // (AppHandle/BandwidthManager) live in the upload_drop OnceLock,
-                // set by lib.rs before this server starts. The previous
-                // conditional registration silently skipped in one live session
-                // (healthy server + 404), which is exactly what globals prevent.
-                cfg.service(crate::commands::upload_drop::upload_drop);
+                // Drop-upload route: plain route registration — mechanism-identical
+                // to the /__whoami route above, which works in the environment
+                // where the #[post] macro-generated Resource silently 404'd.
+                cfg.route(
+                    "/upload-drop",
+                    web::post().to(crate::commands::upload_drop::upload_drop_handler),
+                );
                 log::info!("Drop-upload route /upload-drop REGISTERED");
             })
             .service(stream_media)
