@@ -168,12 +168,7 @@ const pendingDrops: string[] = [];
 
 function enqueueStart(id: string) {
     if (activeDrops < MAX_PARALLEL_DROPS) {
-        activeDrops++;
-        void startOne(id).finally(() => {
-            activeDrops--;
-            const next = pendingDrops.shift();
-            if (next) enqueueStart(next);
-        });
+        dequeueStart(id);
     } else {
         pendingDrops.push(id);
     }
@@ -250,7 +245,28 @@ async function startOne(id: string) {
 
 /** User-facing cancel: aborts the XHR (server sees disconnect, stops uploading). */
 export function cancelDropStream(id: string) {
-    activeXhrs.get(id)?.abort();
+    const xhr = activeXhrs.get(id);
+    if (xhr) {
+        xhr.abort();
+        return;
+    }
+    // Not started yet (waiting in the concurrency-gate FIFO): mark it so
+    // dequeueStart skips it — otherwise the "cancelled" row resurrects when
+    // its turn comes. Same defect class as the Cancel-All leak.
+    cancelledBeforeStart.add(id);
+}
+
+/** Ids cancelled while queued in the concurrency gate — never start these. */
+const cancelledBeforeStart = new Set<string>();
+
+function dequeueStart(id: string) {
+    if (cancelledBeforeStart.delete(id)) return; // user cancelled while queued: stay dead
+    activeDrops++;
+    void startOne(id).finally(() => {
+        activeDrops--;
+        const next = pendingDrops.shift();
+        if (next) dequeueStart(next);
+    });
 }
 
 /**
