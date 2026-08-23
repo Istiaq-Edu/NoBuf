@@ -338,7 +338,7 @@ pub async fn cmd_vault_pull_sync(app: AppHandle) -> Result<serde_json::Value, St
         Err(e) => return Err(e),
     };
     let store = vault::load_store(&app);
-    let resp = vault::state_response_public(&store);
+    let resp = vault::state_response_public(&app, &store);
     Ok(serde_json::json!({ "merged": seeded, "state": resp }))
 }
 
