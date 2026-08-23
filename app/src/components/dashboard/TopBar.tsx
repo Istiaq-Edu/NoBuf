@@ -1,7 +1,10 @@
-import { LayoutGrid, Settings, ArrowLeftRight, Menu, Globe, Info } from 'lucide-react';
+import { LayoutGrid, Settings, ArrowLeftRight, Menu, Globe, Info, ArrowLeft } from 'lucide-react';
 
 interface TopBarProps {
     currentFolderName: string;
+    /** Back navigation (view history). Absent → no back button renders. */
+    onBack?: () => void;
+    canGoBack?: boolean;
     selectedIds: number[];
     onShowMoveModal: () => void;
     onBulkDownload: () => void;
@@ -25,7 +28,7 @@ interface TopBarProps {
 }
 
 export function TopBar({
-    currentFolderName, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
+    currentFolderName, onBack, canGoBack, selectedIds, onShowMoveModal, onBulkDownload, onBulkDelete,
     onSelectAll, viewMode, setViewMode, searchTerm, onSearchChange, onSettingsClick, onAboutClick, onRemoteUpload,
     onToggleTransfers, showTransferPanel,
     uploadActiveCount = 0, uploadFinishedCount = 0,
@@ -45,6 +48,15 @@ export function TopBar({
                     </button>
                 )}
                 <div className="hidden sm:flex items-center text-sm breadcrumbs text-nobuf-subtext select-none">
+                    {onBack && canGoBack && (
+                        <button
+                            onClick={onBack}
+                            className="p-1 -ml-1 mr-1.5 rounded-md text-nobuf-subtext hover:text-nobuf-text hover:bg-nobuf-hover transition-colors"
+                            title="Back"
+                        >
+                            <ArrowLeft className="w-4 h-4" />
+                        </button>
+                    )}
                     <span className="hover:text-nobuf-text cursor-pointer transition-colors">Start</span>
                     <span className="mx-2">/</span>
                     <span className="text-nobuf-text font-medium">{currentFolderName}</span>
