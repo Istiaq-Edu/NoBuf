@@ -112,10 +112,13 @@ export async function streamDroppedFiles(
         const info = await getStreamInfo();
         const headStatus = (url: string) =>
             fetch(url, { method: 'HEAD' }).then(r => r.status).catch(() => null);
-        // Normalize to 127.0.0.1: the server binds IPv4-only; 'localhost' can
-        // resolve to ::1 first under some resolver/proxy configurations.
+        // Normalize EVERYTHING to 127.0.0.1: the server binds IPv4-only, so any
+        // request that resolves to ::1 talks to a different stack. Mixing
+        // localhost/127.0.0.1 between probes is how two "different servers"
+        // appear on one port.
         const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
         const liveness = await headStatus(`${rootUrl}/`);
+        console.info(`[drop] probe: HEAD / -> ${liveness ?? 'no-answer'}`);
         // Cross-check the Rust-side bind flag EVEN when liveness resolved: a
         // zombie previous instance can hold the port while THIS session's bind
         // failed — probing the zombie would end in 401s or a misleading
@@ -129,7 +132,9 @@ export async function streamDroppedFiles(
         if (liveness === null) {
             throw new Error('webview blocked local requests');
         }
-        if ((await headStatus(`${info.base_url}/upload-drop`)) === 404) {
+        const routeStatus = await headStatus(`${rootUrl}/upload-drop`);
+        console.info(`[drop] probe: HEAD /upload-drop -> ${routeStatus ?? 'no-answer'}`);
+        if (routeStatus === 404) {
             throw new Error('direct-upload route missing — restart/update NoBuf');
         }
     } catch (e) {
