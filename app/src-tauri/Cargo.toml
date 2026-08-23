@@ -33,6 +33,7 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2"
 chrono = "0.4"
 base64 = "0.21"
+fs4 = "0.9"
 log = "0.4"
 env_logger = "0.11"
 tauri-plugin-updater = "2.9.0"
@@ -56,6 +57,7 @@ sqlite = { version = "0.37", features = ["bundled"] }
 rar = "0.4"
 sevenz-rust2 = "0.7"
 url = "2"
+tauri-plugin-single-instance = "2.4.3"
 
 [profile.release]
 opt-level = 3

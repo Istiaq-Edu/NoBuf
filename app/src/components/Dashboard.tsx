@@ -12,6 +12,7 @@ import { Sidebar } from './dashboard/Sidebar';
 import { TopBar } from './dashboard/TopBar';
 import { FileExplorer } from './dashboard/FileExplorer';
 import { TransferPanel } from './dashboard/TransferPanel';
+import { cancelStaging } from '../hooks/useDroppedFileUpload';
 import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
@@ -133,12 +134,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
     const [externalDragActive, setExternalDragActive] = useState(false);
     const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
+    // Re-fetch the Premium-aware limit whenever the Telegram connection (re)establishes,
+    // so a mid-session account change isn't stuck with the stale mount-time value.
     useEffect(() => {
+        if (!isConnected) return;
         invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
-    }, []);
+    }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
-    const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; stage: ((f: File[], l: number, hasFolder: boolean) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, stage: null });
+    // Staging-in-progress rows (dropped files being copied to %TEMP% before they
+    // enter the upload queue). Keyed by name; cleared when its batch finishes.
+    const [stagingItems, setStagingItems] = useState<{ name: string; pct: number }[]>([]);
+    // Names the user cancelled: their in-flight chunk's progress callback must not
+    // resurrect the row after removal (that forced a second cancel click).
+    const cancelledStagingRef = useRef<Set<string>>(new Set());
+    const dropCtxRef = useRef<{ canUploadHere: boolean; limit: number; connected: boolean; stage: ((f: File[], l: number, hasFolder: boolean, onStagingProgress?: (fileName: string, pct: number) => void) => Promise<void>) | null }>({ canUploadHere: true, limit: 2_000_000_000, connected: false, stage: null });
+    // Last dragover/drop timestamp for external drags. WebView2 fires NO event when a
+    // drag is cancelled mid-window (Esc key): dragleave carries in-window coordinates
+    // and dragend only fires on the (external) source. The watchdog below uses this to
+    // dismiss the overlay when drags silently die.
+    const lastExternalDragActivityRef = useRef(0);
 
 
     const { data: nbFiles = [], isLoading: nbFilesLoading, error } = useQuery({
@@ -519,7 +534,24 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     // Keep dropCtxRef current so the document-level listeners (registered once) never
     // read stale state.
-    dropCtxRef.current = { canUploadHere, limit: uploadLimitBytes, stage: stageAndQueue };
+    dropCtxRef.current = {
+        canUploadHere,
+        limit: uploadLimitBytes,
+        stage: stageAndQueue,
+        connected: isConnected,
+    };
+    // Staging progress rows: upsert on each chunk, remove when the batch settles
+    // (item either enters the queue or was rejected/failed).
+    const updateStagingProgress = useCallback((fileName: string, pct: number) => {
+        // A cancelled name stays suppressed until a FRESH staging starts for it
+        // (pct=0 clears the guard), so late callbacks from its final in-flight
+        // chunk can't bring the row back.
+        if (cancelledStagingRef.current.has(fileName)) return;
+        setStagingItems(prev => {
+            const others = prev.filter(i => i.name !== fileName);
+            return pct < 100 ? [...others, { name: fileName, pct }] : others;
+        });
+    }, []);
 
     // Register native document-level drag/drop listeners in the CAPTURE phase. WebView2
     // delivers external OS file drops here — React's synthetic onDrop on a div does not
@@ -534,6 +566,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const onDragOver = (e: DragEvent) => {
             if (!isExternal(e.dataTransfer)) return;
             e.preventDefault();  // required so 'drop' fires
+            lastExternalDragActivityRef.current = Date.now();
             if (e.dataTransfer) e.dataTransfer.dropEffect = dropCtxRef.current.canUploadHere ? 'copy' : 'none';
             setExternalDragActive(true);
         };
@@ -543,9 +576,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             }
         };
         const onDrop = async (e: DragEvent) => {
-            if (!isExternal(e.dataTransfer)) return;  // internal drops handled by their own targets
+            if (!isExternal(e.dataTransfer)) {
+                // Non-file, non-internal drop (e.g. a link or text dragged in from a
+                // browser) would navigate the whole webview on drop. Block that —
+                // unless the target is an editable field, where text drops are legit.
+                const t = e.dataTransfer ? Array.from(e.dataTransfer.types) : [];
+                const isInternal = t.includes(FILE_ID_MIME) || t.includes(FOLDER_REORDER_MIME);
+                if (!isInternal) {
+                    const el = e.target as HTMLElement | null;
+                    if (!el?.closest?.('input, textarea, [contenteditable="true"]')) e.preventDefault();
+                }
+                return;  // internal drops handled by their own targets
+            }
             e.preventDefault();
             e.stopPropagation();
+            lastExternalDragActivityRef.current = Date.now();
             setExternalDragActive(false);
             const { canUploadHere: canUp, limit, stage } = dropCtxRef.current;
             // Detect folders SYNCHRONOUSLY before any await — the items list is neutralized
@@ -560,12 +605,16 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 }
             }
             const files = e.dataTransfer ? Array.from(e.dataTransfer.files) : [];
+            if (!dropCtxRef.current.connected) {
+                toast.error("Not connected to Telegram — connect first, then drop files.");
+                return;
+            }
             if (!canUp) {
                 toast.error("Can't upload to a public channel — switch to Saved Messages or a folder.");
                 return;
             }
             if (files.length === 0 || !stage) return;
-            await stage(files, limit, hasFolder);
+            await stage(files, limit, hasFolder, updateStagingProgress);
         };
         document.addEventListener('dragover', onDragOver, true);
         document.addEventListener('dragleave', onDragLeave, true);
@@ -576,6 +625,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             document.removeEventListener('drop', onDrop, true);
         };
     }, []);
+
+    // External-drag overlay dismissal for the cases the DOM never reports:
+    // - Esc key cancels an OS drag mid-window; WebView2 fires no dragleave/dragend
+    // - a drag can silently die (source window destroyed) without any event
+    // While the overlay is up we watch for both: Escape directly, and a dragover
+    // heartbeat that stops arriving. Gated on externalDragActive → zero cost otherwise.
+    useEffect(() => {
+        if (!externalDragActive) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setExternalDragActive(false);
+        };
+        const watchdog = window.setInterval(() => {
+            if (Date.now() - lastExternalDragActivityRef.current > 700) setExternalDragActive(false);
+        }, 150);
+        window.addEventListener('keydown', onKey);
+        return () => {
+            window.clearInterval(watchdog);
+            window.removeEventListener('keydown', onKey);
+        };
+    }, [externalDragActive]);
 
     const previewNeighbors = previewNeighborFiles();
 
@@ -756,6 +825,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 isOpen={showTransferPanel}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
+                stagingItems={stagingItems}
+                onCancelStaging={name => {
+                    cancelledStagingRef.current.add(name);
+                    cancelStaging(name);
+                    // Remove the preparing row immediately; the staging loop's
+                    // StagingCancelledError path discards partial bytes + toasts.
+                    setStagingItems(prev => prev.filter(i => i.name !== name));
+                }}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
                 onCancelAllUploads={cancelUploads}
                 onCancelUploadItem={cancelUploadItem}

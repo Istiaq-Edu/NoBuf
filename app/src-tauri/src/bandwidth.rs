@@ -22,9 +22,10 @@ impl Default for BandwidthStats {
     }
 }
 
+#[derive(Clone)]
 pub struct BandwidthManager {
     pub file_path: PathBuf,
-    pub stats: Mutex<BandwidthStats>,
+    pub stats: std::sync::Arc<Mutex<BandwidthStats>>,
     pub limit: u64, // Daily limit in bytes
 }
 
@@ -47,7 +48,7 @@ impl BandwidthManager {
 
         Self {
             file_path,
-            stats: Mutex::new(stats),
+            stats: std::sync::Arc::new(std::sync::Mutex::new(stats)),
             limit: 250 * 1024 * 1024 * 1024, // 250 GB
         }
     }
