@@ -909,6 +909,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <VaultView
                         onOpenFolder={(id) => setActiveView({ type: 'folder', folderId: id })}
                         onOpenPublicChannel={(id) => setActiveView({ type: 'public', channelId: id })}
+                        getFolderName={(id) => folders.find(f => f.id === id)?.name || `Unknown folder (${id})`}
+                        getChannelName={(id) => publicChannels.find(c => c.channel_id === id)?.name || `Unknown channel (${id})`}
                     />
                 ) : (
                 <FileExplorer
