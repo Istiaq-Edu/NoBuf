@@ -231,7 +231,10 @@ pub(crate) async fn upload_drop_handler(
     }
 
     match upload_res {
-        Ok(_) if was_cancelled => HttpResponse::BadRequest().body("Transfer cancelled"),
+        Ok(_) if was_cancelled => {
+            log::info!("[drop] tid={tid} cancelled after {consumed_bytes}B (user abort)");
+            HttpResponse::BadRequest().body("Transfer cancelled")
+        }
         Ok(uploaded) => {
             // Integrity gate: grammers tolerates a short FINAL part, so a body
             // that drained before `size` bytes would silently upload a truncated
@@ -248,7 +251,10 @@ pub(crate) async fn upload_drop_handler(
                 Ok(peer) => {
                     let msg = grammers_client::types::InputMessage::new().text("").document(uploaded);
                     match client.send_message(&peer, msg).await {
-                        Ok(m) => HttpResponse::Ok().json(serde_json::json!({ "message_id": m.id() })),
+                        Ok(m) => {
+                            log::info!("[drop] tid={tid} SUCCESS: '{name}' ({size}B) sent, message_id={}", m.id());
+                            HttpResponse::Ok().json(serde_json::json!({ "message_id": m.id() }))
+                        }
                         Err(e) => HttpResponse::InternalServerError()
                             .body(format!("Upload succeeded but send failed: {e}")),
                     }
