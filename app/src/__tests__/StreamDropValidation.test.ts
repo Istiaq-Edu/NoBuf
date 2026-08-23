@@ -15,7 +15,7 @@ function makeFile(size: number, name = 'a.bin'): File {
     return f;
 }
 
-const BASE = { token: 'tok-123', base_url: 'http://localhost:14201', video_base_url: '' };
+const BASE = { token: 'tok-123', base_url: 'http://localhost:14201', video_base_url: '', alive: true };
 
 beforeEach(() => {
     invokeMock.mockReset();
@@ -63,17 +63,37 @@ describe('streamDroppedFiles validation', () => {
     });
 });
 
-describe('probe fallback', () => {
-    it('throws (caller falls back to staging) when the server is unreachable', async () => {
+describe('probe fallback (two-step classifier)', () => {
+    it('throws /not reachable/ when server down AND this session did not bind', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('refused'); }));
+        invokeMock.mockImplementation(async (cmd: string) =>
+            cmd === 'cmd_get_stream_info' ? { ...BASE, alive: false } : undefined);
         await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
             .rejects.toThrow(/not reachable/);
+    });
+
+    it('throws /held by another NoBuf instance/ when port answers but we did not bind (zombie)', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
+        invokeMock.mockImplementation(async (cmd: string) =>
+            cmd === 'cmd_get_stream_info'
+                ? { ...BASE, alive: false }  // liveness resolved, but not OUR bind
+                : undefined);
+        await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
+            .rejects.toThrow(/held by another NoBuf instance/);
     });
 
     it('throws on 404 — old binary without the route must fall back too', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
         await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
             .rejects.toThrow(/route missing/);
+    });
+
+    it('throws /webview blocked/ when fetch rejects but the Rust side IS bound', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('refused'); }));
+        invokeMock.mockImplementation(async (cmd: string) =>
+            cmd === 'cmd_get_stream_info' ? { ...BASE, alive: true } : undefined);
+        await expect(streamDroppedFiles([makeFile(10)], 1, 2_000_000_000, false))
+            .rejects.toThrow(/webview blocked/);
     });
 
     it('accepts 405 — route exists, wrong method is the expected probe answer', async () => {
