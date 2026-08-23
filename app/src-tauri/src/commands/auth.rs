@@ -1,10 +1,12 @@
 use tauri::State;
 use tauri::Manager;
+use tauri::Emitter;
 use grammers_client::Client;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
+use grammers_session::Session;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -94,6 +96,10 @@ pub async fn ensure_client_initialized(
     }
     
     let session = Arc::new(session);
+    // Stash a handle to the session so the password-verification step can move
+    // the client's home DC to where the SRP challenge was issued (see
+    // cmd_auth_check_password). The client shares this same Arc.
+    *state.sqlite_session.lock().await = Some(Arc::clone(&session));
     let pool = SenderPool::new(session, api_id);
     let client = Client::new(&pool);
     
@@ -230,6 +236,8 @@ pub async fn cmd_logout(
         state.stored_api_id.store(0, std::sync::atomic::Ordering::SeqCst);
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
+        state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        *state.password_dc.lock().await = None;
         crate::commands::utils::clear_peer_cache(&state.peer_cache).await;
     state.cancelled_transfers.write().await.clear();
 
@@ -351,25 +359,76 @@ pub async fn cmd_auth_check_password(
     password: String,
     state: State<'_, TelegramState>,
 ) -> Result<AuthResult, String> {
+    log::info!("Verifying cloud password...");
     let client = {
         let guard = state.client.lock().await;
         guard.as_ref().ok_or("Client not initialized")?.clone()
     };
-    
-    let mut pw_guard = state.password_token.lock().await;
-    let pw_token = pw_guard.take().ok_or("No password session found")?;
+
+    // Non-destructive read: the SRP token survives failed attempts. The old
+    // take() consumed it on the first try, making attempt #2 fail with
+    // "No password session found" regardless of correctness.
+    let pw_token = {
+        let guard = state.password_token.lock().await;
+        guard.as_ref().cloned().ok_or("No password session found")?
+    };
+
+    // Cross-DC verification: when the QR token was accepted via
+    // loginTokenMigrateTo, the SRP challenge was issued by THAT DC and
+    // auth.CheckPassword must be presented there — presenting it on the home
+    // DC fails like a wrong password. Move the client's home DC first (the
+    // invoke path re-reads home_dc_id per call, and grammers applies the same
+    // migration on RPC 303 for its own auth calls). After success the account
+    // genuinely lives on that DC, so the new home stays correct.
+    let pw_dc = *state.password_dc.lock().await;
+    if let Some(dc) = pw_dc {
+        if let Some(session) = state.sqlite_session.lock().await.as_ref() {
+            log::info!("Cloud password check on DC {} (challenge DC)", dc);
+            session.set_home_dc_id(dc);
+        }
+    }
 
     match client.check_password(pw_token, password.as_str()).await {
         Ok(_user) => {
-             log::info!("2FA Success.");
-             Ok(AuthResult {
+            log::info!("2FA Success.");
+            *state.password_dc.lock().await = None;
+            Ok(AuthResult {
                 success: true,
                 next_step: Some("dashboard".to_string()),
                 error: None,
             })
         }
-        Err(e) => Err(format!("2FA Failed: {}", e))
+        Err(e) => {
+            // Log the REAL reason (was previously invisible) and refresh the
+            // SRP challenge for the next attempt — reference clients re-fetch
+            // between tries. The stored token is kept, so the user can simply
+            // try again.
+            log::warn!("2FA verification failed: {}", e);
+            let get_password = tl::functions::account::GetPassword {};
+            let refreshed = match pw_dc {
+                Some(d) => client.invoke_in_dc(d, &get_password).await,
+                None => client.invoke(&get_password).await,
+            };
+            if let Ok(p) = refreshed {
+                let password_info: tl::types::account::Password = p.into();
+                *state.password_token.lock().await =
+                    Some(grammers_client::types::PasswordToken::new(password_info));
+            }
+            let msg = e.to_string();
+            if msg.contains("PASSWORD_HASH_INVALID") {
+                Err("Incorrect password. Please try again.".to_string())
+            } else {
+                Err(format!("2FA Failed: {}", msg))
+            }
+        }
     }
+}
+
+/// Encodes a raw login token into the `tg://login?token=...` URL that the
+/// frontend renders as a QR code. Shared by cmd_auth_qr_login and
+/// cmd_auth_qr_current so both produce identical URLs for the same token.
+fn qr_login_url(token: &[u8]) -> String {
+    format!("tg://login?token={}", URL_SAFE_NO_PAD.encode(token))
 }
 
 /// QR Login -- Step 1: Export a login token and return the `tg://login?token=...` URL.
@@ -395,6 +454,8 @@ pub async fn cmd_auth_qr_login(
         state.stored_api_id.store(api_id, std::sync::atomic::Ordering::SeqCst);
         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
     state.last_qr_export_ts.store(0, std::sync::atomic::Ordering::SeqCst);
+        state.qr_2fa_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        *state.password_dc.lock().await = None;
 
         // Clear any previous QR token
         *state.qr_token.lock().await = None;
@@ -409,12 +470,11 @@ pub async fn cmd_auth_qr_login(
 
     match result {
         tl::enums::auth::LoginToken::Token(t) => {
-            let encoded = URL_SAFE_NO_PAD.encode(&t.token);
-            let url = format!("tg://login?token={}", encoded);
             log::info!("QR login URL generated, expires at {}", t.expires);
             // Store the token so cmd_auth_qr_poll can call importLoginToken with it
             *state.qr_token.lock().await = Some(t.token.clone());
-            Ok(url)
+            spawn_qr_scan_watcher(app_handle.clone(), std::sync::Arc::new(state.inner().clone()));
+            Ok(qr_login_url(&t.token))
         }
         tl::enums::auth::LoginToken::Success(_s) => {
             // Already authorized (e.g. from a previous session)
@@ -435,11 +495,10 @@ pub async fn cmd_auth_qr_login(
 
             match import_result {
                 Ok(tl::enums::auth::LoginToken::Token(t)) => {
-                    let encoded = URL_SAFE_NO_PAD.encode(&t.token);
-                    let url = format!("tg://login?token={}", encoded);
                     log::info!("QR login URL generated after DC migration, expires at {}", t.expires);
                     *state.qr_token.lock().await = Some(t.token.clone());
-                    Ok(url)
+                    spawn_qr_scan_watcher(app_handle.clone(), std::sync::Arc::new(state.inner().clone()));
+                    Ok(qr_login_url(&t.token))
                 }
                 Ok(tl::enums::auth::LoginToken::Success(_s)) => {
                     log::info!("QR login: already authorized after DC migration");
@@ -479,6 +538,18 @@ pub async fn cmd_auth_qr_poll(
         let guard = state.client.lock().await;
         guard.as_ref().ok_or("Client not initialized")?.clone()
     };
+
+    // Once the phone accepted the QR and Telegram asked for the cloud password,
+    // stick to the password step: re-probing exportLoginToken re-consumes the
+    // accepted token until AUTH_TOKEN_EXPIRED and can clobber the pending 2FA
+    // handshake (observed live 2026-08-21).
+    if state.qr_2fa_pending.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(AuthResult {
+            success: false,
+            next_step: Some("password".to_string()),
+            error: None,
+        });
+    }
 
     // Check if already finalized
     if state.qr_finalized.load(std::sync::atomic::Ordering::SeqCst) {
@@ -550,7 +621,7 @@ pub async fn cmd_auth_qr_poll(
                             Err(e) => {
                                 let err_msg = e.to_string();
                                 if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                    return handle_2fa(&client, &state).await;
+                                    return handle_2fa(&client, &state, Some(m.dc_id)).await;
                                 }
                                 log::warn!("QR finalization migration error: {}", e);
                                 state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -577,7 +648,7 @@ pub async fn cmd_auth_qr_poll(
                     Err(e) => {
                         let err_msg = e.to_string();
                         if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                            return handle_2fa(&client, &state).await;
+                            return handle_2fa(&client, &state, None).await;
                         }
                         // Reset and keep waiting
                         state.qr_finalized.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -639,7 +710,13 @@ pub async fn cmd_auth_qr_poll(
                         }
                         Ok(tl::enums::auth::LoginToken::Token(t)) => {
                             // Same or refreshed token — still waiting
-                            *state.qr_token.lock().await = Some(t.token.clone());
+                            let rotated = {
+                                let mut qr_guard = state.qr_token.lock().await;
+                                let same = qr_guard.as_ref() == Some(&t.token);
+                                *qr_guard = Some(t.token.clone());
+                                !same
+                            };
+                            log::info!("QR poll probe: token received (rotated={}, len={})", rotated, t.token.len());
                             return Ok(AuthResult {
                                 success: false,
                                 next_step: Some("waiting".to_string()),
@@ -672,7 +749,7 @@ pub async fn cmd_auth_qr_poll(
                                 Err(e) => {
                                     let err_msg = e.to_string();
                                     if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                        return handle_2fa(&client, &state).await;
+                                        return handle_2fa(&client, &state, Some(m.dc_id)).await;
                                     }
                                     log::warn!("QR poll migration error: {}", e);
                                     return Ok(AuthResult {
@@ -686,7 +763,7 @@ pub async fn cmd_auth_qr_poll(
                         Err(e) => {
                             let err_msg = e.to_string();
                             if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                                return handle_2fa(&client, &state).await;
+                                return handle_2fa(&client, &state, None).await;
                             }
                             if err_msg.contains("TOKEN_EXPIRED") || err_msg.contains("token expired") {
                                 log::warn!("QR login: token expired");
@@ -717,7 +794,7 @@ pub async fn cmd_auth_qr_poll(
         Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("SESSION_PASSWORD_NEEDED") {
-                return handle_2fa(&client, &state).await;
+                return handle_2fa(&client, &state, None).await;
             }
             if err_msg.contains("TOKEN_EXPIRED") || err_msg.contains("token expired") {
                 log::warn!("QR login: token expired");
@@ -746,17 +823,128 @@ pub async fn cmd_auth_qr_poll(
     }
 }
 
+/// QR Login -- Step 3: Return the CURRENT login-token URL without exporting
+/// a new one.
+///
+/// The QR token Telegram issues expires in ~30 seconds, and per the qr-login
+/// spec (core.telegram.org/api/qr-login) the polling client must re-call
+/// exportLoginToken and re-render a fresh QR automatically. cmd_auth_qr_poll
+/// performs exactly that rotation while waiting (it stores every refreshed
+/// token in state.qr_token), but the rotated URL never reached the UI: the
+/// displayed QR kept showing the ORIGINAL token, so scanning it long after
+/// expiry could never complete and the panel stayed on "Waiting for scan..."
+/// forever. This command exposes the current token so the poll handler can
+/// keep the rendered QR in sync with what the backend is actually probing.
+#[tauri::command]
+pub async fn cmd_auth_qr_current(
+    state: State<'_, TelegramState>,
+) -> Result<Option<String>, String> {
+    let guard = state.qr_token.lock().await;
+    Ok(guard.as_ref().map(|t| qr_login_url(t)))
+}
+
+/// QR Login -- Step 4: background scan watcher.
+///
+/// The poll loop only probes exportLoginToken every ~15s (flood protection),
+/// so a scan can sit undetected for up to ~20s while the UI says "Waiting for
+/// scan...". This task probes every 5s purely to DETECT acceptance early and
+/// emit "qr-scan-detected" to the frontend; it never rotates tokens or
+/// mutates auth state. qr_scan_watching guarantees a single instance per
+/// login attempt; the loop exits once authorized, expired, or superseded.
+fn spawn_qr_scan_watcher(app_handle: tauri::AppHandle, state: std::sync::Arc<TelegramState>) {
+    if state.qr_scan_watching.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // a watcher is already running
+    }
+    tauri::async_runtime::spawn(async move {
+        log::info!("QR scan watcher started");
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if !state.qr_scan_watching.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(180) {
+                log::info!("QR scan watcher timed out");
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            // Stop when the poll loop finalized (or the user refreshed)
+            if state.qr_finalized.load(std::sync::atomic::Ordering::SeqCst) {
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+
+            let client_opt = state.client.lock().await.clone();
+            let Some(client) = client_opt else {
+                state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                break;
+            };
+
+            match client.invoke(&tl::functions::auth::ExportLoginToken {
+                api_id: state.stored_api_id.load(std::sync::atomic::Ordering::SeqCst),
+                api_hash: state.stored_api_hash.lock().await.clone().unwrap_or_default(),
+                except_ids: vec![],
+            }).await {
+                Ok(tl::enums::auth::LoginToken::Success(_)) => {
+                    log::info!("QR scan watcher: acceptance detected — emitting event");
+                    let _ = app_handle.emit("qr-scan-detected", true);
+                    // Let the next poll tick perform finalization through the
+                    // normal, already-tested path.
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Ok(tl::enums::auth::LoginToken::MigrateTo(_)) => {
+                    // Acceptance that requires DC migration — equally final.
+                    log::info!("QR scan watcher: acceptance detected (migrate) — emitting event");
+                    let _ = app_handle.emit("qr-scan-detected", true);
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Ok(tl::enums::auth::LoginToken::Token(_)) => {}
+                Err(ref e)
+                    if e.to_string().contains("AUTH_TOKEN_EXPIRED") || e.to_string().contains("FLOOD_WAIT") =>
+                {
+                    // Token dead or throttled — stop watching quietly; the poll
+                    // loop reports expiry/flood through its own channels.
+                    state.qr_scan_watching.store(false, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Err(_) => {} // transient network noise — keep watching
+            }
+        }
+        log::info!("QR scan watcher stopped");
+    });
+}
+
 /// Handle 2FA password requirement after QR scan
 async fn handle_2fa(
     client: &Client,
     state: &State<'_, TelegramState>,
+    dc_id: Option<i32>,
 ) -> Result<AuthResult, String> {
-    log::info!("QR login: 2FA password required");
-    let password: tl::types::account::Password = match client.invoke(&tl::functions::account::GetPassword {}).await {
-        Ok(p) => p.into(),
-        Err(pe) => return Err(format!("2FA required but failed to get password info: {}", pe)),
+    // Fetch password info from the SAME DC that reported SESSION_PASSWORD_NEEDED.
+    // When the QR token was accepted via loginTokenMigrateTo (DC mismatch), the
+    // requirement is raised on THAT DC; asking the home DC can fail and leave the
+    // UI stuck on "Waiting for scan..." forever (observed 2026-08-21).
+    log::info!("QR login: 2FA password required (dc={:?})", dc_id);
+    state.qr_2fa_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+    let get_password = tl::functions::account::GetPassword {};
+    let result = match dc_id {
+        Some(dc) => client.invoke_in_dc(dc, &get_password).await,
+        None => client.invoke(&get_password).await,
+    };
+    let password: tl::types::account::Password = match result {
+        Ok(p) => {
+            log::info!("QR login: account.GetPassword ok");
+            p.into()
+        }
+        Err(pe) => {
+            log::error!("QR login: account.GetPassword failed: {}", pe);
+            return Err(format!("2FA required but failed to get password info: {}", pe));
+        }
     };
     *state.password_token.lock().await = Some(grammers_client::types::PasswordToken::new(password));
+    *state.password_dc.lock().await = dc_id;
     Ok(AuthResult {
         success: false,
         next_step: Some("password".to_string()),
@@ -1107,4 +1295,141 @@ pub async fn cmd_open_telegram_auth(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod qr_login_url_tests {
+    use super::*;
+
+    /// Regression guard for the "stuck on Waiting for scan" bug: the QR token
+    /// Telegram issues expires in ~30s and cmd_auth_qr_poll rotates it, but the
+    /// rotated URL never reached the UI. cmd_auth_qr_current + the frontend poll
+    /// handler now re-render the live token; this pins the shared encoder so the
+    /// exported and re-served URLs stay byte-identical for the same token.
+    #[test]
+    fn encodes_token_as_url_safe_base64_without_padding() {
+        // 0xFB 0xFF -> "+/" in standard base64, "-" "_" in URL_SAFE
+        let url = qr_login_url(&[0x04, 0x08, 0x10, 0x20, 0xFB, 0xFF]);
+        assert!(url.starts_with("tg://login?token="));
+        let encoded = &url["tg://login?token=".len()..];
+        assert_eq!(encoded, "BAgQIPv_"); // URL-safe alphabet, no '=' padding
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
+    }
+
+    #[test]
+    fn matches_the_url_cmd_auth_qr_login_builds() {
+        // The exact expression cmd_auth_qr_login used before the helper was
+        // extracted; both paths must stay identical.
+        let token: Vec<u8> = (0u8..=64).collect();
+        let expected = format!("tg://login?token={}", URL_SAFE_NO_PAD.encode(&token));
+        assert_eq!(qr_login_url(&token), expected);
+    }
+
+    #[test]
+    fn empty_token_yields_empty_credentials_segment() {
+        assert_eq!(qr_login_url(&[]), "tg://login?token=");
+    }
+
+    /// Structural guard binding cmd_auth_qr_poll to cmd_auth_qr_current: the
+    /// waiting-probe MUST persist every refreshed token into state.qr_token,
+    /// because cmd_auth_qr_current serves THAT stored token back to the UI.
+    /// Deleting the store line compiles clean and passes every behavioral test
+    /// (the poll loop needs a live Telegram client) while re-serving a stale
+    /// QR forever — the original "stuck on Waiting for scan" bug. This
+    /// source-level assert is the only gate that sees that seam.
+    /// Pins the 2FA latch: once handle_2fa runs, every subsequent poll must
+    /// return the password step WITHOUT re-probing exportLoginToken (which
+    /// re-consumes the accepted token until AUTH_TOKEN_EXPIRED — observed
+    /// live 2026-08-21). All four sides must exist together.
+    #[test]
+    fn qr_2fa_latch_is_set_checked_and_reset() {
+        let src = include_str!("auth.rs");
+
+        // handle_2fa SETS the latch before any fallible work
+        let h = src.find("async fn handle_2fa").expect("handle_2fa missing");
+        let hbody = &src[h..h + 900];
+        assert!(
+            hbody.contains("state.qr_2fa_pending.store(true,"),
+            "handle_2fa no longer sets the 2FA latch"
+        );
+
+        // cmd_auth_qr_poll CHECKS the latch before probing (early return)
+        let p = src.find("pub async fn cmd_auth_qr_poll").expect("cmd_auth_qr_poll missing");
+        let pbody = &src[p..p + 1200];
+        assert!(
+            pbody.contains("if state.qr_2fa_pending.load(") && pbody.contains("\"password\".to_string()"),
+            "cmd_auth_qr_poll no longer short-circuits to the password step while 2FA is pending"
+        );
+
+        // Fresh QR login RESETS the latch
+        let l = src.find("pub async fn cmd_auth_qr_login").expect("cmd_auth_qr_login missing");
+        let lbody = &src[l..l + 1200];
+        assert!(
+            lbody.contains("state.qr_2fa_pending.store(false,"),
+            "cmd_auth_qr_login no longer resets the 2FA latch"
+        );
+
+        // Logout RESETS the latch
+        let lo = src.find("pub async fn cmd_logout").expect("cmd_logout missing");
+        let lobody = &src[lo..lo + 2600];
+        assert!(
+            lobody.contains("state.qr_2fa_pending.store(false,"),
+            "cmd_logout no longer resets the 2FA latch"
+        );
+    }
+
+    /// Pins the cloud-password verification contract (2026-08-22 fixes):
+    /// (1) the SRP token must be read NON-destructively so a wrong password
+    /// doesn't brick attempt #2 ("No password session found"), and (2) when a
+    /// challenge DC is recorded, the client home DC must move there before
+    /// auth.CheckPassword — presenting DC5 SRP proof on another DC fails like
+    /// a wrong password. Also pins the failure-path SRP refresh.
+    #[test]
+    fn password_check_is_retryable_and_cross_dc() {
+        let src = include_str!("auth.rs");
+        let start = src
+            .find("pub async fn cmd_auth_check_password")
+            .expect("cmd_auth_check_password missing");
+        let end = src[start..].find("fn qr_login_url").map(|off| start + off).expect("fn boundary missing");
+        let body = &src[start..end];
+
+        assert!(
+            !body.contains(".take().ok_or(\"No password session found\")"),
+            "password token is consumed on first attempt — retries break"
+        );
+        assert!(
+            body.contains("guard.as_ref().cloned()"),
+            "SRP token no longer read non-destructively"
+        );
+        assert!(
+            body.contains("session.set_home_dc_id(dc);"),
+            "home DC not moved to the SRP challenge DC before CheckPassword"
+        );
+        // Failure path must refresh the stored SRP material for the next try
+        let err_idx = body.find("2FA verification failed").expect("failure log missing");
+        assert!(
+            body[err_idx..].contains("GetPassword"),
+            "failed attempt no longer refreshes the SRP challenge"
+        );
+    }
+
+    #[test]
+    fn poll_probe_stores_rotated_token_for_cmd_auth_qr_current() {
+        let src = include_str!("auth.rs");
+        let start = src
+            .find("// Same or refreshed token")
+            .expect("probe Token arm comment missing from auth.rs");
+        let body = &src[start..start + 400];
+        // The probe persists each refreshed token through the qr_guard lock so
+        // cmd_auth_qr_current can serve the live URL back to the UI. Deleting
+        // the store compiles clean and passes every behavioral test while
+        // re-serving a stale QR forever — this source-level assert is the
+        // only gate that sees that seam.
+        assert!(
+            body.contains("*qr_guard = Some(t.token.clone());"),
+            "poll probe no longer stores the rotated QR token; the UI would re-render a stale code forever"
+        );
+    }
 }

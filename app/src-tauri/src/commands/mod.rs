@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicBool};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, Semaphore};
 use grammers_client::{Client};
 use grammers_client::types::{LoginToken, PasswordToken, Peer};
@@ -62,17 +62,34 @@ pub struct TelegramState {
     /// following Telegram's official recommendation for parallel downloads.
     /// Initialized on first successful connection; None until then.
     pub download_pool: Arc<Mutex<Option<DownloadPool>>>,
-    /// Whether the player's IOController is actively downloading (NOT paused by lazyLoad).
-    /// Set by cmd_report_playback_position from the frontend every ~10s.
-    /// When true, the proactive prebuffer throttles itself (100ms delay between
-    /// segments) to yield Telegram bandwidth and avoid FLOOD_PREMIUM_WAIT.
-    /// When false (IOController paused), proactive prebuffer runs at full speed.
-    pub player_actively_downloading: Arc<AtomicBool>,
+    /// Millisecond wall-clock timestamp (UNIX epoch) of the last report that said
+    /// the player's IOController is actively downloading; 0 = idle. Set by
+    /// cmd_report_playback_position. The proactive prebuffer yields while the
+    /// timestamp is FRESH (see player_download_flag_fresh) and resumes once it
+    /// decays. Round-9 I-2b: this was an AtomicBool that only that command ever
+    /// wrote — the MKV seek path stores `true` and has no periodic reporter to
+    /// clear it, so one MKV seek starved PROACTIVE for the rest of the session
+    /// (9-t: 0 bytes downloaded in 70s, offset frozen). Freshness-decay makes a
+    /// stale `true` self-heal while keeping MP4 (2s cadence) and TS (10s cadence)
+    /// semantics identical.
+    pub player_actively_downloading: Arc<AtomicU64>,
+    /// Round-14 F1: epoch-ms of the last `seek-bisect` probe seen by /stream;
+    /// 0 = none. PROACTIVE declines to spawn while this is FRESH (see
+    /// `seek_critical_read_fresh`), so a cue-less MKV bisect does not race an
+    /// 893 MB background prefetch for the 300ms-spaced Telegram limiter
+    /// (observed 14-t:184-187 — the prefetch spawned in the same second as the
+    /// first probe). A TIMESTAMP, never a bool: round-9 I-2b proved a sticky
+    /// flag here starves the prefetch permanently (0 bytes in 70s).
+    pub seek_critical_read_at: Arc<AtomicU64>,
     /// Latest proactive prebuffer target for each message. Updated by
     /// cmd_report_playback_position so the prebuffer task can slide its window
     /// as the playhead advances instead of being a one-shot fixed-window download.
     /// (current_byte, duration_s, playback_rate, file_size)
     pub proactive_targets: Arc<tokio::sync::RwLock<HashMap<i32, (u64, f64, f64, u64)>>>,
+    pub proactive_generations: Arc<tokio::sync::RwLock<HashMap<i32, u64>>>,
+    /// Latest container-resolved byte from a timestamp-seeked remux input.
+    /// Value: (seek time, frontend estimate, actual source byte).
+    pub remux_seek_anchors: Arc<tokio::sync::RwLock<HashMap<i32, (f64, u64, u64)>>>,
     /// Exact media duration (seconds) as resolved by the /remux ffprobe pass,
     /// keyed by message_id. The /fmp4/metadata endpoint (which the seek bar reads)
     /// otherwise derives duration from Telegram DocumentAttributeVideo → PTS-tail →
@@ -81,6 +98,16 @@ pub struct TelegramState {
     /// has probed the file we cache the true value here so /fmp4/metadata can prefer
     /// it. Only populated for files that went through the remux probe.
     pub probed_durations: Arc<tokio::sync::RwLock<HashMap<i32, f64>>>,
+    /// Memoized /audio_tracks probe result (serialized JSON) keyed by
+    /// message_id. A file's stream layout is immutable, and each probe costs an
+    /// ffprobe pass over the (possibly uncached, rate-limited) stream — memoize
+    /// so menu re-opens and player re-inits don't re-probe.
+    pub audio_tracks_json: Arc<tokio::sync::RwLock<HashMap<i32, String>>>,
+    /// Memoized /subtitles list probe result (serialized JSON) keyed by
+    /// message_id. Same rationale as `audio_tracks_json`: stream layout is
+    /// immutable per file and each probe costs an ffprobe pass over the
+    /// (possibly uncached, rate-limited) stream.
+    pub sub_tracks_json: Arc<tokio::sync::RwLock<HashMap<(i64, i32), String>>>,
     /// PTS-tail-derived duration (seconds) keyed by message_id. Computing this
     /// requires downloading the last 512KB of the file from Telegram to read the
     /// final video PTS. That value never changes for a given file, but the
@@ -117,7 +144,14 @@ pub struct TelegramState {
     /// Stored API id for QR poll finalization
     pub stored_api_id: Arc<std::sync::atomic::AtomicI32>,
     /// Whether we've already called exportLoginToken to finalize QR login
-        pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,
+        pub qr_finalized: Arc<std::sync::atomic::AtomicBool>,        pub qr_2fa_pending: Arc<std::sync::atomic::AtomicBool>,
+        /// SRP challenge DC for the pending QR 2FA handshake (None = home DC).
+        pub password_dc: Arc<tokio::sync::Mutex<Option<i32>>>,
+        /// Shared handle to the SqliteSession so the password step can move the
+        /// client home DC to the challenge DC before invoking auth.CheckPassword.
+        pub sqlite_session: Arc<tokio::sync::Mutex<Option<std::sync::Arc<grammers_session::storages::SqliteSession>>>>,
+        /// Guards single-instance QR scan watcher per login attempt.
+        pub qr_scan_watching: Arc<std::sync::atomic::AtomicBool>,
         /// Timestamp (ms since epoch) of last exportLoginToken call in QR poll.
         /// Used to throttle calls to every ~15 seconds to avoid flood waits.
         pub last_qr_export_ts: Arc<std::sync::atomic::AtomicI64>,
@@ -145,6 +179,7 @@ pub mod sprite;
 pub mod archive;
 pub mod folder_groups;
 pub mod public_channels;
+pub mod opensubtitles;
 
 pub use auth::*;
 pub use fs::*;
@@ -157,3 +192,4 @@ pub use archive::*;
 pub use folder_groups::*;
 pub use public_channels::*;
 pub use sprite::*;
+pub use opensubtitles::*;

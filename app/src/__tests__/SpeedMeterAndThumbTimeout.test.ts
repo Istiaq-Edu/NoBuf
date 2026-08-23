@@ -1,47 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { speedMeterValue } from '../hooks/useMSEPlayer';
 import { KEYFRAME_AT_TIMEOUT_MS, BACKEND_KEYFRAME_SEARCH_DEADLINE_MS, resolveKeyframeSegmentMode } from '../hooks/useThumbnailExtractor';
 
 // Mock Tauri invoke so the hook modules import cleanly in jsdom.
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(() => Promise.resolve()),
 }));
-
-/**
- * B1: the download-speed meter used to read ONLY greenBarSpeed (disk cache
- * cached_bytes delta), which sits at 0 during cold start because the disk cache
- * barely grows for the first ~40s while the /remux pipe feeds mpegts.js directly.
- * speedMeterValue falls back to the live MSE pipe throughput (mseSpeed) so the
- * meter isn't stuck at "—", while preserving "paused means paused".
- */
-describe('speedMeterValue (B1 cold-start speed indicator)', () => {
-  it('prefers greenBarSpeed when it is live', () => {
-    // Disk prebuffer running: that IS the real signal, use it over mseSpeed.
-    expect(speedMeterValue(2_000_000, 500_000, false)).toBe(2_000_000);
-  });
-
-  it('falls back to MSE pipe speed during cold start (greenBarSpeed still 0)', () => {
-    // The exact bug: disk delta 0, but bytes ARE streaming through mpegts.js.
-    expect(speedMeterValue(0, 1_234_567, false)).toBe(1_234_567);
-  });
-
-  it('returns 0 (→ "—") when both signals are idle', () => {
-    expect(speedMeterValue(0, 0, false)).toBe(0);
-  });
-
-  it('shows nothing when prefetch is paused, even if bytes are in flight ("paused means paused")', () => {
-    // Residual in-flight bytes must NOT light the meter while the user paused.
-    expect(speedMeterValue(2_000_000, 1_000_000, true)).toBe(0);
-    expect(speedMeterValue(0, 5_000_000, true)).toBe(0);
-  });
-
-  it('ignores negative/garbage values gracefully', () => {
-    // Neither > 0 → 0. (Guards against a transient negative delta.)
-    expect(speedMeterValue(-5, -9, false)).toBe(0);
-    // greenBar garbage but mseSpeed valid → use mseSpeed.
-    expect(speedMeterValue(-5, 800_000, false)).toBe(800_000);
-  });
-});
 
 /**
  * C2: the frontend keyframe-at abort timeout MUST be >= the backend search

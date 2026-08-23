@@ -1,5 +1,7 @@
 pub mod models;
 pub mod ffmpeg_util;
+pub mod no_window;
+pub mod deps;
 
 pub mod commands;
 pub mod stream_cache;
@@ -259,16 +261,24 @@ pub fn run() {
                 chunk_size_kb: Arc::new(std::sync::atomic::AtomicU64::new(512)),
                 keep_alive_interval_sec: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 download_pool: Arc::new(tokio::sync::Mutex::new(None)),
-                player_actively_downloading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                player_actively_downloading: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                seek_critical_read_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 proactive_targets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                proactive_generations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                remux_seek_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 probed_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                audio_tracks_json: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                sub_tracks_json: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 tail_pts_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 telegram_durations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 media_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 qr_token: Arc::new(tokio::sync::Mutex::new(None)),
                 stored_api_hash: Arc::new(tokio::sync::Mutex::new(None)),
                 stored_api_id: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-                qr_finalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                qr_finalized: Arc::new(std::sync::atomic::AtomicBool::new(false)),                qr_2fa_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                password_dc: Arc::new(tokio::sync::Mutex::new(None)),
+                sqlite_session: Arc::new(tokio::sync::Mutex::new(None)),
+                qr_scan_watching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 proactive_keyframe_index: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
@@ -420,6 +430,8 @@ pub fn run() {
             commands::cmd_connect,
             commands::cmd_log,
             commands::cmd_ensure_ffmpeg,
+            commands::cmd_check_dependencies,
+            commands::cmd_reset_dependency_cache,
             commands::cmd_delete_file,
             commands::cmd_download_file,
             commands::cmd_move_files,
@@ -431,6 +443,9 @@ pub fn run() {
             commands::cmd_scan_folders,
             commands::cmd_search_global,
             commands::cmd_get_channel_username,
+            commands::cmd_opensubtitles_validate_key,
+            commands::cmd_opensubtitles_search,
+            commands::cmd_opensubtitles_download,
             commands::cmd_check_connection,
             commands::cmd_rename_folder,
             commands::cmd_start_auto_sync,
@@ -444,6 +459,7 @@ pub fn run() {
             commands::cmd_cancel_transfer,
             commands::cmd_auth_qr_login,
             commands::cmd_auth_qr_poll,
+            commands::cmd_auth_qr_current,
             commands::cmd_open_telegram_auth,
             commands::cmd_get_api_settings,
             commands::cmd_update_api_settings,

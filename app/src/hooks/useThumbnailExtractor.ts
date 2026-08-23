@@ -157,6 +157,119 @@ export function computeThumbnailSeekTarget(
   return Math.min(nudged, (first.start + first.end) / 2);
 }
 
+/** Fix B (round-2): MKV thumbnail capture strategy. 'index' = harvested-keyframe hit within
+ *  maxGap (timestamp is the FOUND ts[lo], never the hover time) → cheap indexed capture.
+ *  Miss/empty: cue-indexed MKV keeps today's 'native' getKeyPacket; cue-less MKV → 'skip'
+ *  (native getKeyPacket on a 0-cue file is an unbounded linear cluster walk — observed 103s+,
+ *  184MB for ONE hover, busy-locking every later hover; the TS path already skips when it has
+ *  no index). Pure + exported for unit testing, like the helpers above. */
+export type MkvCaptureDecision =
+  | { strategy: 'index'; timestamp: number }
+  | { strategy: 'native' }
+  | { strategy: 'skip' };
+
+export function decideMkvCaptureStrategy(
+  timestamps: number[], time: number, maxGap: number, cueless: boolean,
+): MkvCaptureDecision {
+  if (!cueless && timestamps.length > 0) {
+    let lo = 0, hi = timestamps.length - 1;
+    while (lo < hi) {
+      const mid = lo + ((hi - lo + 1) >> 1);
+      if (timestamps[mid] <= time) lo = mid; else hi = mid - 1;
+    }
+    if (timestamps[lo] <= time && time - timestamps[lo] <= maxGap) {
+      return { strategy: 'index', timestamp: timestamps[lo] };
+    }
+  }
+  return cueless ? { strategy: 'skip' } : { strategy: 'native' };
+}
+
+export type ThumbnailBisectMemoEntry = {
+  state: 'inflight' | 'done' | 'failed';
+  at: number;
+  entry?: { elementStartPos: number; startTimestamp: number };
+  promise?: Promise<void>;
+  fallbackAttempted?: boolean;
+};
+
+export function startSingleThumbnailBisect(
+  memo: Map<number, ThumbnailBisectMemoEntry>,
+  bucket: number,
+  now: number,
+  operation: () => Promise<void>,
+  fallbackAttempted = false,
+): Promise<void> {
+  const current = memo.get(bucket);
+  if (current?.state === 'inflight' && current.promise) return current.promise;
+  const promise = Promise.resolve().then(operation);
+  memo.set(bucket, { state: 'inflight', at: now, promise, fallbackAttempted });
+  return promise;
+}
+
+export function shouldStartThumbnailFallback(entry: ThumbnailBisectMemoEntry | undefined): boolean {
+  return entry?.fallbackAttempted !== true;
+}
+
+export type ThumbnailBisectAction = 'capture' | 'wait' | 'cooldown' | 'start';
+
+export function decideThumbnailBisectAction(
+  entry: ThumbnailBisectMemoEntry | undefined,
+  hasNearEntry: boolean,
+  now: number,
+  cooldownMs = 60_000,
+): ThumbnailBisectAction {
+  if (entry?.state === 'failed' && now - entry.at < cooldownMs) return 'cooldown';
+  if (entry?.fallbackAttempted && entry.state === 'done') return 'cooldown';
+  if (hasNearEntry || entry?.state === 'done') return 'capture';
+  if (entry?.state === 'inflight') return 'wait';
+  return 'start';
+}
+
+/** Cue-point count from mediabunny's already-parsed MKV metadata (pure in-memory read — zero
+ *  I/O; getPrimaryVideoTrack already ran readMetadata). Reaches vendored internals by the same
+ *  convention as MediabunnyTransmuxer.extractMkvCueIndex; null = layout drift. */
+export function readMkvCuePointCount(videoTrack: unknown): number | null {
+  try {
+    const cues = (videoTrack as any)?._backing?.internalTrack?.cuePoints;
+    return Array.isArray(cues) ? cues.length : null;
+  } catch { return null; }
+}
+
+// ─── Round-3 Fix C: cue-less MKV far-hover bisection helpers ─────────────────
+// A cue-less MKV forces mediabunny's getKeyPacket into a LINEAR cluster walk
+// from its last known position (observed round-2: 184MB/103s for ONE hover).
+// The demuxer's own walk-start structure — InternalTrack.clusterPositionCache:
+// {elementStartPos, startTimestamp}[] (sorted, sparse-ok, binary-searched by
+// performClusterLookup) — is injectable: byte-bisect the file for the cluster
+// at-or-before the hover time, insert a synthetic entry, and the walk becomes
+// ≤1-2 clusters. Verified against vendored mediabunny 1.45.4
+// (reports/research/round3-verify-c-bisect.md).
+//
+// Round-6: the engine moved to lib/faststream/utils/MkvClusterBisect.ts so the
+// PLAYER seek path (MediabunnyTransmuxer.seekTo) can share it — a cue-less far
+// SEEK without a prior hover hit the same unbounded linear walk (6-t: 83.9MB
+// in 43s, ~7min projected; user killed the app). Re-exported here so existing
+// imports (tests, this hook) keep working.
+import {
+  readMkvTimestampFactor,
+  readMkvClusterSeekStart,
+  injectMkvClusterPosition,
+  findClusterCacheEntryNear,
+  bisectMkvClusterSearch,
+} from '../lib/faststream/utils/MkvClusterBisect';
+export {
+  scanForMkvClusterInWindow,
+  scanForLastMkvClusterAtOrBefore,
+  pickBisectProbe,
+  stepBisectBracket,
+  bisectShouldStop,
+  type BisectBracket,
+  readMkvTimestampFactor,
+  readMkvClusterSeekStart,
+  injectMkvClusterPosition,
+  findClusterCacheEntryNear,
+} from '../lib/faststream/utils/MkvClusterBisect';
+
 // ─── Mini MSE Pipeline ───────────────────────────────────────────────────
 // Creates a hidden video + MediaSource + SourceBuffer + second mp4box instance
 // for thumbnail extraction at any position (buffered or unbuffered).
@@ -667,6 +780,21 @@ class TransmuxerThumbnailPipeline {
   active = true;
   busy = false;
   _initInProgress = false;
+  // Fix B (round-2): cue-less MKV ⇒ native getKeyPacket is an unbounded linear walk — captures
+  // become index-or-skip. Detected in init() from mediabunny's already-parsed metadata.
+  isCuelessMkv = false;
+  private warnedCuelessSkip = false;
+  // Round-3 Fix C: per-bucket bisection memo — processLoop retries every ~250ms,
+  // so an inflight/failed bucket must not re-dispatch (round-3 logs: 36 hammered
+  // retries on one skipped bucket). 'done' buckets carry the injected entry so a
+  // capture throw can evict it (verify-c risk 4). Failed buckets retry after a
+  // cooldown. Adjacent buckets are served without re-bisecting via the R10
+  // clusterPositionCache consult (organic AND injected entries qualify).
+  private bisectMemo = new Map<number, ThumbnailBisectMemoEntry>();
+  /** Round-5 (green bar D3): sink for exact (byte, timeSeconds) pairs from
+   *  validated bisection clusters — wired to the player's recordByteTimeAnchor
+   *  so cached islands render at true VBR positions. Optional; no-op when unset. */
+  onByteTimeAnchor: ((byteOffset: number, timeSeconds: number) => void) | null = null;
 
   constructor(
     streamUrl: string,
@@ -768,6 +896,16 @@ class TransmuxerThumbnailPipeline {
         return false;
       }
 
+      // Fix B (round-2): cue-lessness from already-parsed metadata (zero I/O). null (vendored
+      // layout drift) ⇒ treated cue-less: extractMkvCueIndex degrades to [] the same way, so
+      // playback is ALSO cue-less on drift; a skipped thumbnail beats a 103s busy-locked walk.
+      // Cold branch on pinned mediabunny 1.45.4 (shape proven in prod by the transmuxer).
+      if (this.format === 'mkv') {
+        const cueCount = readMkvCuePointCount(this.videoTrack);
+        this.isCuelessMkv = (cueCount ?? 0) === 0;
+        if (this.isCuelessMkv) console.log('[TransmuxerThumbnailPipeline] MKV has no Cues — native-scan captures disabled (index-or-skip)');
+      }
+
       // Get video codec
       this.videoCodec = await this.videoTrack.getCodec();
 
@@ -835,42 +973,116 @@ class TransmuxerThumbnailPipeline {
       return false;
     }
 
+    // Fix B (round-2): pick the MKV strategy BEFORE locking busy — a cue-less 'skip' must never
+    // block later hovers (the 103s walk also busy-locked every subsequent capture). This region
+    // is await-free, so two hovers cannot interleave between decision and busy=true.
+    const mkvDecision = decideMkvCaptureStrategy(
+      this.keyframeTimestamps,
+      time,
+      THUMB_INDEX_MAX_GAP,
+      this.isCuelessMkv,
+    );
+    // Round-3 Fix C: 'skip' becomes bisect-inject-capture. A synthetic
+    // clusterPositionCache entry at-or-before the hover time bounds mediabunny's
+    // getKeyPacket walk to ≤1-2 clusters — real frames at far positions with
+    // ~11 bounded ranged reads instead of an unbounded linear scan.
+    let bisectedTicks: number | null = null;
+    if (mkvDecision.strategy === 'skip') {
+      const factor = readMkvTimestampFactor(this.videoTrack);
+      if (factor === null) {
+        // Shape drift / no factor — round-2 behavior (skip, warn once).
+        if (!this.warnedCuelessSkip) {
+          this.warnedCuelessSkip = true;
+          console.warn(`[TransmuxerThumbnailPipeline] Cue-less MKV: hover ${time.toFixed(1)}s outside harvested index and bisection unavailable — capture skipped`);
+        }
+        return false;
+      }
+      const targetTicks = Math.round(time * factor);
+      const windowTicks = Math.round(35 * factor); // ≥ max cluster span (32.767s overflow bound)
+      const bucketKey = bucket;
+      const memo = this.bisectMemo.get(bucketKey);
+      // R10: an existing cache entry (organic or injected) near the target
+      // already bounds the walk — capture directly, no bisection.
+      const nearEntry = findClusterCacheEntryNear(this.videoTrack, targetTicks, windowTicks);
+      const action = decideThumbnailBisectAction(memo, !!nearEntry, performance.now());
+      if (action === 'capture') {
+        bisectedTicks = targetTicks;
+      } else if (action === 'wait') {
+        return false; // busy NOT taken — near hovers stay serviceable
+      } else if (action === 'cooldown') {
+        return false; // cooldown — don't hammer a failing region
+      } else {
+        // Fire-and-forget: bisect in the background; processLoop's next retry
+        // for this bucket falls into 'done'/'failed'/nearEntry above.
+        // Round-9 Fix 6: keep the promise in the memo so processLoop can await
+        // the settle instead of blind-polling (_bisectAndInject never rejects —
+        // it writes done/failed internally before resolving).
+        const p = startSingleThumbnailBisect(
+          this.bisectMemo,
+          bucketKey,
+          performance.now(),
+          () => this._bisectAndInject(time, targetTicks, bucketKey),
+        );
+        void p;
+        return false;
+      }
+    }
+
     this.busy = true;
 
     try {
-      // 1. Find nearest keyframe — use cached keyframe index when available
-      //    for instant binary search (O(log n)) instead of slow getKeyPacket
-      //    for TS format (8-12s linear scan per call).
+      // 1. Find nearest keyframe — strategy decided above (fix B).
       let keyPacket: EncodedPacket | null;
-      let keyframeTimestampFromIndex: number | null = null;
 
-      if (this.keyframeTimestamps.length > 0) {
-        // Binary search for nearest keyframe ≤ time
-        const ts = this.keyframeTimestamps;
-        let lo = 0, hi = ts.length - 1;
-        while (lo < hi) {
-          const mid = lo + ((hi - lo + 1) >> 1);
-          if (ts[mid] <= time) {
-            lo = mid;
-          } else {
-            hi = mid - 1;
-          }
-        }
-        if (ts[lo] <= time && time - ts[lo] <= THUMB_INDEX_MAX_GAP) {
-          keyframeTimestampFromIndex = ts[lo];
-          // Use the known timestamp with verifyKeyPackets: false — our index
-          // already confirmed this is a keyframe during the metadataOnly scan.
-          keyPacket = await this.videoSink!.getKeyPacket(keyframeTimestampFromIndex, { verifyKeyPackets: false });
-        } else {
-          // The sparse playback-built index doesn't cover the hover time (it only
-          // holds keyframes seen during playback, e.g. 2 entries near the start).
-          // Binary-searching it for a far hover returns a keyframe hundreds of
-          // seconds away → wrong thumbnail frame. Fall back to native getKeyPacket,
-          // which uses mediabunny's full Cues to find the real keyframe at `time`.
+      if (mkvDecision.strategy === 'index') {
+        // Harvested-index hit — known keyframe timestamp, verifyKeyPackets:false (the index
+        // only ever holds confirmed keyframes). Cold-Input cost is bounded by this timestamp's
+        // cluster byte with a hard in-demuxer stop, warms after the first capture, and is
+        // typically disk-speed (on cue-less files playback already walked ≤ this byte).
+        keyPacket = await this.videoSink!.getKeyPacket(mkvDecision.timestamp, { verifyKeyPackets: false });
+      } else if (bisectedTicks !== null) {
+        // Round-3 Fix C: cue-less far hover with an injected/organic cache entry
+        // bounding the walk. On a throw, evict the injected entry (verify-c risk
+        // 4: a false-positive cluster byte makes readCluster assert) and mark the
+        // bucket failed so the memo cooldown applies.
+        try {
           keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
+        } catch (e) {
+          const memo = this.bisectMemo.get(bucket);
+          if (memo?.entry) {
+            const cache = (this.videoTrack as any)?._backing?.internalTrack?.clusterPositionCache;
+            if (Array.isArray(cache)) {
+              const i = cache.findIndex((c: any) => c.elementStartPos === memo.entry!.elementStartPos);
+              if (i >= 0) cache.splice(i, 1);
+            }
+          }
+          this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
+          console.warn('[TransmuxerThumbnailPipeline] Bisected capture threw — injected entry evicted:', e);
+          return false;
+        }
+        if (!keyPacket) {
+          // Keyframe may live in an EARLIER cluster than the bisected one
+          // (verify-c risk 3): back off one probe step once, then cooldown.
+          console.warn(`[TransmuxerThumbnailPipeline] Bisected getKeyPacket(${time.toFixed(1)}) found no keyframe — backing off`);
+          const factor = readMkvTimestampFactor(this.videoTrack);
+          const memo = this.bisectMemo.get(bucket);
+          if (factor !== null && time > 35 && shouldStartThumbnailFallback(memo)) {
+            void startSingleThumbnailBisect(
+              this.bisectMemo,
+              bucket,
+              performance.now(),
+              () => this._bisectAndInject(time - 35, Math.round((time - 35) * factor), bucket, true),
+              true,
+            );
+          } else {
+            this.bisectMemo.set(bucket, { state: 'failed', at: performance.now() });
+          }
+          return false;
         }
       } else {
-        // No keyframe index — fall back to standard getKeyPacket with verification
+        // 'native' — cue-indexed MKV: the sparse playback-built index misses this hover (or is
+        // empty pre-harvest); mediabunny's full Cues find the real keyframe at `time`. This
+        // tier is byte-identical to pre-fix behavior. Cue-less never reaches here ('skip').
         keyPacket = await this.videoSink!.getKeyPacket(time, { verifyKeyPackets: true });
       }
 
@@ -954,6 +1166,70 @@ class TransmuxerThumbnailPipeline {
     } finally {
       this.busy = false;
     }
+  }
+
+  /** Round-3 Fix C driver: byte-bisect for the cluster at-or-before
+   *  `targetSeconds` and inject it into the demuxer's clusterPositionCache.
+   *  ~11 probes on a 1.5GB file; each probe fetches a bounded window (1MB,
+   *  geometric grow to 8MB when a window holds no cluster ID). Plain fetch with
+   *  explicit source_id=thumbnail (R11: this.streamUrl carries none; the param
+   *  keeps the backend coordinator from cross-cancelling playback downloads).
+   *  Updates bisectMemo[bucketKey] to 'done' (with the injected entry) or
+   *  'failed'. Never throws. */
+  private async _bisectAndInject(
+    targetSeconds: number,
+    targetTicks: number,
+    bucketKey: number,
+    fallbackAttempted = false,
+  ): Promise<void> {
+    const started = performance.now();
+    try {
+      const startLo = readMkvClusterSeekStart(this.videoTrack) ?? 0;
+      const baseUrl = this.sourceConfig.url;
+      const sep = baseUrl.includes('?') ? '&' : '?';
+      // Round-6: search loop shared with MediabunnyTransmuxer.seekTo (player
+      // far-seek) — engine in lib/faststream/utils/MkvClusterBisect.ts.
+      const factor = readMkvTimestampFactor(this.videoTrack);
+      const result = await bisectMkvClusterSearch({
+        probeUrl: `${baseUrl}${sep}source_id=thumbnail`,
+        fileSize: this.sourceConfig.fileSize,
+        startLo,
+        targetTicks,
+        hiTicks: this.duration > 0 && factor !== null ? Math.round(this.duration * factor) : null,
+        shouldContinue: () => this.active,
+        // D3 (green bar): every VALIDATED cluster is an exact (byte, time) pair —
+        // feed them to the player's byte↔time table so cached islands render at
+        // their true positions instead of the file-average slope.
+        onClusterFound: (byte, ticks) => {
+          if (factor !== null) this.onByteTimeAnchor?.(byte, ticks / factor);
+        },
+      });
+
+      if (!result || !this.active) {
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
+        return;
+      }
+      const entry = result.entry;
+      if (!injectMkvClusterPosition(this.videoTrack, entry)) {
+        this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
+        return;
+      }
+      this.bisectMemo.set(bucketKey, { state: 'done', at: performance.now(), entry, fallbackAttempted });
+      console.log(`[TransmuxerThumbnailPipeline] Bisected cluster for ${targetSeconds.toFixed(1)}s: byte=${entry.elementStartPos}, ticks=${entry.startTimestamp} (${(result.bytesFetched / 1048576).toFixed(1)}MB in ${((performance.now() - started) / 1000).toFixed(1)}s)`);
+    } catch (e) {
+      this.bisectMemo.set(bucketKey, { state: 'failed', at: performance.now(), fallbackAttempted });
+      console.warn('[TransmuxerThumbnailPipeline] Bisection failed:', e);
+    }
+  }
+
+  /** Round-9 Fix 6 (I-6): the in-flight bisect promise for the bucket covering
+   *  `time`, or null when none is running. processLoop awaits this (bounded by
+   *  a race timeout) instead of re-polling captureAtTime every ~250ms while a
+   *  bisect runs — the settle wakes it for an immediate capture. */
+  getInflightBisect(time: number): Promise<void> | null {
+    const bucket = Math.floor(time / BUCKET_SIZE) * BUCKET_SIZE;
+    const memo = this.bisectMemo.get(bucket);
+    return memo?.state === 'inflight' ? memo.promise ?? null : null;
   }
 
   /** Fast TS thumbnail capture using OffsetCustomSource.
@@ -1620,6 +1896,13 @@ export function useThumbnailExtractor(
   const pipelineRef = useRef<ThumbnailPipeline | null>(null);
   const transmuxerPipelineRef = useRef<TransmuxerThumbnailPipeline | null>(null);
   const fmp4PipelineRef = useRef<Fmp4ThumbnailPipeline | null>(null);
+  // MP4-HEVC→/remux reroute: hover thumbnails via backend /thumb (server-side
+  // ffmpeg single-frame JPEG). No client pipeline — just a serialized fetch.
+  const remuxThumbBusyRef = useRef(false);
+  // Round-9 Fix 6 (I-6): last hover bucket whose captureAtTime attempt was
+  // logged — gates the transmuxer-branch logs to bucket transitions so retry
+  // polls of the same bucket don't spam the console (115 lines in 9-*).
+  const lastHoverLogBucketRef = useRef<number | null>(null);
   
 
   // ─── Helpers ──────────────────────────────────────────────────────────
@@ -1800,6 +2083,9 @@ export function useThumbnailExtractor(
       getters.getKeyframeTimestamps(), // Cached keyframe index for fast seek
       getters.getKnownDuration?.() ?? 0, // Probed duration — skips EOF-scanning computeDuration() for headerless MKV
     );
+    // Round-5 (green bar D3): bisection clusters are exact (byte,time) pairs —
+    // feed the player's byte↔time table so islands render at true positions.
+    pipeline.onByteTimeAnchor = getters.recordByteTimeAnchor ?? null;
 
     transmuxerPipelineRef.current = pipeline;
 
@@ -2169,7 +2455,53 @@ export function useThumbnailExtractor(
             continue;
           }
 
-          if (fmp4Pipeline && fmp4Pipeline.ready && !fmp4Pipeline.busy) {
+          // MP4-HEVC→/remux reroute: server-side /thumb JPEG fetch. Placed
+          // FIRST — when this config is set no client pipeline exists for the
+          // file (WebView2 can't decode HEVC), so it's the only capture path.
+          const remuxThumbCfg = getters?.getRemuxThumbConfig?.() ?? null;
+          if (remuxThumbCfg) {
+            if (remuxThumbBusyRef.current) {
+              await new Promise(r => setTimeout(r, 150));
+              continue;
+            }
+            remuxThumbBusyRef.current = true;
+            try {
+              const { baseUrl, folderId, messageId, token, duration } = remuxThumbCfg;
+              const url = `${baseUrl}/thumb/${folderId}/${messageId}?token=${encodeURIComponent(token)}&time=${bucket}` +
+                (duration > 0 ? `&duration=${duration}` : '');
+              const resp = await fetch(url);
+              if (resp.ok) {
+                const blob = await resp.blob();
+                const dataUrl = await new Promise<string>((resolve, reject) => {
+                  const fr = new FileReader();
+                  fr.onload = () => resolve(fr.result as string);
+                  fr.onerror = () => reject(fr.error);
+                  fr.readAsDataURL(blob);
+                });
+                // Stale guard: if the effect tore down mid-fetch (video
+                // switched / unmounted), drop the frame instead of writing a
+                // previous video's thumbnail into the fresh frame buffer.
+                // (Native path has the same `active` check before capture.)
+                if (active) {
+                  frameBufferRef.current.set(bucket, dataUrl);
+                  insertionOrderRef.current.push(bucket);
+                  evictIfNeeded();
+                  forceUpdateCachedTimes();
+                }
+              } else if (resp.status === 429) {
+                // Another hover's ffmpeg is running server-side — retry soon.
+                await new Promise(r => setTimeout(r, 400));
+              } else {
+                console.warn(`[ThumbnailExtractor] /thumb HTTP ${resp.status} for t=${bucket}`);
+                await new Promise(r => setTimeout(r, 1000));
+              }
+            } catch (e) {
+              console.warn('[ThumbnailExtractor] /thumb fetch failed:', e);
+              await new Promise(r => setTimeout(r, 1000));
+            } finally {
+              remuxThumbBusyRef.current = false;
+            }
+          } else if (fmp4Pipeline && fmp4Pipeline.ready && !fmp4Pipeline.busy) {
             // fMP4 backend pipeline (TS→fMP4): fetches segments from backend by timestamp
             console.log('[ThumbnailExtractor] Hover: calling fMP4 captureAtTime for time', desiredTime);
             const captured = await fmp4Pipeline.captureAtTime(
@@ -2195,16 +2527,33 @@ export function useThumbnailExtractor(
               await new Promise(r => setTimeout(r, 200));
             }
           } else if (transmuxerPipeline && transmuxerPipeline.ready && !transmuxerPipeline.busy) {
-            console.log('[ThumbnailExtractor] Hover: calling transmuxer captureAtTime for time', desiredTime);
+            // Round-9 Fix 6 (I-6): gate the per-attempt logs to bucket
+            // transitions — the blind 250ms retry loop logged 115 false polls
+            // in 9-* while ONE bisect ran. First attempt per bucket + every
+            // success stay visible; repeat polls of the same bucket go silent.
+            const logBucket = Math.floor(desiredTime / 10) * 10;
+            const logThis = lastHoverLogBucketRef.current !== logBucket;
+            if (logThis) console.log('[ThumbnailExtractor] Hover: calling transmuxer captureAtTime for time', desiredTime);
             const captured = await transmuxerPipeline.captureAtTime(
               desiredTime,
               frameBufferRef.current,
               insertionOrderRef.current,
               forceUpdateCachedTimes,
             );
-            console.log('[ThumbnailExtractor] Hover: transmuxer captureAtTime result', captured);
+            if (logThis || captured) console.log('[ThumbnailExtractor] Hover: transmuxer captureAtTime result', captured);
+            lastHoverLogBucketRef.current = logBucket;
             if (!captured && active) {
-              await new Promise(r => setTimeout(r, 200));
+              // Round-9 Fix 6: when the miss is an in-flight bisect, await its
+              // settle (bounded — hover moves/teardown must stay responsive)
+              // instead of hammering captureAtTime on a fixed 200ms cadence.
+              // On settle the next iteration captures immediately (done/near-
+              // entry) or backs off (failed → 60s cooldown path).
+              const inflight = transmuxerPipeline.getInflightBisect?.(desiredTime) ?? null;
+              if (inflight) {
+                await Promise.race([inflight, new Promise(r => setTimeout(r, 1000))]);
+              } else {
+                await new Promise(r => setTimeout(r, 200));
+              }
             }
           } else {
             console.log('[ThumbnailExtractor] Hover: no pipeline available, mp4=', !!pipeline, 'transmuxer=', !!transmuxerPipeline, 'fmp4=', !!fmp4Pipeline);

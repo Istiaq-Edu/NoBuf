@@ -16,6 +16,7 @@
     "allow-cmd-auth-request-code",
     "allow-cmd-auth-sign-in",
     "allow-cmd-auth-check-password",
+  "allow-cmd-auth-qr-current",
     "allow-cmd-get-files",
     "allow-cmd-upload-file",
     "allow-cmd-upload-limit",
@@ -25,6 +26,8 @@
     "allow-cmd-connect",
     "allow-cmd-log",
     "allow-cmd-ensure-ffmpeg",
+    "allow-cmd-check-dependencies",
+    "allow-cmd-reset-dependency-cache",
     "allow-cmd-delete-file",
     "allow-cmd-download-file",
     "allow-cmd-move-files",
@@ -88,6 +91,9 @@
     "allow-cmd-remove-public-channel",
     "allow-cmd-forward-to-folder",
     "allow-cmd-update-nb-pub-sync",
-    "allow-cmd-sync-public-channels"
+    "allow-cmd-sync-public-channels",
+    "allow-cmd-opensubtitles-validate-key",
+    "allow-cmd-opensubtitles-search",
+    "allow-cmd-opensubtitles-download"
   ]
 }

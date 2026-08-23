@@ -95,6 +95,31 @@ pub async fn cmd_ensure_ffmpeg() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Full dependency health check: resolves ffmpeg/ffprobe and verifies every
+/// component the manifest requires (6 bulk dumps, ~74 ms). Returns a report for
+/// the Settings "Dependencies" panel; `healthy` is false iff a Required
+/// component is missing.
+#[tauri::command]
+pub async fn cmd_check_dependencies() -> Result<crate::deps::probe::HealthReport, String> {
+    // spawn_blocking: the check spawns six subprocesses synchronously; keep
+    // them off the async reactor threads.
+    tokio::task::spawn_blocking(|| {
+        let ffmpeg = crate::ffmpeg_util::ensure_ffmpeg()?;
+        let ffprobe = crate::ffmpeg_util::ensure_ffprobe()?;
+        crate::deps::probe::check(&ffmpeg, &ffprobe)
+    })
+    .await
+    .map_err(|e| format!("dependency check task failed: {e}"))?
+}
+
+/// Re-run resolution after an install/repair so the new binaries are picked up
+/// without restarting the app.
+#[tauri::command]
+pub fn cmd_reset_dependency_cache() -> bool {
+    crate::ffmpeg_util::reset_resolved();
+    true
+}
+
 /// Open a URL in the system's default browser. Only HTTP(S) URLs are allowed.
 #[tauri::command]
 pub async fn cmd_open_url(url: String) -> Result<(), String> {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-opensubtitles-search"
+description = "Enables the cmd_opensubtitles_search command without any pre-configured scope."
+commands.allow = ["cmd_opensubtitles_search"]
+
+[[permission]]
+identifier = "deny-cmd-opensubtitles-search"
+description = "Denies the cmd_opensubtitles_search command without any pre-configured scope."
+commands.deny = ["cmd_opensubtitles_search"]

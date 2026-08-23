@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-check-dependencies"
+description = "Enables the cmd_check_dependencies command without any pre-configured scope."
+commands.allow = ["cmd_check_dependencies"]
+
+[[permission]]
+identifier = "deny-cmd-check-dependencies"
+description = "Denies the cmd_check_dependencies command without any pre-configured scope."
+commands.deny = ["cmd_check_dependencies"]

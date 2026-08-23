@@ -937,6 +937,9 @@ pub async fn cmd_download_file(
                 let to_write = chunk_slice.len().min(remaining_in_gap);
                 let slice = &chunk_slice[..to_write];
 
+                // Record Telegram network bytes for the speed meter
+                cache_state.add_downloaded_bytes(message_id, to_write as u64);
+
                 output_file.seek(SeekFrom::Start(offset))
                     .map_err(|e| format!("Seek error: {}", e))?;
                 output_file.write_all(slice)
@@ -1068,6 +1071,9 @@ pub async fn cmd_download_file(
                         let bytes_in_chunk = final_data.len() as u64;
                         let chunk_range_end = offset + bytes_in_chunk - 1;
 
+                        // Record Telegram network bytes for the speed meter
+                        cache_state.add_downloaded_bytes(message_id, bytes_in_chunk);
+
                         // Write to output file at correct offset
                         file.seek(SeekFrom::Start(offset))
                             .map_err(|e| format!("Seek error: {}", e))?;
@@ -1082,7 +1088,7 @@ pub async fn cmd_download_file(
                             let _lock = cache_state.lock_meta(message_id).await;
                             let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                                 message_id,
-                                folder_id: folder_id.unwrap_or(0),
+                                folder_id: folder_id.unwrap_or(i64::MIN),
                                 total_size,
                                 filename: dl_filename.clone(),
                                 cached_ranges: Vec::new(),
@@ -1206,6 +1212,9 @@ pub async fn cmd_download_file(
         let chunk_start = downloaded;
         downloaded += bytes.len() as u64;
 
+        // Record Telegram network bytes for the speed meter
+        cache_state.add_downloaded_bytes(message_id, bytes.len() as u64);
+
         // Write to cache file and update meta incrementally so the green bar
         // tracks download progress in real-time via cmd_get_cache_status
         if let Some(ref mut cf) = cache_file {
@@ -1215,7 +1224,7 @@ pub async fn cmd_download_file(
             let _lock = cache_state.lock_meta(message_id).await;
             let mut meta = cache_state.load_meta(message_id).unwrap_or_else(|| CacheMeta {
                 message_id,
-                folder_id: folder_id.unwrap_or(0),
+                folder_id: folder_id.unwrap_or(i64::MIN),
                 total_size,
                 filename: dl_filename.clone(),
                 cached_ranges: Vec::new(),

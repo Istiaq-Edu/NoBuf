@@ -248,6 +248,60 @@ export class SourceBufferWrapper {
     });
   }
 
+  /** Change the SourceBuffer's MIME type in place (Chrome 70+/WebView2).
+   *  Used by the audio-track switch when the new track's codec differs from
+   *  the type the buffer was created with (plan H1) — MSE treats codecs not in
+   *  the last successful changeType()/addSourceBuffer() type as unsupported,
+   *  so the new init segment would append-error without this. Waits for idle
+   *  (changeType throws InvalidStateError while updating). */
+  changeType(mimeType: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.fatalError) { resolve(); return; }
+      const apply = () => {
+        try {
+          this.sourceBuffer.changeType(mimeType);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      };
+      const whenIdle = () => {
+        if (this.fatalError) { resolve(); return; }
+        if (this.queue.length === 0 && !this.processing && !this.sourceBuffer.updating) {
+          apply();
+        } else {
+          this.sourceBuffer.addEventListener('updateend', () => setTimeout(whenIdle, 0), { once: true });
+        }
+      };
+      whenIdle();
+    });
+  }
+
+  /** Clear stale seek operations without blocking on removal of the old timeline. */
+  resetForSeekNonBlocking(): Promise<void> {
+    if (this.fatalError) return Promise.resolve();
+    this.queue = [];
+    if (this.processing || this.sourceBuffer.updating) {
+      try { this.sourceBuffer.abort(); } catch (_) {}
+    }
+    this.processing = false;
+    return Promise.resolve();
+  }
+
+  /** Queue removal of every buffered island that does not contain `keepTime`. */
+  pruneBufferedRangesExcept(keepTime: number): void {
+    if (this.fatalError || !Number.isFinite(keepTime)) return;
+    try {
+      const buffered = this.sourceBuffer.buffered;
+      for (let i = 0; i < buffered.length; i++) {
+        const start = buffered.start(i);
+        const end = buffered.end(i);
+        if (keepTime < start || keepTime > end) this.queue.push({ type: 'remove', start, end });
+      }
+      this.processQueue();
+    } catch (_) { /* detached SourceBuffer */ }
+  }
+
   /** Remove all buffered data — for seeking to unbuffered positions.
    *  Does NOT set timestampOffset because mp4box produces absolute timestamps. */
   resetForSeek(): Promise<void> {

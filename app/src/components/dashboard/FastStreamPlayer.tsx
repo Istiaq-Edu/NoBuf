@@ -5,14 +5,268 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TelegramFile } from '../../types';
 import { isVideoFile } from '../../utils';
-import { useMSEPlayer, formatSpeed, speedMeterValue } from '../../hooks/useMSEPlayer';
+import { useMSEPlayer, readPersistedSubTrack, persistSubTrack, shouldReExtractSub, lastCueEnd,
+  shouldReportSubFailure,
+  mergeCues,
+  mergeAssContent, assDialogueIntervals,
+  classifySubRepairOutcome, reduceSubRepairBreaker, shouldAttemptSubRepair,
+  emptySubRepairBreakerState, computeSubRepairBackoffMs, selectSubRepairBreakerKey,
+  SUB_REPAIR_MAX_ATTEMPTS, type SubRepairBreakerState, type SubRepairOutcome } from '../../hooks/useMSEPlayer';
+import { clampSubDelay, SUB_DELAY_LIMIT_S, readCachedSub, persistCachedSub, subtitleLabel } from '../../hooks/useMSEPlayer';
+import { subtitleLayout, SUB_SCALE_MIN, SUB_SCALE_MAX, SUB_OFFSET_MAX_PCT, SUB_OFFSET_MIN_PCT, type SubFit } from '../../lib/faststream/subtitles/subtitleLayout';
+import { pushSample, computeWindowSpeed, speedMeterValue, formatSpeed, type SpeedSample } from '../../lib/faststream/speedMeter';
 import { useThumbnailExtractor } from '../../hooks/useThumbnailExtractor';
-import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact } from '../../context/SettingsContext';
+import { useSettings, SkipDuration, VideoFit, SpeedLimitValue, SPEED_LIMIT_PRESETS, formatSpeedLimit, formatSpeedLimitCompact, liveQuota, parseQuotaResetAt } from '../../context/SettingsContext';
 import { useCacheSession } from '../../context/CacheSessionContext';
 import { VideoCacheDialog } from './VideoCacheDialog';
 import { useSubtitles } from '../../hooks/useSubtitles';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { SubtitleTrack } from '../../lib/faststream/subtitles/SubtitleTrack';
+import { OpenSubtitlesPanel } from './OpenSubtitlesPanel';
+import { open as openUrl } from '@tauri-apps/plugin-shell';
+
+/** Absorbs ±1px drift from fractional getBoundingClientRect at 125%/150% DPI. */
+const SUB_GEOM_EPSILON_PX = 0.5;
+
+export interface SubGeom { boxW: number; boxH: number; ctrlH: number }
+
+/**
+ * The control bar's REAL interactive height: its border box minus the transparent
+ * `pt-16` gradient pad, which is not clickable and must not push subtitles up.
+ *
+ * NOT the same quantity as the existing `controlsHeight` state, which is
+ * `contentRect.height` — the CONTENT box, already excluding pt-16 AND pb-2 (Resize
+ * Observer §2.3). Subtracting the 64px pad from THAT would double-count it and
+ * float subtitles 64px too high; the download overlay depends on the existing
+ * semantics, so this is a separate derivation rather than a redefinition.
+ */
+export function controlsInteractiveHeight(borderBoxH: number, paddingTop: number): number {
+  const h = Number.isFinite(borderBoxH) ? borderBoxH : 0;
+  const pad = Number.isFinite(paddingTop) ? paddingTop : 0;
+  return Math.max(0, h - pad);
+}
+
+/** True when a new measurement differs enough to be worth a re-render. */
+export function subGeomChanged(prev: SubGeom, next: SubGeom): boolean {
+  return Math.abs(prev.boxW - next.boxW) >= SUB_GEOM_EPSILON_PX
+    || Math.abs(prev.boxH - next.boxH) >= SUB_GEOM_EPSILON_PX
+    || Math.abs(prev.ctrlH - next.ctrlH) >= SUB_GEOM_EPSILON_PX;
+}
+
+/**
+ * Vertical space the download progress overlay occupies above the control bar's
+ * real content, used to lift subtitles clear of it while it is visible.
+ *
+ * Derived from its own markup rather than measured, to avoid a third
+ * ResizeObserver on an element that only exists while a download runs:
+ *   px-3 py-2 row  → 8 + 8 vertical padding
+ *   tallest child  → the cancel button (p-1 + w-4 h-4 svg) = 24px
+ *   ⇒ ~40px tall
+ * It is positioned at `bottom: controlsHeight + 12` where controlsHeight is the
+ * CONTENT box (excludes pb-2), so relative to our border-box-minus-pt-16 measure it
+ * sits ~4px lower. 40 + 4 + a 12px breathing gap ⇒ 56.
+ */
+const DL_OVERLAY_RESERVE_PX = 56;
+
+/**
+ * Lead time (seconds) for `shouldReExtractSubAhead`: re-extract when the playhead
+ * comes within this many seconds of the coverage frontier. Chosen well under the
+ * ~100 s an island covers (so the fetch lands before exhaustion) and well above a
+ * normal inter-cue gap (so ordinary dialogue silences do not trigger it). 20 s.
+ */
+export const SUB_REEXTRACT_LEAD_S = 20;
+
+export type SubCoverageInterval = { startTime: number; endTime: number };
+
+/** Select scheduling evidence without changing the merged render union. */
+export function selectSubRepairCoverageIntervals(
+  mergedIntervals: readonly SubCoverageInterval[],
+  latestIslandIntervals: readonly SubCoverageInterval[] | null,
+  isFullyCovered: boolean,
+): readonly SubCoverageInterval[] {
+  if (isFullyCovered || latestIslandIntervals == null) return mergedIntervals;
+  return latestIslandIntervals;
+}
+
+export function subRepairRegionRetryDelay(
+  outcome: SubRepairOutcome,
+  successfulEmptyPartial: boolean = false,
+): number | null {
+  if (outcome === 'progress' || outcome === 'progress-uncovered') return 5_000;
+  if (outcome === 'deferred') return successfulEmptyPartial ? 3_000 : 1_000;
+  return null;
+}
+
+/**
+ * Should the per-region one-shot ledger entry be RELEASED after this outcome, so
+ * a later timeupdate can re-extract within the same 120s region?
+ *
+ * The bug this fixes (13-c/13-t): an ASS island extraction that covers the
+ * playhead AT EXTRACTION TIME returns `ok`, which latches the region as "done"
+ * (`subRepairRegionRetryDelay('ok') === null`, so no retry is scheduled and the
+ * ledger entry is never cleared). But an island only carries a few seconds of
+ * cues; as the playhead advances WITHIN the same region it outruns them, and the
+ * one-shot guard (subRepairAttemptedRef) blocks every further attempt until the
+ * viewer seeks or crosses into the next region. Measured: after a seek to 1204s
+ * the delta grew +0.00 → −21.87s over 22s of playback with ZERO repair attempts.
+ *
+ * A still-`partial` track means island mode — coverage is inherently incomplete,
+ * so releasing the ledger lets the NEXT exhaustion re-arm one extraction.
+ *
+ * Round-14(B2) — MUST also require `coverageAdvanced`. Releasing on EVERY
+ * `ok+partial` caused the 15-c storm: a lead-time re-extraction that returned
+ * `ok` WITHOUT extending coverage (same island, content unchanged) released the
+ * ledger, which re-armed the trigger, which fired again next tick — ~4
+ * extractions/second, all `ok 956B→956B`. The breaker cannot stop it because
+ * `ok` is its reset condition. Gating release on real forward progress
+ * (frontier moved for SRT, or ASS content grew) makes a non-extending `ok` keep
+ * the region LATCHED, so the trigger fires again only after the viewer advances
+ * into a new region or seeks — never in a tight loop. When coverage DID advance,
+ * releasing is correct and safe: `shouldReExtractSub`/`shouldReExtractSubAhead`
+ * stay false until the (now-later) frontier is again approached.
+ *
+ * A FULLY-covered `ok` (not partial) keeps the entry latched — nothing left to
+ * extract. Failures/no-progress keep it latched too; the breaker's backoff owns
+ * those. Pure + exported for testing.
+ */
+export function shouldReleaseSubRepairRegion(
+  outcome: SubRepairOutcome,
+  trackStillPartial: boolean,
+  coverageAdvanced: boolean,
+): boolean {
+  return outcome === 'ok' && trackStillPartial && coverageAdvanced;
+}
+
+/**
+ * Lead-time re-extraction trigger (Round-14 B2). Fires when the playhead is
+ * approaching the END of current coverage — `lastCueEndS - playhead < leadS` —
+ * so the next island is fetched BEFORE the visible cues run out, instead of
+ * after (which shows a gap). Complements `shouldReExtractSub`, whose 90 s grace
+ * is deliberately wide (anti-spin on sparse films) and therefore lets coverage
+ * lapse for up to 90 s before re-extracting.
+ *
+ * Storm-safe by construction, in three independent ways:
+ *  1. Returns FALSE when there are no cues yet (`lastCueEndS == null`) — the
+ *     quiet intro before the first dialogue never triggers it (15-c fired ~30×
+ *     in the first 8 s precisely because the old predicate treated "no cue
+ *     nearby" as a hole).
+ *  2. Returns FALSE for a fully-covered track — nothing left to extract.
+ *  3. It is one-shot per 120 s region via the existing `subRepairAttemptedRef`
+ *     ledger, and the ledger is only released after coverage ACTUALLY advances
+ *     (see `shouldReleaseSubRepairRegion`). So a re-extraction that returns `ok`
+ *     without extending the frontier keeps the region latched — it cannot re-arm
+ *     itself in a loop.
+ *
+ * `leadS` should be well under the island's coverage span (≈100 s at 24 MiB) so
+ * the fetch completes before exhaustion, and comfortably above a normal
+ * inter-cue gap so ordinary dialogue silences do not trip it. Pure + exported.
+ */
+export function shouldReExtractSubAhead(
+  playheadS: number,
+  lastCueEndS: number | null,
+  isFullyCovered: boolean,
+  leadS: number = SUB_REEXTRACT_LEAD_S,
+): boolean {
+  if (isFullyCovered) return false;
+  if (lastCueEndS == null) return false;      // no coverage yet → intro, not a hole
+  if (!Number.isFinite(playheadS) || playheadS < 0) return false;
+  // Approaching the coverage frontier: within `leadS` of the last cue's end, or
+  // already past it (coverage exhausted). Playheads comfortably inside coverage
+  // (frontier more than leadS ahead) do NOT trigger.
+  return playheadS > lastCueEndS - leadS;
+}
+
+/**
+ * Round-21 (17-c/17-t) + Round-22 (18-c/18-t): should the one-shot region ledger
+ * be BYPASSED for one more extraction, even though this 120 s region was already
+ * attempted?
+ *
+ * The bug this fixes: an island covers only a few seconds, but the region
+ * ledger latches the whole 120 s region after the island stops growing (a
+ * memo-replay `ok` returns identical bytes → `coverageAdvanced === false` → the
+ * region stays latched by the anti-storm rule). The playhead then walks from the
+ * island's end to the region boundary — up to ~112 s — with the ledger blocking
+ * every re-extraction. Measured (17-t): seek to 982s, island covers to ~990s,
+ * then the playhead advanced to 1024s with ZERO further `[SUBS-ISLAND]` calls and
+ * `active=0` the entire time.
+ *
+ * The `coverageAdvanced` release (round-14) is not enough: it releases only when
+ * an extraction GREW coverage, never when the playhead OUTRAN a frontier that
+ * stopped growing — which is exactly the blank case.
+ *
+ * Round-22: the bypass must fire on the LEAD condition (playhead APPROACHING the
+ * frontier, `playhead > lastCueEnd - graceS`), not only after the playhead has
+ * already PASSED it. 18-t showed the old "must be past frontier + grace" rule
+ * pre-fetched too late: the lead trigger (`shouldReExtractSubAhead`) wanted to
+ * fetch the next island ~20 s before coverage ran out, but the ledger blocked it
+ * until the playhead was 20 s PAST the frontier — so on the 512 KiB proxy the
+ * island download (~10-20 s) started too late and subtitles blanked in the gap
+ * (playhead 1179-1188 s, active=0, until the next extract landed at 1189 s). Firing
+ * on the lead edge closes that gap while playback still has covered runway.
+ *
+ * Storm-safety is unchanged and does NOT rely on the playhead being past the
+ * frontier: the bypass is refused unless the frontier has ADVANCED since the last
+ * bypass in this region (`lastCueEnd > lastBypassFrontierS`). The 15-c storm
+ * re-extracts the SAME island (frontier unchanged) — that is still blocked. Only a
+ * genuine forward step (new cues merged, frontier moved) earns another bypass.
+ * `graceS` (= the lead window) keeps ordinary inter-cue silences from tripping it.
+ * Pure + exported.
+ */
+export function shouldBypassRegionLedger(
+  playheadS: number,
+  lastCueEndS: number | null,
+  isFullyCovered: boolean,
+  lastBypassFrontierS: number | null,
+  graceS: number = SUB_REEXTRACT_LEAD_S,
+): boolean {
+  if (isFullyCovered) return false;
+  if (lastCueEndS == null) return false;      // no coverage yet → intro, handled elsewhere
+  if (!Number.isFinite(playheadS) || playheadS < 0) return false;
+  // Round-22: fire on the LEAD edge — playhead within graceS BEFORE the frontier,
+  // or already past it — so the next island is fetched while covered runway
+  // remains (the 512 KiB proxy needs ~10-20 s to land it). The old rule required
+  // `playhead > lastCueEnd + graceS` (already 20 s past), which pre-fetched too
+  // late and blanked the gap.
+  if (playheadS <= lastCueEndS - graceS) return false;
+  // Storm guard: a memo-replay returns the SAME frontier. Only bypass when the
+  // frontier has ADVANCED since the last bypass in this region — otherwise a
+  // non-growing island (whose `ok` resets the breaker) could bypass every tick.
+  // The first bypass (lastBypassFrontierS == null) is always allowed. This is the
+  // sole storm defense now that the position gate no longer requires being past
+  // the frontier.
+  if (lastBypassFrontierS != null && lastCueEndS <= lastBypassFrontierS) return false;
+  return true;
+}
+
+export interface SubRepairRetrySchedule {
+  regionKey: string;
+  delayMs: number;
+  generation: number;
+  timers: Map<string, number>;
+  attemptedRegions: Set<string>;
+  currentGeneration: () => number;
+  currentPlayhead: () => number;
+  retry: (playheadS: number) => void;
+}
+
+export function scheduleSubRepairRegionRetry(schedule: SubRepairRetrySchedule): void {
+  const existingTimer = schedule.timers.get(schedule.regionKey);
+  if (existingTimer != null) window.clearTimeout(existingTimer);
+  const timer = window.setTimeout(() => {
+    schedule.timers.delete(schedule.regionKey);
+    if (schedule.currentGeneration() !== schedule.generation) return;
+    schedule.attemptedRegions.delete(schedule.regionKey);
+    schedule.retry(schedule.currentPlayhead());
+  }, schedule.delayMs);
+  schedule.timers.set(schedule.regionKey, timer);
+}
+
+export function shouldStagePendingPartialSubTrack(
+  error: 'empty' | 'empty-partial' | 'failed',
+  hasExistingTrack: boolean,
+): boolean {
+  return error === 'empty-partial' && !hasExistingTrack;
+}
 
 interface FastStreamPlayerProps {
   file: TelegramFile;
@@ -125,12 +379,34 @@ interface FastStreamPlayerProps {
   export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const vidRef = useRef<HTMLVideoElement>(null);
+  const videoBoxRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
   const subFileInputRef = useRef<HTMLInputElement>(null);
   const { settings, updateSetting } = useSettings();
   const cacheSession = useCacheSession();
   const subs = useSubtitles();
+  // Embedded subtitle bookkeeping: stream idx → loaded SubtitleTrack (so a
+  // re-click toggles instead of re-fetching, E18), which idx is mid-fetch
+  // (spinner row + double-click guard), and the busy idx as state for renders.
+  const embeddedSubTracksRef = useRef<Map<number, {
+    track: SubtitleTrack;
+    partial: boolean;
+    localIntervals: SubCoverageInterval[] | null;
+  }>>(new Map());
+  const embeddedSubLoadingIdxRef = useRef<number | null>(null);
+  const [embeddedSubBusyIdx, setEmbeddedSubBusyIdx] = useState<number | null>(null);
+  const [subtitleRevision, setSubtitleRevision] = useState(0);
+  // Round-14 F4: tracks whose AUTOMATIC session-restore found no usable cues.
+  // Drives a passive marker on the subtitle row instead of an unprompted toast
+  // (F4.5 (b)). Cleared per track on any successful extraction, and wholesale on
+  // a file switch — "unavailable" is a statement about one file's cache state,
+  // never a durable property of the track.
+  const [embeddedSubUnavailable, setEmbeddedSubUnavailable] = useState<Set<number>>(new Set());
+  // Generation counter bumped on every file switch: an extraction that started
+  // on file A must NOT activate/persist/clear state after the player moved to
+  // file B (review finding: stale cues crossing a mid-extraction file switch).
+  const embeddedSubFileGenRef = useRef(0);
 
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -148,10 +424,34 @@ interface FastStreamPlayerProps {
   // Drop any loaded subtitle tracks when the source file changes.
   useEffect(() => {
     subs.clearTracks();
+    embeddedSubTracksRef.current.clear();
+    embeddedSubLoadingIdxRef.current = null;
+    setEmbeddedSubBusyIdx(null);
+    setEmbeddedSubUnavailable(new Set()); // round-14 F4: per-file, never durable
+    embeddedSubFileGenRef.current++; // invalidate any in-flight extraction
+    // Re-attach a previously downloaded online subtitle for THIS file. Done here,
+    // immediately after the clear, so ordering is guaranteed — a separate effect
+    // could run before it and have its track wiped. NOT auto-activated: the user
+    // picks it from the captions menu, matching how embedded tracks behave.
+    const cached = readCachedSub(`${activeFolderId ?? 'pub'}:${file.id}`);
+    if (cached) {
+      try {
+        const track = new SubtitleTrack(
+          subtitleLabel(cached.label),
+          cached.language || null,
+        );
+        track.loadText(cached.text);
+        subs.addTrack(track);
+      } catch (e) {
+        console.error('[Subtitles] cached subtitle failed to parse:', e);
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.id]);
   const [_buf, setBuf] = useState(0);  // tracked for re-render triggering; bar now reads video.buffered directly
   const [load, setLoad] = useState(true);
+  const loadRef = useRef(true);
+  loadRef.current = load;
   const [err, setErr] = useState<string | null>(null);
   // Track the actual URL set as <video>.src for diagnostic display
   const [lastVideoSrc, setLastVideoSrc] = useState<string | null>(null);
@@ -159,6 +459,10 @@ interface FastStreamPlayerProps {
   const [fs, setFs] = useState(false);
   const [menu, setMenu] = useState(false);
   const [subMenu, setSubMenu] = useState(false);
+  /** OpenSubtitles search modal. Separate from subMenu: it is a dialog, not a popover. */
+  const [osPanel, setOsPanel] = useState(false);
+  const [audioMenu, setAudioMenu] = useState(false);
+  const [audioSwitching, setAudioSwitching] = useState(false);
   const [tip, setTip] = useState<{ t: number; x: number; show: boolean }>({ t: 0, x: 0, show: false });
 
   // Settings panel state
@@ -252,7 +556,6 @@ interface FastStreamPlayerProps {
     isPrefetching: msePlayer.isPrefetching,
     isPaused: msePlayer.isPaused,
     isComplete: msePlayer.isComplete,
-    speed: msePlayer.speed,
     pausePrefetch: msePlayer.pausePrefetch,
     resumePrefetch: msePlayer.resumePrefetch,
     seekTo: msePlayer.seekTo,
@@ -261,7 +564,6 @@ interface FastStreamPlayerProps {
     downloadedTimeRanges: msePlayer.downloadedTimeRanges,
     byteToTime: msePlayer.byteToTime,
     recordByteTimeAnchor: msePlayer.recordByteTimeAnchor,
-    setSuppressBackendReports: msePlayer.setSuppressBackendReports,
     thumbnailDataReady: msePlayer.thumbnailDataReady,
     moovBufferReady: msePlayer.moovBufferReady,
     isTransmuxer: msePlayer.isTransmuxer,
@@ -295,7 +597,6 @@ interface FastStreamPlayerProps {
     isPrefetching: _isPrefetching,
     isPaused: prefetchPaused,
     isComplete: prefetchComplete,
-    speed: mseSpeed,  // live MSE pipe throughput — fallback for the speed meter during cold start when greenBarSpeed (disk delta) is still 0
     pausePrefetch,
     resumePrefetch,
     seekTo,
@@ -304,7 +605,6 @@ interface FastStreamPlayerProps {
     downloadedTimeRanges: _downloadedTimeRanges, // kept for re-render triggering + backend reporting
     byteToTime,
     recordByteTimeAnchor,
-    setSuppressBackendReports,
     thumbnailDataReady,
     moovBufferReady,
     isTransmuxer,
@@ -362,8 +662,8 @@ interface FastStreamPlayerProps {
   // TS files use the MSE transmuxer (MediabunnyTransmuxer) with byte-offset
   // keyframe seeking — no separate HLS thumbnail pipeline needed.
   const mseGetters = useMemo(() => ({
-    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, getKnownDuration: msePlayer.getKnownDuration, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config,
-  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.getKnownDuration, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config]);
+    getMoovBuffer: msePlayer.getMoovBuffer, getFirstChunk: msePlayer.getFirstChunk, getInitSegments: msePlayer.getInitSegments, getVideoTrackInfo: msePlayer.getVideoTrackInfo, getMP4BoxClass: msePlayer.getMP4BoxClass, getFileLength: msePlayer.getFileLength, isTransmuxer: msePlayer.isTransmuxer, getFormat: msePlayer.getFormat, getKnownDuration: msePlayer.getKnownDuration, isTransmuxerActive: msePlayer.isTransmuxerActive, getKeyframeTimestamps: msePlayer.getKeyframeTimestamps, getKeyframeByteOffsets: msePlayer.getKeyframeByteOffsets, getTsHeaderData: msePlayer.getTsHeaderData, getTransmuxerSourceConfig: msePlayer.getTransmuxerSourceConfig, recordByteTimeAnchor: msePlayer.recordByteTimeAnchor, keyframeIndexReady: msePlayer.keyframeIndexReady, isFmp4Stream: msePlayer.isFmp4Stream, getFmp4Config: msePlayer.getFmp4Config, getRemuxThumbConfig: msePlayer.getRemuxThumbConfig,
+  }), [msePlayer.getMoovBuffer, msePlayer.getFirstChunk, msePlayer.getInitSegments, msePlayer.getVideoTrackInfo, msePlayer.getMP4BoxClass, msePlayer.getFileLength, msePlayer.isTransmuxer, msePlayer.getFormat, msePlayer.getKnownDuration, msePlayer.isTransmuxerActive, msePlayer.getKeyframeTimestamps, msePlayer.getKeyframeByteOffsets, msePlayer.getTsHeaderData, msePlayer.getTransmuxerSourceConfig, msePlayer.recordByteTimeAnchor, msePlayer.keyframeIndexReady, msePlayer.isFmp4Stream, msePlayer.getFmp4Config, msePlayer.getRemuxThumbConfig]);
 
   const { getCachedThumbnailSync, setDesiredHoverTime, clearDesiredHover, cachedTimes } = useThumbnailExtractor(vidRef, streamUrl, playerUseNative, mseGetters, thumbnailDataReady, moovBufferReady, maxCachedTime);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
@@ -486,9 +786,10 @@ interface FastStreamPlayerProps {
 
   // Poll cache status for green bar — updates every 500ms for near-realtime feel.
   // Merges disk cache ranges (from backend) with shadow cache ranges (from JS memory)
-  // Also computes the GREEN BAR download speed (actual Telegram download speed),
-  // not the white bar speed (which is now just local disk reads).
-  const greenBarSpeedHistoryRef = useRef<{ bytes: number; time: number }[]>([]);
+  // Also computes the download-speed meter value from the backend's cumulative
+  // session_downloaded_bytes counter (bytes that actually arrived from Telegram
+  // — disk-cache HITs never touch it). Window math lives in speedMeter.ts.
+  const greenBarSpeedHistoryRef = useRef<SpeedSample[]>([]);
   const [greenBarSpeed, setGreenBarSpeed] = useState(0);
   // When the green-bar poll gate (seek-settle) first engaged, for the bounded-
   // freeze safety timeout below. 0 = gate not currently engaged.
@@ -496,7 +797,6 @@ interface FastStreamPlayerProps {
 
   useEffect(() => {
     let active = true;
-    let lastCachedBytes = 0;
     const poll = async () => {
       while (active) {
         try {
@@ -530,38 +830,35 @@ interface FastStreamPlayerProps {
           }
           const _gateExpired =
             seekSettleStartRef.current > 0 && _nowMs - seekSettleStartRef.current > 8000;
+
+          // Fetch status EVERY tick — the speed meter must never sit behind the
+          // seek-settle gate (a gated sample series reads as a fake stall → 0
+          // during seeks). Only the ranges→time consumers below stay gated.
+          const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
+
+          // ── Download speed (bytes actually fetched from Telegram) ──
+          // status.session_downloaded_bytes is a backend cumulative counter fed
+          // ONLY at iter_download chunk arrivals — cache HITs can't inflate it.
+          // Windowed cumulative diff + stall-zero + reset guard: speedMeter.ts.
+          {
+            const sampleT = Date.now();
+            const samples = greenBarSpeedHistoryRef.current;
+            if (status?.is_complete) {
+              // Fully cached: nothing can be downloading — snap to 0 now
+              // instead of waiting out the 3s stall window.
+              samples.length = 0;
+              setGreenBarSpeed(0);
+            } else {
+              pushSample(samples, sampleT, status?.session_downloaded_bytes ?? 0);
+              setGreenBarSpeed(computeWindowSpeed(samples, sampleT));
+            }
+          }
+
           if (!_seekSettling || _gateExpired) {
             if (_gateExpired) seekSettleStartRef.current = 0; // reset so next seek re-arms
-            const status = await invoke<any>('cmd_get_cache_status', { messageId: file.id });
           if (status) {
             setCachePercent(status.percentage);
             setCacheComplete(status.is_complete);
-
-            // ── Green bar download speed (actual Telegram speed) ──
-            // Compute from cached_bytes delta over time, using a 5-second sliding window
-            const now = Date.now();
-            const cachedBytes: number = status.cached_bytes ?? 0;
-            if (lastCachedBytes > 0 && cachedBytes > lastCachedBytes) {
-              const delta = cachedBytes - lastCachedBytes;
-              const hist = greenBarSpeedHistoryRef.current;
-              hist.push({ bytes: delta, time: now });
-              // Keep last 5 seconds of history
-              while (hist.length > 0 && hist[0].time < now - 5000) hist.shift();
-              if (hist.length >= 2) {
-                const totalBytes = hist.reduce((s, e) => s + e.bytes, 0);
-                const dt = (hist[hist.length - 1].time - hist[0].time) / 1000;
-                if (dt > 0.3) {
-                  setGreenBarSpeed(totalBytes / dt);
-                }
-              }
-            }
-            if (cachedBytes > 0) lastCachedBytes = cachedBytes;
-            // Reset speed when cache is complete (no more downloading)
-            if (status.is_complete) {
-              setGreenBarSpeed(0);
-              lastCachedBytes = 0;
-              greenBarSpeedHistoryRef.current = [];
-            }
 
             // Update session cache tracker via ref (avoids re-triggering this effect)
             const cs = cacheSessionRef.current;
@@ -601,26 +898,18 @@ interface FastStreamPlayerProps {
           //     guarded) so byteToTime self-calibrates off the linear fallback.
           if (status?.cached_ranges && status.total_bytes > 0 && durForBar > 0) {
             const cachedRanges = status.cached_ranges as [number, number][];
-            const seekTarget = (window as any).__nobuf_seekTargetTime;
             // (rawPlayhead removed with the GREEN-BAR diagnostic log; re-add
             //  `const rawPlayhead = vidRef.current?.currentTime ?? 0;` if re-enabling.)
-            // (B) Capture a VBR anchor for the active seek before converting.
-            if (typeof seekTarget === 'number' && seekTarget > 0 && recordByteTimeAnchor) {
-              const linearByte = (seekTarget / durForBar) * status.total_bytes;
-              // Nearest cached-range START to the linear estimate = ffmpeg's real
-              // cluster read for this seek. Ignore the front (0) and tail ranges.
-              let best: number | null = null;
-              let bestDist = Infinity;
-              for (const [s] of cachedRanges) {
-                if (s < 4 * 1024 * 1024) continue; // skip cold-start front reads
-                const d = Math.abs(s - linearByte);
-                if (d < bestDist) { bestDist = d; best = s; }
-              }
-              // Only trust it when the range start is within 128MB of the estimate
-              // (VBR skew is large but bounded — see backend max_window 256MB).
-              if (best !== null && bestDist < 128 * 1024 * 1024) {
-                recordByteTimeAnchor(best, seekTarget);
-              }
+            // The backend marks only the final timestamp-seeked ffmpeg input and
+            // publishes the exact source-container Range it requested. Use that
+            // measured pair; choosing the cached range nearest a linear estimate
+            // mapped correct VBR downloads to the wrong timeline position.
+            if (
+              !isTransmuxer() && recordByteTimeAnchor &&
+              typeof status.remux_seek_time_s === 'number' &&
+              typeof status.remux_seek_actual_byte === 'number'
+            ) {
+              recordByteTimeAnchor(status.remux_seek_actual_byte, status.remux_seek_time_s, true);
             }
             // Show EVERY cached range. This bar is sourced from the backend disk
             // cache (status.cached_ranges) — every range in it is ON DISK and
@@ -701,7 +990,6 @@ interface FastStreamPlayerProps {
           }
         } catch { /* ignore */ }
         if (event.payload.percent >= 100) {
-          setSuppressBackendReports(false);
           setDlOverlay(prev => prev ? { ...prev, completed: true } : null);
           dlTransferIdRef.current = '';
         }
@@ -728,12 +1016,9 @@ interface FastStreamPlayerProps {
       setDlOverlayVisible(true);
       clearTimeout(dismissTimerRef.current);
 
-      // Suppress player's cache meta reports during download — download updates
-      // CacheMeta per-chunk instead (protected by per-message Mutex in Rust).
-      // Player prebuffer continues running — both interleave through Semaphore(1)
-      // at the Rust level (one Telegram iter_download call at a time → no FLOOD_WAIT).
-      setSuppressBackendReports(true);
-
+      // Player prebuffer continues running — download and prebuffer interleave
+      // through Semaphore(1) at the Rust level (one Telegram iter_download call
+      // at a time → no FLOOD_WAIT). The backend updates CacheMeta per-chunk.
       await invoke('cmd_download_file', {
         messageId: file.id,
         savePath,
@@ -741,11 +1026,9 @@ interface FastStreamPlayerProps {
         transferId,
       });
 
-      setSuppressBackendReports(false);
       toast.success(cacheComplete ? `Downloaded from cache: ${file.name}` : `Downloaded: ${file.name}`);
     } catch (e: any) {
       const errMsg = String(e);
-      setSuppressBackendReports(false);
       if (!errMsg.includes('cancelled') && !errMsg.includes('Cancel')) {
         toast.error(`Download failed: ${errMsg}`);
       }
@@ -756,7 +1039,7 @@ interface FastStreamPlayerProps {
         dlTransferIdRef.current = '';
       }, 300);
     }
-  }, [file, activeFolderId, cacheComplete, setSuppressBackendReports]);
+  }, [file, activeFolderId, cacheComplete]);
 
   // Cancel or dismiss download overlay
   const handleCancelDownload = useCallback(async () => {
@@ -771,14 +1054,13 @@ interface FastStreamPlayerProps {
     try {
       await invoke('cmd_cancel_transfer', { transferId: dlTransferIdRef.current });
     } catch { /* ignore */ }
-    setSuppressBackendReports(false);
     setDlOverlayVisible(false);
     clearTimeout(dismissTimerRef.current);
     dismissTimerRef.current = window.setTimeout(() => {
       setDlOverlay(null);
       dlTransferIdRef.current = '';
     }, 300);
-  }, [setSuppressBackendReports, dlOverlay?.completed]);
+  }, [dlOverlay?.completed]);
 
 
   const fmt = (s: number) => {
@@ -874,7 +1156,7 @@ interface FastStreamPlayerProps {
         v.src = videoUrl;
         setLastVideoSrc(videoUrl);
       } else {
-        console.log('[Player] MSE URL is null (mpegts.js mode) — skipping video.src, mpegts.js will set it');
+        console.log('[Player] MSE URL not set yet — active tier (mpegts.js/MKV transmuxer) attaches its own src');
         // mpegts.js will set video.src after attachMediaElement()
         // Mark as MSE blob URL for the durationchange guard
         setLastVideoSrc('mpegts://internal');
@@ -1029,6 +1311,9 @@ interface FastStreamPlayerProps {
         ranges.push([v.buffered.start(i), v.buffered.end(i)]);
       }
       setBufferedRanges(ranges);
+      // Repair is normally driven by timeupdate. Deferred/progress outcomes also
+      // schedule a bounded retry so paused playback cannot strand a usable island.
+      maybeRepairSubCoverageRef.current?.(ct);
     };
     const onPlay = () => {
       // Clear remux loading overlay — video is actually playing now
@@ -1060,6 +1345,17 @@ interface FastStreamPlayerProps {
     const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
     const onWait = () => { if (!suppressLoadingSpinnerRef.current) setLoad(true); };
     const onPlay2 = () => setLoad(false);
+    const onRemuxSeekPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{ presented?: boolean }>).detail;
+      console.log(
+        `[Player] remux seek presentation: presented=${detail?.presented === true} ` +
+        `covers={spinner:${loadRef.current},cold:${coldStartBufferingRef.current},remux:${isRemuxLoadingRef.current}}`,
+      );
+      if (detail?.presented === true) {
+        setLoad(false);
+        if (isRemuxLoadingRef.current) setIsRemuxLoading(false);
+      }
+    };
     const onProgress = () => {
       // Update buffer end for UI
       if (v.buffered.length > 0) {
@@ -1086,6 +1382,7 @@ interface FastStreamPlayerProps {
     v.addEventListener('ended', onEnded);
     v.addEventListener('waiting', onWait);
     v.addEventListener('playing', onPlay2);
+    v.addEventListener('nobuf:remux-seek-presentation', onRemuxSeekPresentation);
     v.addEventListener('progress', onProgress);
     const onDurChange = () => {
       if (!file) return;
@@ -1215,6 +1512,7 @@ interface FastStreamPlayerProps {
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('waiting', onWait);
       v.removeEventListener('playing', onPlay2);
+      v.removeEventListener('nobuf:remux-seek-presentation', onRemuxSeekPresentation);
       v.removeEventListener('progress', onProgress);
       v.removeEventListener('durationchange', onDurChange);
     };
@@ -1412,6 +1710,57 @@ interface FastStreamPlayerProps {
     return () => observer.disconnect();
   }, []);
 
+  // Subtitle geometry inputs. Deliberately SEPARATE from `controlsHeight` above:
+  // that value is `contentRect.height` (the CONTENT box, which per Resize Observer
+  // §2.3 excludes pt-16/pb-2) and the download overlay at the bottom of this file
+  // is positioned against it — redefining it would shift that overlay by ~72px.
+  //
+  // Observe videobox rather than <video>: videobox always exists (the `err` branch
+  // unmounts the video mid-playback), and since <video> is `w-full h-full` with no
+  // padding/border, their content boxes are identical anyway.
+  //
+  // Both reads use the rect/contentRect family, never offsetHeight — mixing
+  // fractional rects with rounded offsets drifts ±1px under 125%/150% Windows
+  // scaling, which is enough to put a cue one pixel inside the control bar.
+  const [subGeom, setSubGeom] = useState({ boxW: 0, boxH: 0, ctrlH: 0 });
+  const commitSubGeom = useCallback((next: { boxW: number; boxH: number; ctrlH: number }) => {
+    // Identical reference when nothing moved → React skips the re-render.
+    setSubGeom((prev) => (subGeomChanged(prev, next) ? next : prev));
+  }, []);
+  const subGeomRef = useRef(subGeom);
+  subGeomRef.current = subGeom;
+
+  useEffect(() => {
+    const box = videoBoxRef.current;
+    const controls = controlsRef.current;
+    if (!box) return;
+
+    const measure = () => {
+      const boxRect = box.getBoundingClientRect();
+      // videobox is `flex-1 min-h-0`, so it is legitimately 0x0 for a frame during
+      // mount. Never commit that: a cached 0 yields fontSize 0 and never recovers.
+      if (!(boxRect.width > 0) || !(boxRect.height > 0)) return;
+      let ctrlH = subGeomRef.current.ctrlH;
+      if (controls) {
+        // getComputedStyle is free here: a ResizeObserver callback already runs
+        // post-layout, so this cannot trigger an extra reflow.
+        const rect = controls.getBoundingClientRect();
+        const padTop = parseFloat(getComputedStyle(controls).paddingTop) || 0;
+        ctrlH = controlsInteractiveHeight(rect.height, padTop);
+      }
+      commitSubGeom({ boxW: boxRect.width, boxH: boxRect.height, ctrlH });
+    };
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(box);
+    // Observing the controls too: wrapping the chip row on a narrow window changes
+    // its height, and subtitles must move with it. Safe from the ResizeObserver
+    // feedback loop because neither element's size depends on subtitle content.
+    if (controls) observer.observe(controls);
+    measure();
+    return () => observer.disconnect();
+  }, [commitSubGeom]);
+
   const toggle = useCallback(() => { const v = vidRef.current; if (!v) return; if (videoEndedRef.current) { replay(); } else { v.paused ? v.play().catch(() => {}) : v.pause(); } }, [replay]);
   const seek = useCallback((s: number) => {
     const v = vidRef.current;
@@ -1505,6 +1854,559 @@ interface FastStreamPlayerProps {
     }
   }, [subs]);
 
+  // Accept a subtitle downloaded from OpenSubtitles. Deliberately the SAME path a
+  // sidecar file takes (loadText → addTrack → activateTrack): the payload is plain
+  // WebVTT, so it needs a new source, not a new renderer.
+  const acceptOnlineSub = useCallback((text: string, label: string, language: string) => {
+    try {
+      const track = new SubtitleTrack(subtitleLabel(label), language || null);
+      track.loadText(text);
+      subs.activateTrack(subs.addTrack(track));
+      // Cache the TEXT: clearTracks() drops the track when the file closes, and with
+      // only 5 downloads a day a re-open must not spend another one.
+      persistCachedSub(`${activeFolderId ?? 'pub'}:${file.id}`, { text, label, language });
+      toast.success(`Loaded subtitles: ${label}`);
+    } catch (e) {
+      toast.error('Failed to load downloaded subtitles');
+      console.error('[Subtitles] OpenSubtitles load failed:', e);
+    }
+  }, [subs, activeFolderId, file.id]);
+
+  // Toggle an EMBEDDED subtitle track (captions menu → Embedded section).
+  // First click extracts via the backend (spinner row while running) and
+  // activates; later clicks toggle the already-loaded track without refetch.
+  // The choice is persisted per file (-1 = explicitly off) and re-applied on
+  // the next open of the same file.
+  // Round-14 F4: `origin` distinguishes a human click from the session-restore
+  // effect that re-applies a persisted choice on open. Both paths run the SAME
+  // extraction — only the FAILURE REPORTING differs. It defaults to 'user' so
+  // every existing caller keeps today's behaviour; only the auto-restore site
+  // passes 'auto'.
+  //
+  // Why this exists (14-t:120, forensics C6): on open, the extractor gets the
+  // contiguous 0-prefix — 3,670,016 B = 20.8 s of an 8888 s film. Inception's
+  // first 20 s is the beach/waves sequence with no dialogue, so ZERO cues is the
+  // CORRECT result for that input. The old code still fired
+  // "No cues in the downloaded portion yet — try again as more downloads",
+  // which is (a) unprompted, (b) wrong (nothing is stalled), and (c) advice the
+  // user cannot act on — island mode needs a playhead, and at open there is none.
+  const toggleEmbeddedSub = useCallback(async (idx: number, label: string, language: string, origin: 'user' | 'auto' = 'user') => {
+    const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+    // Already loaded → plain toggle; EXCEPT a track whose cues no longer reach the
+    // playhead, which is re-extracted against the island around the viewer.
+    //
+    // Round-10 P1-2: the old condition was `partial && !active`. That dead-ended:
+    // the backend's disk-cache replay omits X-Subs-Partial, so a truncated body
+    // arrived as partial:false and could NEVER re-extract (session A: cues for
+    // 0-196s of an 8888s film, viewer at 4500s, nothing renderable, no escape).
+    // Coverage is now judged from the cue list itself — ground truth about what
+    // the user can actually see — so a stale track repairs on the next click even
+    // while it is active.
+    const existing = embeddedSubTracksRef.current.get(idx);
+    const isActive = existing ? subs.activeTracks.includes(existing.track) : false;
+    // Coverage MUST be read from the real cue source. ASS keeps `cues` empty
+    // (jassub renders `assContent`), so reading `.cues` reported zero coverage
+    // and forced staleForPlayhead=true on EVERY ASS click — killing the plain
+    // toggle branch (an active ASS track could never be turned off) and forcing
+    // a needless re-extract + re-activate that stomps the current selection.
+    // Mirror the repair loop, which already uses assDialogueIntervals.
+    const coverageIntervals = existing
+      ? (existing.track.isASS
+          ? assDialogueIntervals(existing.track.assContent)
+          : existing.track.cues)
+      : [];
+    const staleForPlayhead = existing
+      ? shouldReExtractSub(
+          vidRef.current?.currentTime ?? 0,
+          lastCueEnd(coverageIntervals),
+          !existing.partial,
+          undefined,
+          // Round-20: pass the cue INTERVALS so a backward seek into a hole
+          // between two islands is seen as uncovered.
+          coverageIntervals,
+        )
+      : false;
+    // Re-extract only when the cues can't serve the viewer: stale coverage, or a
+    // partial track being switched back ON. Everything else is a plain toggle.
+    if (existing && !staleForPlayhead && !(existing.partial && !isActive)) {
+      subs.toggleTrack(existing.track);
+      persistSubTrack(fileKey, isActive ? -1 : idx);
+      return;
+    }
+    // The persisted-track restore may already be extracting this exact track when
+    // the user opens the menu. That request will activate it on success; don't
+    // turn a normal early click into an error-looking toast.
+    if (embeddedSubLoadingIdxRef.current != null) {
+      if (embeddedSubLoadingIdxRef.current !== idx || origin !== 'user') {
+        if (origin === 'user') toast.info('Subtitle extraction already running — one moment');
+      }
+      return;
+    }
+    // Round-10b: a manual toggle is an explicit human request, so it RESETS the
+    // breaker for this track. Automatic repair may have given up; the user
+    // asking again must always get a real attempt.
+    // Breakers are region-scoped: clear every region for this track so a manual
+    // request always gets a fresh attempt, regardless of where automatic repair
+    // previously stopped.
+    const breakerPrefix = `${file.id}:${idx}:`;
+    for (const key of subBreakerRef.current.keys()) {
+      if (key.startsWith(breakerPrefix)) subBreakerRef.current.delete(key);
+    }
+    embeddedSubLoadingIdxRef.current = idx;
+    setEmbeddedSubBusyIdx(idx);
+    const genAtStart = embeddedSubFileGenRef.current;
+    // Partial re-select: show the old cues IMMEDIATELY while the re-extract runs.
+    if (existing) {
+      subs.activateTrack(existing.track);
+      persistSubTrack(fileKey, idx);
+    }
+    const selectionVersionAtStart = subs.getSelectionVersion();
+    try {
+      const res = await msePlayer.fetchEmbeddedSubText(idx);
+      // File switched while extracting: the reset effect already cleared the
+      // bookkeeping — drop this result entirely (activating would attach file
+      // A's cues to file B; the finally must not clobber B's state either).
+      if (embeddedSubFileGenRef.current !== genAtStart) return;
+      if ('error' in res) {
+        if (
+          origin === 'user'
+          && shouldStagePendingPartialSubTrack(res.error, !!existing)
+          && subs.getSelectionVersion() === selectionVersionAtStart
+        ) {
+          const track = new SubtitleTrack(label, language || null);
+          embeddedSubTracksRef.current.set(idx, { track, partial: true, localIntervals: null });
+          subs.activateTrack(subs.addTrack(track));
+          persistSubTrack(fileKey, idx);
+          setEmbeddedSubUnavailable((prev) => {
+            if (!prev.has(idx)) return prev;
+            const next = new Set(prev);
+            next.delete(idx);
+            return next;
+          });
+          subRepairAttemptedRef.current.delete(
+            `${file.id}:${idx}:${Math.floor((vidRef.current?.currentTime ?? 0) / 120)}`,
+          );
+          return;
+        }
+        // Round-14 F4: an AUTOMATIC session-restore must not narrate its own
+        // failure. The user did not ask for this extraction, the advice
+        // ("try again as more downloads") is wrong at open, and island mode
+        // cannot help without a playhead. Record it silently instead — the
+        // subtitle button renders a passive "unavailable" marker (F4.5 (b)),
+        // which is honest without hijacking the screen.
+        //
+        // A MANUAL click still reports everything, exactly as before: round-10b
+        // fixed a silently-dropped click, and over-suppressing here would
+        // reintroduce that defect (F4.2).
+        if (!shouldReportSubFailure(origin)) {
+          setEmbeddedSubUnavailable((prev) => {
+            if (prev.has(idx)) return prev;
+            const next = new Set(prev);
+            next.add(idx);
+            return next;
+          });
+          return;
+        }
+        if (res.error === 'empty') toast.info('This subtitle track has no cues');
+        else if (res.error === 'empty-partial') {
+          // Round-9 I-5: distinguish "nothing new downloaded" from a fresh miss.
+          if (res.unchanged) toast.info('Cache front hasn\u2019t advanced — more of the file must download before new cues can appear');
+          else toast.info('No cues in the downloaded portion yet — try again as more downloads');
+        }
+        else if (!existing) toast.error('Subtitle extraction failed');
+        // Partial re-extract failure: old cues stay active — nothing to undo.
+        return;
+      }
+      // Round-14 F4: a successful extraction clears any prior "unavailable"
+      // marker for this track (the cache front advanced, or the user seeked
+      // into a region that has cues).
+      setEmbeddedSubUnavailable((prev) => {
+        if (!prev.has(idx)) return prev;
+        const next = new Set(prev);
+        next.delete(idx);
+        return next;
+      });
+      if (existing) {
+        // Round-15 R-3: MERGE, never clobber — same defect as the repair path.
+        // loadText REPLACES state for ASS (assContent) but APPENDS cues for
+        // SRT/VTT (parser.oncue pushes), so the live track cannot be reused
+        // directly; parse into a scratch track and union the cue lists.
+        const scratch = new SubtitleTrack(null, null);
+        scratch.loadText(res.text);
+        existing.localIntervals = scratch.isASS
+          ? assDialogueIntervals(scratch.assContent)
+          : scratch.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime }));
+        if (scratch.isASS) {
+          // Island extraction returns only the current region. Replacing the ASS
+          // payload here discarded every previously downloaded region whenever
+          // the user manually refreshed the active track.
+          existing.track.loadText(mergeAssContent(existing.track.assContent, res.text));
+        } else {
+          existing.track.cues = mergeCues(existing.track.cues, scratch.cues);
+          existing.track.format = scratch.format;
+        }
+        existing.partial = res.partial;
+        if (subs.isTrackActive(existing.track)) {
+          setSubtitleRevision((revision) => revision + 1);
+        }
+        return;
+      }
+      const track = new SubtitleTrack(label, language || null);
+      track.loadText(res.text);
+      embeddedSubTracksRef.current.set(idx, {
+        track,
+        partial: res.partial,
+        localIntervals: track.isASS
+          ? assDialogueIntervals(track.assContent)
+          : track.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime })),
+      });
+      const added = subs.addTrack(track);
+      if (subs.getSelectionVersion() === selectionVersionAtStart) {
+        subs.activateTrack(added);
+        persistSubTrack(fileKey, idx);
+      }
+    } finally {
+      if (embeddedSubFileGenRef.current === genAtStart) {
+        embeddedSubLoadingIdxRef.current = null;
+        setEmbeddedSubBusyIdx(null);
+      }
+    }
+  }, [subs, msePlayer, activeFolderId, file.id]);
+
+  const toggleLoadedSubTrack = useCallback((track: SubtitleTrack) => {
+    for (const [idx, entry] of embeddedSubTracksRef.current) {
+      if (entry.track !== track) continue;
+      const info = msePlayer.embeddedSubTracks.find((candidate) => candidate.idx === idx);
+      void toggleEmbeddedSub(
+        idx,
+        info?.label ?? track.label ?? `Track ${idx}`,
+        info?.language ?? track.language ?? '',
+      );
+      return;
+    }
+    subs.toggleTrack(track);
+  }, [msePlayer.embeddedSubTracks, subs, toggleEmbeddedSub]);
+
+  // Round-10 P1-2: automatic subtitle-coverage repair.
+  //
+  // Session A: the viewer seeked to 4500s of an 8888s film while the extracted
+  // cues covered 0-196s. Nothing rendered, and nothing in the app ever
+  // re-extracted — `fetchEmbeddedSubText` had exactly one consumer (a manual
+  // click), and even that dead-ended on the `partial` flag. This closes the loop:
+  // when an ACTIVE track's cues fall behind the playhead, re-extract against the
+  // island around the viewer and swap the cues in place.
+  //
+  // Normally driven by timeupdate; deferred and still-uncovered outcomes schedule
+  // their own bounded retry so repair also progresses while playback is paused.
+  //   - only for an ACTIVE embedded track (never resurrects a disabled one)
+  //   - coverage judged from the cue list, so ASS/jassub tracks (cues stay empty)
+  //     report unknown coverage and are left alone
+  //   - one repair per playhead REGION, so a still-short result can't spin
+  //   - skipped while any extraction is in flight, and generation-guarded so a
+  //     file switch mid-fetch discards the result
+  const subRepairAttemptedRef = useRef<Set<string>>(new Set());
+  const subRepairRetryTimersRef = useRef<Map<string, number>>(new Map());
+  // Round-21: last coverage frontier (s) at which we BYPASSED the region ledger,
+  // per region key. Lets `shouldBypassRegionLedger` refuse a repeat bypass at an
+  // unchanged frontier (memo-replay), so the bypass cannot storm.
+  const subRepairBypassFrontierRef = useRef<Map<string, number>>(new Map());
+  // Breaker state is per (file, track, 120-second region). A failed or deferred
+  // opening-prefix extraction is evidence about that region only; it must not
+  // spend the attempt ceiling for a later seek where a usable island exists.
+  // The LRU cap keeps the bounded per-region state from growing without limit.
+  const subBreakerRef = useRef<Map<string, SubRepairBreakerState>>(new Map());
+  const SUB_BREAKER_LRU_CAP = 32;
+  const getBreaker = useCallback((key: string): SubRepairBreakerState => {
+    return subBreakerRef.current.get(key) ?? emptySubRepairBreakerState();
+  }, []);
+  const setBreaker = useCallback((key: string, next: SubRepairBreakerState) => {
+    const m = subBreakerRef.current;
+    m.delete(key);          // re-insert so Map iteration order is LRU
+    m.set(key, next);
+    while (m.size > SUB_BREAKER_LRU_CAP) {
+      const oldest = m.keys().next().value;
+      if (oldest === undefined) break;
+      m.delete(oldest);
+    }
+  }, []);
+  const maybeRepairSubCoverageRef = useRef<((t: number) => void) | null>(null);
+  useEffect(() => {
+    maybeRepairSubCoverageRef.current = (playheadS: number) => {
+      if (embeddedSubLoadingIdxRef.current != null) return;
+      if (!Number.isFinite(playheadS) || playheadS <= 0) return;
+      for (const [idx, entry] of embeddedSubTracksRef.current) {
+        if (!subs.activeTracks.includes(entry.track)) continue;
+        // Round-20: pass the cue INTERVALS. With only `lastCueEnd` this gate
+        // silently skipped every backward seek into a hole between two islands
+        // (20-c: 7 consecutive seeks, zero requests reached the backend).
+        const mergedCoverageIntervals = entry.track.isASS
+          ? assDialogueIntervals(entry.track.assContent)
+          : entry.track.cues;
+        const coverageIntervals = selectSubRepairCoverageIntervals(
+          mergedCoverageIntervals, entry.localIntervals, !entry.partial,
+        );
+        const coverageFrontier = lastCueEnd([...coverageIntervals]);
+        // Fire on EITHER the wide adequacy gate (playhead outran coverage by the
+        // 90 s grace, or fell in a hole) OR the tight lead-time gate (playhead is
+        // within SUB_REEXTRACT_LEAD_S of the coverage frontier — fetch the next
+        // island BEFORE the visible cues run out). The lead gate is what makes
+        // the larger 24 MiB island refresh seamlessly instead of lapsing; it is
+        // storm-safe because the region ledger is only released after coverage
+        // actually advances (Round-14 B2).
+        const emptyPartialSnapshot =
+          entry.partial && entry.localIntervals != null && entry.localIntervals.length === 0;
+        const needsReExtract =
+          emptyPartialSnapshot ||
+          shouldReExtractSub(
+            playheadS, coverageFrontier, !entry.partial,
+            undefined, coverageIntervals,
+          ) ||
+          shouldReExtractSubAhead(playheadS, coverageFrontier, !entry.partial);
+        if (!needsReExtract) continue;
+        const regionKey = selectSubRepairBreakerKey(String(file.id), idx, playheadS);
+        // Breaker and ledger share the same region key. A deferred retry stays
+        // bounded within this region, while a distant seek starts with clean
+        // evidence and its own attempt ceiling.
+        const bkey = regionKey;
+        const st = getBreaker(bkey);
+        if (!shouldAttemptSubRepair(st, Date.now(), false)) {
+          continue;
+        }
+        // One attempt per ~2-minute region, on top of the breaker: a genuinely
+        // uncached region must not re-fetch on every tick.
+        //
+        // Round-21 (17-c/17-t): but an island covers only a few seconds while a
+        // region is 120 s, so once the playhead OUTRUNS a non-growing island the
+        // ledger would otherwise blank subtitles for up to ~112 s. Bypass the
+        // one-shot ledger when the playhead has clearly passed the loaded
+        // coverage frontier — that re-extraction targets a new island (forward
+        // progress), not the 15-c storm (which re-hits the SAME island from
+        // INSIDE its coverage). The breaker (checked above) still bounds it.
+        const bypassLedger = shouldBypassRegionLedger(
+          playheadS, coverageFrontier, !entry.partial,
+          subRepairBypassFrontierRef.current.get(regionKey) ?? null,
+        );
+        if (!bypassLedger && subRepairAttemptedRef.current.has(regionKey)) continue;
+        if (bypassLedger && coverageFrontier != null) {
+          subRepairBypassFrontierRef.current.set(regionKey, coverageFrontier);
+        }
+        subRepairAttemptedRef.current.add(regionKey);
+        void repairSubCoverage(idx, entry, bkey, playheadS, regionKey);
+        return; // one at a time; the backend serialises extractions anyway
+      }
+    };
+  });
+
+  const repairSubCoverage = useCallback(async (
+    idx: number,
+    entry: { track: SubtitleTrack; partial: boolean; localIntervals: SubCoverageInterval[] | null },
+    bkey: string,
+    playheadS: number,
+    regionKey?: string,
+  ) => {
+    if (embeddedSubLoadingIdxRef.current != null) return;
+    embeddedSubLoadingIdxRef.current = idx;
+    const genAtStart = embeddedSubFileGenRef.current;
+    const startedAt = Date.now();
+    const before = lastCueEnd(entry.track.cues);
+    // Round-20: cue COUNT before the repair. A backward-seek repair fills a hole
+    // in the middle of the timeline, which raises the count without moving
+    // `lastCueEnd` at all — so the count is what proves it did something.
+    const cuesBeforeCount = entry.track.cues?.length ?? 0;
+    // Round-16: ASS/SSA keeps `cues` empty (jassub renders `assContent`), so the
+    // cue list cannot describe its coverage. Track content length instead.
+    const assBeforeLen = entry.track.isASS ? (entry.track.assContent?.length ?? 0) : null;
+    const assBeforeCount = entry.track.isASS ? assDialogueIntervals(entry.track.assContent).length : null;
+    const stBefore = getBreaker(bkey);
+    const selectionVersionAtStart = subs.getSelectionVersion();
+    const attemptNo = stBefore.attempts + 1;
+    let hadError = false;
+    let after: number | null = before;
+    let assAfterLen: number | null = assBeforeLen;
+    let assIntervalsAfter = entry.track.isASS ? assDialogueIntervals(entry.track.assContent) : null;
+    // Round-17: the backend's contiguous cache frontier, from X-Subs-Frontier.
+    // `reduceSubRepairBreaker` resets the failure counter when this GROWS between
+    // attempts — the mechanism that reopens the breaker as data arrives. It was
+    // dead code until now because this call site passed a hardcoded `null`.
+    let frontierBytes: number | null = null;
+    let supplyActive = false;
+    // `X-Subs-Unchanged` can accompany a non-empty HTTP 200 memo replay. It must
+    // survive past the fetch try/finally into outcome classification.
+    let snapshotUnchanged = false;
+    let successfulEmptyPartial = false;
+    try {
+      const res = await msePlayer.fetchEmbeddedSubText(idx);
+      if (embeddedSubFileGenRef.current !== genAtStart) return; // file switched
+      frontierBytes = res.frontier;
+      if ('error' in res) {
+        hadError = true;
+        supplyActive = res.supplyActive === true;
+        // A 204 empty-partial response is local evidence about THIS island. Do
+        // not retain a previous seek's future intervals: the bounded retry would
+        // otherwise consult stale coverage and suppress the very recheck it scheduled.
+        if (res.error === 'empty-partial') entry.localIntervals = [];
+      } else {
+        snapshotUnchanged = res.unchanged;
+        // Round-15 R-3: MERGE, never clobber. The old code did
+        // `entry.track.cues = []; entry.track.loadText(res.text)` — a blind
+        // replace that destroyed coverage whenever a later island-mode
+        // extraction returned a narrower span (15-c:188: 2300s -> 169s).
+        //
+        // `cues = []` cannot simply be dropped: loadText APPENDS for SRT/VTT
+        // (parser.oncue pushes), so reusing the live track would duplicate every
+        // cue. Parse into a scratch track instead, then union the two lists.
+        //
+        // ASS is exempt: loadText stores `assContent` and leaves `cues` empty
+        // (SubtitleTrack.ts:80-86), so there is no cue list to merge and jassub
+        // needs the replacement content verbatim.
+        const scratch = new SubtitleTrack(null, null);
+        scratch.loadText(res.text);
+        entry.localIntervals = scratch.isASS
+          ? assDialogueIntervals(scratch.assContent)
+          : scratch.cues.map((cue) => ({ startTime: cue.startTime, endTime: cue.endTime }));
+        successfulEmptyPartial = res.partial && entry.localIntervals.length === 0;
+        if (scratch.isASS) {
+          entry.track.loadText(mergeAssContent(entry.track.assContent, res.text));
+          assAfterLen = entry.track.assContent?.length ?? 0;
+          assIntervalsAfter = assDialogueIntervals(entry.track.assContent);
+        } else {
+          entry.track.cues = mergeCues(entry.track.cues, scratch.cues);
+          entry.track.format = scratch.format;
+        }
+        entry.partial = res.partial;
+        after = lastCueEnd(entry.track.cues);
+        if (
+          subs.getSelectionVersion() === selectionVersionAtStart
+          && subs.isTrackActive(entry.track)
+        ) {
+          setSubtitleRevision((revision) => revision + 1);
+        }
+      }
+    } catch {
+      hadError = true;
+    } finally {
+      // Round-10b: clear UNCONDITIONALLY. The old code only cleared when the
+      // generation still matched, so a file switch mid-repair left the flag set
+      // and blocked EVERY future repair for the session.
+      if (embeddedSubLoadingIdxRef.current === idx) {
+        embeddedSubLoadingIdxRef.current = null;
+      }
+    }
+    if (embeddedSubFileGenRef.current !== genAtStart) return;
+    const outcome = classifySubRepairOutcome(
+      before, after, playheadS, hadError, !entry.partial,
+      undefined, assBeforeLen, assAfterLen,
+      // Round-17: growth between attempts turns a 204 decline from `failed`
+      // (150s ladder) into `deferred` (retry soon, no failure budget spent).
+      stBefore.lastFrontierBytes, frontierBytes,
+      // Round-20: cue intervals + the pre-repair count, so a backward-seek
+      // repair that filled a mid-file hole is scored on what it actually did.
+      entry.track.cues, cuesBeforeCount,
+      assIntervalsAfter, assBeforeCount,
+      supplyActive,
+      // Preserve X-Subs-Unchanged on HTTP 200 memo replays. Without this, the
+      // stale partial snapshot is misclassified `ok` and the region never reopens
+      // to observe a later, larger cached island.
+      snapshotUnchanged,
+    );
+    const stAfter = reduceSubRepairBreaker(stBefore, outcome, startedAt, frontierBytes);
+    setBreaker(bkey, stAfter);
+    // Release the one-shot region ledger after a successful-but-PARTIAL island
+    // extraction that ACTUALLY EXTENDED coverage, so forward playback within the
+    // same 120s region can re-extract once the playhead outruns the cues. Without
+    // this the region latches on the first `ok` and subtitles freeze until the
+    // next seek (13-c: delta grew to −21.87s, zero repairs).
+    //
+    // Round-14(B2): the release MUST require forward progress. An `ok` that did
+    // not extend the frontier (same island re-extracted, content unchanged) must
+    // keep the region LATCHED, or the lead-time trigger re-arms and fires every
+    // tick — the 15-c storm (~4 `ok 956B→956B`/s, which the breaker cannot stop
+    // because `ok` is its reset condition). Progress = SRT frontier advanced
+    // (`after > before`) OR ASS content grew (`assAfterLen > assBeforeLen`).
+    const coverageAdvanced =
+      (after != null && (before == null || after > before)) ||
+      (assAfterLen != null && (assBeforeLen == null || assAfterLen > assBeforeLen));
+    if (regionKey && shouldReleaseSubRepairRegion(outcome, entry.partial, coverageAdvanced)) {
+      subRepairAttemptedRef.current.delete(regionKey);
+    }
+    const retryDelay = subRepairRegionRetryDelay(outcome, successfulEmptyPartial);
+    if (regionKey && retryDelay != null) {
+      scheduleSubRepairRegionRetry({
+        regionKey,
+        delayMs: retryDelay,
+        generation: genAtStart,
+        timers: subRepairRetryTimersRef.current,
+        attemptedRegions: subRepairAttemptedRef.current,
+        currentGeneration: () => embeddedSubFileGenRef.current,
+        currentPlayhead: () => vidRef.current?.currentTime ?? playheadS,
+        retry: (currentTime) => maybeRepairSubCoverageRef.current?.(currentTime),
+      });
+    }
+    const elapsed = Date.now() - startedAt;
+    // Round-10b: 12-t.md had 444 identical lines with no counter, so the runaway
+    // was invisible until byte totals were summed by hand. Every line now carries
+    // attempt n/max, coverage before→after, elapsed ms, and the outcome.
+    console.log(
+      `[SUBS] repair track ${idx} attempt ${attemptNo}/${SUB_REPAIR_MAX_ATTEMPTS}: ` +
+      `${outcome} — ` +
+      (assAfterLen != null
+        // ASS/SSA has no cue list, so "coverage 2300s" is meaningless for it —
+        // report what actually changed (16-c:213 logged `nones → nones`).
+        ? `content ${assBeforeLen ?? 0}B → ${assAfterLen}B, `
+        : `coverage ${before?.toFixed(0) ?? 'none'}s → ${after?.toFixed(0) ?? 'none'}s, `) +
+      `playhead ${playheadS.toFixed(0)}s, ${elapsed}ms`,
+    );
+    if (stAfter.open && !stBefore.open) {
+      console.warn(
+        `[SUBS] repair BREAKER OPEN for track ${idx} after ${stAfter.consecutiveFailures} ` +
+        `consecutive non-progress attempts — automatic repair suspended for this file. ` +
+        `A manual track toggle still forces a retry.`,
+      );
+    } else if (!stAfter.open && stAfter.consecutiveFailures > 0) {
+      console.log(
+        `[SUBS] repair backoff for track ${idx}: next attempt in ` +
+        `${Math.round(computeSubRepairBackoffMs(stAfter.consecutiveFailures) / 1000)}s`,
+      );
+    }
+  }, [subs, msePlayer, getBreaker, setBreaker]);
+
+  // Reset the per-region repair ledger when the file changes. The BREAKER map
+  // deliberately survives: a file known to be unrepairable must stay known.
+  useEffect(() => {
+    for (const timer of subRepairRetryTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    subRepairRetryTimersRef.current.clear();
+    subRepairAttemptedRef.current.clear();
+    subRepairBypassFrontierRef.current.clear();
+    return () => {
+      for (const timer of subRepairRetryTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      subRepairRetryTimersRef.current.clear();
+    };
+  }, [file.id]);
+
+  // Re-apply the persisted embedded-subtitle choice when the track list for
+  // this file materializes (plan §2.4: never auto-enable without a persisted
+  // choice; -1 = explicit off, absent = no stored preference).
+  const embeddedSubAutoAppliedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const fileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+    if (embeddedSubAutoAppliedRef.current === fileKey) return; // once per file
+    if (msePlayer.embeddedSubTracks.length === 0) return;
+    embeddedSubAutoAppliedRef.current = fileKey;
+    const persisted = readPersistedSubTrack(fileKey);
+    if (persisted == null || persisted < 0) return; // off / no choice
+    const t = msePlayer.embeddedSubTracks.find((s) => s.idx === persisted && s.kind === 'text');
+    if (!t) return;
+    // Round-14 F4: 'auto' — this is session restore, not a human request. A
+    // failure here must not toast (forensics C6: it fired on EVERY open of a
+    // partially-cached file with a persisted choice).
+    void toggleEmbeddedSub(t.idx, t.label, t.language, 'auto');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msePlayer.embeddedSubTracks, file.id, activeFolderId]);
+
   // Settings panel resize: drag the left edge. Width is clamped to the player box
   // and persisted so it's remembered across sessions. Panel grows leftward, so a
   // drag to the LEFT (smaller clientX) = wider panel.
@@ -1540,7 +2442,7 @@ interface FastStreamPlayerProps {
   // positionable on the bar like any chip, but it can never live inside the tray
   // popover (it IS the popover) and must always be present somewhere on the bar.
   const TRAY = '__tray__';
-  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'captions', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
+  const ALL_CHIPS = useMemo(() => ['skipBack', 'skipFwd', 'captions', 'audio', 'loop', 'pip', 'speed', 'download', 'settings', 'pin', 'fullscreen', TRAY], []);
   const barLayout = useMemo(() => {
     const raw = settings.playerBarLayout ?? { left: [], right: [], tray: [] };
     const seen = new Set<string>();
@@ -1664,10 +2566,12 @@ interface FastStreamPlayerProps {
         // - MP4 MSE: mini pipeline + moov buffer enables on-demand capture
         // - Transmuxer (MKV/TS): second transmuxer instance + hidden video + MSE
         // - TS via fMP4 backend: Fmp4ThumbnailPipeline (backend /fmp4/segment)
+        // - MP4-HEVC→/remux reroute: backend /thumb (server-side ffmpeg JPEG)
         const canGenerateThumbnails = playerUseNative
           || (thumbnailDataReady && moovBufferReady)
           || isTransmuxer()
-          || (thumbnailDataReady && mseGetters?.isFmp4Stream());
+          || (thumbnailDataReady && mseGetters?.isFmp4Stream())
+          || (thumbnailDataReady && !!mseGetters?.getRemuxThumbConfig?.());
         if (canGenerateThumbnails) {
           setThumbUrl(null);
           setThumbLoading(true);
@@ -1740,6 +2644,74 @@ interface FastStreamPlayerProps {
   // immediately. Does NOT touch the seek bar / time readout.
   const barDur = dur || (window as any).__nobuf_ptsDuration || (window as any).__nobuf_estimateDuration || 0;
 
+  // Subtitle sync delay, in seconds, persisted per FILE (a 2.5s offset for one
+  // release is wrong for every other). Applied at cue-READ time, never by mutating
+  // cue times — coverage repair merges freshly extracted cues into live tracks and
+  // would silently half-revert a destructively shifted track.
+  const subFileKey = `${activeFolderId ?? 'pub'}:${file.id}`;
+  // SESSION-ONLY. Sync delay is deliberately NOT persisted: it reset per file anyway,
+  // and keeping a growing per-file map on disk is not worth the storage. Switching
+  // files inside one session still clears it, matching the old behaviour for a file
+  // that had no stored offset.
+  const [subDelay, setSubDelay] = useState(0);
+  useEffect(() => { setSubDelay(0); }, [subFileKey]);
+  const applySubDelay = useCallback((seconds: number) => {
+    setSubDelay(clampSubDelay(seconds));
+  }, []);
+
+  // Subtitle SIZE and POSITION are session-only: they reset to the defaults every
+  // launch rather than being written to settings.json. Kept as component state (not
+  // `settings`) so nothing subtitle-appearance-related touches disk. The API key and
+  // language DO persist — retyping a credential every launch is not acceptable.
+  const [subFontScale, setSubFontScale] = useState(1);
+  const [subOffsetPct, setSubOffsetPct] = useState(0);
+
+  // Subtitles are NOT reserved away from the settings panel. The panel is z-50 and
+  // the overlay is z-20, so the panel simply draws on top — which is the desired
+  // behaviour ("the settings panel should get on top of the subtitle"). Squeezing the
+  // cue box horizontally while the panel is open reflowed the text mid-playback for
+  // no benefit, so the reserve is fixed at 0.
+  const panelReserveRight = 0;
+
+  // All subtitle geometry, computed once per geometry change rather than per frame.
+  // Deps are PRIMITIVES on purpose: setVideoResolution allocates a new {w,h} object
+  // on every onMeta, so an object dep would invalidate this memo even when the
+  // numbers are identical. Nothing here may read getBoundingClientRect — `time`
+  // re-renders this component ~4x/second.
+  const subLayout = useMemo(() => subtitleLayout({
+    boxW: subGeom.boxW,
+    boxH: subGeom.boxH,
+    videoW: videoResolution?.w ?? null,
+    videoH: videoResolution?.h ?? null,
+    fit: (settings.playerVideoFit === 'original' ? 'none' : settings.playerVideoFit) as SubFit,
+    rotation: (rotation === 90 || rotation === 180 || rotation === 270 ? rotation : 0) as 0 | 90 | 180 | 270,
+    controlsContentH: subGeom.ctrlH,
+    dlOverlayH: dlOverlayVisible ? DL_OVERLAY_RESERVE_PX : 0,
+    panelReserveRight,
+    fontScale: subFontScale,
+    offsetPct: subOffsetPct,
+  }), [
+    subGeom.boxW, subGeom.boxH, subGeom.ctrlH,
+    videoResolution?.w, videoResolution?.h,
+    settings.playerVideoFit, rotation,
+    dlOverlayVisible, panelReserveRight,
+    subFontScale, subOffsetPct,
+  ]);
+
+
+  // The captions menu has a dedicated "Embedded" section (below) that owns every
+  // embedded MKV track. Embedded tracks are ALSO pushed into `subs.tracks` (so
+  // the overlay and `activeTracks` can see them), which made them appear a
+  // SECOND time in the generic loaded-tracks list — and that duplicate row was
+  // wired to a raw single-active swap with no extraction/coverage/persistence.
+  // Selecting a new embedded track grew this list, reflowed the rows, and a
+  // stray click on the duplicate silently reverted the active track. Show only
+  // genuine sidecar tracks here; embedded tracks are rendered once, below.
+  const embeddedTrackObjs = new Set(
+    [...embeddedSubTracksRef.current.values()].map((e) => e.track),
+  );
+  const sidecarTracks = subs.tracks.filter((t) => !embeddedTrackObjs.has(t));
+
   // Chip registry: id → button JSX. Each movable control lives here once and is
   // placed by the persisted layout into left/right/tray zones.
   const chipButton = (id: string): { el: React.ReactNode; label: string } => {
@@ -1758,19 +2730,233 @@ interface FastStreamPlayerProps {
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 12h4v2H4v-2zm10 6H4v-2h10v2zm6 0h-4v-2h4v2zm0-4H10v-2h10v2z"/></svg>
           </button>
           {subMenu && (
-            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
-              <button onClick={() => { subs.activeTracks.forEach(subs.deactivateTrack); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
-              {subs.tracks.map((t, i) => (
-                <button key={i} onClick={() => subs.toggleTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
-                  {t.label || t.language || `Track ${i + 1}`}{t.isASS ? ' (ASS)' : ''}
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg z-50 shadow-2xl flex items-stretch max-h-80 w-[520px] max-w-[92vw]" onClick={e => e.stopPropagation()}>
+              {/* LEFT column — track selection. Scrolls independently so a file with
+                  many embedded tracks can't push the sliders out of reach. */}
+              <div className="flex-1 min-w-0 overflow-y-auto py-1">
+              <button onClick={() => { subs.deactivateAll(); persistSubTrack(`${activeFolderId ?? 'pub'}:${file.id}`, -1); }} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 ${subs.activeTracks.length === 0 ? 'text-nobuf-primary font-semibold' : 'text-white'}`}>Off</button>
+              {sidecarTracks.map((t) => (
+                <button key={`${t.label ?? ''}:${t.language ?? ''}`} onClick={() => toggleLoadedSubTrack(t)} className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${subs.activeTracks.includes(t) ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold' : 'text-white'}`}>
+                  {t.label || t.language || 'Subtitle'}{t.isASS ? ' (ASS)' : ''}
                 </button>
               ))}
+              {(msePlayer.embeddedSubTracks.length > 0 || msePlayer.embeddedSubsLoading) && (
+                <div className="border-t border-white/10 mt-1 pt-1">
+                  <div className="px-3 py-1 text-[11px] uppercase tracking-wider text-white/40 select-none">Embedded</div>
+                  {msePlayer.embeddedSubsLoading && msePlayer.embeddedSubTracks.length === 0 && (
+                    <div className="px-3 py-1.5 text-sm text-white/50">Scanning tracks…</div>
+                  )}
+                  {msePlayer.embeddedSubTracks.map((t) => {
+                    const loaded = embeddedSubTracksRef.current.get(t.idx);
+                    const active = !!loaded && subs.activeTracks.includes(loaded.track);
+                    const busy = embeddedSubBusyIdx === t.idx;
+                    // Round-14 F4.5(b): a silent auto-restore failure surfaces
+                    // here instead of as a toast. Suppressed while busy/active.
+                    const unavailable = embeddedSubUnavailable.has(t.idx) && !busy && !active;
+                    const disabled = t.kind !== 'text' || busy;
+                    return (
+                      <button
+                        key={t.idx}
+                        disabled={disabled}
+                        title={t.kind !== 'text'
+                          ? 'Image-based subtitles — not supported'
+                          : unavailable
+                            ? 'No cues in the downloaded portion yet — click to retry'
+                            : t.label}
+                        onClick={() => { void toggleEmbeddedSub(t.idx, t.label, t.language); }}
+                        className={`block w-full text-left px-3 py-1.5 text-sm truncate ${
+                          t.kind !== 'text'
+                            ? 'text-white/30 cursor-not-allowed'
+                            : active
+                              ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold hover:bg-white/10'
+                              : 'text-white hover:bg-white/10'
+                        }`}
+                      >
+                        {busy
+                          ? `${t.label} — extracting…`
+                          : `${t.label}${t.kind !== 'text' ? ' (image-based)' : ''}`}
+                        {unavailable && <span className="text-white/40"> — not downloaded yet</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <div className="border-t border-white/10 mt-1 pt-1">
                 <button onClick={() => { setSubMenu(false); subFileInputRef.current?.click(); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Load subtitle file…</button>
+                <button onClick={() => { setSubMenu(false); setOsPanel(true); }} className="block w-full text-left px-3 py-1.5 text-sm text-white/80 hover:bg-white/10">Search online…</button>
               </div>
+              </div>
+              {/* RIGHT column — appearance + sync. Sliders are native range inputs
+                  (the no-native-<select> rule targets dropdowns; a range has no popup
+                  list). Size/position live in settings.json (per-taste, all files);
+                  the sync delay is per-FILE, because an offset that fixes one release
+                  is wrong for every other.
+                  Gated on there being at least one track (D13): subtitle appearance
+                  controls on a file with no subtitles are dead UI. */}
+              {(subs.tracks.length > 0 || msePlayer.embeddedSubTracks.length > 0) && (
+              <div className="w-[248px] shrink-0 border-l border-white/10 overflow-y-auto px-3 py-2 space-y-2">
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Size</span>
+                    <span className="font-mono text-white/80">{Math.round(subFontScale * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={SUB_SCALE_MIN} max={SUB_SCALE_MAX} step={0.05}
+                    value={subFontScale}
+                    onChange={(e) => setSubFontScale(parseFloat(e.target.value))}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); setSubFontScale(1); }}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle size"
+                    title="Double-click to reset to 100%"
+                  />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Position</span>
+                    <span className="font-mono text-white/80">
+                      {subOffsetPct === 0
+                        ? 'Default'
+                        : `${subOffsetPct > 0 ? '+' : '−'}${Math.abs(subOffsetPct)}%`}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={SUB_OFFSET_MIN_PCT} max={SUB_OFFSET_MAX_PCT} step={1}
+                    value={subOffsetPct}
+                    onChange={(e) => setSubOffsetPct(parseInt(e.target.value, 10))}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); setSubOffsetPct(0); }}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle vertical position"
+                    title="Double-click to reset to default"
+                  />
+                  <div className="flex items-center justify-between text-[10px] text-white/35 leading-none mt-0.5">
+                    <span>lower</span>
+                    <span>raise</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>Sync</span>
+                    <span className="font-mono text-white/80">{subDelay === 0 ? '0.00s' : `${subDelay > 0 ? '+' : ''}${subDelay.toFixed(2)}s`}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-SUB_DELAY_LIMIT_S} max={SUB_DELAY_LIMIT_S} step={0.05}
+                    value={subDelay}
+                    onChange={(e) => applySubDelay(parseFloat(e.target.value))}
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-full h-1 accent-nobuf-primary cursor-pointer"
+                    aria-label="Subtitle sync delay"
+                  />
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="text-[10px] text-white/40 leading-none">Subtitles {subDelay < 0 ? 'earlier' : 'later'}</span>
+                    <div className="flex items-center gap-1.5">
+                      {/* ±0.1s nudges: dragging a 0.05-step range to a precise offset
+                          is fiddly, and fine sync correction is exactly the case
+                          where the user knows the number they want. */}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(subDelay - 0.1); }}
+                        disabled={subDelay <= -SUB_DELAY_LIMIT_S}
+                        className="px-1 text-[10px] font-mono text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                        title="0.1s earlier"
+                      >
+                        −0.1
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(subDelay + 0.1); }}
+                        disabled={subDelay >= SUB_DELAY_LIMIT_S}
+                        className="px-1 text-[10px] font-mono text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                        title="0.1s later"
+                      >
+                        +0.1
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); applySubDelay(0); }}
+                        disabled={subDelay === 0}
+                        className="text-[10px] text-white/60 hover:text-white disabled:opacity-30 disabled:hover:text-white/60 leading-none"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                {/* OpenSubtitles key. Lives here so everything subtitle-related is in
+                    one place. type=password because it is a credential; the API only
+                    ever leaves via the Rust commands, never a renderer fetch. */}
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/60 leading-none mb-1">
+                    <span>OpenSubtitles key</span>
+                    {settings.openSubtitlesApiKey ? (
+                      <span className="text-[10px] text-nobuf-primary leading-none">saved</span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); void openUrl('https://www.opensubtitles.com/en/consumers'); }}
+                        className="text-[10px] text-white/50 hover:text-white leading-none underline"
+                      >
+                        get one free
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    type="password"
+                    value={settings.openSubtitlesApiKey}
+                    onChange={(e) => updateSetting('openSubtitlesApiKey', e.target.value.trim())}
+                    onClick={(e) => e.stopPropagation()}
+                    placeholder="Paste API key"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full px-2 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 focus:border-nobuf-primary focus:outline-none placeholder-white/25"
+                    aria-label="OpenSubtitles API key"
+                  />
+                </div>
+              </div>
+              )}
             </div>
           )}
         </div> };
+      case 'audio': {
+        // Audio-track menu — visual twin of the captions chip. Hidden entirely
+        // when the file has ≤1 audio track (no dead UI). Switching rebuilds the
+        // pipeline like a seek and NEVER unpauses a paused player.
+        const aTracks = msePlayer.audioTracks;
+        if (aTracks.length <= 1) return { label: 'Audio', el: null };
+        const nonDefaultActive = msePlayer.activeAudioTrackId != null
+          && aTracks.some(t => t.id === msePlayer.activeAudioTrackId && !t.isDefault);
+        return { label: 'Audio', el:
+        <div className="relative">
+          <button onClick={(e) => { e.stopPropagation(); setAudioMenu(m => !m); }} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${nonDefaultActive ? 'text-nobuf-primary' : 'text-white'}`} title="Audio track">
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+          </button>
+          {audioMenu && (
+            <div className="absolute bottom-full right-0 mb-2 bg-black/95 border border-white/10 rounded-lg overflow-hidden min-w-[180px] max-h-72 overflow-y-auto z-50 shadow-2xl py-1" onClick={e => e.stopPropagation()}>
+              {aTracks.map((t) => (
+                <button
+                  key={t.id}
+                  disabled={audioSwitching || !t.playable}
+                  onClick={async () => {
+                    setAudioMenu(false);
+                    if (t.id === msePlayer.activeAudioTrackId) return;
+                    setAudioSwitching(true);
+                    const ok = await msePlayer.switchAudioTrack(t.id);
+                    setAudioSwitching(false);
+                    if (!ok) toast.error('Audio switch failed — reverted');
+                  }}
+                  className={`block w-full text-left px-3 py-1.5 text-sm hover:bg-white/10 truncate ${
+                    t.id === msePlayer.activeAudioTrackId
+                      ? 'text-nobuf-primary bg-nobuf-primary/10 font-semibold'
+                      : t.playable ? 'text-white' : 'text-white/40 cursor-not-allowed'
+                  }`}
+                >
+                  {t.label}{!t.playable ? ' (unsupported)' : ''}
+                </button>
+              ))}
+            </div>
+          )}
+        </div> };
+      }
       case 'loop': return { label: 'Loop', el:
         <button onClick={() => setLoop(l => !l)} className={`p-1.5 hover:bg-white/10 rounded transition-colors ${loop ? 'text-nobuf-primary' : 'text-white'}`} title={loop ? 'Loop on' : 'Loop off'}>
           <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
@@ -1819,11 +3005,27 @@ interface FastStreamPlayerProps {
     if (id === TRAY) return renderTray();
     const { el, label } = chipButton(id);
     if (!el) return null;
+    // A chip whose popover is OPEN must not be draggable. WebView2 hands a nested
+    // drag to the OUTERMOST draggable ancestor, so dragging a slider inside the
+    // captions/settings popover started a CHIP drag instead: the insertion bar
+    // appeared, the bar-layout logic armed, and the range input never got its
+    // pointer stream. Same class as the tray fix (a draggable must never CONTAIN
+    // other interactive children) — but the tray solved it by moving `draggable`
+    // onto its button, which does not work here because the popover is rendered by
+    // `chipButton` inside the same relative wrapper. Disabling the drag while the
+    // menu is open is the surgical equivalent: the chip is still draggable whenever
+    // its menu is closed, which is the only time you would want to move it.
+    const menuOpen =
+      (id === 'captions' && subMenu) ||
+      (id === 'speed' && menu) ||
+      (id === 'audio' && audioMenu);
+    const isDraggable = !menuOpen;
     return (
       <div
         key={id}
-        draggable
+        draggable={isDraggable}
         onDragStart={(e) => {
+          if (!isDraggable) { e.preventDefault(); return; }
           markDragStart();
           setDragChip(id);
           setDragKind('chip');
@@ -1836,9 +3038,9 @@ interface FastStreamPlayerProps {
           e.dataTransfer.setData('text/plain', id); // required or the webview aborts the drag
         }}
         onDragEnd={() => { markDragEnd(); setDragChip(null); setDragKind(null); setDropSide(null); setDropIndex(null); }}
-        title={`${label} — drag to move`}
+        title={isDraggable ? `${label} — drag to move` : label}
         data-chip-id={id}
-        className={`transition-all duration-150 cursor-grab active:cursor-grabbing ${dragChip === id ? 'opacity-30 scale-90' : 'opacity-100 hover:-translate-y-0.5'}`}
+        className={`transition-all duration-150 ${isDraggable ? 'cursor-grab active:cursor-grabbing' : ''} ${dragChip === id ? 'opacity-30 scale-90' : 'opacity-100 hover:-translate-y-0.5'}`}
       >
         {el}
       </div>
@@ -1939,8 +3141,29 @@ interface FastStreamPlayerProps {
         className="hidden"
         onChange={(e) => { loadSubFile(e.target.files); e.target.value = ''; }}
       />
+      {/* OpenSubtitles search. Rendered here (a sibling of the video box) rather than
+          inside the captions popover: it is a modal with its own backdrop. */}
+      {osPanel && (
+        <OpenSubtitlesPanel
+          filename={file.name}
+          apiKey={settings.openSubtitlesApiKey}
+          language={settings.openSubtitlesLanguage}
+          onLanguageChange={(code) => updateSetting('openSubtitlesLanguage', code)}
+          quota={liveQuota(settings.openSubtitlesQuota, Date.now())}
+          onQuotaReported={(remaining, resetTime) => {
+            // reset_time is PROSE ("09 hours and 10 minutes"), so convert it to an
+            // absolute deadline; without one the stored quota could never expire.
+            const resetAtMs = parseQuotaResetAt(resetTime, Date.now());
+            updateSetting('openSubtitlesQuota', resetAtMs ? { remaining, resetAtMs } : null);
+          }}
+          fetchMovieHash={msePlayer.fetchMovieHash}
+          onPicked={acceptOnlineSub}
+          onClose={() => setOsPanel(false)}
+          onGetKey={() => { void openUrl('https://www.opensubtitles.com/en/consumers'); }}
+        />
+      )}
       {/* Video - FastStream's DirectVideoPlayer approach */}
-      <div className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
+      <div ref={videoBoxRef} className="flex-1 flex items-center justify-center min-h-0 relative cursor-pointer" onClick={toggle} onDoubleClick={fs2}>
         {err ? (
           <div className="text-center px-8">
             <div className="text-amber-400 text-lg mb-2">{err}</div>
@@ -1969,9 +3192,9 @@ interface FastStreamPlayerProps {
           />
         )}
         {!err && (
-          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} />
+          <SubtitleOverlay vidRef={vidRef} activeTracks={subs.activeTracks} currentTime={time} revision={subtitleRevision} assFonts={msePlayer.getEmbeddedSubFontUrls()} layout={subLayout} delaySec={subDelay} />
         )}
-        {load && !err && (
+        {load && !err && !showColdStartOverlay && !isRemuxLoading && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin" />
           </div>
@@ -2049,7 +3272,7 @@ interface FastStreamPlayerProps {
               </button>
             )}
             <span className="text-[10px] font-mono text-white/60 bg-black/40 px-1.5 py-0.5 rounded">
-              {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
+              {(() => { const s = speedMeterValue(greenBarSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
             </span>
           </div>
           <div className="relative h-[2px] bg-white/20">
@@ -2058,11 +3281,37 @@ interface FastStreamPlayerProps {
         </div>
       )}
 
-      {/* Controls - FastStream-style */}
+      {/* Control-bar scrim. Carries the gradient that used to live on the bar itself.
+          z-10 keeps it BELOW the subtitle overlay (z-20), so it darkens the video
+          behind the buttons without washing over cue text — the bar is z-40 for
+          popover stacking, and a gradient at that level tinted the lower subtitle
+          lines. Geometry mirrors the bar (bottom-anchored, pt-16 worth of height);
+          opacity/transform follow `vis` so it fades with the controls. */}
+      <div
+        data-controls-scrim
+        aria-hidden
+        className="absolute bottom-0 left-0 right-0 z-10 pointer-events-none bg-gradient-to-t from-black/90 via-black/50 to-transparent"
+        style={{
+          height: (subGeom.ctrlH || 0) + 64,
+          opacity: vis ? 1 : 0,
+          transform: vis ? 'translateY(0)' : 'translateY(20px)',
+          transition: 'opacity 300ms ease-out, transform 300ms ease-out',
+        }}
+      />
+
+      {/* Controls - FastStream-style.
+          The bar is z-40 so popovers opened from a chip are never covered by
+          subtitles (overlay is z-20) or by the seek bar's own indicators.
+
+          But the bar itself must stay TRANSPARENT: its `bg-gradient-to-t
+          from-black/90 … pt-16` is a 64px dark wash, and at z-40 that wash paints
+          OVER subtitle text, visibly darkening the lower cue lines. The gradient now
+          lives in a sibling scrim rendered BELOW the overlay, so it still darkens the
+          video behind the buttons without tinting the cues. */}
       <div
         ref={controlsRef}
         data-controls-root
-        className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
+        className={`absolute bottom-0 left-0 right-0 z-40 pt-16 pb-2 px-3 ${vis ? '' : 'pointer-events-none'}`}
         style={{
           opacity: vis ? 1 : 0,
           transform: vis ? 'translateY(0)' : 'translateY(20px)',
@@ -2205,7 +3454,12 @@ interface FastStreamPlayerProps {
           onDragOver={(e) => { if (dragKind) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; const s = sideFromX(e.clientX); setDropSide(s); setDropIndex(dragKind === 'chip' ? indexFromX(s, e.clientX) : null); } }}
           onDrop={onRowDrop}
         >
-          <div className="flex items-center gap-1 relative z-10">
+          {/* z-40, not z-10: popovers opened from a chip must paint ABOVE the seek
+              bar's internal layers (cached-range green z-20, thumbnail-coverage
+              yellow z-30). The seek-bar track is a SIBLING of this row, so at z-10
+              those bars outranked every popover rendered inside here no matter what
+              the popover's own z-index said. */}
+          <div className="flex items-center gap-1 relative z-40">
             {/* Play/Pause — fixed anchor, larger for visual weight + centering */}
             <button onClick={toggle} className="p-1 hover:bg-white/10 rounded text-white transition-transform active:scale-90 flex items-center justify-center" title="Play/Pause (Space)">
               <svg className="w-7 h-7 block" fill="currentColor" viewBox="0 0 24 24">
@@ -2231,7 +3485,12 @@ interface FastStreamPlayerProps {
 
             <span className="text-white text-xs font-mono leading-none ml-1">{fmt(time)} / {fmt(dur)}</span>
           </div>
-          <div className="flex items-center gap-1 relative z-10">
+          {/* z-40, not z-10: popovers opened from a chip must paint ABOVE the seek
+              bar's internal layers (cached-range green z-20, thumbnail-coverage
+              yellow z-30). The seek-bar track is a SIBLING of this row, so at z-10
+              those bars outranked every popover rendered inside here no matter what
+              the popover's own z-index said. */}
+          <div className="flex items-center gap-1 relative z-40">
 
             {(() => {
               const vid = vidRef.current;
@@ -2279,7 +3538,7 @@ interface FastStreamPlayerProps {
                   </button>
                   {/* Download speed */}
                   <span className="text-xs font-mono text-white/60" title="Download speed from Telegram">
-                    {(() => { const s = speedMeterValue(greenBarSpeed, mseSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
+                    {(() => { const s = speedMeterValue(greenBarSpeed, prefetchPaused); return s > 0 ? formatSpeed(s) : '—'; })()}
                   </span>
                   {/* Buffer ahead */}
                   <span className={`text-xs font-mono ${healthColor}`} title={`SourceBuffer: ${sbAhead.toFixed(0)}s ahead\nDisk cache: +${cacheAhead.toFixed(0)}s ahead`}>
@@ -2325,7 +3584,7 @@ interface FastStreamPlayerProps {
       {/* Settings overlay panel */}
       {settingsOpen && (
         <div
-          className="absolute right-0 top-0 bottom-0 z-30 bg-gradient-to-b from-black/80 to-black/70 backdrop-blur-2xl border-l border-white/10 overflow-y-auto shadow-2xl shadow-black/50 animate-[settingsIn_180ms_ease-out]"
+          className="absolute right-0 top-0 bottom-0 z-50 bg-gradient-to-b from-black/80 to-black/70 backdrop-blur-2xl border-l border-white/10 overflow-y-auto shadow-2xl shadow-black/50 animate-[settingsIn_180ms_ease-out]"
           onClick={(e) => e.stopPropagation()}
           style={{ width: panelDragWidth ?? settings.playerSettingsWidth, maxWidth: '70%', scrollbarWidth: 'thin', transition: panelDragWidth == null ? 'width 120ms ease' : 'none' }}
         >

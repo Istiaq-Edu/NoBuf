@@ -1,5 +1,6 @@
 use std::net::TcpStream;
 use std::time::Duration;
+use crate::no_window::NoWindow;
 
 /// Telegram production Data Centres.
 /// Used by cmd_is_network_available for failover — if one DC is unreachable,
@@ -50,6 +51,7 @@ pub async fn cmd_detect_vpn() -> Result<bool, String> {
 fn detect_vpn_impl() -> Result<bool, String> {
     use std::process::Command;
     let output = Command::new("ipconfig")
+        .no_window()
         .output()
         .map_err(|e| format!("Failed to run ipconfig: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();

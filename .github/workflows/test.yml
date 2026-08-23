@@ -1,0 +1,45 @@
+name: Tests
+
+# Fast gate that runs on every push and PR: typecheck + unit tests only.
+# The heavy 4-platform Tauri builds stay manual (see main.yml) so this stays
+# quick enough to block a merge on.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Typecheck & unit tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: app
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        working-directory: app
+        run: npm test
+        env:
+          CI: true

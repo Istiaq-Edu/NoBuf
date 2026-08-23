@@ -14,6 +14,8 @@ fn main() {
                 "cmd_connect",
                 "cmd_log",
                 "cmd_ensure_ffmpeg",
+                "cmd_check_dependencies",
+                "cmd_reset_dependency_cache",
                 "cmd_delete_file",
                 "cmd_download_file",
                 "cmd_move_files",
@@ -35,6 +37,7 @@ fn main() {
                 "cmd_cancel_transfer",
                 "cmd_auth_qr_login",
                 "cmd_auth_qr_poll",
+                "cmd_auth_qr_current",
                 "cmd_open_telegram_auth",
                 "cmd_get_api_settings",
                 "cmd_update_api_settings",
@@ -77,6 +80,9 @@ fn main() {
                                 "cmd_forward_to_folder",
                                 "cmd_update_nb_pub_sync",
                                 "cmd_sync_public_channels",
+                                "cmd_opensubtitles_validate_key",
+                                "cmd_opensubtitles_search",
+                                "cmd_opensubtitles_download",
                             ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");
