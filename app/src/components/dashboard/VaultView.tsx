@@ -185,7 +185,7 @@ function HiddenRow({ icon: Icon, label, kindLabel, onOpen, onUnhide }: {
             <Icon className="w-4 h-4 shrink-0 text-nobuf-subtext group-hover:text-nobuf-primary transition-colors" />
             <span className="flex-1 text-sm text-nobuf-text truncate">{label}</span>
             <button
-                onClick={onOpen}
+                onClick={(e) => { e.stopPropagation(); onOpen(); }}
                 className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-nobuf-subtext hover:text-nobuf-primary rounded-md hover:bg-nobuf-hover transition-colors"
             >
                 Open <ChevronRight className="w-3 h-3" />
