@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useQueryClient } from '@tanstack/react-query';
 
@@ -181,7 +181,15 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         apply(s);
     }, [apply]);
 
-    const value: VaultContextValue = {
+    // Stable Sets: consumers pass these into memo/effect dep arrays — fresh
+    // Set objects every render would re-fire the restore gate and recompute
+    // filtering on every unrelated Dashboard state change (bandwidth ticks
+    // at 5s, selection clicks, search debounce). Recomputed only when the
+    // underlying state actually changes.
+    const hiddenFolderIds = useMemo(() => new Set(state?.folder_ids ?? []), [state?.folder_ids]);
+    const hiddenPublicIds = useMemo(() => new Set(state?.public_ids ?? []), [state?.public_ids]);
+
+    const value: VaultContextValue = useMemo(() => ({
         ready: ready && state !== null,
         isUnlocked: state?.is_unlocked ?? false,
         hasPasscode: state?.has_passcode ?? false,
@@ -189,8 +197,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         folderCount: state?.folder_count ?? 0,
         publicCount: state?.public_count ?? 0,
         totalCount: (state?.folder_count ?? 0) + (state?.public_count ?? 0),
-        hiddenFolderIds: new Set(state?.folder_ids ?? []),
-        hiddenPublicIds: new Set(state?.public_ids ?? []),
+        hiddenFolderIds,
+        hiddenPublicIds,
         refresh,
         hide,
         unhide,
@@ -200,7 +208,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         lock,
         reset,
         setEntryVisible,
-    };
+    }), [ready, state, hiddenFolderIds, hiddenPublicIds, refresh, hide, unhide, verify, setPasscode, changePasscode, lock, reset, setEntryVisible]);
 
     return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
 }
