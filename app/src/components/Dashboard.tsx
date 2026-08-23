@@ -54,6 +54,36 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
+
+        // ---- View history (Back button) ------------------------------------
+        // Every navigation through navigateTo pushes onto the stack; goBack
+        // pops. Direct setActiveView calls (restore-gate resets, D3/D14 jumps)
+        // intentionally bypass history — they're corrections, not navigation.
+        const pastViewsRef = useRef<ActiveView[]>([]);
+        const activeViewRef = useRef<ActiveView>(activeView);
+        useEffect(() => { activeViewRef.current = activeView; }, [activeView]);
+        const [canGoBack, setCanGoBack] = useState(false);
+        const navigateTo = useCallback((next: ActiveView) => {
+            const prev = activeViewRef.current;
+            const changed = prev.type !== next.type
+                || (next.type === 'folder' && prev.type === 'folder' && prev.folderId !== next.folderId)
+                || (next.type === 'public' && prev.type === 'public' && prev.channelId !== next.channelId);
+            if (changed) {
+                pastViewsRef.current = [...pastViewsRef.current, prev].slice(-50);
+                setCanGoBack(true);
+            }
+            setActiveView(next);
+        }, []);
+        const goBack = useCallback(() => {
+            const past = pastViewsRef.current;
+            if (past.length === 0) return;
+            const target = past[past.length - 1];
+            pastViewsRef.current = past.slice(0, -1);
+            setCanGoBack(pastViewsRef.current.length > 0);
+            if (target.type === 'folder') setActiveFolderId(target.folderId);
+            else if (target.type !== 'public') setActiveFolderId(null);
+            setActiveView(target);
+        }, [setActiveFolderId]);
         const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
@@ -188,12 +218,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // the useEffect below would immediately reset activeFolderId back.
         const handleSelectFolder = useCallback((id: number | null) => {
             if (id === null) {
-                setActiveView({ type: 'saved' });
+                navigateTo({ type: 'saved' });
             } else {
-                setActiveView({ type: 'folder', folderId: id });
+                navigateTo({ type: 'folder', folderId: id });
             }
             setActiveFolderId(id);
-        }, [setActiveFolderId]);
+        }, [setActiveFolderId, navigateTo]);
 
         // Sync activeFolderId with activeView for backward compat
             useEffect(() => {
@@ -879,10 +909,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onMobileClose={() => setMobileSidebarOpen(false)}
                 activeView={activeView}
                 publicChannels={visiblePublicChannels}
-                onSelectPublicChannel={(channelId) => setActiveView({ type: 'public', channelId })}
+                onSelectPublicChannel={(channelId) => navigateTo({ type: 'public', channelId })}
                 onPublicChannelsChanged={() => syncFromRemote.mutate()}
                 onRemovePublicChannel={handleRemovePublicChannel}
-                onOpenVault={() => setActiveView({ type: 'vault' })}
+                onOpenVault={() => navigateTo({ type: 'vault' })}
                 onHideInVault={handleHideInVault}
                 onVaultRejectFileDrop={() => toast.error('Only channels can be hidden')}
                 vaultEntryVisible={vault.entryVisible}
@@ -892,6 +922,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
                 <TopBar
                     currentFolderName={currentFolderName}
+                    onBack={goBack}
+                    canGoBack={canGoBack}
                     selectedIds={selectedIds}
                     onShowMoveModal={() => setShowMoveModal(true)}
                     onBulkDownload={handleBulkDownload}
@@ -922,8 +954,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {activeView.type === 'vault' ? (
                     <VaultView
-                        onOpenFolder={(id) => setActiveView({ type: 'folder', folderId: id })}
-                        onOpenPublicChannel={(id) => setActiveView({ type: 'public', channelId: id })}
+                        onOpenFolder={(id) => navigateTo({ type: 'folder', folderId: id })}
+                        onOpenPublicChannel={(id) => navigateTo({ type: 'public', channelId: id })}
                         getFolderName={(id) => folders.find(f => f.id === id)?.name || `Unknown folder (${id})`}
                         getChannelName={(id) => publicChannels.find(c => c.channel_id === id)?.name || `Unknown channel (${id})`}
                     />
