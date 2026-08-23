@@ -248,6 +248,14 @@ async function startOne(id: string) {
             window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
                 detail: { id, status: 'success', messageId: undefined },
             }));
+        } else if (result.error?.includes('ALREADY_STORED')) {
+            // Bytes reached Telegram but the final send/resolve step failed —
+            // the document exists server-side. Retrying would duplicate it.
+            window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
+                detail: { id, status: 'error', error: `File was uploaded but delivering it to the folder failed (it may exist in Telegram already). ${result.error}` },
+            }));
+            // Retire the handle: retry is intentionally NOT offered for this state.
+            forgetLiveDrop(id);
         } else if (result.error?.includes('cancel')) {
             window.dispatchEvent(new CustomEvent('nobuf-drop-done', {
                 detail: { id, status: 'cancelled', error: result.error },
@@ -302,6 +310,14 @@ export function retryDropStream(item: QueueItem): boolean {
         toast.error('Source file handle lost — drop the file again.');
         return true; // handled (as failure)
     }
+    // P1 fix (final sweep): a cancelled-while-queued id can sit in pendingDrops
+    // MORE THAN ONCE if the user retries and cancels again before the slot
+    // frees. Purge every stale occurrence plus the skip-marker so this retry
+    // starts exactly once, from a clean slate.
+    for (let i = pendingDrops.length - 1; i >= 0; i--) {
+        if (pendingDrops[i] === item.id) pendingDrops.splice(i, 1);
+    }
+    cancelledBeforeStart.delete(item.id);
     // Route through the gate like a fresh drop — retry must not bypass the
     // concurrency cap, or a 20-file retry storm reopens the FLOOD_WAIT hole.
     void enqueueStart(item.id);

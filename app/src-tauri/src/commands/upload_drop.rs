@@ -255,12 +255,22 @@ pub(crate) async fn upload_drop_handler(
                             log::info!("[drop] tid={tid} SUCCESS: '{name}' ({size}B) sent, message_id={}", m.id());
                             HttpResponse::Ok().json(serde_json::json!({ "message_id": m.id() }))
                         }
-                        Err(e) => HttpResponse::InternalServerError()
-                            .body(format!("Upload succeeded but send failed: {e}")),
+                        // Distinct marker body: bytes are ALREADY STORED in
+                        // Telegram's servers. Retrying would re-upload and
+                        // duplicate the document. Frontend treats this as
+                        // terminal 'sent-unconfirmed', not retryable error.
+                        Err(e) => {
+                            log::warn!("[drop] tid={tid} stored but send failed (document orphaned in TG): {e}");
+                            HttpResponse::UnprocessableEntity()
+                                .body(format!("ALREADY_STORED: {e}"))
+                        }
                     }
                 }
-                Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("Upload succeeded but resolve failed: {e}")),
+                Err(e) => {
+                    log::warn!("[drop] tid={tid} stored but resolve failed (document orphaned in TG): {e}");
+                    HttpResponse::UnprocessableEntity()
+                        .body(format!("ALREADY_STORED: {e}"))
+                }
             }
         }
         Err(e) => {
