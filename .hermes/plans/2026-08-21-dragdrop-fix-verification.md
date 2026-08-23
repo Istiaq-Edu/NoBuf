@@ -105,3 +105,24 @@ with POST enforced inside the handler; probes now truthful for any verb.
 
 cargo test **378/378** · cargo build clean (0 warnings) · tsc clean ·
 vitest **1128/1128** (95 files) · tree clean at c82dca1.
+
+## Final-sweep addendum (4-reviewer panel, pre-merge)
+
+SHIP verdict, zero release blockers. Key confirmations: integrity gate
+cannot false-positive (grammers flush-chain proof); no actix body-limit
+blocker (streamed Payload bypasses extractor defaults; MAX_DROP_BYTES is
+the ceiling); prod CORS/CSP verified at HEAD; token never logged.
+
+Pre-merge fixes applied from the sweep:
+- P1 zombie resurrection (cancel->retry->cancel duplicate pendingDrops
+  entry) — fixed in retryDropStream.
+- F1 retry-after-send-failure duplicates Telegram docs — handler now
+  returns 208-style distinct body "already stored"; frontend marks such
+  rows 'sent-unconfirmed' and refuses blind re-upload.
+
+Known unguarded (documented, post-merge): integrity gate + bandwidth
+accounting need a grammers seam; staging-fallback trigger; FIFO order by
+name. The attempted actix route-presence test remains blocked by the
+lib-test-binary load failure (STATUS_ENTRYPOINT_NOT_FOUND when actix_test
+links into app_lib tests — reproducible, cause unresolved); runtime
+REGISTERED logging + frontend probe remain the guards.
