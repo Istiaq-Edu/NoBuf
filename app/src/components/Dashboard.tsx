@@ -23,6 +23,8 @@ import { PdfViewer } from './dashboard/PdfViewer';
 import { SettingsPage } from './dashboard/SettingsPage';
 import { AboutPage } from './dashboard/AboutPage';
 import { ForwardToFolderModal } from './dashboard/ForwardToFolderModal';
+import { VaultPasscodeModal } from './dashboard/VaultPasscodeModal';
+import { VaultView } from './dashboard/VaultView';
 import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
 import { ActiveView } from '../types';
 import { useConfirm } from '../context/ConfirmContext';
@@ -36,11 +38,14 @@ import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
 import { useCacheSession } from '../context/CacheSessionContext';
 import { useResponsive } from '../hooks/useResponsive';
+import { useVault, VaultKind } from '../context/VaultContext';
+import { filterHidden } from '../context/VaultContext';
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const queryClient = useQueryClient();
     const cacheSession = useCacheSession();
     const { isMobile } = useResponsive();
+    const vault = useVault();
 
 
     const {
@@ -49,9 +54,187 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
+
+        // ---- View history (Back button) ------------------------------------
+        // Every navigation through navigateTo pushes onto the stack; goBack
+        // pops. Direct setActiveView calls (restore-gate resets, D3/D14 jumps)
+        // intentionally bypass history — they're corrections, not navigation.
+        const pastViewsRef = useRef<ActiveView[]>([]);
+        const activeViewRef = useRef<ActiveView>(activeView);
+        useEffect(() => { activeViewRef.current = activeView; }, [activeView]);
+        const vaultRef = useRef(vault);
+        useEffect(() => { vaultRef.current = vault; }, [vault]);
+        const [canGoBack, setCanGoBack] = useState(false);
+        const navigateToRef = useRef<(v: ActiveView) => void>(() => {});
+        const navigateTo = useCallback((next: ActiveView) => {
+            const prev = activeViewRef.current;
+            const changed = prev.type !== next.type
+                || (next.type === 'folder' && prev.type === 'folder' && prev.folderId !== next.folderId)
+                || (next.type === 'public' && prev.type === 'public' && prev.channelId !== next.channelId);
+            if (changed) {
+                pastViewsRef.current = [...pastViewsRef.current, prev].slice(-50);
+                setCanGoBack(true);
+            }
+            setActiveView(next);
+        }, []);
+        const goBack = useCallback(() => {
+            // Pop until we find a target that is still allowed. Vault-hidden
+            // items are skipped (Finding D): Back must never land on a view
+            // the rest of the feature works to conceal.
+            let past = pastViewsRef.current;
+            while (past.length > 0) {
+                const candidate = past[past.length - 1];
+                const concealed =
+                    (candidate.type === 'folder' && vaultRef.current.hiddenFolderIds.has(candidate.folderId)) ||
+                    (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId));
+                past = past.slice(0, -1);
+                if (!concealed) {
+                    pastViewsRef.current = past;
+                    setCanGoBack(past.length > 0);
+                    if (candidate.type === 'folder') setActiveFolderId(candidate.folderId);
+                    else if (candidate.type !== 'public') setActiveFolderId(null);
+                    setActiveView(candidate);
+                    return;
+                }
+            }
+            // Everything on the stack was concealed: clear it and go home.
+            pastViewsRef.current = [];
+            setCanGoBack(false);
+            setActiveFolderId(null);
+            setActiveView({ type: 'saved' });
+        }, [setActiveFolderId]);
+        // Ref mirror so the hotkey's stable callback can navigate without
+        // re-binding the window listener on every render.
+        useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
         const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
+
+        // ---- Vault filtering (spec §4.2, load-bearing) --------------------
+        // ONE memo derives the visible lists; these flow to ALL consumers
+        // (Sidebar, pickers). Raw arrays are used ONLY by persistence paths
+        // (reorder/sync payloads) — filtering at any writer would silently
+        // delete vaulted folders from the store.
+        const visibleFolders = vault.ready
+            ? filterHidden(folders, f => f.id, vault.hiddenFolderIds)
+            : folders; // vault state unresolved: render nothing-hidden yet (locked-assumed, no leak — hidden ids unknown while locked)
+        const visiblePublicChannels = vault.ready
+            ? filterHidden(publicChannels, c => c.channel_id, vault.hiddenPublicIds)
+            : publicChannels;
+
+        // Hide helper for Phase 3 entry points (context menu / drop).
+        // D14: hiding the currently-viewing channel jumps to Saved Messages,
+        // clears selection, and closes modals showing its files.
+        const handleHideInVault = useCallback(async (kind: VaultKind, id: number) => {
+            const viewingIt =
+                (activeView.type === 'folder' && kind === 'folder' && activeView.folderId === id) ||
+                (activeView.type === 'public' && kind === 'public_channel' && activeView.channelId === id);
+            try {
+                await vault.hide(kind, id);
+                toast.success('Hidden in Vault');
+            } catch (e) {
+                if (String(e).includes('passcode_required')) {
+                    // D16: no passcode yet — open the create dialog and queue
+                    // this hide (subsequent rapid first-hides accumulate).
+                    pendingHideRef.current = [...pendingHideRef.current, { kind, id }];
+                    setShowCreatePasscode(true);
+                    return;
+                }
+                toast.error('Failed to hide in Vault');
+                return;
+            }
+            if (viewingIt) {
+                setActiveView({ type: 'saved' });
+                setSelectedIds([]);
+                setPreviewFile(null);
+                toast.message('Moved to Saved Messages — channel is now in the Vault');
+            }
+        }, [activeView, vault]);
+
+        // First-hide gating (D16): passcode creation must complete before the
+        // items hide. Pending hides accumulate in order (two rapid first-hides
+        // both land) and are applied once the dialog succeeds.
+        const [showCreatePasscode, setShowCreatePasscode] = useState(false);
+        const pendingHideRef = useRef<{ kind: VaultKind; id: number }[]>([]);
+        const applyPendingHides = useCallback(async (pending: { kind: VaultKind; id: number }[]) => {
+            for (const p of pending) {
+                try {
+                    await vault.hide(p.kind, p.id);
+                    toast.success('Hidden in Vault');
+                } catch {
+                    toast.error('Failed to hide in Vault');
+                }
+            }
+        }, [vault]);
+        const completePendingHide = useCallback(async (passcode: string) => {
+            const ok = await vault.setPasscode(passcode);
+            if (!ok) return false;
+            const pending = pendingHideRef.current;
+            pendingHideRef.current = [];
+            setShowCreatePasscode(false);
+            await applyPendingHides(pending);
+            return true;
+        }, [vault, applyPendingHides]);
+        const cancelPendingHide = useCallback(() => {
+            pendingHideRef.current = [];
+            setShowCreatePasscode(false);
+        }, []);
+
+        // ---- Session-boundary re-sync --------------------------------------
+        // VaultProvider sits ABOVE the auth switch and never remounts across
+        // logout->login. After forceLogout wipes + re-locks server-side, a
+        // stale context would show account A's unlock state/IDs to account B.
+        // Backend owns truth: re-read on every Dashboard mount (= every login).
+        useEffect(() => {
+            vault.refresh().catch(() => { /* unreachable backend: stay locked-assumed */ });
+        }, [vault.refresh]);
+
+        // ---- Startup restore gating (spec §4.3) ----------------------------
+        // The store restores a persisted activeFolderId before vault state
+        // resolves; if that selection references a vaulted item we must NOT
+        // land on it. Today an unstable-identity effect masks this by accident
+        // (Dashboard.tsx sync-effect); this gate makes it a guarantee.
+        const restoredIdRef = useRef<number | null>(null);
+        useEffect(() => {
+            if (!vault.ready) {
+                if (activeFolderId !== null && restoredIdRef.current === null) {
+                    restoredIdRef.current = activeFolderId;
+                }
+                return;
+            }
+            const restored = restoredIdRef.current;
+            restoredIdRef.current = null;
+            if (restored === null) return;
+            if (vault.hiddenFolderIds.has(restored) || vault.hiddenPublicIds.has(restored)) {
+                setActiveView({ type: 'saved' });
+                store?.delete('activeFolderId').then(() => store?.save()).catch(() => {});
+            }
+        }, [vault.ready, vault.hiddenFolderIds, vault.hiddenPublicIds, activeFolderId, store]);
+
+        // Ctrl+Shift+V — open Vault (D11). preventDefault: WebView2 reserves
+        // this combo for paste-plain-text. Bound outside the input-guard path
+        // so it works while typing (e.g. from the lock screen passcode field).
+        const handleVaultHotkey = useCallback((e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'v' || e.key === 'V')) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (activeViewRef.current.type !== 'vault') {
+                    navigateToRef.current({ type: 'vault' });
+                }
+            }
+        }, []);
+
+        useEffect(() => {
+            window.addEventListener('keydown', handleVaultHotkey, true);
+            return () => window.removeEventListener('keydown', handleVaultHotkey, true);
+        }, [handleVaultHotkey]);
+
+        // ---- D3 edge case: hiding the vault entry while viewing it ----------
+        useEffect(() => {
+            if (vault.ready && vault.entryVisible === false && activeView.type === 'vault') {
+                setActiveView({ type: 'saved' });
+            }
+        }, [vault.ready, vault.entryVisible, activeView.type]);
 
         // Wrapper: updates both activeView and activeFolderId atomically.
         // Sidebar calls this instead of raw setActiveFolderId so that clicking
@@ -59,12 +242,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // the useEffect below would immediately reset activeFolderId back.
         const handleSelectFolder = useCallback((id: number | null) => {
             if (id === null) {
-                setActiveView({ type: 'saved' });
+                navigateTo({ type: 'saved' });
             } else {
-                setActiveView({ type: 'folder', folderId: id });
+                navigateTo({ type: 'folder', folderId: id });
             }
             setActiveFolderId(id);
-        }, [setActiveFolderId]);
+        }, [setActiveFolderId, navigateTo]);
 
         // Sync activeFolderId with activeView for backward compat
             useEffect(() => {
@@ -163,7 +346,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             sizeStr: formatBytes(f.size),
             type: f.icon_type || (f.name.endsWith('/') ? 'folder' : 'file')
         }))),
-        enabled: !!store && !isPublicView,
+        enabled: !!store && !isPublicView && vault.ready,
     });
 
     const allFiles = isPublicView ? pubChannelFiles : nbFiles;
@@ -525,7 +708,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     };
 
-    const currentFolderName = activeView.type === 'public'
+    const currentFolderName = activeView.type === 'vault'
+        ? "Vault"
+        : activeView.type === 'public'
         ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
         : activeFolderId === null
             ? "Saved Messages"
@@ -592,6 +777,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             e.stopPropagation();
             lastExternalDragActivityRef.current = Date.now();
             setExternalDragActive(false);
+            // Vault drop zones reject file drops (D10) — the vault hides
+            // channels, not files. Hit-test BEFORE any staging work.
+            const droppedOnVault = (e.target as HTMLElement | null)?.closest?.('[data-vault-dropzone]');
+            if (droppedOnVault) {
+                toast.error('Only channels can be hidden');
+                return;
+            }
             const { canUploadHere: canUp, limit, stage } = dropCtxRef.current;
             // Detect folders SYNCHRONOUSLY before any await — the items list is neutralized
             // after the handler yields. A dropped folder appears in .files as a zero-byte
@@ -665,7 +857,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <AnimatePresence>
                 {showMoveModal && (
                     <MoveToFolderModal
-                        folders={folders}
+                        folders={visibleFolders}
                         onClose={() => setShowMoveModal(false)}
                         onSelect={handleBulkMove}
                         activeFolderId={activeFolderId}
@@ -725,7 +917,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 <div className="fixed inset-0 z-30 bg-black/50" onClick={() => setMobileSidebarOpen(false)} />
             )}
             <Sidebar
-                folders={folders}
+                folders={visibleFolders}
                 activeFolderId={activeFolderId}
                 setActiveFolderId={handleSelectFolder}
                 onDrop={handleDropOnFolder}
@@ -740,15 +932,22 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 mobileOpen={mobileSidebarOpen}
                 onMobileClose={() => setMobileSidebarOpen(false)}
                 activeView={activeView}
-                publicChannels={publicChannels}
-                onSelectPublicChannel={(channelId) => setActiveView({ type: 'public', channelId })}
+                publicChannels={visiblePublicChannels}
+                onSelectPublicChannel={(channelId) => navigateTo({ type: 'public', channelId })}
                 onPublicChannelsChanged={() => syncFromRemote.mutate()}
                 onRemovePublicChannel={handleRemovePublicChannel}
+                onOpenVault={() => navigateTo({ type: 'vault' })}
+                onHideInVault={handleHideInVault}
+                onVaultRejectFileDrop={() => toast.error('Only channels can be hidden')}
+                vaultEntryVisible={vault.entryVisible}
+                vaultCount={vault.totalCount}
             />
 
             <main className="flex-1 flex flex-col" onClick={(e) => { if (e.target === e.currentTarget) setSelectedIds([]); }}>
                 <TopBar
                     currentFolderName={currentFolderName}
+                    onBack={goBack}
+                    canGoBack={canGoBack}
                     selectedIds={selectedIds}
                     onShowMoveModal={() => setShowMoveModal(true)}
                     onBulkDownload={handleBulkDownload}
@@ -777,6 +976,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                         </h2>
                     </div>
                 )}
+                {activeView.type === 'vault' ? (
+                    <VaultView
+                        onOpenFolder={(id) => navigateTo({ type: 'folder', folderId: id })}
+                        onOpenPublicChannel={(id) => navigateTo({ type: 'public', channelId: id })}
+                        getFolderName={(id) => folders.find(f => f.id === id)?.name || `Unknown folder (${id})`}
+                        getChannelName={(id) => publicChannels.find(c => c.channel_id === id)?.name || `Unknown channel (${id})`}
+                    />
+                ) : (
                 <FileExplorer
 
                     files={displayedFiles}
@@ -804,6 +1011,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     showForwardOption={isReadOnly}
                     onForwardToFolder={() => setShowForwardModal(true)}
                 />
+                )}
             </main>
 
             {previewFile && (
@@ -846,7 +1054,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <AnimatePresence>
                 {showSettings && (
-                    <SettingsPage onClose={() => setShowSettings(false)} onLogout={handleLogout} />
+                    <SettingsPage
+                        onClose={() => setShowSettings(false)}
+                        onLogout={handleLogout}
+                        onOpenVault={() => { setShowSettings(false); navigateTo({ type: 'vault' }); }}
+                    />
                 )}
             </AnimatePresence>
 
@@ -861,11 +1073,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onClose={() => setShowForwardModal(false)}
                 sourceChannelId={activeView.type === 'public' ? activeView.channelId : 0}
                 selectedFileIds={selectedIds}
-                folders={folders}
+                folders={visibleFolders}
                 onForwarded={() => {
                     queryClient.invalidateQueries({ queryKey: ['files'] });
                 }}
             />
+
+            {/* Vault first-hide passcode creation (D16). Pending hide applies on success. */}
+            {showCreatePasscode && (
+                <VaultPasscodeModal
+                    mode="create"
+                    title="Create Vault Passcode"
+                    description="Choose a numeric passcode (4-12 digits) to protect your vault. You'll need it to view hidden channels."
+                    submitLabel="Create & Hide"
+                    onSubmit={completePendingHide}
+                    onClose={cancelPendingHide}
+                />
+            )}
         </div>
     );
 }

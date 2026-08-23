@@ -309,6 +309,8 @@ pub fn run() {
             app.manage(ApiServerHandle(Arc::new(std::sync::Mutex::new(None))));
             app.manage(ApiServerRunning(Arc::new(std::sync::atomic::AtomicBool::new(false))));
             app.manage(commands::api_settings::ConfigLock(std::sync::Mutex::new(())));
+            app.manage(commands::vault::VaultLock(std::sync::Mutex::new(())));
+            app.manage(commands::vault::VaultUnlocked(std::sync::atomic::AtomicBool::new(false)));
 
             // Initialize stream cache manager
             // Use app_data_dir instead of temp_dir: on Windows, %TEMP% is
@@ -547,6 +549,19 @@ pub fn run() {
             commands::cmd_forward_to_folder,
             commands::cmd_update_nb_pub_sync,
             commands::cmd_sync_public_channels,
+            commands::cmd_vault_get_state,
+            commands::cmd_vault_hide,
+            commands::cmd_vault_unhide,
+            commands::cmd_vault_verify,
+            commands::cmd_vault_set_passcode,
+            commands::cmd_vault_change_passcode,
+            commands::cmd_vault_lock,
+            commands::cmd_vault_reset,
+            commands::cmd_vault_wipe_ids,
+            commands::cmd_vault_prune,
+            commands::cmd_vault_set_entry_visible,
+            commands::cmd_vault_pull_sync,
+            commands::cmd_vault_push_sync,
         ])
         .register_asynchronous_uri_scheme_protocol("nobuf-stream", move |_ctx, request, responder| {
             responder.respond(handle_nobuf_stream_protocol(request));

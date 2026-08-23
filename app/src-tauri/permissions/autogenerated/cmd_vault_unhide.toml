@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-vault-unhide"
+description = "Enables the cmd_vault_unhide command without any pre-configured scope."
+commands.allow = ["cmd_vault_unhide"]
+
+[[permission]]
+identifier = "deny-cmd-vault-unhide"
+description = "Denies the cmd_vault_unhide command without any pre-configured scope."
+commands.deny = ["cmd_vault_unhide"]

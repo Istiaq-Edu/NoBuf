@@ -1,5 +1,6 @@
-import { AlertCircle, Trash2 } from 'lucide-react';
-import { PublicChannel } from '../../types';
+import { useState } from 'react';
+import { AlertCircle, Trash2, Lock } from 'lucide-react';
+import { PublicChannel, PUBLIC_CHANNEL_DRAG_MIME } from '../../types';
 
 interface Props {
     channel: PublicChannel;
@@ -7,9 +8,26 @@ interface Props {
     collapsed: boolean;
     onClick: () => void;
     onRemove: () => void;
+    /** Vault (D9): right-click → "Hide in Vault". */
+    onHideInVault?: () => void;
 }
 
-export function PublicChannelItem({ channel, active, collapsed, onClick, onRemove }: Props) {
+/**
+ * Public channel sidebar entry. Minimal context menu (R10: smallest consistent
+ * surface) with Hide in Vault; draggable via the public-channel MIME so it can
+ * be dropped on the vault item (D9). Draggable only when expanded — the
+ * collapsed w-8 h-8 icon row stays click-only, matching folder behavior.
+ */
+export function PublicChannelItem({ channel, active, collapsed, onClick, onRemove, onHideInVault }: Props) {
+    const [showMenu, setShowMenu] = useState(false);
+    const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
+    const [menuRef, setMenuRef] = useState<HTMLDivElement | null>(null);
+
+    // Close on outside click (same pattern as SidebarItem's context menu).
+    const closeOnOutside = (e: React.MouseEvent) => {
+        if (menuRef && !menuRef.contains(e.target as Node)) setShowMenu(false);
+    };
+
     return (
         <div
             className={`group flex items-center rounded-lg transition-all cursor-pointer ${
@@ -21,6 +39,20 @@ export function PublicChannelItem({ channel, active, collapsed, onClick, onRemov
             }`}
             onClick={onClick}
             title={collapsed ? channel.name : undefined}
+            draggable={!collapsed}
+            onDragStart={(e) => {
+                if (collapsed) { e.preventDefault(); return; }
+                e.dataTransfer.setData(PUBLIC_CHANNEL_DRAG_MIME, String(channel.channel_id));
+                e.dataTransfer.effectAllowed = 'move';
+            }}
+            onContextMenu={(e) => {
+                if (!onHideInVault) return;
+                e.preventDefault();
+                e.stopPropagation();
+                setMenuPos({ x: e.clientX, y: e.clientY });
+                setShowMenu(true);
+            }}
+            onMouseDown={showMenu ? closeOnOutside : undefined}
         >
             {/* Avatar circle with first letter */}
             <div className="relative shrink-0">
@@ -46,6 +78,15 @@ export function PublicChannelItem({ channel, active, collapsed, onClick, onRemov
                             <span className="text-[10px] text-nobuf-subtext truncate block">@{channel.username}</span>
                         )}
                     </div>
+                    {onHideInVault && (
+                        <button
+                            onClick={(e) => { e.stopPropagation(); onHideInVault(); }}
+                            className="opacity-0 group-hover:opacity-100 text-nobuf-subtext hover:text-nobuf-primary transition-all shrink-0 p-1 rounded hover:bg-nobuf-primary/10"
+                            title="Hide in Vault"
+                        >
+                            <Lock className="w-3.5 h-3.5" />
+                        </button>
+                    )}
                     <button
                         onClick={(e) => { e.stopPropagation(); onRemove(); }}
                         className="opacity-0 group-hover:opacity-100 text-nobuf-subtext hover:text-red-500 transition-all shrink-0 p-1 rounded hover:bg-red-500/10"
@@ -54,6 +95,26 @@ export function PublicChannelItem({ channel, active, collapsed, onClick, onRemov
                         <Trash2 className="w-3.5 h-3.5" />
                     </button>
                 </>
+            )}
+
+            {showMenu && (
+                <div
+                    ref={setMenuRef}
+                    className="fixed z-50 bg-nobuf-surface/95 backdrop-blur-md border border-nobuf-border rounded-xl shadow-2xl py-1.5 min-w-[180px] animate-in fade-in zoom-in-95 duration-150"
+                    style={{
+                        left: Math.min(menuPos.x, window.innerWidth - 200),
+                        top: Math.min(menuPos.y, window.innerHeight - 120),
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    <button
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
+                        onClick={() => { setShowMenu(false); onHideInVault?.(); }}
+                    >
+                        <Lock className="w-4 h-4" />
+                        Hide in Vault
+                    </button>
+                </div>
             )}
         </div>
     );
