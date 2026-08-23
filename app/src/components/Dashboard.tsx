@@ -82,8 +82,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 toast.success('Hidden in Vault');
             } catch (e) {
                 if (String(e).includes('passcode_required')) {
+                    // D16: no passcode yet — open the create dialog and queue
+                    // this hide (subsequent rapid first-hides accumulate).
+                    pendingHideRef.current = [...pendingHideRef.current, { kind, id }];
                     setShowCreatePasscode(true);
-                    pendingHideRef.current = { kind, id };
                     return;
                 }
                 toast.error('Failed to hide in Vault');
@@ -98,27 +100,31 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }, [activeView, vault]);
 
         // First-hide gating (D16): passcode creation must complete before the
-        // item hides. The pending hide is applied once the dialog succeeds.
+        // items hide. Pending hides accumulate in order (two rapid first-hides
+        // both land) and are applied once the dialog succeeds.
         const [showCreatePasscode, setShowCreatePasscode] = useState(false);
-        const pendingHideRef = useRef<{ kind: VaultKind; id: number } | null>(null);
-        const completePendingHide = useCallback(async (passcode: string) => {
-            const ok = await vault.setPasscode(passcode);
-            if (!ok) return false;
-            const pending = pendingHideRef.current;
-            pendingHideRef.current = null;
-            setShowCreatePasscode(false);
-            if (pending) {
+        const pendingHideRef = useRef<{ kind: VaultKind; id: number }[]>([]);
+        const applyPendingHides = useCallback(async (pending: { kind: VaultKind; id: number }[]) => {
+            for (const p of pending) {
                 try {
-                    await vault.hide(pending.kind, pending.id);
+                    await vault.hide(p.kind, p.id);
                     toast.success('Hidden in Vault');
                 } catch {
                     toast.error('Failed to hide in Vault');
                 }
             }
-            return true;
         }, [vault]);
+        const completePendingHide = useCallback(async (passcode: string) => {
+            const ok = await vault.setPasscode(passcode);
+            if (!ok) return false;
+            const pending = pendingHideRef.current;
+            pendingHideRef.current = [];
+            setShowCreatePasscode(false);
+            await applyPendingHides(pending);
+            return true;
+        }, [vault, applyPendingHides]);
         const cancelPendingHide = useCallback(() => {
-            pendingHideRef.current = null;
+            pendingHideRef.current = [];
             setShowCreatePasscode(false);
         }, []);
 
