@@ -104,7 +104,7 @@ fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
 /// worked — root cause unresolved after three review rounds. Plain
 /// `web::post().to(...)` registration (see server.rs) is mechanism-identical
 /// to the proven-working /__whoami route and is what production now uses.
-pub async fn upload_drop_handler(
+pub(crate) async fn upload_drop_handler(
     req: HttpRequest,
     payload: web::Payload,
     tg_state: web::Data<Arc<TelegramState>>,
