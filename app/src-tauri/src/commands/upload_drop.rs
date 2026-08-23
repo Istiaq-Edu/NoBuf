@@ -96,8 +96,15 @@ fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
     q.get(key).cloned()
 }
 
-#[post("/upload-drop")]
-async fn upload_drop(
+/// Stream-direct drop upload handler.
+///
+/// NOTE: deliberately NOT wrapped in #[post("/upload-drop")]. The macro
+/// generates a codegen Resource whose registration silently 404'd in one
+/// environment while a sibling cfg.route() in the same configure closure
+/// worked — root cause unresolved after three review rounds. Plain
+/// `web::post().to(...)` registration (see server.rs) is mechanism-identical
+/// to the proven-working /__whoami route and is what production now uses.
+pub async fn upload_drop_handler(
     req: HttpRequest,
     payload: web::Payload,
     tg_state: web::Data<Arc<TelegramState>>,
