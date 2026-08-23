@@ -337,6 +337,11 @@ pub async fn cmd_vault_pull_sync(app: AppHandle) -> Result<serde_json::Value, St
         }
         Err(e) => return Err(e),
     };
+    // NOTE (deferred, review R2): when two PCs cold-launch with no existing
+    // blob, BOTH seed their own Saved Messages message. Union merge keeps
+    // contents convergent, but each PC keeps editing only its own message id.
+    // Remedy if ever observed: on pull-found, adopt the remote's message id
+    // into local sync_message_id before the next push.
     let store = vault::load_store(&app);
     let resp = vault::state_response_public(&app, &store);
     Ok(serde_json::json!({ "merged": seeded, "state": resp }))
