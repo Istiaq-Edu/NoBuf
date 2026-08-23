@@ -2,18 +2,39 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.1.0] - 2026-08-21
+## [1.1.0] - 2026-08-22
+
+### Bug Fixes
+
+- Fix QR login polling and status feedback
+- Fix QR login stuck on "Waiting for scan" (stale QR + DC-migrated 2FA)  Two root causes produced the same symptom; both verified against live logs.  Root cause 1 — displayed QR went stale: Telegram QR tokens expire in ~30s and cmd_auth_qr_poll rotates them correctly, but the rotated URL never reached the UI. The panel kept rendering the original tg://login URL, so any scan more than ~30s after open hit an expired token that can never complete, and every error path mapped to "waiting".  Root cause 2 — 2FA failed silently after DC migration: When token acceptance returns via loginTokenMigrateTo, SESSION_PASSWORD_NEEDED is raised on the TARGET DC, but handle_2fa called account.GetPassword via plain client.invoke() pinned to the home DC. That call failed, the error reached the frontend as a swallowed IPC rejection, and polling continued — re-consuming the accepted token until AUTH_TOKEN_EXPIRED while the UI sat on "Waiting for scan...".  Fixes: - Extract qr_login_url(); add cmd_auth_qr_current serving the current token URL - Poll handler re-renders the QR whenever the token rotates (functional setState) - handle_2fa() takes the reporting dc_id and fetches password info via   invoke_in_dc when the requirement came from a migrated call - Add qr_2fa_pending latch: once 2FA starts, polls return the password step   without re-probing exportLoginToken; reset on fresh QR login and logout - Poll errors are never swallowed: console.error plus amber inline status   (FLOOD_WAIT / transport failures now visible instead of an endless spinner) - Probe logs each cycle: "QR poll probe: token received (rotated=..., len=...)"  Tests: - qr_login_url_tests: encoder behavior + include_str! structural guards pinning   the probe's token-store line and all four sides of the 2FA latch - QrPollTokenSync.test.ts: rotation sync, branch order, non-silent catch - All new guards mutation-proven RED on removal, restored byte-identical  Also drops the unused `Requirement` import in deps/probe.rs (build warning).  Gates: cargo test 364/364 · vitest 1081/1081 · tsc --noEmit clean · 0 warnings
+- Fix QR 2FA on migrated DCs: cross-DC verify, retries, instant scan feedback
+- Fix release workflow crash on commit messages containing backticks
+
+### Features
+
+- Add dependency health check, kill console-window flashes, cache ffmpeg resolution
+
+### Other
+
+- Expose current QR login token for UI sync
+
+## [1.0.0] - 2026-08-19
 
 ### Bug Fixes
 
 - Fix seek deadlock from stale buffer islands
 - Fix playback issues: seek dispatch, stale guard, landing time, and zombie cancel
+- **faststream:** Coverage-derived prebuffer resume, VBR seek mapping, subtitle repair
+- Fix subtitle sync, stream recovery, and login persistence
+- Fix cold-start overlay timing and remux producer handoff
 
 ### Documentation
 
 - Update CHANGELOG.md for v1.0.0
 - Update CHANGELOG.md for v1.0.0
 - Update CHANGELOG.md for v1.0.0
+- Update CHANGELOG.md for v1.1.0
 - Update CHANGELOG.md for v1.1.0
 - Update CHANGELOG.md for v1.1.0
 
@@ -28,17 +49,58 @@ All notable changes to NoBuf will be documented in this file.
 - Add seek-to-play probe and SBW op-timing fix
 - Add byte-forward remux seeks (start_byte)
 - Add proactive keyframe index for instant hover thumbnails
+- Add MP4‑HEVC /remux reroute + server thumbnails
+- Add TS-HEVC remux recovery & tests
+- Add per-file audio track selection across all playback tiers
+- Add embedded subtitle extraction & selection (SRT/ASS + fonts)
+- Add decideMkvCaptureStrategy helper for cue-less MKV thumbnail guard
+- Add shouldAbandonResolvedSeek predicate for post-resolve seek belt
+- Add rounds 1-3 test suites + forensics/plan/solution reports (previously untracked)
+- Add thumbnail bisect single-flight and CORS headers
+- Add authoritative remux-seek anchors & subtitle fixes
+- Create review-mkv-subtitle-regression.md
+- Create review-current-subtitle-retry.md
+- Add subtitle sizing/position/sync controls and OpenSubtitles search
 
 ### Other
 
 - Refresh README; fix /remux MPEG-TS mismatch
 - Apply 2MB seek-backoff to reported byte
 - Interrupt in-flight seeks; warmer yield
+- Avoid stale thumbnail writes; add support matrix
+- Make seek supersession sticky + post-resolve belt (kills zombie getKeyPacket walks)
+- Guard cue-less MKV thumbnail captures (index-or-skip, no native scans)
+- Audio-switch B4 reroute mapping + sbHasAudio planning (pre-round-3 in-flight work)
+- Cue-less MKV: fall back to harvested keyframe index for refill/switch boundaries
+- Audio switch: transmux before flush + in-place changeType revert (kills switch stutter window)
+- Cached_prefix bounded extraction — body ends at cache frontier (16min→seconds)
+- Surface partial extractions and re-extract on re-select
+- MKV cluster scan/injection helpers for cue-less bisection (pure, tested)
+- Cue-less MKV far-hover: cluster bisection + position-cache injection (bounded, memoized)
+- Round-4 log fixes: cached_prefix=true (serde bool 400) + interpolation bisect w/ in-buffer advance
+- Kill bisect probe spin + phantom green bar on transmuxer seeks
+- Player-side cluster bisection on cue-less far seeks + green-bar anchor densification
+- Keyframe-shadow-safe seek bisection (fix round-6 fatal reroute)
+- Audio-switch E3 refill conflation + shadow-estimator saturation
+- PROACTIVE true-byte anchoring + unstarve, 4MiB bisect stop-gap, Windows lock release, switch drain, subs frontier gate, hover await
+- Proactive prebuffer, durable subtitle promotion
+- Make subtitle state session-only
+- Increase subtitle line widths; remove panelReserve
+- Normalize EOL-sensitive test assertions
 
 ### Performance
 
 - Optimize keyframe search & memoize duration lookups
 - Improve keyframe logging and thumbnail seeking
+- Improve subtitle scheduling and proactive reporting
+
+### Refactor
+
+- Replace speed meter with backend cumulative counter
+
+### Removed
+
+- Remove trace-27 seek-search byte-accounting probe (confirmed)
 
 ## [0.9.0] - 2026-07-12
 
