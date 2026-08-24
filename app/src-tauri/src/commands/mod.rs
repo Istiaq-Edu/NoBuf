@@ -178,6 +178,7 @@ pub mod streaming;
 pub mod api_settings;
 pub mod sprite;
 pub mod split_upload;
+pub mod stage_drop;
 pub mod archive;
 pub mod folder_groups;
 pub mod public_channels;

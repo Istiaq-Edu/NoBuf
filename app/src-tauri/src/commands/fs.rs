@@ -331,17 +331,12 @@ pub async fn cmd_staging_free_space() -> Result<u64, String> {
 /// Returns the temp file's absolute path on the final chunk, else "".
 /// NOTE: `std::io::Write` is already imported at the top of this file (write_all in scope).
 #[tauri::command]
-pub async fn cmd_stage_dropped_file(
-    upload_id: String,
-    file_name: String,
-    chunk_index: u64,
-    is_last: bool,
-    bytes_b64: String,
-) -> Result<String, String> {
-    use base64::Engine as _;
-
-    // Sanitize: strip any path components — keep the bare filename only.
-    let safe_name = std::path::Path::new(&file_name)
+/// Sanitize a staged-file name: strip path components, keep the bare
+/// filename, truncate the stem (never the extension) so the result fits
+/// Windows' 255-UTF-16-unit filename cap with room for the "<id>-" prefix.
+/// Single source of truth shared by cmd_stage_dropped_file and /stage-drop.
+pub fn sanitize_staged_name(file_name: &str) -> String {
+    let safe_name = std::path::Path::new(file_name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "dropped".to_string());
@@ -373,6 +368,20 @@ pub async fn cmd_stage_dropped_file(
             safe_name
         }
     };
+    safe_name
+}
+
+#[tauri::command]
+pub async fn cmd_stage_dropped_file(
+    upload_id: String,
+    file_name: String,
+    chunk_index: u64,
+    is_last: bool,
+    bytes_b64: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let safe_name = sanitize_staged_name(&file_name);
     let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if safe_id.is_empty() {
         return Err("Invalid upload id".to_string());

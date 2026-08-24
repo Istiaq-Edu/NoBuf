@@ -16,6 +16,58 @@ import { useFileDrop } from './useFileDrop';
 import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
 
+/**
+ * Fast drop-staging: POST the File as raw binary to the local actix server's
+ * /stage-drop route. Progress rides the standard `upload-progress` event
+ * channel (server emits it), so callers can also listen there; the `pct`
+ * callback here is driven by xhr.upload.onprogress for immediate feedback.
+ * Throws when the route/server is unavailable so callers can fall back to
+ * the chunked IPC stager. Returns the staged absolute path.
+ */
+async function stageViaHttp(file: File, onPct?: (pct: number) => void): Promise<string> {
+    const { getStreamInfo } = await import('./useDropStreamUpload');
+    let info;
+    try {
+        info = await getStreamInfo();
+    } catch (e) {
+        throw new Error(`stream-info unavailable: ${e}`);
+    }
+    const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
+    const params = new URLSearchParams({
+        token: info.token ?? '',
+        name: file.name,
+        size: String(file.size),
+        id: Math.random().toString(36).slice(2, 11),
+        tid: '',
+    });
+    return await new Promise<string>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${rootUrl}/stage-drop?${params.toString()}`, true);
+        xhr.timeout = 0;
+        if (xhr.upload && onPct) {
+            xhr.upload.onprogress = (ev) => {
+                if (ev.lengthComputable) onPct(Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+            };
+        }
+        xhr.onerror = () => reject(new Error('network error talking to local server'));
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                try {
+                    const parsed = JSON.parse(xhr.responseText);
+                    if (parsed?.path) resolve(parsed.path as string);
+                    else reject(new Error('stage-drop returned no path'));
+                } catch {
+                    reject(new Error('stage-drop returned invalid JSON'));
+                }
+            } else {
+                reject(new Error(xhr.responseText || `stage-drop HTTP ${xhr.status}`));
+            }
+        };
+        xhr.send(file);
+    });
+}
+
+
 interface ProgressPayload {
     id: string;
     percent: number;
@@ -363,27 +415,39 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
         // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
-        // File has no filesystem path (WebView2 constraint), so it is staged to
-        // %TEMP% first via the existing chunked stager, then handed to the same
-        // prepare → modal → confirm chain the picker flow uses.
+        // File has no filesystem path (WebView2 constraint), so it is copied to
+        // %TEMP% once, then handed to the same prepare → modal → confirm chain
+        // the picker flow uses. Fast path: raw-binary POST to the local actix
+        // server (/stage-drop) — no base64, no per-chunk IPC. Falls back to
+        // the legacy chunked IPC stager when the route is absent/unreachable.
         const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
         const splitCandidates = files.filter(f => f.size > limitBytes && VIDEO_RE.test(f.name));
         if (splitCandidates.length > 0 && splitFlow.open !== true) {
             const f = splitCandidates[0];
             try {
                 onStagingProgress?.(f.name, 0);
-                const id = Math.random().toString(36).slice(2, 11);
-                const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+                const tempPath = await stageViaHttp(f, pct => onStagingProgress?.(f.name, pct));
                 onStagingProgress?.(f.name, 100);
                 if (tempPath) {
                     splitFlow.prepare(tempPath, activeFolderId);
                     toast.info(`Preparing ${f.name} for split upload…`);
                 }
-            } catch (e) {
-                if (e instanceof StagingCancelledError) {
-                    toast.info(`Stopped preparing ${f.name}.`);
-                } else {
-                    toast.error(`Couldn't read ${f.name}: ${e}`);
+            } catch (httpErr) {
+                console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
+                try {
+                    const id = Math.random().toString(36).slice(2, 11);
+                    const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+                    onStagingProgress?.(f.name, 100);
+                    if (tempPath) {
+                        splitFlow.prepare(tempPath, activeFolderId);
+                        toast.info(`Preparing ${f.name} for split upload…`);
+                    }
+                } catch (e) {
+                    if (e instanceof StagingCancelledError) {
+                        toast.info(`Stopped preparing ${f.name}.`);
+                    } else {
+                        toast.error(`Couldn't read ${f.name}: ${e}`);
+                    }
                 }
             }
             if (splitCandidates.length > 1) {
