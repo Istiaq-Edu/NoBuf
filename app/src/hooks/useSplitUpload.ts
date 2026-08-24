@@ -55,12 +55,19 @@ export function useSplitUpload() {
 
     // Liveness token — bumped on every remount; stale async results are dropped.
     const liveRef = useRef(0);
+    // Path of the %TEMP% copy created when an oversize video arrived via drag-
+    // and-drop (picker sources are real user files). Deleted if the user closes
+    // the modal without starting; Rust owns deletion once the job starts.
+    const stagedSourceRef = useRef<string | null>(null);
+    // Flips true the moment cmd_start_split_job is invoked from this session.
+    const jobStartedRef = useRef(false);
     useEffect(() => {
         liveRef.current += 1;
         return () => { liveRef.current += 1; };
     }, []);
 
     const prepare = useCallback(async (path: string, folderId: number | null) => {
+        stagedSourceRef.current = path;
         const live = liveRef.current;
         setOpen(true);
         setPreparing(true);
@@ -89,6 +96,7 @@ export function useSplitUpload() {
         try {
             // Send the plan with user-adjusted boundaries; parts are rebuilt
             // server-side from boundaries (chained-snap preserved).
+            jobStartedRef.current = true;
             const jobId = await invoke<string>('cmd_start_split_job', {
                 plan: { ...plan, boundaries: edits.boundaries },
             });
@@ -106,6 +114,10 @@ export function useSplitUpload() {
 
     /** Modal closed via X/Cancel/Done. Clears transient success state. */
     const close = useCallback(() => {
+        if (!jobStartedRef.current && stagedSourceRef.current) {
+            invoke('cmd_delete_staged_file', { path: stagedSourceRef.current }).catch(() => {});
+            stagedSourceRef.current = null;
+        }
         setOpen(false);
         setStartedJobId(null);
     }, []);

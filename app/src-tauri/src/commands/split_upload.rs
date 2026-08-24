@@ -973,6 +973,19 @@ pub fn cmd_discard_split_job(id: String, app: AppHandle) -> Result<(), String> {
             None => return Err("Job not found".to_string()),
         }
     };
+    // A discarded job will never finish — its drop-staged source is garbage now.
+    // (Read source before the row deletion that follows.)
+    let src_opt = {
+        let conn2 = get_connection(&app)?;
+        let mut st2 = conn2.prepare("SELECT source_path FROM split_upload_jobs WHERE id = ?").map_err(|e| e.to_string())?;
+        st2.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        let mut it2 = st2.iter();
+        match it2.next() {
+            Some(Ok(row)) => Some(vs(&row[0])),
+            _ => None,
+        }
+    };
+    if let Some(src) = src_opt { delete_staged_source_if_dropped(&src); }
     // Delete any leftover temps for THIS job (jobid8 = first 8 chars of id).
     let job_id8: String = id.chars().take(8).collect();
     if let Ok(entries) = std::fs::read_dir(&temp_dir) {
@@ -1169,6 +1182,19 @@ async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
     }
 
     update_status_quiet(&app, &job_id, "done", None);
+    // Drop-staged sources are %TEMP% copies; once every part is uploaded they
+    // are garbage. Picker sources (real user files) are never touched — the
+    // helper no-ops unless the path is inside the staging dir.
+    let src_for_cleanup = {
+        let conn = get_connection(&app)?;
+        match crate::commands::split_upload::load_job_source_path(&conn, &job_id) {
+            Some(p) => Some(p),
+            None => None,
+        }
+    };
+    if let Some(src) = src_for_cleanup {
+        delete_staged_source_if_dropped(&src);
+    }
     let _ = app.emit(
         "split-progress",
         SplitProgressPayload {
@@ -1182,6 +1208,21 @@ async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Delete the staged copy of a DROPPED source file, if this job's source lives
+/// in the drop-staging dir (%TEMP%\nobuf_dropped). Picker sources are real
+/// user files and must NEVER be touched. Best-effort: failures only log.
+fn delete_staged_source_if_dropped(source_path: &str) {
+    let staged_dir = std::env::temp_dir().join("nobuf_dropped");
+    let p = std::path::PathBuf::from(source_path);
+    if p.parent() == Some(staged_dir.as_path()) {
+        match std::fs::remove_file(&p) {
+            Ok(()) => log::info!("[SPLIT] deleted drop-staged source {}", p.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("[SPLIT] failed to delete drop-staged source {}: {}", p.display(), e),
+        }
+    }
+}
 /// Renumber indexes/names for the tail starting at position `start` so a
 /// mid-job insertion keeps names contiguous (tail-only replan rule).
 fn renumber_tail(parts: &mut [JobPartState], start: usize) {
@@ -1199,6 +1240,17 @@ fn renumber_tail(parts: &mut [JobPartState], start: usize) {
     for (i, p) in parts.iter_mut().enumerate().skip(start) {
         p.idx = i as u32 + 1;
         p.name = part_display_name(&stem.0, p.idx, &stem.1, total);
+    }
+}
+
+/// Load a job's source_path from the jobs DB. Returns None if the row is gone.
+pub fn load_job_source_path(conn: &sqlite::Connection, job_id: &str) -> Option<String> {
+    let mut stmt = conn.prepare("SELECT source_path FROM split_upload_jobs WHERE id = ?").ok()?;
+    stmt.bind((1, job_id)).ok()?;
+    let mut rows = stmt.iter();
+    match rows.next() {
+        Some(Ok(row)) => Some(vs(&row[0])),
+        _ => None,
     }
 }
 
