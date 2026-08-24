@@ -295,6 +295,9 @@ pub fn run() {
                 last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 proactive_keyframe_index: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
+            // Split-upload hygiene: flip crash-stale running jobs to
+            // interrupted BEFORE any sweep can classify their temps.
+            commands::split_upload::normalize_stale_jobs(app.handle());
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));

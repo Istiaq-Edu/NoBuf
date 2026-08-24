@@ -586,6 +586,7 @@ pub async fn cmd_prepare_split(
     let ffmpeg = crate::ffmpeg_util::ensure_ffmpeg()?;
     let path_str = canonical.to_string_lossy().to_string();
 
+    log::info!("[SPLIT] prepare: start {}", path);
     // Shape gate FIRST: reject audio/image files mislabeled as video, decide
     // the stream-drop policy before anything expensive runs.
     let (has_video, has_data, has_subs) = probe_stream_shape(&ffprobe, &path_str).await?;
@@ -601,7 +602,9 @@ pub async fn cmd_prepare_split(
         None
     };
 
+    log::info!("[SPLIT] prepare: shape ok map_all={}", map_all);
     let duration = probe_duration_local(&ffprobe, &path_str).await?;
+    log::info!("[SPLIT] prepare: duration={}s", duration);
     if duration < MIN_PART_SECS {
         return Err(format!("Video too short to split (<{}s)", MIN_PART_SECS as u32));
     }
@@ -609,7 +612,9 @@ pub async fn cmd_prepare_split(
         return Err("Source file is empty".to_string());
     }
 
+    log::info!("[SPLIT] prepare: fetching cap...");
     let cap = effective_cap(&state).await?;
+    log::info!("[SPLIT] prepare: cap={}B", cap);
     if source_size <= cap {
         return Err("File does not exceed the upload limit".to_string());
     }
@@ -619,6 +624,7 @@ pub async fn cmd_prepare_split(
         return Err("File does not exceed the upload limit".to_string());
     }
 
+    log::info!("[SPLIT] prepare: snapping {} boundaries...", n_parts - 1);
     // Auto-propose equal cuts, snapped to the nearest preceding keyframe.
     // Boundaries are stored POST-SNAP (chained invariant holds by construction).
     let raw = equal_boundaries(duration, n_parts);
@@ -634,10 +640,12 @@ pub async fn cmd_prepare_split(
         boundaries.push(snapped.unwrap_or(b));
     }
 
+    log::info!("[SPLIT] prepare: snap done");
     let (container, part_ext) = container_for(&ext_no_dot(&path_str));
     let stem = source_stem(&path_str);
     let parts = build_parts(&stem, part_ext, &boundaries, duration);
 
+    log::info!("[SPLIT] prepare: filmstrip...");
     // Filmstrip: evenly spaced fast-seek thumbs.
     let mut thumbs = Vec::with_capacity(FILMSTRIP_THUMBS);
     for i in 0..FILMSTRIP_THUMBS {
@@ -656,6 +664,7 @@ pub async fn cmd_prepare_split(
         }
     }
 
+    log::info!("[SPLIT] prepare: DONE");
     // Per-part byte estimates (proportional by duration share).
     Ok(SplitPlan {
         source_path: path_str,
@@ -1112,8 +1121,9 @@ async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
         delete_temp_later(temp_path.to_string_lossy().to_string());
 
         match upload_res {
-            Ok(_) => {
+            Ok((_, msg_id)) => {
                 parts[k].status = "done".to_string();
+                parts[k].message_id = msg_id;
                 persist_parts(&app, &job_id, &parts)?;
             }
             Err(e) => {
@@ -1212,34 +1222,44 @@ fn load_folder_id(app: &AppHandle, job_id: &str) -> Result<Option<i64>, String> 
     }
 }
 
-/// Delete `.nobuf-tmp` orphans whose jobid8 matches no live (non-done) job.
+/// Sweep `.nobuf-tmp` orphans: delete any temp whose job is terminal
+/// (done/failed/interrupted) or unknown. Temps of non-terminal jobs
+/// (running/preparing) are LIVE — never touched. Callers must ensure stale
+/// `running` rows were normalized to `interrupted` at startup first
+/// (`normalize_stale_jobs`), otherwise crash-orphaned temps would be
+/// misclassified as live forever.
 fn sweep_orphan_temps(app: &AppHandle) {
-    let live_prefixes: Vec<String> = match get_connection(app) {
-        Ok(conn) => {
-            let mut stmt = match conn.prepare(
-                "SELECT id, temp_dir, status FROM split_upload_jobs",
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut rows: Vec<(String, String, String)> = Vec::new();
-            let mut c = stmt.iter();
-            while let Some(Ok(row)) = c.next() {
-                rows.push((vs(&row[0]), vs(&row[1]), vs(&row[2])));
-            }
-            let prefixes: Vec<String> = rows
-                .iter()
-                .filter(|(_, _, st)| st != "done")
-                .map(|(id, _, _)| id.chars().take(8).collect())
-                .collect();
-            for (_, dir, _) in rows {
-                scan_and_sweep_dir(&dir, &prefixes);
-            }
-            prefixes
-        }
-        Err(_) => return,
-    };
-    let _ = live_prefixes;
+    let Ok(conn) = get_connection(app) else { return };
+    let Ok(mut stmt) = conn.prepare("SELECT id, temp_dir, status FROM split_upload_jobs") else { return };
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    let mut c = stmt.iter();
+    while let Some(Ok(row)) = c.next() {
+        rows.push((vs(&row[0]), vs(&row[1]), vs(&row[2])));
+    }
+    // Prefixes whose temps must NOT be swept.
+    let protected: Vec<String> = rows
+        .iter()
+        .filter(|(_, _, st)| st == "running" || st == "preparing")
+        .map(|(id, _, _)| id.chars().take(8).collect())
+        .collect();
+    // Distinct dirs (temps may sit next to several jobs' sources).
+    let mut dirs: Vec<String> = rows.iter().map(|(_, d, _)| d.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    for d in dirs {
+        scan_and_sweep_dir(&d, &protected);
+    }
+}
+
+/// Startup hygiene: any job still marked running/preparing when a fresh
+/// process boots was killed mid-flight. Flip it to interrupted so resume
+/// offers correctly AND the orphan sweep can classify its temps.
+pub fn normalize_stale_jobs(app: &AppHandle) {
+    let Ok(conn) = get_connection(app) else { return };
+    let _ = conn.execute(
+        "UPDATE split_upload_jobs SET status='interrupted', error=COALESCE(error,'App closed mid-job') \
+         WHERE status IN ('running','preparing')",
+    );
 }
 
 fn scan_and_sweep_dir(dir: &str, live_prefixes: &[String]) {

@@ -475,7 +475,9 @@ pub fn effective_document_name(display_name: &Option<String>, path: &str) -> Str
 /// `folder_id`. Extracted verbatim from cmd_upload_file so the split-upload
 /// orchestrator (split_upload.rs) reuses the IDENTICAL pipeline — progress
 /// events, cancellation, bandwidth accounting, display-name handling.
-/// Returns the same human-readable status strings the command always returned.
+/// Returns (status string, Telegram message id of the sent document). The
+/// message id is None on the mock path; the command wrapper flattens to the
+/// status string for backward compatibility.
 pub(crate) async fn upload_file_inner(
     app_handle: &tauri::AppHandle,
     state: &TelegramState,
@@ -484,7 +486,7 @@ pub(crate) async fn upload_file_inner(
     folder_id: Option<i64>,
     transfer_id: Option<String>,
     display_name: Option<String>,
-) -> Result<String, String> {
+) -> Result<(String, Option<i64>), String> {
     // Security: validate path exists and is a regular file (not a symlink to sensitive data)
     let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {}", e))?;
     if !canonical.is_file() {
@@ -499,7 +501,7 @@ pub(crate) async fn upload_file_inner(
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
         bw_state.add_up(size);
-        return Ok("Mock upload successful".to_string());
+        return Ok(("Mock upload successful".to_string(), None));
     }
     let client = client_opt.unwrap();
 
@@ -577,7 +579,7 @@ pub(crate) async fn upload_file_inner(
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
-    client.send_message(&peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&peer, message).await.map_err(map_error)?;
 
     bw_state.add_up(size);
 
@@ -588,9 +590,10 @@ pub(crate) async fn upload_file_inner(
         });
     }
 
-    Ok("File uploaded successfully".to_string())
+    Ok(("File uploaded successfully".to_string(), Some(sent.id() as i64)))
 }
 
+/// Flattening wrapper kept for the original command signature.
 #[tauri::command]
 pub async fn cmd_upload_file(
     path: String,
@@ -601,7 +604,8 @@ pub async fn cmd_upload_file(
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
-    upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await
+    let (msg, _) = upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await?;
+    Ok(msg)
 }
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
