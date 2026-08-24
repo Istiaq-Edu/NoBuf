@@ -393,6 +393,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         if (import.meta.env.DEV) {
             (window as any).__NOBUF_SPLIT_DEV__ = {
                 prepare: (path: string, folderId: number | null) => splitFlow.prepare(path, folderId),
+                listJobs: () => invoke('cmd_list_split_jobs'),
+                resumeJob: (id: string) => invoke('cmd_resume_split_job', { id }),
+                cancelJob: (id: string) => invoke('cmd_cancel_split_job', { id }),
+                discardJob: (id: string) => invoke('cmd_discard_split_job', { id }),
             };
         }
     }, [splitFlow]);
