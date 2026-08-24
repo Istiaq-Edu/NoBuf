@@ -736,6 +736,20 @@ pub async fn cmd_start_split_job(
         return Err("Source file changed since preview — reopen and try again".to_string());
     }
 
+    // Single-pipeline rule (authoritative): refuse to start while another job
+    // is live. The frontend gate only covers the open modal; after 'Split &
+    // Upload' succeeds the modal closes and a second drop could otherwise
+    // start a competing job mid-upload.
+    {
+        let conn = get_connection(&app_handle)?;
+        if has_active_split_job(&conn) {
+            return Err(
+                "Another split job is already running — wait for it to finish or cancel it first."
+                    .to_string(),
+            );
+        }
+    }
+
     let job_id = derive_job_id(&plan.source_path, plan.source_size, epoch_secs());
     let job_id8: String = job_id.chars().take(8).collect();
 
@@ -1253,6 +1267,27 @@ fn renumber_tail(parts: &mut [JobPartState], start: usize) {
         p.idx = i as u32 + 1;
         p.name = part_display_name(&stem.0, p.idx, &stem.1, total);
     }
+}
+
+/// True while any split job is preparing/running in this process's DB view.
+/// (Stale 'running' rows are normalized to 'interrupted' at startup, so this
+/// reflects live reality, not leftovers from a crash.)
+pub fn has_active_split_job(conn: &sqlite::Connection) -> bool {
+    let mut stmt = match conn.prepare(
+        "SELECT COUNT(*) FROM split_upload_jobs WHERE status IN ('preparing','running')",
+    ) {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+    stmt.iter()
+        .next()
+        .and_then(|r| r.ok())
+        .and_then(|row| match &row[0] {
+            sqlite::Value::Integer(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0)
+        > 0
 }
 
 /// Load a job's source_path from the jobs DB. Returns None if the row is gone.
