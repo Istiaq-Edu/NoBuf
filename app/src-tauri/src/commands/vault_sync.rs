@@ -319,27 +319,24 @@ fn vault_path_mtime(app: &AppHandle) -> Result<Option<i64>, String> {
 /// Tauri command wrapper: manual "Sync now" + used at startup after connect.
 #[tauri::command]
 pub async fn cmd_vault_pull_sync(app: AppHandle) -> Result<serde_json::Value, String> {
-    // Ok(false) = no sync blob exists yet in Saved Messages. Seed it from
-    // local state so first-time setup propagates without requiring a
-    // mutation on the source PC (review gap #1). The response carries the
-    // post-sync state so the frontend can apply it immediately (gap #2)
-    // instead of waiting for a remount.
-    let seeded = match pull_and_merge(&app).await {
-        Ok(true) => false,
-        Ok(false) => {
-            push_state(&app).await?;
-            true
-        }
+    // Always end with a push. Two cases:
+    // - No usable blob in Saved Messages (first sync ever): our push SEEDS
+    //   the cloud from local state.
+    // - Blob existed and was merged (union): RE-PUSH the union so the other
+    //   side converges. Without this, a PC whose vault predates sync never
+    //   uploads — it pulls, merges, stays silent, and its richer local state
+    //   never leaves the machine (the exact bug seen on cross-PC install).
+    let had_remote = match pull_and_merge(&app).await {
+        Ok(found) => found,
         Err(e) => return Err(e),
     };
-    // NOTE (deferred, review R2): when two PCs cold-launch with no existing
-    // blob, BOTH seed their own Saved Messages message. Union merge keeps
-    // contents convergent, but each PC keeps editing only its own message id.
-    // Remedy if ever observed: on pull-found, adopt the remote's message id
-    // into local sync_message_id before the next push.
+    push_state(&app).await?;
+    // Dual-blob note (review R2): two PCs cold-launching simultaneously can
+    // each create their own marker message; union merge keeps contents
+    // convergent, so at most a stray duplicate message — acceptable.
     let store = vault::load_store(&app);
     let resp = vault::state_response_public(&app, &store);
-    Ok(serde_json::json!({ "merged": seeded, "state": resp }))
+    Ok(serde_json::json!({ "merged": !had_remote, "state": resp }))
 }
 
 /// Tauri command wrapper: fire-and-forget push (called post-mutation).
