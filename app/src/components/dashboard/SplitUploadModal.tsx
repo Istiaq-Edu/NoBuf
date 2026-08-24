@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Scissors, X, Loader2, AlertTriangle, CheckCircle2, Film } from 'lucide-react';
 import type { SplitPlan, PlanEdits } from '../../hooks/useSplitUpload';
@@ -97,11 +97,29 @@ export function SplitUploadModal({
     useEffect(() => {
         if (!open || preparing || starting) return;
         const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') onClose();
+            if (e.key === 'Escape') requestClose();
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
     }, [open, preparing, starting, onClose]);
+
+    // ---- Confirm-before-close (user rule: active popups warn on close) ----
+    // The modal is "active" whenever it holds work a close would discard:
+    // a prepared plan with edits, an in-flight prepare, or a starting job.
+    const [confirmingClose, setConfirmingClose] = useState(false);
+
+    const isDirty =
+        (!!plan && !startedJobId) || preparing || starting;
+
+    const requestClose = () => {
+        if (!isDirty) { onClose(); return; }
+        setConfirmingClose(true);
+    };
+
+    // Re-arm the guard each time the modal opens fresh.
+    useEffect(() => {
+        if (open) setConfirmingClose(false);
+    }, [open]);
 
     return (
         <AnimatePresence>
@@ -116,7 +134,7 @@ export function SplitUploadModal({
                 >
                     <motion.div
                         initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
-                        className="bg-nobuf-surface border border-nobuf-border rounded-xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+                        className="relative bg-nobuf-surface border border-nobuf-border rounded-xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto"
                         onClick={(e) => e.stopPropagation()}
                     >
                         {/* Header */}
@@ -125,10 +143,36 @@ export function SplitUploadModal({
                                 <Scissors className="w-5 h-5 text-nobuf-primary" />
                                 <h3 className="text-lg font-semibold text-nobuf-text">Split Large Video</h3>
                             </div>
-                            <button onClick={onClose} className="p-1 hover:bg-nobuf-hover rounded-md transition" title="Close">
+                            <button onClick={requestClose} className="p-1 hover:bg-nobuf-hover rounded-md transition" title="Close">
                                 <X className="w-5 h-5 text-nobuf-subtext" />
                             </button>
                         </div>
+
+                        {confirmingClose && (
+                            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/70 backdrop-blur-sm rounded-xl">
+                                <AlertTriangle className="w-7 h-7 text-amber-400" />
+                                <p className="text-sm text-nobuf-text px-6 text-center font-medium">Discard this split?</p>
+                                <p className="text-xs text-nobuf-subtext px-6 text-center -mt-2">
+                                    {starting ? 'The job is starting — closing now aborts it.' :
+                                     preparing ? 'Analysis in progress will be cancelled.' :
+                                     'Your cut adjustments and the staged copy setup will be lost.'}
+                                </p>
+                                <div className="flex items-center gap-2 mt-1">
+                                    <button
+                                        onClick={() => setConfirmingClose(false)}
+                                        className="px-4 py-1.5 rounded-lg text-sm bg-nobuf-primary text-black font-medium hover:brightness-110 transition"
+                                    >
+                                        Keep editing
+                                    </button>
+                                    <button
+                                        onClick={onClose}
+                                        className="px-4 py-1.5 rounded-lg text-sm text-red-300 border border-red-400/40 hover:bg-red-400/10 transition"
+                                    >
+                                        Discard
+                                    </button>
+                                </div>
+                            </div>
+                        )}
 
                         {preparing && (
                             <div className="flex flex-col items-center justify-center py-12 gap-3">
@@ -141,7 +185,7 @@ export function SplitUploadModal({
                             <div className="flex flex-col items-center justify-center py-10 gap-3">
                                 <AlertTriangle className="w-8 h-8 text-red-400" />
                                 <p className="text-sm text-nobuf-text text-center px-4">{error}</p>
-                                <button onClick={onClose} className="mt-2 px-4 py-2 rounded-lg bg-nobuf-hover text-nobuf-text text-sm hover:brightness-110 transition">
+                                <button onClick={requestClose} className="mt-2 px-4 py-2 rounded-lg bg-nobuf-hover text-nobuf-text text-sm hover:brightness-110 transition">
                                     Close
                                 </button>
                             </div>
@@ -226,7 +270,7 @@ export function SplitUploadModal({
 
                                 {/* Footer */}
                                 <div className="flex justify-end gap-2 mt-4">
-                                    <button onClick={onClose} className="px-4 py-2 rounded-lg text-sm text-nobuf-subtext hover:bg-nobuf-hover transition">
+                                    <button onClick={requestClose} className="px-4 py-2 rounded-lg text-sm text-nobuf-subtext hover:bg-nobuf-hover transition">
                                         Cancel
                                     </button>
                                     <button
