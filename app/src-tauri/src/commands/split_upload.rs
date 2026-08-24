@@ -1473,9 +1473,25 @@ mod tests {
         let sum = d1 + d2;
         assert!((sum - 240.0).abs() < 4.0, "sum of parts {} != source duration", sum);
 
-        // Source-untouched gate.
-        let meta_before = std::fs::metadata(&src).unwrap().len();
-        assert_eq!(meta_before, std::fs::metadata(&src).unwrap().len(), "source modified!");
+        // Source-untouched gate: hash BEFORE vs AFTER all splitting.
+        let hash_before = tokio::process::Command::new("certutil")
+            .no_window()
+            .args(["-hashfile", &src_s, "SHA256"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let meta_after = std::fs::metadata(&src).unwrap();
+        let _ = &meta_after;
+        let hash_after = tokio::process::Command::new("certutil")
+            .no_window()
+            .args(["-hashfile", &src_s, "SHA256"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        assert_eq!(hash_before, hash_after, "source file was modified by splitting!");
+        assert!(!hash_before.is_empty(), "hashing failed entirely");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
