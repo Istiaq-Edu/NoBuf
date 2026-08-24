@@ -5,6 +5,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { forgetLiveDrop, cancelDropStream, retryDropStream } from './useDropStreamUpload';
+import { stageOne as stageOneExport, StagingCancelledError } from './useDroppedFileUpload';
 import { QueueItem } from '../types';
 
 /** True when a queue item is a stream-direct drop (never touches cmd_upload_file). */
@@ -361,10 +362,42 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
+        // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
+        // File has no filesystem path (WebView2 constraint), so it is staged to
+        // %TEMP% first via the existing chunked stager, then handed to the same
+        // prepare → modal → confirm chain the picker flow uses.
+        const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
+        const splitCandidates = files.filter(f => f.size > limitBytes && VIDEO_RE.test(f.name));
+        if (splitCandidates.length > 0 && splitFlow.open !== true) {
+            const f = splitCandidates[0];
+            try {
+                onStagingProgress?.(f.name, 0);
+                const id = Math.random().toString(36).slice(2, 11);
+                const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+                onStagingProgress?.(f.name, 100);
+                if (tempPath) {
+                    splitFlow.prepare(tempPath, activeFolderId);
+                    toast.info(`Preparing ${f.name} for split upload…`);
+                }
+            } catch (e) {
+                if (e instanceof StagingCancelledError) {
+                    toast.info(`Stopped preparing ${f.name}.`);
+                } else {
+                    toast.error(`Couldn't read ${f.name}: ${e}`);
+                }
+            }
+            if (splitCandidates.length > 1) {
+                toast.error(`${splitCandidates.length - 1} more large video(s) skipped \u2014 split them one at a time.`);
+            }
+        }
+
         // B′: dropped files stream DIRECTLY to Telegram over the local actix
         // server — no %TEMP% staging, no preparing phase. Falls back to the old
         // staging path when the availability probe in streamDroppedFiles throws
         // (server down / route absent).
+        const remaining = files.filter(f => !splitCandidates.includes(f));
+        files = remaining;
+        if (files.length === 0) return;
         try {
             const { streamDroppedFiles } = await import('./useDropStreamUpload');
             // Dedupe keys computed BEFORE the call: streamDroppedFiles skips
