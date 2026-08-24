@@ -243,8 +243,11 @@ pub fn parse_kind(kind: &str) -> Result<VaultKind, String> {
 }
 
 /// Public state response for cross-module callers (vault_sync pull result).
-pub fn state_response_public(store: &VaultStore) -> VaultStateResponse {
-    state_response(store, false)
+/// Reflects the REAL runtime unlock flag — a hardcoded false here would
+/// force-lock the UI whenever a sync event fires while the user is inside
+/// the unlocked vault (review finding E).
+pub fn state_response_public(app: &AppHandle, store: &VaultStore) -> VaultStateResponse {
+    state_response(store, is_unlocked_public(app))
 }
 
 fn state_response(store: &VaultStore, unlocked: bool) -> VaultStateResponse {
