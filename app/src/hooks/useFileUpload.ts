@@ -12,6 +12,7 @@ export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
     return item.path.startsWith('nobuf-drop-stream://');
 }
 import { useFileDrop } from './useFileDrop';
+import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
 
 interface ProgressPayload {
@@ -191,36 +192,55 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         }
     };
 
+    const splitFlow = useSplitUpload();
+
     const handleManualUpload = async () => {
         try {
             const selected = await open({ multiple: true, directory: false });
             if (selected) {
                 const paths = Array.isArray(selected) ? selected : [selected];
                 // Pre-validate against the Premium-aware size limit (consistent with drop path).
+                const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
                 const kept: string[] = [];
-                const oversized: string[] = [];
+                const oversizedNames: string[] = [];
+                let splitCandidate: string | null = null;
                 for (const p of paths) {
                     try {
                         const size = await invoke<number>('cmd_file_size', { path: p });
-                        if (size > limitBytes) { oversized.push(p.split(/[/\\]/).pop() || p); continue; }
+                        if (size > limitBytes) {
+                            const name = p.split(/[/\\]/).pop() || p;
+                            if (VIDEO_RE.test(name)) {
+                                // First oversize video opens the split screen; extra ones rejected.
+                                if (!splitCandidate) splitCandidate = p;
+                                else oversizedNames.push(name);
+                            } else {
+                                oversizedNames.push(name);
+                            }
+                            continue;
+                        }
                     } catch { /* if size probe fails, let the upload flow surface the error */ }
                     kept.push(p);
                 }
-                if (oversized.length > 0) {
+                if (oversizedNames.length > 0) {
                     const gb = Math.round(limitBytes / 1_000_000_000);
                     // Name the files (spec §3.3 style), matching the drop path's wording.
-                    const names = oversized.slice(0, 3).join(', ') + (oversized.length > 3 ? ` +${oversized.length - 3} more` : '');
-                    toast.error(`${names} ${oversized.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
+                    const names = oversizedNames.slice(0, 3).join(', ') + (oversizedNames.length > 3 ? ` +${oversizedNames.length - 3} more` : '');
+                    toast.error(`${names} ${oversizedNames.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
                 }
-                if (kept.length === 0) return;
-                const newItems: QueueItem[] = kept.map((path: string) => ({
-                    id: Math.random().toString(36).substr(2, 9),
-                    path,
-                    folderId: activeFolderId,
-                    status: 'pending'
-                }));
-                setUploadQueue(prev => [...prev, ...newItems]);
-                toast.info(`Queued ${kept.length} files for upload`);
+                if (splitCandidate) {
+                    splitFlow.prepare(splitCandidate, activeFolderId);
+                }
+                if (kept.length > 0) {
+                    const newItems: QueueItem[] = kept.map((path: string) => ({
+                        id: Math.random().toString(36).substr(2, 9),
+                        path,
+                        folderId: activeFolderId,
+                        status: 'pending'
+                    }));
+                    setUploadQueue(prev => [...prev, ...newItems]);
+                    toast.info(`Queued ${kept.length} files for upload`);
+                }
+                if (kept.length === 0 && !splitCandidate) return;
             }
         } catch {
             toast.error("Failed to open file dialog");
@@ -395,6 +415,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         cancelAll,
         cancelItem,
         retryItem,
-        isDragging
+        isDragging,
+        splitFlow
     };
 }

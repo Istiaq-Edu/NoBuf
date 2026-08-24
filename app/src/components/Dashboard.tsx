@@ -33,6 +33,7 @@ import { useConfirm } from '../context/ConfirmContext';
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
 import { useFileUpload } from '../hooks/useFileUpload';
+import { SplitUploadModal } from './dashboard/SplitUploadModal';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
@@ -383,7 +384,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
@@ -868,6 +869,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     open={showRemoteUpload}
                     onClose={() => setShowRemoteUpload(false)}
                     onSubmit={handleRemoteUpload}
+                />
+                <SplitUploadModal
+                    open={splitFlow.open}
+                    preparing={splitFlow.preparing}
+                    plan={splitFlow.plan}
+                    edits={splitFlow.edits}
+                    starting={splitFlow.starting}
+                    startedJobId={splitFlow.startedJobId}
+                    error={splitFlow.error}
+                    onClose={splitFlow.close}
+                    onConfirm={splitFlow.start}
+                    onEditBoundaries={(next) => splitFlow.setEdits({ boundaries: next })}
                 />
                 {playingFile && (
                     <MediaPlayer

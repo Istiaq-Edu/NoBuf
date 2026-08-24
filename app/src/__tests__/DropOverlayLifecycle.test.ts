@@ -63,7 +63,8 @@ describe('staged uploads keep their original name end-to-end', () => {
             path.resolve(process.cwd(), 'src-tauri/src/commands/fs.rs'), 'utf8',
         ).replace(/\r\n/g, '\n');
         expect(rust).toContain('display_name: Option<String>');
-        expect(rust).toContain('effective_document_name(&display_name, &path)');
+        // Extraction moved the call into upload_file_inner (param is `path`, no &).
+        expect(rust).toMatch(/effective_document_name\(&display_name, &?path\)/);
     });
 
     it('queue UI shows the display name, not the temp path', () => {
