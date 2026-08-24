@@ -24,3 +24,4 @@ Error.html
 
 # Split-upload QA fixtures (generated test videos) — never track media.
 app/tmp/
+app/.npm-cache/
