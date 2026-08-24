@@ -471,18 +471,22 @@ pub fn effective_document_name(display_name: &Option<String>, path: &str) -> Str
         .unwrap_or_else(|| "file".to_string())
 }
 
-#[tauri::command]
-pub async fn cmd_upload_file(
-    path: String,
+/// Shared upload engine: streams a local file to Telegram as a document in
+/// `folder_id`. Extracted verbatim from cmd_upload_file so the split-upload
+/// orchestrator (split_upload.rs) reuses the IDENTICAL pipeline — progress
+/// events, cancellation, bandwidth accounting, display-name handling.
+/// Returns the same human-readable status strings the command always returned.
+pub(crate) async fn upload_file_inner(
+    app_handle: &tauri::AppHandle,
+    state: &TelegramState,
+    bw_state: &BandwidthManager,
+    path: &str,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
     display_name: Option<String>,
-    app_handle: tauri::AppHandle,
-    state: State<'_, TelegramState>,
-    bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
     // Security: validate path exists and is a regular file (not a symlink to sensitive data)
-    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {}", e))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {}", e))?;
     if !canonical.is_file() {
         return Err("Path does not point to a regular file".to_string());
     }
@@ -507,8 +511,8 @@ pub async fn cmd_upload_file(
     }
 
     // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
-    let file_name = effective_document_name(&display_name, &path);
+    let (mut reader, file_size, bytes_counter) = ProgressReader::new(path).await?;
+    let file_name = effective_document_name(&display_name, path);
 
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
@@ -585,6 +589,19 @@ pub async fn cmd_upload_file(
     }
 
     Ok("File uploaded successfully".to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_upload_file(
+    path: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    display_name: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, BandwidthManager>,
+) -> Result<String, String> {
+    upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await
 }
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
