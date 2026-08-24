@@ -32,8 +32,10 @@ import { useConfirm } from '../context/ConfirmContext';
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
 import { SplitUploadModal } from './dashboard/SplitUploadModal';
+import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
@@ -384,7 +386,31 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store,
+        // Decision-first: an oversize DROPPED video asks before any temp copy.
+        // "Pick instead" aborts staging and opens the native picker — selecting
+        // the same file there runs the zero-copy split flow.
+        (file, proceed) => {
+            setOversizeChoice({ file, proceed });
+        }
+    );
+    const [oversizeChoice, setOversizeChoice] = useState<{ file: File; proceed: () => void } | null>(null);
+
+    const handleOversizePickInstead = useCallback(async () => {
+        if (!oversizeChoice) return;
+        setOversizeChoice(null);
+        try {
+            const selected = await openFileDialog({ multiple: false, directory: false });
+            if (selected) {
+                const p = Array.isArray(selected) ? selected[0] : selected;
+                await processPickedPaths([p]);
+            } else {
+                toast.info('No file picked — nothing uploaded.');
+            }
+        } catch (e) {
+            toast.error(`Picker failed: ${e}`);
+        }
+    }, [oversizeChoice]);
 
     // While an oversize drop is being staged or split-processed, surface the
     // Transfers panel so the user sees the copy/prepare progress. Closes are
@@ -892,7 +918,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onClose={() => setShowRemoteUpload(false)}
                     onSubmit={handleRemoteUpload}
                 />
-                <SplitUploadModal
+                                {oversizeChoice && (
+                    <OversizeDropChoiceModal
+                        fileName={oversizeChoice.file.name}
+                        sizeGb={`${(oversizeChoice.file.size / 1_000_000_000).toFixed(2)} GB`}
+                        onUseTempCopy={() => {
+                            oversizeChoice.proceed();
+                            setOversizeChoice(null);
+                        }}
+                        onPickInstead={() => { void handleOversizePickInstead(); }}
+                        onClose={() => setOversizeChoice(null)}
+                    />
+                )}
+<SplitUploadModal
                     open={splitFlow.open}
                     preparing={splitFlow.preparing}
                     plan={splitFlow.plan}

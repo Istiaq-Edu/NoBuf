@@ -67,6 +67,48 @@ async function stageViaHttp(file: File, onPct?: (pct: number) => void): Promise<
     });
 }
 
+type SplitFlowLite = {
+    open: boolean;
+    prepare: (path: string, folderId: number | null) => void;
+};
+
+/**
+ * Stage a dropped oversize video (fast /stage-drop route, chunked IPC fallback)
+ * and open the split screen. Invoked only AFTER the user accepts the temp-copy
+ * choice in OversizeDropChoiceModal (or directly when no choice UI is wired).
+ */
+export async function runSplitStaging(
+    f: File,
+    activeFolderId: number | null,
+    onStagingProgress: ((fileName: string, pct: number) => void) | undefined,
+    splitFlow: SplitFlowLite,
+): Promise<void> {
+    try {
+        onStagingProgress?.(f.name, 0);
+        const tempPath = await stageViaHttp(f, pct => onStagingProgress?.(f.name, pct));
+        onStagingProgress?.(f.name, 100);
+        if (tempPath) {
+            splitFlow.prepare(tempPath, activeFolderId);
+        }
+    } catch (httpErr) {
+        console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
+        try {
+            const id = Math.random().toString(36).slice(2, 11);
+            const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+            onStagingProgress?.(f.name, 100);
+            if (tempPath) {
+                splitFlow.prepare(tempPath, activeFolderId);
+            }
+        } catch (e) {
+            if (e instanceof StagingCancelledError) {
+                toast.info(`Stopped preparing ${f.name}.`);
+            } else {
+                toast.error(`Couldn't read ${f.name}: ${e}`);
+            }
+        }
+    }
+}
+
 
 interface ProgressPayload {
     id: string;
@@ -97,7 +139,8 @@ export function cleanupStagedTemp(item: Pick<QueueItem, 'stagedTempPath'>): void
     invoke('cmd_delete_staged_file', { path: item.stagedTempPath }).catch(() => {});
 }
 
-export function useFileUpload(activeFolderId: number | null, store: Store | null) {
+export function useFileUpload(activeFolderId: number | null, store: Store | null,
+    onOversizeDropChoice?: (file: File, proceed: () => void) => void) {
     const queryClient = useQueryClient();
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
     const [processing, setProcessing] = useState(false);
@@ -247,11 +290,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const splitFlow = useSplitUpload();
 
-    const handleManualUpload = async () => {
-        try {
-            const selected = await open({ multiple: true, directory: false });
-            if (selected) {
-                const paths = Array.isArray(selected) ? selected : [selected];
+    // Post-dialog logic shared by the Upload button and the oversize-drop
+    // "pick instead" lane (which re-opens the picker for one file).
+    const processPickedPaths = async (paths: string[]) => {
                 // Pre-validate against the Premium-aware size limit (consistent with drop path).
                 const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
                 const kept: string[] = [];
@@ -294,6 +335,14 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                     toast.info(`Queued ${kept.length} files for upload`);
                 }
                 if (kept.length === 0 && !splitCandidate) return;
+    };
+
+    const handleManualUpload = async () => {
+        try {
+            const selected = await open({ multiple: true, directory: false });
+            if (selected) {
+                const paths = Array.isArray(selected) ? selected : [selected];
+                await processPickedPaths(paths);
             }
         } catch {
             toast.error("Failed to open file dialog");
@@ -412,6 +461,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const { isDragging } = useFileDrop();
 
+    // Pending oversize-drop candidate awaiting the user's copy/no-copy choice.
+    const [pendingOversizeDrop, setPendingOversizeDrop] = useState<{ file: File; folderId: number | null } | null>(null);
+
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
         // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
@@ -424,41 +476,23 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         const splitCandidates = files.filter(f => f.size > limitBytes && VIDEO_RE.test(f.name));
         if (splitCandidates.length > 0 && splitFlow.open !== true) {
             const f = splitCandidates[0];
-            try {
-                onStagingProgress?.(f.name, 0);
-                const tempPath = await stageViaHttp(f, pct => onStagingProgress?.(f.name, pct));
-                onStagingProgress?.(f.name, 100);
-                if (tempPath) {
-                    splitFlow.prepare(tempPath, activeFolderId);
-                    toast.warning(
-                        `${f.name} exceeds your upload limit. It was copied to a temp folder once for splitting \u2014 this copy is deleted when the job finishes. Tip: use the Upload button instead to pick the file directly and split it with no copying.`,
-                        { duration: 9000 },
-                    );
-                }
-            } catch (httpErr) {
-                console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
-                try {
-                    const id = Math.random().toString(36).slice(2, 11);
-                    const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
-                    onStagingProgress?.(f.name, 100);
-                    if (tempPath) {
-                        splitFlow.prepare(tempPath, activeFolderId);
-                        toast.warning(
-                            `${f.name} exceeds your upload limit. It was copied to a temp folder once for splitting \u2014 this copy is deleted when the job finishes. Tip: use the Upload button instead to pick the file directly and split it with no copying.`,
-                            { duration: 9000 },
-                        );
-                    }
-                } catch (e) {
-                    if (e instanceof StagingCancelledError) {
-                        toast.info(`Stopped preparing ${f.name}.`);
-                    } else {
-                        toast.error(`Couldn't read ${f.name}: ${e}`);
-                    }
-                }
-            }
             if (splitCandidates.length > 1) {
                 toast.error(`${splitCandidates.length - 1} more large video(s) skipped \u2014 split them one at a time.`);
             }
+            // DECISION FIRST: ask before copying anything. onOversizeDropChoice,
+            // when provided, receives the candidate + a proceed() callback that
+            // runs the original stage-and-open flow.
+            if (onOversizeDropChoice) {
+                setPendingOversizeDrop({ file: f, folderId: activeFolderId });
+                const proceed = () => { void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow); };
+                onOversizeDropChoice(f, proceed);
+                // The non-split remainder still uploads normally.
+            } else {
+                void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow);
+            }
+            const remaining2 = files.filter(x => !splitCandidates.includes(x));
+            files = remaining2;
+            if (files.length === 0) return;
         }
 
         // B′: dropped files stream DIRECTLY to Telegram over the local actix
@@ -511,9 +545,10 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     return {
         uploadQueue,
         setUploadQueue,
-        handleManualUpload,
+        handleManualUpload, processPickedPaths,
         handleFolderUpload,
         handleRemoteUpload,
+        pendingOversizeDrop, setPendingOversizeDrop,
         stageAndQueue,
         cancelAll,
         cancelItem,
