@@ -461,9 +461,6 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const { isDragging } = useFileDrop();
 
-    // Pending oversize-drop candidate awaiting the user's copy/no-copy choice.
-    const [pendingOversizeDrop, setPendingOversizeDrop] = useState<{ file: File; folderId: number | null } | null>(null);
-
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
         // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
@@ -483,7 +480,6 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             // when provided, receives the candidate + a proceed() callback that
             // runs the original stage-and-open flow.
             if (onOversizeDropChoice) {
-                setPendingOversizeDrop({ file: f, folderId: activeFolderId });
                 const proceed = () => { void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow); };
                 onOversizeDropChoice(f, proceed);
                 // The non-split remainder still uploads normally.
@@ -492,6 +488,18 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             }
             const remaining2 = files.filter(x => !splitCandidates.includes(x));
             files = remaining2;
+            if (files.length === 0) return;
+        } else if (splitCandidates.length > 0) {
+            // A split screen/job is already active. These candidates must be
+            // rejected LOUDLY — falling through to the generic remainder filter
+            // used to make them vanish silently (no upload, no message).
+            const names = splitCandidates.slice(0, 3).map(x => x.name).join(', ')
+                + (splitCandidates.length > 3 ? ` +${splitCandidates.length - 3} more` : '');
+            toast.error(
+                `Split already in progress \u2014 ${names} not queued. Finish or cancel it first.`,
+                { duration: 7000 },
+            );
+            files = files.filter(x => !splitCandidates.includes(x));
             if (files.length === 0) return;
         }
 
@@ -548,7 +556,6 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         handleManualUpload, processPickedPaths,
         handleFolderUpload,
         handleRemoteUpload,
-        pendingOversizeDrop, setPendingOversizeDrop,
         stageAndQueue,
         cancelAll,
         cancelItem,
