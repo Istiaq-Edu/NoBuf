@@ -295,6 +295,16 @@ pub async fn cmd_cancel_transfer(
 /// Frontend caches this to pre-validate drops/picks instantly without a round-trip per file.
 #[tauri::command]
 pub async fn cmd_upload_limit(state: State<'_, TelegramState>) -> Result<u64, String> {
+    // Dev-QA override (same knob the split pipeline honors): keeps the
+    // frontend's oversize checks consistent with the backend during tests.
+    if let Ok(v) = std::env::var("NOBUF_FAKE_UPLOAD_CAP_BYTES") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                log::info!("[SPLIT] upload-limit override active: {n}B");
+                return Ok(n);
+            }
+        }
+    }
     let client_opt = { state.client.lock().await.clone() };
     match client_opt {
         Some(client) => crate::commands::utils::upload_limit_bytes(&client).await,

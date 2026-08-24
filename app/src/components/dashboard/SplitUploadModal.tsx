@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Scissors, X, Loader2, AlertTriangle, CheckCircle2, Film } from 'lucide-react';
 import type { SplitPlan, PlanEdits } from '../../hooks/useSplitUpload';
@@ -91,13 +91,28 @@ export function SplitUploadModal({
 
     const tooShort = parts.some(p => p.end - p.start < MIN_PART_SECS);
 
+    // Escape closes ONLY when nothing expensive is in flight. During preparing
+    // (probe/filmstrip on a multi-GB file) or starting, Esc is ignored so an
+    // accidental keypress can't orphan the work; the X stays visible instead.
+    useEffect(() => {
+        if (!open || preparing || starting) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') onClose();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [open, preparing, starting, onClose]);
+
     return (
         <AnimatePresence>
             {open && (
                 <motion.div
                     initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
                     className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-                    onClick={onClose}
+                    // UX rule (user-reported): backdrop clicks must NEVER dismiss this
+                    // modal — it holds expensive state (staged copy, prepared plan,
+                    // live job) that has no reopen path. Closing is explicit only:
+                    // X, Cancel, Done, or Escape.
                 >
                     <motion.div
                         initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
