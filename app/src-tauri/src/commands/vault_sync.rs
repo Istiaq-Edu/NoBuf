@@ -167,6 +167,7 @@ fn hex_of(bytes: Option<&String>) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("odd-length hex".into());
@@ -244,8 +245,6 @@ fn persist_sync_message_id(app: &AppHandle, msg_id: i32) -> Result<(), String> {
 /// PULL: find the newest sync message in Saved Messages and merge it in.
 /// Returns true when a remote blob was found and merged.
 pub async fn pull_and_merge(app: &AppHandle) -> Result<bool, String> {
-    use std::time::UNIX_EPOCH;
-
     let client_opt = {
         let state = app.state::<crate::TelegramState>();
         let guard = state.client.lock().await;
@@ -298,10 +297,6 @@ pub async fn pull_and_merge(app: &AppHandle) -> Result<bool, String> {
     apply_remote_blob(app, &remote, remote_newer)?;
     Ok(true)
 }
-
-/// Minimal date holder so we don't depend on chrono features here.
-#[allow(dead_code)]
-pub struct chrono_or_fallback(pub i64);
 
 fn vault_path_mtime(app: &AppHandle) -> Result<Option<i64>, String> {
     use std::time::UNIX_EPOCH;
