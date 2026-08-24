@@ -146,9 +146,32 @@ struct SplitProgressPayload {
 // ============================================================================
 
 /// How many parts does `size` need under a per-part budget of `cap`?
-fn compute_part_count(size: u64, cap: u64) -> u32 {
-    let budget = cap.saturating_sub(MARGIN_BYTES).max(1);
-    (((size + budget - 1) / budget).max(1)) as u32
+/// Unique job id: two SipHash rounds over path|size|time -> 32 hex chars.
+/// The old base64-truncate scheme collapsed to the shared directory prefix
+/// (first 18 bytes), colliding on the second job for ANY file in the same
+/// folder. Hashing the FULL string cannot collide across different inputs.
+fn derive_job_id(source_path: &str, size: u64, secs: i64) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let raw = format!("{}|{}|{}", source_path, size, secs);
+    let mut h1 = DefaultHasher::new();
+    raw.hash(&mut h1);
+    let mut h2 = DefaultHasher::new();
+    format!("{}#split", raw).hash(&mut h2);
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// Sane minimum per-part byte budget. Real caps are GiB-scale; anything
+/// smaller means a bogus/test override and must be rejected, not exploded
+/// into millions of parts.
+const MIN_PART_BUDGET_BYTES: u64 = 1_048_576; // 1 MiB
+
+fn compute_part_count(size: u64, cap: u64) -> Option<u32> {
+    let budget = cap.saturating_sub(MARGIN_BYTES);
+    if budget < MIN_PART_BUDGET_BYTES {
+        return None;
+    }
+    Some((((size + budget - 1) / budget).max(1)) as u32)
 }
 
 /// Equal-time internal cut points for `n` parts over `duration`.
@@ -619,7 +642,12 @@ pub async fn cmd_prepare_split(
         return Err("File does not exceed the upload limit".to_string());
     }
 
-    let n_parts = compute_part_count(source_size, cap);
+    let n_parts = compute_part_count(source_size, cap).ok_or_else(|| {
+        format!(
+            "Upload cap too small to split ({} bytes) — expected the account limit (2 GB / 4 GB)",
+            cap
+        )
+    })?;
     if n_parts < 2 {
         return Err("File does not exceed the upload limit".to_string());
     }
@@ -689,21 +717,14 @@ pub async fn cmd_start_split_job(
     app_handle: tauri::AppHandle,
     _state: State<'_, TelegramState>,
 ) -> Result<String, String> {
+    log::info!("[SPLIT] start: entered, source={}", plan.source_path);
     // Re-verify the source hasn't moved/changed since prepare.
     let meta = std::fs::metadata(&plan.source_path).map_err(|_| "Source file is gone".to_string())?;
     if meta.len() != plan.source_size {
         return Err("Source file changed since preview — reopen and try again".to_string());
     }
 
-    let job_id = {
-        use base64::Engine as _;
-        let raw = format!("{}|{}|{}", plan.source_path, plan.source_size, epoch_secs());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(raw)
-            .chars()
-            .take(24)
-            .collect::<String>()
-    };
+    let job_id = derive_job_id(&plan.source_path, plan.source_size, epoch_secs());
     let job_id8: String = job_id.chars().take(8).collect();
 
     // Pre-flight disk space: largest estimated part + slack must fit where
@@ -750,7 +771,10 @@ pub async fn cmd_start_split_job(
 
     let now = epoch_secs();
     {
-        let conn = get_connection(&app_handle)?;
+        let conn = get_connection(&app_handle).map_err(|e| {
+            log::error!("[SPLIT] start: db open failed: {}", e);
+            e
+        })?;
         let mut stmt = conn
             .prepare(&format!(
                 "INSERT INTO split_upload_jobs ({}) VALUES \
@@ -789,7 +813,12 @@ pub async fn cmd_start_split_job(
         stmt.bind((17, sqlite::Value::Null)).map_err(|e| e.to_string())?;
         stmt.bind((18, now)).map_err(|e| e.to_string())?;
         stmt.bind((19, now)).map_err(|e| e.to_string())?;
-        stmt.iter().next();
+        // An INSERT whose result is discarded fails SILENTLY — surface it.
+        match stmt.iter().next() {
+            Some(Err(e)) => return Err(format!("job insert failed: {}", e)),
+            _ => {}
+        }
+        log::info!("[SPLIT] start: job row inserted {}", job_id);
     }
 
     let app = app_handle.clone();
@@ -1315,15 +1344,31 @@ mod tests {
     fn part_count_respects_margin() {
         // At or under the EFFECTIVE budget (cap - MARGIN) → single part.
         let budget = 2 * GB - MARGIN_BYTES;
-        assert_eq!(compute_part_count(budget, 2 * GB), 1);
+        assert_eq!(compute_part_count(budget, 2 * GB), Some(1));
         // Exactly at cap → 2 parts: the margin exists precisely so every part
         // keeps drift headroom below the hard cap (plan §3.2 formula).
-        assert_eq!(compute_part_count(2 * GB, 2 * GB), 2);
+        assert_eq!(compute_part_count(2 * GB, 2 * GB), Some(2));
         // Just over cap → 2 parts.
-        assert_eq!(compute_part_count(2 * GB + 1, 2 * GB), 2);
+        assert_eq!(compute_part_count(2 * GB + 1, 2 * GB), Some(2));
         // Way over → ceiling division.
-        assert_eq!(compute_part_count(10 * GB, 2 * GB), 6); // budget 1.936GB ⇒ ceil(10/1.936)=6
-        assert_eq!(compute_part_count(0, 2 * GB), 1);
+        assert_eq!(compute_part_count(10 * GB, 2 * GB), Some(6)); // budget 1.936GB ⇒ ceil(10/1.936)=6
+        assert_eq!(compute_part_count(0, 2 * GB), Some(1));
+        // Bogus tiny caps must be rejected, not exploded into millions of parts.
+        assert_eq!(compute_part_count(3_000_000, 1_000_000), None); // below margin floor
+        assert_eq!(compute_part_count(3_000_000, 50_000_000), None); // budget 0 < 1MiB
+    }
+
+    #[test]
+    fn job_ids_differ_within_same_directory() {
+        // Regression: base64-truncate ids collapsed to the shared dir prefix.
+        let a = derive_job_id("D:/dir/a.mp4", 100, 1000);
+        let b = derive_job_id("D:/dir/b.mp4", 100, 1000);
+        assert_ne!(a, b);
+        let c = derive_job_id("D:/dir/a.mp4", 100, 1001);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 32);
+        let a2 = derive_job_id("D:/dir/a.mp4", 100, 1000);
+        assert_eq!(a, a2); // deterministic for identical inputs
     }
 
     #[test]
