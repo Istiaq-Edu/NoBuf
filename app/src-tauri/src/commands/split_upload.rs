@@ -1481,8 +1481,6 @@ mod tests {
             .await
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        let meta_after = std::fs::metadata(&src).unwrap();
-        let _ = &meta_after;
         let hash_after = tokio::process::Command::new("certutil")
             .no_window()
             .args(["-hashfile", &src_s, "SHA256"])
