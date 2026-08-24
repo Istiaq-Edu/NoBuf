@@ -446,6 +446,36 @@ pub async fn cmd_delete_staged_file(path: String) -> Result<(), String> {
     }
 }
 
+/// Startup sweep: any file in %TEMP%\nobuf_dropped older than STALE_STAGED_MAX_AGE
+/// is a leftover from a crashed/killed session (the app deletes its own staged
+/// copies on every normal path; see ed85a8a). Age-gated so a concurrently
+/// running instance can never have an in-flight staging deleted from under it.
+const STALE_STAGED_MAX_AGE_SECS: u64 = 48 * 3600;
+
+pub fn sweep_stale_staged_uploads() {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut removed = 0u32;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() { continue }
+        let age = match meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()) {
+            Some(m) => now.saturating_sub(m.as_secs()),
+            None => continue,
+        };
+        if age >= STALE_STAGED_MAX_AGE_SECS {
+            if std::fs::remove_file(e.path()).is_ok() { removed += 1; }
+        }
+    }
+    if removed > 0 {
+        log::info!("[stage-drop] startup sweep removed {} stale staged file(s) (>=48h old)", removed);
+    }
+}
+
 /// Best-effort delete of a PARTIALLY staged dropped file (stage aborted mid-stream,
 /// e.g. the source vanished or a chunk failed). Derives the same path as
 /// cmd_stage_dropped_file so the frontend never constructs filesystem paths.

@@ -298,6 +298,9 @@ pub fn run() {
             // Split-upload hygiene: flip crash-stale running jobs to
             // interrupted BEFORE any sweep can classify their temps.
             commands::split_upload::normalize_stale_jobs(app.handle());
+            // Reclaim disk from crash-orphaned drop-staged files before anything else.
+            crate::commands::fs::sweep_stale_staged_uploads();
+
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
