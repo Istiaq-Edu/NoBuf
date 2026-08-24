@@ -42,6 +42,12 @@ pub struct VaultStore {
     /// Saved Messages message id carrying the sync blob (edit-in-place).
     #[serde(default)]
     pub sync_message_id: Option<i32>,
+    /// Monotonic local revision, bumped on every save. Sync compares this
+    /// against the revision embedded in the cloud blob to decide whether the
+    /// other side has changed since our last sync — replaces mtime/message-
+    /// date heuristics that break under edit-one-message pushes.
+    #[serde(default)]
+    pub rev: u64,
 }
 
 impl Default for VaultStore {
@@ -54,6 +60,7 @@ impl Default for VaultStore {
             vaulted_public_channel_ids: Vec::new(),
             entry_visible: true,
             sync_message_id: None,
+            rev: 0,
         }
     }
 }
@@ -98,7 +105,12 @@ pub fn load_store(app: &AppHandle) -> VaultStore {
 
 /// Atomic write: .tmp → sync_all → rename over target (Windows-safe as shipped
 /// in api_settings.rs:57-68). Caller must hold VaultLock.
-pub(crate) fn save_store(app: &AppHandle, store: &VaultStore) -> Result<(), String> {
+pub(crate) fn save_store(app: &AppHandle, store: &mut VaultStore) -> Result<(), String> {
+    // Monotonic local revision (sync review F1): every save stamps this so
+    // vault_sync can compare "local changed since last sync" without relying
+    // on file mtime (unreliable across machines/clock skew) or message date
+    // (frozen by edit-one-message pushes).
+    store.rev = store.rev.max(1) + 1;
     let path = vault_path(app)?;
     let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
     let tmp_path = path.with_extension("json.tmp");
@@ -333,13 +345,13 @@ pub async fn cmd_vault_hide(
         VaultKind::Folder => {
             if !store.vaulted_folder_ids.contains(&id) {
                 store.vaulted_folder_ids.push(id);
-                save_store(&app, &store)?;
+                save_store(&app, &mut store)?;
             }
         }
         VaultKind::PublicChannel => {
             if !store.vaulted_public_channel_ids.contains(&id) {
                 store.vaulted_public_channel_ids.push(id);
-                save_store(&app, &store)?;
+                save_store(&app, &mut store)?;
             }
         }
     }
@@ -356,11 +368,11 @@ pub async fn cmd_vault_unhide(
     require_unlocked(&app)?;
     let lock = app.state::<VaultLock>();
     let _guard = lock.0.lock().map_err(|e| format!("Vault lock error: {}", e))?;
-    let store = match parsed_kind {
+    let mut store = match parsed_kind {
         VaultKind::Folder => prune_folder_ids(load_store(&app), &[id]),
         VaultKind::PublicChannel => prune_public_ids(load_store(&app), &[id]),
     };
-    save_store(&app, &store)?;
+    save_store(&app, &mut store)?;
     Ok(state_response(&store, true))
 }
 
@@ -395,8 +407,8 @@ pub async fn cmd_vault_set_passcode(
         return Err("vault_locked".to_string());
     }
 
-    let store = store_set_passcode(existing, &passcode)?;
-    save_store(&app, &store)?;
+    let mut store = store_set_passcode(existing, &passcode)?;
+    save_store(&app, &mut store)?;
     Ok(state_response(&store, is_unlocked(&app)))
 }
 
@@ -408,8 +420,8 @@ pub async fn cmd_vault_change_passcode(
     require_unlocked(&app)?;
     let lock = app.state::<VaultLock>();
     let _guard = lock.0.lock().map_err(|e| format!("Vault lock error: {}", e))?;
-    let store = store_set_passcode(load_store(&app), &new_passcode)?;
-    save_store(&app, &store)?;
+    let mut store = store_set_passcode(load_store(&app), &new_passcode)?;
+    save_store(&app, &mut store)?;
     Ok(state_response(&store, true))
 }
 
@@ -432,7 +444,7 @@ pub async fn cmd_vault_reset(app: AppHandle) -> Result<VaultStateResponse, Strin
     store.iterations = PBKDF2_ITERATIONS;
     store.vaulted_folder_ids.clear();
     store.vaulted_public_channel_ids.clear();
-    save_store(&app, &store)?;
+    save_store(&app, &mut store)?;
     set_unlocked(&app, false);
     Ok(state_response(&store, false))
 }
@@ -449,7 +461,7 @@ pub async fn cmd_vault_wipe_ids(app: AppHandle) -> Result<VaultStateResponse, St
     let mut store = load_store(&app);
     store.vaulted_folder_ids.clear();
     store.vaulted_public_channel_ids.clear();
-    save_store(&app, &store)?;
+    save_store(&app, &mut store)?;
     set_unlocked(&app, false);
     Ok(state_response(&store, false))
 }
@@ -463,11 +475,11 @@ pub async fn cmd_vault_prune(
     let parsed_kind = parse_kind(&kind)?;
     let lock = app.state::<VaultLock>();
     let _guard = lock.0.lock().map_err(|e| format!("Vault lock error: {}", e))?;
-    let store = match parsed_kind {
+    let mut store = match parsed_kind {
         VaultKind::Folder => prune_folder_ids(load_store(&app), &ids),
         VaultKind::PublicChannel => prune_public_ids(load_store(&app), &ids),
     };
-    save_store(&app, &store)?;
+    save_store(&app, &mut store)?;
     Ok(state_response(&store, is_unlocked(&app)))
 }
 
@@ -480,7 +492,7 @@ pub async fn cmd_vault_set_entry_visible(
     let _guard = lock.0.lock().map_err(|e| format!("Vault lock error: {}", e))?;
     let mut store = load_store(&app);
     store.entry_visible = visible;
-    save_store(&app, &store)?;
+    save_store(&app, &mut store)?;
     Ok(state_response(&store, is_unlocked(&app)))
 }
 

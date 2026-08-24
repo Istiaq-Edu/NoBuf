@@ -22,6 +22,12 @@ pub struct VaultSyncBlob {
     /// Telegram user id of the vault owner. Pull skips blobs whose owner
     /// differs from the logged-in account (cross-account safety).
     pub owner_id: i64,
+    /// Monotonic revision of the state in this blob (mirrors VaultStore.rev
+    /// of whichever machine pushed it). Sync review F1: message date is
+    /// frozen by edit-one-message pushes and mtimes aren't comparable across
+    /// machines — this counter is the only sound recency signal.
+    #[serde(default)]
+    pub rev: u64,
     #[serde(default)]
     pub folder_ids: Vec<i64>,
     #[serde(default)]
@@ -112,6 +118,7 @@ pub fn blob_from_store(store: &vault::VaultStore, owner_id: i64) -> VaultSyncBlo
     VaultSyncBlob {
         v: 1,
         owner_id,
+        rev: store.rev,
         folder_ids: store.vaulted_folder_ids.clone(),
         public_ids: store.vaulted_public_channel_ids.clone(),
         salt_hex: hex_of(store.salt.as_ref()),
@@ -121,14 +128,22 @@ pub fn blob_from_store(store: &vault::VaultStore, owner_id: i64) -> VaultSyncBlo
     }
 }
 
-/// Apply a pulled remote blob into vault.json (merge + save) and return
-/// the refreshed state response. Caller must hold VaultLock.
+/// Apply a pulled remote blob into vault.json (merge + save). Caller must
+/// hold VaultLock. Returns true when the merge CHANGED local state — used to
+/// suppress no-op re-pushes (edit ping-pong, sync review F1).
 pub fn apply_remote_blob(
     app: &AppHandle,
     remote: &VaultSyncBlob,
     remote_newer: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut store = vault::load_store(app);
+    let before_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone());
+    let before = (
+        store.salt.clone(),
+        store.passcode_hash.clone(),
+        store.iterations,
+        store.entry_visible,
+    );
     {
         let mut salt_hex = hex_of(store.salt.as_ref());
         let mut hash_hex = hex_of(store.passcode_hash.as_ref());
@@ -156,8 +171,16 @@ pub fn apply_remote_blob(
             Some(hash_hex)
         };
     }
-    vault::save_store(app, &store)?;
-    Ok(())
+    // Lamport-style revision adoption: our rev must dominate every blob we
+    // have ever seen, so the next push is unambiguously "at least as new".
+    if remote.rev > store.rev {
+        store.rev = remote.rev;
+    }
+    let after_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone());
+    let changed = after_ids != before_ids
+        || (store.salt.clone(), store.passcode_hash.clone(), store.iterations, store.entry_visible) != before;
+    vault::save_store(app, &mut store)?;
+    Ok(changed)
 }
 
 fn hex_of(bytes: Option<&String>) -> String {
@@ -239,7 +262,7 @@ fn persist_sync_message_id(app: &AppHandle, msg_id: i32) -> Result<(), String> {
     let _guard = lock.0.lock().map_err(|e| e.to_string())?;
     let mut store = vault::load_store(app);
     store.sync_message_id = Some(msg_id);
-    vault::save_store(app, &store)
+    vault::save_store(app, &mut store)
 }
 
 /// PULL: find the newest sync message in Saved Messages and merge it in.
@@ -259,17 +282,42 @@ pub async fn pull_and_merge(app: &AppHandle) -> Result<bool, String> {
     };
     let peer = resolve_peer(&client, None, &peer_cache).await?;
 
-    // Scan the newest ~50 messages of Saved Messages for our marker.
+    // F2: if we know which message carries our blob, try fetching it FIRST —
+    // a busy Saved Messages can push the marker past the scan window, and
+    // dual-blob steady states make "newest marker" ambiguous.
+    let stored_msg_id = { vault::load_store(app).sync_message_id };
+    let mut newest: Option<VaultSyncBlob> = None;
+    let mut remote_msg_id: Option<i32> = None;
+    if let Some(mid) = stored_msg_id {
+        let mut by_id = client.iter_messages(&peer).limit(50);
+        while let Some(msg) = by_id.next().await.map_err(|e| e.to_string())? {
+            if msg.id() == mid {
+                if let Some(blob) = parse_sync_message(msg.text()) {
+                    newest = Some(blob);
+                    remote_msg_id = Some(mid);
+                }
+                break;
+            }
+        }
+    }
+
+    // Scan the newest ~50 messages of Saved Messages for our marker; prefer
+    // whichever candidate (stored-id hit vs newest scan hit) has the higher
+    // revision.
     let mut msgs = client.iter_messages(&peer).limit(50);
-    let mut newest: Option<(i64, VaultSyncBlob)> = None;
     while let Some(msg) = msgs.next().await.map_err(|e| e.to_string())? {
-        let body_raw = msg.text();
-        if let Some(blob) = parse_sync_message(body_raw) {
-            newest = Some((msg.date().timestamp(), blob));
+        if let Some(blob) = parse_sync_message(msg.text()) {
+            match &newest {
+                Some(prev) if prev.rev >= blob.rev => {}
+                _ => {
+                    newest = Some(blob);
+                    remote_msg_id = Some(msg.id());
+                }
+            }
             break; // iter_messages yields newest-first
         }
     }
-    let Some((msg_secs, remote)) = newest else {
+    let Some(remote) = newest else {
         return Ok(false);
     };
 
@@ -285,36 +333,28 @@ pub async fn pull_and_merge(app: &AppHandle) -> Result<bool, String> {
         return Ok(false);
     }
 
-    // Remote-newer test: sync message date vs vault.json mtime.
-    let local_mtime = vault_path_mtime(app)?;
-    let remote_newer = match local_mtime {
-        Some(m) => msg_secs > m,
-        None => true,
-    };
+    // F1: recency via monotonic revisions. The cloud blob carries the rev of
+    // the machine that pushed it; local rev bumps on every save. remote_newer
+    // gates credential/visibility adoption only (IDs always union-merge).
+    // F2: adopt the remote message id so future edits land on the message the
+    // other side actually reads (kills dual-blob divergence). The id is
+    // persisted together with the merge below — one save, one rev bump.
+    let store_now = vault::load_store(app);
+    let remote_newer = remote.rev > store_now.rev;
 
     let lock = app.state::<VaultLock>();
     let _guard = lock.0.lock().map_err(|e| e.to_string())?;
     apply_remote_blob(app, &remote, remote_newer)?;
+    if let Some(mid) = remote_msg_id {
+        if vault::load_store(app).sync_message_id != Some(mid) {
+            let mut st = vault::load_store(app);
+            st.sync_message_id = Some(mid);
+            vault::save_store(app, &mut st)?;
+        }
+    }
     Ok(true)
 }
 
-fn vault_path_mtime(app: &AppHandle) -> Result<Option<i64>, String> {
-    use std::time::UNIX_EPOCH;
-    // Read mtime of app_data/vault.json (same path resolution as vault.rs).
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
-    let p = dir.join("vault.json");
-    match std::fs::metadata(&p) {
-        Ok(meta) => Ok(meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)),
-        Err(_) => Ok(None),
-    }
-}
 
 /// Tauri command wrapper: manual "Sync now" + used at startup after connect.
 #[tauri::command]
@@ -322,21 +362,29 @@ pub async fn cmd_vault_pull_sync(app: AppHandle) -> Result<serde_json::Value, St
     // Always end with a push. Two cases:
     // - No usable blob in Saved Messages (first sync ever): our push SEEDS
     //   the cloud from local state.
-    // - Blob existed and was merged (union): RE-PUSH the union so the other
-    //   side converges. Without this, a PC whose vault predates sync never
-    //   uploads — it pulls, merges, stays silent, and its richer local state
-    //   never leaves the machine (the exact bug seen on cross-PC install).
+    // - Blob existed and was merged: RE-PUSH the union so the other side
+    //   converges — without this, a PC whose vault predates sync never
+    //   uploads its richer local state (the cross-PC install bug).
+    // F3: the push is BEST-EFFORT — a failed push must not discard an
+    // already-merged pull; the frontend applies result.state regardless.
     let had_remote = match pull_and_merge(&app).await {
         Ok(found) => found,
         Err(e) => return Err(e),
     };
-    push_state(&app).await?;
-    // Dual-blob note (review R2): two PCs cold-launching simultaneously can
-    // each create their own marker message; union merge keeps contents
-    // convergent, so at most a stray duplicate message — acceptable.
+    let push_ok = match push_state(&app).await {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("[vault-sync] post-pull push failed (non-fatal): {e}");
+            false
+        }
+    };
     let store = vault::load_store(&app);
     let resp = vault::state_response_public(&app, &store);
-    Ok(serde_json::json!({ "merged": !had_remote, "state": resp }))
+    Ok(serde_json::json!({
+        "seeded": !had_remote,      // true = we created the cloud blob
+        "push_ok": push_ok,
+        "state": resp,
+    }))
 }
 
 /// Tauri command wrapper: fire-and-forget push (called post-mutation).
@@ -353,6 +401,7 @@ mod tests {
         VaultSyncBlob {
             v: 1,
             owner_id: 42,
+            rev: 0,
             folder_ids: folder_ids.to_vec(),
             public_ids: public_ids.to_vec(),
             salt_hex: if hash_hex.is_empty() { String::new() } else { "aabb".into() },
