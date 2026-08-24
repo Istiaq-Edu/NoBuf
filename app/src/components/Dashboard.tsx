@@ -386,7 +386,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store,
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
         // Decision-first: an oversize DROPPED video asks before any temp copy.
         // "Pick instead" aborts staging and opens the native picker — selecting
         // the same file there runs the zero-copy split flow.
@@ -1105,6 +1105,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <TransferPanel
                 isOpen={showTransferPanel}
+                splitJobs={splitJobRows}
+                onCancelSplitJob={jobId => { void invoke('cmd_cancel_split_job', { id: jobId }); }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}

@@ -43,6 +43,73 @@ function errText(e: unknown): string {
     return typeof e === 'string' ? e : String(e);
 }
 
+
+// ---------------------------------------------------------------------------
+// Live split-job rows for the Transfers panel.
+// Fed by the backend `split-progress` events; initial state comes from the DB
+// via cmd_list_split_jobs so rows survive app restarts.
+// ---------------------------------------------------------------------------
+
+export interface SplitJobRow {
+    jobId: string;
+    displayName: string;
+    /** 'queued' | 'splitting' | 'uploading' | 'done' | 'interrupted' | 'cancelled' */
+    phase: string;
+    doneParts: number;
+    totalParts: number;
+    currentPart: string;
+}
+
+/** Module-level store so multiple hook instances share one source of truth. */
+const splitRows = new Map<string, SplitJobRow>();
+const splitRowListeners = new Set<() => void>();
+let progressListenerAttached = false;
+
+function notifySplitRows() {
+    splitRowListeners.forEach(l => l());
+}
+
+function upsertSplitRow(row: Partial<SplitJobRow> & { jobId: string }) {
+    const prev = splitRows.get(row.jobId);
+    splitRows.set(row.jobId, {
+        jobId: row.jobId,
+        displayName: row.displayName ?? prev?.displayName ?? 'Split upload',
+        phase: row.phase ?? prev?.phase ?? 'queued',
+        doneParts: row.doneParts ?? prev?.doneParts ?? 0,
+        totalParts: row.totalParts ?? prev?.totalParts ?? 0,
+        currentPart: row.currentPart ?? prev?.currentPart ?? '',
+    });
+    notifySplitRows();
+}
+
+/** Attach ONE Tauri event listener for the lifetime of the webview. */
+async function ensureProgressListener() {
+    if (progressListenerAttached) return;
+    progressListenerAttached = true;
+    try {
+        const { listen } = await import('@tauri-apps/api/event');
+        await listen<{ jobId: string; phase: string; partIdx: number; totalParts: number; message: string }>(
+            'split-progress',
+            (ev) => {
+                const p = ev.payload;
+                const prev = splitRows.get(p.jobId);
+                upsertSplitRow({
+                    jobId: p.jobId,
+                    phase: p.phase,
+                    doneParts: p.partIdx,
+                    totalParts: p.totalParts,
+                    currentPart: p.message,
+                    // display name survives via prev
+                    displayName: prev?.displayName,
+                });
+            },
+        );
+    } catch (e) {
+        console.warn('[split-rows] listener attach failed', e);
+        progressListenerAttached = false;
+    }
+}
+
 export function useSplitUpload() {
     const [open, setOpen] = useState(false);
     const [preparing, setPreparing] = useState(false);
@@ -126,5 +193,37 @@ export function useSplitUpload() {
     // panel while an oversize drop is staging/splitting).
     const phase: 'idle' | 'preparing' | 'ready' | 'running' =
         open ? (startedJobId ? 'running' : plan ? 'ready' : 'preparing') : 'idle';
-    return { open, preparing, plan, edits, setEdits, starting, startedJobId, error, phase, prepare, start, close };
+    // Subscribe this component to the shared split-row store and hydrate once.
+    const [, forceTick] = useState(0);
+    useEffect(() => {
+        void ensureProgressListener();
+        const listener = () => forceTick(t => t + 1);
+        splitRowListeners.add(listener);
+        // One-time hydration from the jobs DB (survives restarts).
+        (async () => {
+            try {
+                const jobs = await invoke<Array<{
+                    id: string; displayName: string; status: string;
+                    totalParts: number; doneParts: number; error?: string | null;
+                }>>('cmd_list_split_jobs');
+                for (const j of jobs) {
+                    if (j.status === 'done' || j.status === 'cancelled') continue;
+                    upsertSplitRow({
+                        jobId: j.id,
+                        displayName: j.displayName,
+                        phase: j.status,
+                        doneParts: j.doneParts ?? 0,
+                        totalParts: j.totalParts ?? 0,
+                        currentPart: j.error ?? '',
+                    });
+                }
+                notifySplitRows();
+            } catch { /* panel just stays empty */ }
+        })();
+        return () => { splitRowListeners.delete(listener); };
+    }, []);
+
+    const splitJobRows: SplitJobRow[] = Array.from(splitRows.values());
+
+    return { open, preparing, plan, edits, setEdits, starting, startedJobId, error, phase, splitJobRows, prepare, start, close };
 }

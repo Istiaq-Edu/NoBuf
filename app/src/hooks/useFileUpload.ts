@@ -561,6 +561,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         cancelItem,
         retryItem,
         isDragging,
-        splitFlow
+        splitFlow,
+        splitJobRows: splitFlow.splitJobRows,
     };
 }

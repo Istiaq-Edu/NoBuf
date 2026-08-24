@@ -736,19 +736,14 @@ pub async fn cmd_start_split_job(
         return Err("Source file changed since preview — reopen and try again".to_string());
     }
 
-    // Single-pipeline rule (authoritative): refuse to start while another job
-    // is live. The frontend gate only covers the open modal; after 'Split &
-    // Upload' succeeds the modal closes and a second drop could otherwise
-    // start a competing job mid-upload.
-    {
+    // Single-pipeline rule (authoritative): if another job is live, this one
+    // is stored as 'queued' instead of running. A promotion runner starts
+    // queued jobs in insertion order whenever the pipeline frees up — so
+    // multiple big files line up like every other transfer in the app.
+    let start_status = {
         let conn = get_connection(&app_handle)?;
-        if has_active_split_job(&conn) {
-            return Err(
-                "Another split job is already running — wait for it to finish or cancel it first."
-                    .to_string(),
-            );
-        }
-    }
+        if has_active_split_job(&conn) { "queued" } else { "running" }
+    };
 
     let job_id = derive_job_id(&plan.source_path, plan.source_size, epoch_secs());
     let job_id8: String = job_id.chars().take(8).collect();
@@ -835,7 +830,7 @@ pub async fn cmd_start_split_job(
             serde_json::to_string(&plan.thumbs).unwrap_or_else(|_| "[]".into()).as_str(),
         ))
         .map_err(|e| e.to_string())?;
-        stmt.bind((16, "running")).map_err(|e| e.to_string())?;
+        stmt.bind((16, start_status)).map_err(|e| e.to_string())?;
         stmt.bind((17, sqlite::Value::Null)).map_err(|e| e.to_string())?;
         stmt.bind((18, now)).map_err(|e| e.to_string())?;
         stmt.bind((19, now)).map_err(|e| e.to_string())?;
@@ -849,13 +844,96 @@ pub async fn cmd_start_split_job(
 
     let app = app_handle.clone();
     let job_id_spawn = job_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_job(app, job_id_spawn).await {
-            log::warn!("[SPLIT] job ended: {}", e);
-        }
-    });
+    if start_status == "running" {
+        tokio::spawn(async move {
+            if let Err(e) = run_job(app, job_id_spawn).await {
+                log::warn!("[SPLIT] job ended: {}", e);
+            }
+        });
+    } else {
+        log::info!("[SPLIT] start: job {} queued (pipeline busy)", job_id);
+        // Kick the promotion runner: if nothing is actually running (e.g. the
+        // active job finished between our check and this insert), this starts
+        // the queue immediately.
+        let app2 = app_handle.clone();
+        tokio::spawn(async move { promote_queued_jobs(app2).await });
+    }
 
     Ok(job_id)
+}
+
+/// Start queued jobs (oldest first) while no other job is running. Called
+/// after a job reaches a terminal state and whenever a queued job is added.
+pub fn promote_queued_jobs<'a>(app: AppHandle) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(promote_queued_jobs_impl(app))
+}
+
+async fn promote_queued_jobs_impl(app: AppHandle) {
+    // Small delay coalesces bursts (multi-file drops insert several rows).
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    loop {
+        let next = {
+            let conn = match get_connection(&app) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let busy = has_active_split_job(&conn);
+            if busy { return; }
+            // Oldest queued job by created_at.
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM split_upload_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1",
+            ) {
+                Ok(q) => q,
+                Err(_) => return,
+            };
+            stmt.iter()
+                .next()
+                .and_then(|r| r.ok())
+                .and_then(|row| match &row[0] {
+                    sqlite::Value::String(x) => Some(x.to_string()),
+                    _ => None,
+                })
+        };
+        let Some(job_id) = next else { return };
+        {
+            let conn = match get_connection(&app) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut stmt = match conn.prepare(
+                "UPDATE split_upload_jobs SET status='running', updated_at=strftime('%s','now') WHERE id=? AND status='queued'",
+            ) {
+                Ok(q) => q,
+                Err(_) => return,
+            };
+            if stmt.bind((1, job_id.as_str())).is_err() { return; }
+            // Guarded flip: only succeeds if the row is still 'queued'.
+            let flipped = stmt.iter().next().map(|r| r.is_ok()).unwrap_or(false);
+            if !flipped { continue; }
+        }
+        log::info!("[SPLIT] promoted queued job {} to running", job_id);
+        let _ = app.emit(
+            "split-progress",
+            SplitProgressPayload {
+                job_id: job_id.clone(),
+                phase: "splitting".into(),
+                part_idx: 0,
+                total_parts: 0,
+                message: "Queued job starting".into(),
+            },
+        );
+        let a = app.clone();
+        let jid = job_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_job(a, jid).await {
+                log::warn!("[SPLIT] promoted job ended: {}", e);
+            }
+            // Chain: when this job finishes, try to start the next queued one.
+            let a2 = app.clone();
+            tokio::spawn(async move { promote_queued_jobs(a2).await });
+        });
+        return; // one promotion per call; chaining handles the rest
+    }
 }
 
 #[tauri::command]
@@ -892,6 +970,17 @@ pub async fn cmd_cancel_split_job(
         for t in to_cancel {
             set.insert(t);
         }
+    }
+    // If it was QUEUED, no runner exists to observe the token — flip it here.
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn
+            .prepare(
+                "UPDATE split_upload_jobs SET status='cancelled', error='Cancelled before start', updated_at=strftime('%s','now') WHERE id=? AND status='queued'",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        let _ = stmt.iter().next();
     }
     update_status(&app, &id, "interrupted", Some("Cancelled by user".to_string()))?;
     Ok(())
@@ -1035,7 +1124,38 @@ pub fn cmd_discard_split_job(id: String, app: AppHandle) -> Result<(), String> {
 // Orchestrator
 // ============================================================================
 
-async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
+
+fn run_job<'a>(app: AppHandle, job_id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(run_job_impl(app, job_id))
+}
+
+async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
+    // A 'queued' row must never execute; promotion flips it to 'running'
+    // before spawning run_job. This guard covers any race where a stale
+    // spawn fires against a still-queued row. (Sync DB access fully scoped;
+    // the connection must not live across an await or the future turns !Send.)
+    let job_status = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn
+            .prepare("SELECT status FROM split_upload_jobs WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, job_id.as_str())).map_err(|e| e.to_string())?;
+        let status: String = stmt
+            .iter()
+            .next()
+            .and_then(|r| r.ok())
+            .map(|row| match &row[0] {
+                sqlite::Value::String(x) => x.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        status
+    };
+    if job_status == "queued" {
+        log::info!("[SPLIT] run_job skipped: {} still queued", job_id);
+        return Ok(());
+    }
+
     let job_id8: String = job_id.chars().take(8).collect();
 
     // Load everything the loop needs in one sync scope.
@@ -1202,6 +1322,11 @@ async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
                 } else {
                     update_status_quiet(&app, &job_id, "interrupted", Some(e.clone()));
                 }
+                // A cancelled/failed job frees the pipeline: promote next queued.
+                {
+                    let a2 = app.clone();
+                    tokio::spawn(async move { promote_queued_jobs(a2).await });
+                }
                 return Err(format!("part {} upload failed: {}", idx, e));
             }
         }
@@ -1220,6 +1345,10 @@ async fn run_job(app: AppHandle, job_id: String) -> Result<(), String> {
     };
     if let Some(src) = src_for_cleanup {
         delete_staged_source_if_dropped(&src);
+    }
+    {
+        let a2 = app.clone();
+        tokio::spawn(async move { promote_queued_jobs(a2).await });
     }
     let _ = app.emit(
         "split-progress",

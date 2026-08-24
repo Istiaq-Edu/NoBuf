@@ -1,5 +1,5 @@
 ﻿import { useState } from 'react';
-import { Upload, Download, X, RotateCcw, AlertCircle, Check } from 'lucide-react';
+import { Upload, Download, X, RotateCcw, AlertCircle, Check, Scissors } from 'lucide-react';
 import { QueueItem, DownloadItem } from '../../types';
 
 function formatBytes(bytes: number): string {
@@ -18,6 +18,8 @@ interface TransferPanelProps {
     // Upload props
     uploadItems: QueueItem[];
     stagingItems?: { name: string; pct: number }[];
+    splitJobs?: { jobId: string; displayName: string; phase: string; doneParts: number; totalParts: number; currentPart: string }[];
+    onCancelSplitJob?: (jobId: string) => void;
     onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
@@ -33,7 +35,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -147,6 +149,70 @@ export function TransferPanel({
             {/* Items list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
                 {/* Staging rows: dropped files being copied to %TEMP% before entering the queue */}
+                {effectiveTab === 'uploads' && splitJobs.map(j => {
+                    // Phase → visual language: spinner=working, dot=waiting, check/x=terminal.
+                    const pctNum = j.totalParts > 0 ? Math.round((j.doneParts / j.totalParts) * 100) : (j.phase === 'queued' ? 0 : j.phase === 'done' ? 100 : 5);
+                    const phaseLabel =
+                        j.phase === 'queued' ? 'queued — waiting for current split to finish'
+                        : j.phase === 'preparing' ? 'analyzing video…'
+                        : j.phase === 'splitting' ? `splitting part ${j.doneParts + 1}/${j.totalParts || '?'}`
+                        : j.phase === 'uploading' ? `uploading part ${Math.min(j.doneParts + 1, j.totalParts)}/${j.totalParts} (${pctNum}%)`
+                        : j.phase === 'interrupted' ? 'paused — will resume from last part'
+                        : j.phase === 'cancelled' ? 'cancelled'
+                        : j.phase;
+                    const active = j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading' || j.phase === 'preparing';
+                    return (
+                        <div key={j.jobId} className={`flex flex-col gap-1 p-2.5 rounded-lg ${active ? 'bg-nobuf-primary/10 border border-nobuf-primary/30' : 'bg-nobuf-hover'}`}>
+                            <div className="flex items-center gap-3 text-sm">
+                                <div className="flex-shrink-0">
+                                    {j.phase === 'queued' && (
+                                        <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
+                                            <div className="w-2 h-2 bg-yellow-500 rounded-full" />
+                                        </div>
+                                    )}
+                                    {active && (
+                                        <div className="w-4 h-4 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />
+                                    )}
+                                    {j.phase === 'done' && (
+                                        <div className="w-4 h-4 rounded-full bg-green-500/20 flex items-center justify-center">
+                                            <Check className="w-3 h-3 text-green-500" />
+                                        </div>
+                                    )}
+                                    {(j.phase === 'interrupted') && (
+                                        <div className="w-4 h-4 rounded-full bg-orange-500/20 flex items-center justify-center">
+                                            <AlertCircle className="w-3 h-3 text-orange-400" />
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-nobuf-text text-xs truncate break-all leading-snug flex items-center gap-1.5">
+                                        <Scissors className="w-3 h-3 text-nobuf-primary shrink-0" />
+                                        <span className="truncate">{j.displayName}</span>
+                                        <span className="text-[9px] uppercase tracking-wide font-semibold px-1 py-px rounded bg-black/30 text-nobuf-subtext shrink-0">split</span>
+                                    </div>
+                                    <div className="text-[10px] text-nobuf-subtext mt-0.5 truncate">{phaseLabel}</div>
+                                </div>
+                                {onCancelSplitJob && active && (
+                                    <button
+                                        onClick={() => onCancelSplitJob(j.jobId)}
+                                        className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0"
+                                        title="Cancel this split job"
+                                    >
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+                            </div>
+                            {j.totalParts > 0 && (
+                                <div className="w-full bg-nobuf-border h-1 mt-1 rounded-full overflow-hidden">
+                                    <div
+                                        className={`h-full rounded-full transition-all duration-300 ${j.phase === 'interrupted' ? 'bg-orange-400' : 'bg-nobuf-primary'}`}
+                                        style={{ width: `${pctNum}%` }}
+                                    />
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
                 {effectiveTab === 'uploads' && stagingItems.map(s => (
                     <div key={s.name} className="flex flex-col gap-1 p-2.5 bg-nobuf-hover rounded-lg">
                         <div className="flex items-center gap-3 text-sm">
