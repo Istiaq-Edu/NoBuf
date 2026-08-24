@@ -122,5 +122,9 @@ export function useSplitUpload() {
         setStartedJobId(null);
     }, []);
 
-    return { open, preparing, plan, edits, setEdits, starting, startedJobId, error, prepare, start, close };
+    // Coarse lifecycle for outside observers (e.g. auto-opening the Transfers
+    // panel while an oversize drop is staging/splitting).
+    const phase: 'idle' | 'preparing' | 'ready' | 'running' =
+        open ? (startedJobId ? 'running' : plan ? 'ready' : 'preparing') : 'idle';
+    return { open, preparing, plan, edits, setEdits, starting, startedJobId, error, phase, prepare, start, close };
 }

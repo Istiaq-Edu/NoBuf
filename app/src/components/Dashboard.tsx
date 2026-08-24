@@ -386,6 +386,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store);
 
+    // While an oversize drop is being staged or split-processed, surface the
+    // Transfers panel so the user sees the copy/prepare progress. Closes are
+    // left to the user — no forced-hide.
+    useEffect(() => {
+        if (splitFlow.phase !== 'idle') setShowTransferPanel(true);
+    }, [splitFlow.phase]);
+
     // DEV-ONLY: QA seam for the split-upload flow (dead-code-eliminated in
     // release builds). Lets tests bypass the native file picker while still
     // exercising prepare -> modal -> confirm -> orchestrator end-to-end.
@@ -1025,6 +1032,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                     onPreview={handlePreview}
                     onManualUpload={handleManualUpload}
+                    uploadHighlight={externalDragActive && canUploadHere}
                     onFolderUpload={handleFolderUpload}
                     onSelectionClear={() => setSelectedIds([])}
                     onToggleSelection={handleToggleSelection}

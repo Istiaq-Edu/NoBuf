@@ -22,6 +22,8 @@ interface FileExplorerProps {
     onDownload: (id: number, name: string) => void;
     onPreview: (file: TelegramFile, orderedFiles?: TelegramFile[]) => void;
     onManualUpload: () => void;
+    /** True while an external OS drag hovers the window — Upload button gets a highlight ring. */
+    uploadHighlight?: boolean;
     onFolderUpload: () => void;
     onSelectionClear: () => void;
     onToggleSelection: (id: number) => void;
@@ -122,7 +124,7 @@ function useGridColumns(density: GridDensity) {
 
 export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
-    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd,
+    onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd, uploadHighlight,
     readOnly, hasMore, onLoadMore,
     onForwardToFolder, showForwardOption,
     notAMember, onRemoveChannel
@@ -372,7 +374,7 @@ export function FileExplorer({
                             <button
                                 onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
                                 disabled={readOnly}
-                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''} ${uploadHighlight ? 'ring-2 ring-white/90 shadow-[0_0_14px_rgba(29,252,159,0.65)] animate-pulse' : ''}`}
                             >
                                 <Plus className="w-3.5 h-3.5" />
                                 <span className="hidden sm:inline">Upload</span>
@@ -446,7 +448,7 @@ export function FileExplorer({
                             <button
                                 onClick={(e) => { e.stopPropagation(); onManualUpload(); }}
                                 disabled={readOnly}
-                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-nobuf-primary text-nobuf-county-green hover:brightness-110 active:scale-95 transition-all btn-shine ${readOnly ? 'opacity-50 cursor-not-allowed' : ''} ${uploadHighlight ? 'ring-2 ring-white/90 shadow-[0_0_14px_rgba(29,252,159,0.65)] animate-pulse' : ''}`}
                             >
                                 <Plus className="w-3.5 h-3.5" />
                                 <span className="hidden sm:inline">Upload</span>

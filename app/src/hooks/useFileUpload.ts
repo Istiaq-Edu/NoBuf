@@ -430,7 +430,10 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 onStagingProgress?.(f.name, 100);
                 if (tempPath) {
                     splitFlow.prepare(tempPath, activeFolderId);
-                    toast.info(`Preparing ${f.name} for split upload…`);
+                    toast.warning(
+                        `${f.name} exceeds your upload limit. It was copied to a temp folder once for splitting \u2014 this copy is deleted when the job finishes. Tip: use the Upload button instead to pick the file directly and split it with no copying.`,
+                        { duration: 9000 },
+                    );
                 }
             } catch (httpErr) {
                 console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
@@ -440,7 +443,10 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                     onStagingProgress?.(f.name, 100);
                     if (tempPath) {
                         splitFlow.prepare(tempPath, activeFolderId);
-                        toast.info(`Preparing ${f.name} for split upload…`);
+                        toast.warning(
+                            `${f.name} exceeds your upload limit. It was copied to a temp folder once for splitting \u2014 this copy is deleted when the job finishes. Tip: use the Upload button instead to pick the file directly and split it with no copying.`,
+                            { duration: 9000 },
+                        );
                     }
                 } catch (e) {
                     if (e instanceof StagingCancelledError) {
