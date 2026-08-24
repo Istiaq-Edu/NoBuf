@@ -385,6 +385,17 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
     const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitFlow } = useFileUpload(activeFolderId, store);
+
+    // DEV-ONLY: QA seam for the split-upload flow (dead-code-eliminated in
+    // release builds). Lets tests bypass the native file picker while still
+    // exercising prepare -> modal -> confirm -> orchestrator end-to-end.
+    useEffect(() => {
+        if (import.meta.env.DEV) {
+            (window as any).__NOBUF_SPLIT_DEV__ = {
+                prepare: (path: string, folderId: number | null) => splitFlow.prepare(path, folderId),
+            };
+        }
+    }, [splitFlow]);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
