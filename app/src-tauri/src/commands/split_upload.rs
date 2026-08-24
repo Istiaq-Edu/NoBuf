@@ -651,6 +651,18 @@ pub async fn cmd_prepare_split(
     if n_parts < 2 {
         return Err("File does not exceed the upload limit".to_string());
     }
+    // Sanity floor (mirrors the frontend's MIN_PART_SECS invariant): a plan
+    // whose parts would average under one minute is pathological — it can only
+    // arise from a dev/QA cap override far below the real account limit, and
+    // preparing it means minutes of per-boundary keyframe probes before any
+    // UI appears. Reject up front instead.
+    let avg_part_secs = duration / f64::from(n_parts);
+    if avg_part_secs < MIN_PART_SECS {
+        return Err(format!(
+            "Cap too small for this video: {} parts would average {:.0}s each (minimum 60s). Use your real account limit.",
+            n_parts, avg_part_secs
+        ));
+    }
 
     log::info!("[SPLIT] prepare: snapping {} boundaries...", n_parts - 1);
     // Auto-propose equal cuts, snapped to the nearest preceding keyframe.
@@ -1402,6 +1414,21 @@ mod tests {
         assert_eq!(compute_part_count(2 * GB, 2 * GB), Some(2));
         // Just over cap → 2 parts.
         assert_eq!(compute_part_count(2 * GB + 1, 2 * GB), Some(2));
+
+    #[test]
+    fn pathological_plan_rejected_before_snapping() {
+        // 6127.9s video (the user's real repro) under a 70MB QA cap → ~1179
+        // parts averaging 5.2s. The prepare path must reject this BEFORE any
+        // keyframe probing, surfacing an error instead of grinding for minutes.
+        let duration: f64 = 6127.904;
+        let n_parts = compute_part_count(3_200_000_000, 73_400_320).unwrap();
+        assert!(n_parts >= 2);
+        let avg = duration / f64::from(n_parts);
+        assert!(
+            avg < MIN_PART_SECS,
+            "fixture sanity: expected sub-minute average, got {avg}"
+        );
+    }
         // Way over → ceiling division.
         assert_eq!(compute_part_count(10 * GB, 2 * GB), Some(6)); // budget 1.936GB ⇒ ceil(10/1.936)=6
         assert_eq!(compute_part_count(0, 2 * GB), Some(1));
