@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-prepare-split"
+description = "Enables the cmd_prepare_split command without any pre-configured scope."
+commands.allow = ["cmd_prepare_split"]
+
+[[permission]]
+identifier = "deny-cmd-prepare-split"
+description = "Denies the cmd_prepare_split command without any pre-configured scope."
+commands.deny = ["cmd_prepare_split"]

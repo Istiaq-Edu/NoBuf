@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-resume-split-job"
+description = "Enables the cmd_resume_split_job command without any pre-configured scope."
+commands.allow = ["cmd_resume_split_job"]
+
+[[permission]]
+identifier = "deny-cmd-resume-split-job"
+description = "Denies the cmd_resume_split_job command without any pre-configured scope."
+commands.deny = ["cmd_resume_split_job"]

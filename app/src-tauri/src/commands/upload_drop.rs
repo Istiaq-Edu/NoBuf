@@ -37,11 +37,11 @@ pub fn set_upload_deps(deps: UploadDeps) {
     let _ = UPLOAD_DEPS.set(deps);
 }
 
-fn upload_deps() -> UploadDeps {
+pub(crate) fn upload_deps() -> UploadDeps {
     UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None })
 }
 
-const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
+pub(crate) const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
 
 #[derive(Clone, serde::Serialize)]
 struct DropProgressPayload {
@@ -90,7 +90,7 @@ impl tokio::io::AsyncRead for BodyReader {
     }
 }
 
-fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
+pub(crate) fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
     use actix_web::web::Query;
     let q = Query::<std::collections::HashMap<String, String>>::from_query(req.query_string()).ok()?;
     q.get(key).cloned()

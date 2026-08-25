@@ -7834,6 +7834,12 @@ pub async fn start_streaming_server(
                     "/upload-drop",
                     web::to(crate::commands::upload_drop::upload_drop_handler),
                 );
+                // Fast drop-staging: raw-binary File -> %TEMP% copy for the
+                // drop->split flow (no base64, no per-chunk IPC).
+                cfg.route(
+                    "/stage-drop",
+                    web::to(crate::commands::stage_drop::stage_drop_handler),
+                );
                 log::info!("Drop-upload route /upload-drop REGISTERED");
             })
             .service(stream_media)

@@ -5,6 +5,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { forgetLiveDrop, cancelDropStream, retryDropStream } from './useDropStreamUpload';
+import { stageOne as stageOneExport, StagingCancelledError } from './useDroppedFileUpload';
 import { QueueItem } from '../types';
 
 /** True when a queue item is a stream-direct drop (never touches cmd_upload_file). */
@@ -12,7 +13,102 @@ export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
     return item.path.startsWith('nobuf-drop-stream://');
 }
 import { useFileDrop } from './useFileDrop';
+import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
+
+/**
+ * Fast drop-staging: POST the File as raw binary to the local actix server's
+ * /stage-drop route. Progress rides the standard `upload-progress` event
+ * channel (server emits it), so callers can also listen there; the `pct`
+ * callback here is driven by xhr.upload.onprogress for immediate feedback.
+ * Throws when the route/server is unavailable so callers can fall back to
+ * the chunked IPC stager. Returns the staged absolute path.
+ */
+async function stageViaHttp(file: File, onPct?: (pct: number) => void): Promise<string> {
+    const { getStreamInfo } = await import('./useDropStreamUpload');
+    let info;
+    try {
+        info = await getStreamInfo();
+    } catch (e) {
+        throw new Error(`stream-info unavailable: ${e}`);
+    }
+    const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
+    const params = new URLSearchParams({
+        token: info.token ?? '',
+        name: file.name,
+        size: String(file.size),
+        id: Math.random().toString(36).slice(2, 11),
+        tid: '',
+    });
+    return await new Promise<string>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${rootUrl}/stage-drop?${params.toString()}`, true);
+        xhr.timeout = 0;
+        if (xhr.upload && onPct) {
+            xhr.upload.onprogress = (ev) => {
+                if (ev.lengthComputable) onPct(Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+            };
+        }
+        xhr.onerror = () => reject(new Error('network error talking to local server'));
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                try {
+                    const parsed = JSON.parse(xhr.responseText);
+                    if (parsed?.path) resolve(parsed.path as string);
+                    else reject(new Error('stage-drop returned no path'));
+                } catch {
+                    reject(new Error('stage-drop returned invalid JSON'));
+                }
+            } else {
+                reject(new Error(xhr.responseText || `stage-drop HTTP ${xhr.status}`));
+            }
+        };
+        xhr.send(file);
+    });
+}
+
+type SplitFlowLite = {
+    open: boolean;
+    prepare: (path: string, folderId: number | null) => void;
+};
+
+/**
+ * Stage a dropped oversize video (fast /stage-drop route, chunked IPC fallback)
+ * and open the split screen. Invoked only AFTER the user accepts the temp-copy
+ * choice in OversizeDropChoiceModal (or directly when no choice UI is wired).
+ */
+export async function runSplitStaging(
+    f: File,
+    activeFolderId: number | null,
+    onStagingProgress: ((fileName: string, pct: number) => void) | undefined,
+    splitFlow: SplitFlowLite,
+): Promise<void> {
+    try {
+        onStagingProgress?.(f.name, 0);
+        const tempPath = await stageViaHttp(f, pct => onStagingProgress?.(f.name, pct));
+        onStagingProgress?.(f.name, 100);
+        if (tempPath) {
+            splitFlow.prepare(tempPath, activeFolderId);
+        }
+    } catch (httpErr) {
+        console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
+        try {
+            const id = Math.random().toString(36).slice(2, 11);
+            const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+            onStagingProgress?.(f.name, 100);
+            if (tempPath) {
+                splitFlow.prepare(tempPath, activeFolderId);
+            }
+        } catch (e) {
+            if (e instanceof StagingCancelledError) {
+                toast.info(`Stopped preparing ${f.name}.`);
+            } else {
+                toast.error(`Couldn't read ${f.name}: ${e}`);
+            }
+        }
+    }
+}
+
 
 interface ProgressPayload {
     id: string;
@@ -43,7 +139,8 @@ export function cleanupStagedTemp(item: Pick<QueueItem, 'stagedTempPath'>): void
     invoke('cmd_delete_staged_file', { path: item.stagedTempPath }).catch(() => {});
 }
 
-export function useFileUpload(activeFolderId: number | null, store: Store | null) {
+export function useFileUpload(activeFolderId: number | null, store: Store | null,
+    onOversizeDropChoice?: (file: File, proceed: () => void) => void) {
     const queryClient = useQueryClient();
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
     const [processing, setProcessing] = useState(false);
@@ -191,36 +288,61 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         }
     };
 
+    const splitFlow = useSplitUpload();
+
+    // Post-dialog logic shared by the Upload button and the oversize-drop
+    // "pick instead" lane (which re-opens the picker for one file).
+    const processPickedPaths = async (paths: string[]) => {
+                // Pre-validate against the Premium-aware size limit (consistent with drop path).
+                const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
+                const kept: string[] = [];
+                const oversizedNames: string[] = [];
+                let splitCandidate: string | null = null;
+                for (const p of paths) {
+                    try {
+                        const size = await invoke<number>('cmd_file_size', { path: p });
+                        if (size > limitBytes) {
+                            const name = p.split(/[/\\]/).pop() || p;
+                            if (VIDEO_RE.test(name)) {
+                                // First oversize video opens the split screen; extra ones rejected.
+                                if (!splitCandidate) splitCandidate = p;
+                                else oversizedNames.push(name);
+                            } else {
+                                oversizedNames.push(name);
+                            }
+                            continue;
+                        }
+                    } catch { /* if size probe fails, let the upload flow surface the error */ }
+                    kept.push(p);
+                }
+                if (oversizedNames.length > 0) {
+                    const gb = Math.round(limitBytes / 1_000_000_000);
+                    // Name the files (spec §3.3 style), matching the drop path's wording.
+                    const names = oversizedNames.slice(0, 3).join(', ') + (oversizedNames.length > 3 ? ` +${oversizedNames.length - 3} more` : '');
+                    toast.error(`${names} ${oversizedNames.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
+                }
+                if (splitCandidate) {
+                    splitFlow.prepare(splitCandidate, activeFolderId);
+                }
+                if (kept.length > 0) {
+                    const newItems: QueueItem[] = kept.map((path: string) => ({
+                        id: Math.random().toString(36).substr(2, 9),
+                        path,
+                        folderId: activeFolderId,
+                        status: 'pending'
+                    }));
+                    setUploadQueue(prev => [...prev, ...newItems]);
+                    toast.info(`Queued ${kept.length} files for upload`);
+                }
+                if (kept.length === 0 && !splitCandidate) return;
+    };
+
     const handleManualUpload = async () => {
         try {
             const selected = await open({ multiple: true, directory: false });
             if (selected) {
                 const paths = Array.isArray(selected) ? selected : [selected];
-                // Pre-validate against the Premium-aware size limit (consistent with drop path).
-                const kept: string[] = [];
-                const oversized: string[] = [];
-                for (const p of paths) {
-                    try {
-                        const size = await invoke<number>('cmd_file_size', { path: p });
-                        if (size > limitBytes) { oversized.push(p.split(/[/\\]/).pop() || p); continue; }
-                    } catch { /* if size probe fails, let the upload flow surface the error */ }
-                    kept.push(p);
-                }
-                if (oversized.length > 0) {
-                    const gb = Math.round(limitBytes / 1_000_000_000);
-                    // Name the files (spec §3.3 style), matching the drop path's wording.
-                    const names = oversized.slice(0, 3).join(', ') + (oversized.length > 3 ? ` +${oversized.length - 3} more` : '');
-                    toast.error(`${names} ${oversized.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
-                }
-                if (kept.length === 0) return;
-                const newItems: QueueItem[] = kept.map((path: string) => ({
-                    id: Math.random().toString(36).substr(2, 9),
-                    path,
-                    folderId: activeFolderId,
-                    status: 'pending'
-                }));
-                setUploadQueue(prev => [...prev, ...newItems]);
-                toast.info(`Queued ${kept.length} files for upload`);
+                await processPickedPaths(paths);
             }
         } catch {
             toast.error("Failed to open file dialog");
@@ -341,10 +463,53 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
 
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
+        // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
+        // File has no filesystem path (WebView2 constraint), so it is copied to
+        // %TEMP% once, then handed to the same prepare → modal → confirm chain
+        // the picker flow uses. Fast path: raw-binary POST to the local actix
+        // server (/stage-drop) — no base64, no per-chunk IPC. Falls back to
+        // the legacy chunked IPC stager when the route is absent/unreachable.
+        const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
+        const splitCandidates = files.filter(f => f.size > limitBytes && VIDEO_RE.test(f.name));
+        if (splitCandidates.length > 0 && splitFlow.open !== true) {
+            const f = splitCandidates[0];
+            if (splitCandidates.length > 1) {
+                toast.error(`${splitCandidates.length - 1} more large video(s) skipped \u2014 split them one at a time.`);
+            }
+            // DECISION FIRST: ask before copying anything. onOversizeDropChoice,
+            // when provided, receives the candidate + a proceed() callback that
+            // runs the original stage-and-open flow.
+            if (onOversizeDropChoice) {
+                const proceed = () => { void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow); };
+                onOversizeDropChoice(f, proceed);
+                // The non-split remainder still uploads normally.
+            } else {
+                void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow);
+            }
+            const remaining2 = files.filter(x => !splitCandidates.includes(x));
+            files = remaining2;
+            if (files.length === 0) return;
+        } else if (splitCandidates.length > 0) {
+            // A split screen/job is already active. These candidates must be
+            // rejected LOUDLY — falling through to the generic remainder filter
+            // used to make them vanish silently (no upload, no message).
+            const names = splitCandidates.slice(0, 3).map(x => x.name).join(', ')
+                + (splitCandidates.length > 3 ? ` +${splitCandidates.length - 3} more` : '');
+            toast.error(
+                `Split already in progress \u2014 ${names} not queued. Finish or cancel it first.`,
+                { duration: 7000 },
+            );
+            files = files.filter(x => !splitCandidates.includes(x));
+            if (files.length === 0) return;
+        }
+
         // B′: dropped files stream DIRECTLY to Telegram over the local actix
         // server — no %TEMP% staging, no preparing phase. Falls back to the old
         // staging path when the availability probe in streamDroppedFiles throws
         // (server down / route absent).
+        const remaining = files.filter(f => !splitCandidates.includes(f));
+        files = remaining;
+        if (files.length === 0) return;
         try {
             const { streamDroppedFiles } = await import('./useDropStreamUpload');
             // Dedupe keys computed BEFORE the call: streamDroppedFiles skips
@@ -388,13 +553,15 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     return {
         uploadQueue,
         setUploadQueue,
-        handleManualUpload,
+        handleManualUpload, processPickedPaths,
         handleFolderUpload,
         handleRemoteUpload,
         stageAndQueue,
         cancelAll,
         cancelItem,
         retryItem,
-        isDragging
+        isDragging,
+        splitFlow,
+        splitJobRows: splitFlow.splitJobRows,
     };
 }

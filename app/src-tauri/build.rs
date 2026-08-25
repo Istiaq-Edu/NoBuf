@@ -100,6 +100,12 @@ fn main() {
                                 "cmd_vault_set_entry_visible",
                                 "cmd_vault_pull_sync",
                                 "cmd_vault_push_sync",
+                "cmd_prepare_split",
+                "cmd_start_split_job",
+                "cmd_cancel_split_job",
+                "cmd_resume_split_job",
+                "cmd_list_split_jobs",
+                "cmd_discard_split_job",
                             ])),
     )
     .expect("Failed to build Tauri application: check tauri.conf.json and capabilities");

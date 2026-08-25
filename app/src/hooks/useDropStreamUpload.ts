@@ -19,7 +19,8 @@ interface StreamInfo {
 
 let cachedStreamInfo: StreamInfo | null = null;
 
-async function getStreamInfo(): Promise<StreamInfo> {
+/** Exported for the /stage-drop fast-staging path (token+base_url source). */
+export async function getStreamInfo(): Promise<StreamInfo> {
     if (!cachedStreamInfo) {
         cachedStreamInfo = await invoke<StreamInfo>('cmd_get_stream_info');
     }

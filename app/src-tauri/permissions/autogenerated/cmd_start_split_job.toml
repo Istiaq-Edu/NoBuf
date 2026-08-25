@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-start-split-job"
+description = "Enables the cmd_start_split_job command without any pre-configured scope."
+commands.allow = ["cmd_start_split_job"]
+
+[[permission]]
+identifier = "deny-cmd-start-split-job"
+description = "Denies the cmd_start_split_job command without any pre-configured scope."
+commands.deny = ["cmd_start_split_job"]

@@ -17,6 +17,7 @@ import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
+import { parseSplitName, collapseParts, type SplitChain } from '../utils/splitChain';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
@@ -32,7 +33,10 @@ import { useConfirm } from '../context/ConfirmContext';
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
+import { SplitUploadModal } from './dashboard/SplitUploadModal';
+import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
@@ -297,6 +301,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         _setInternalDragFileId(id);
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
+    // Chain mode: the split-parts group being played (null = single file).
+    const [playingChain, setPlayingChain] = useState<SplitChain | null>(null);
+    // Virtual-timeline time where playback should start (clicked part K → Σ
+    // durations of parts 1..K-1). Consumed by MediaPlayer on mount.
+    const [playingChainStartT, setPlayingChainStartT] = useState(0);
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveFile, setArchiveFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
@@ -319,9 +328,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
     // Re-fetch the Premium-aware limit whenever the Telegram connection (re)establishes,
     // so a mid-session account change isn't stuck with the stale mount-time value.
+    // ALSO poll until the first successful load: at mount the client often isn't
+    // signed in yet, the one-shot fetch fails silently, and the default 2GB sticks —
+    // which would route an oversize drop into the regular uploader instead of split.
     useEffect(() => {
+        let cancelled = false;
+        const load = () => invoke<number>('cmd_upload_limit')
+            .then(v => { if (!cancelled) setUploadLimitBytes(v); return true; })
+            .catch(() => false);
         if (!isConnected) return;
-        invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
+        load().then(ok => {
+            if (ok || cancelled) return;
+            const t = setInterval(() => { load().then(ok2 => { if (ok2) clearInterval(t); }); }, 3000);
+            return () => clearInterval(t);
+        });
+        return () => { cancelled = true; };
     }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
@@ -383,7 +404,68 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
+        // Decision-first: an oversize DROPPED video asks before any temp copy.
+        // "Pick instead" aborts staging and opens the native picker — selecting
+        // the same file there runs the zero-copy split flow.
+        (file, proceed) => {
+            const stageDropCap = 4_294_967_295; // Telegram hard ceiling (backend MAX_DROP_BYTES)
+            if (file.size > stageDropCap) {
+                toast.error(`"${file.name}" is larger than the 4 GB maximum — upload it with the Upload button instead.`);
+                return;
+            }
+            // If a decision dialog is already open, reject this candidate
+            // loudly instead of silently replacing (and losing) the pending one.
+            if (oversizeChoiceRef.current) {
+                toast.error(`Another large video ("${oversizeChoiceRef.current.file.name}") is awaiting your choice — decide on it first, then drop "${file.name}" again.`);
+                return;
+            }
+            setOversizeChoice({ file, proceed });
+        }
+    );
+    const [oversizeChoice, setOversizeChoice] = useState<{ file: File; proceed: () => void } | null>(null);
+    // Mirror for use inside the useFileUpload drop callback (stable identity
+    // across renders — state would read stale inside the callback closure).
+    const oversizeChoiceRef = useRef<{ file: File; proceed: () => void } | null>(null);
+    oversizeChoiceRef.current = oversizeChoice;
+
+    const handleOversizePickInstead = useCallback(async () => {
+        if (!oversizeChoice) return;
+        setOversizeChoice(null);
+        try {
+            const selected = await openFileDialog({ multiple: false, directory: false });
+            if (selected) {
+                const p = Array.isArray(selected) ? selected[0] : selected;
+                await processPickedPaths([p]);
+            } else {
+                toast.info('No file picked — nothing uploaded.');
+            }
+        } catch (e) {
+            toast.error(`Picker failed: ${e}`);
+        }
+    }, [oversizeChoice]);
+
+    // While an oversize drop is being staged or split-processed, surface the
+    // Transfers panel so the user sees the copy/prepare progress. Closes are
+    // left to the user — no forced-hide.
+    useEffect(() => {
+        if (splitFlow.phase !== 'idle') setShowTransferPanel(true);
+    }, [splitFlow.phase]);
+
+    // DEV-ONLY: QA seam for the split-upload flow (dead-code-eliminated in
+    // release builds). Lets tests bypass the native file picker while still
+    // exercising prepare -> modal -> confirm -> orchestrator end-to-end.
+    useEffect(() => {
+        if (import.meta.env.DEV) {
+            (window as any).__NOBUF_SPLIT_DEV__ = {
+                prepare: (path: string, folderId: number | null) => splitFlow.prepare(path, folderId),
+                listJobs: () => invoke('cmd_list_split_jobs'),
+                resumeJob: (id: string) => invoke('cmd_resume_split_job', { id }),
+                cancelJob: (id: string) => invoke('cmd_cancel_split_job', { id }),
+                discardJob: (id: string) => invoke('cmd_discard_split_job', { id }),
+            };
+        }
+    }, [splitFlow]);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
@@ -553,7 +635,34 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const isPdf = isPdfFile(file.name);
         const isArchive = isArchiveFile(file.name);
 
+        // Chain detection: clicking part K of a split set plays the whole
+        // chain starting at K's position on the virtual timeline.
         if (isMedia) {
+            const p = parseSplitName(file.name);
+            if (p) {
+                const items = collapseParts(contextFiles);
+                const hit = items.find((i): i is Extract<typeof i, { kind: 'chain' }> => i.kind === 'chain' && i.chain.stem === p.stem);
+                // Gap rule: docs outside the playable prefix exist but are not
+                // chain-playable — tell the user how many.
+                const allWithStem = contextFiles.filter(f => parseSplitName(f.name)?.stem === p.stem);
+                const missing = hit ? Math.max(0, allWithStem.length - hit.chain.docs.length) : 0;
+                if (hit && hit.chain.docs.some(d => String(d.id) === String(file.id))) {
+                    const chainHit: SplitChain = hit.chain;
+                    setPlayingChain(chainHit);
+                    setPlayingChainStartT(() => {
+                        let acc = 0;
+                        for (const x of chainHit.docs) { if (String(x.id) === String(file.id)) return acc; acc += x.duration; }
+                        return acc;
+                    });
+                    setPlayingFile(file);
+                    setPreviewFile(null); setPdfFile(null); setArchiveFile(null);
+                    if (missing > 0) toast.info(`Playing ${chainHit.docs.length} uploaded segment${chainHit.docs.length > 1 ? 's' : ''} — ${missing} later part${missing > 1 ? 's' : ''} not uploaded yet.`);
+                    return;
+                }
+                // No playable chain (or clicked a gap orphan): play as single.
+                setPlayingChain(null);
+            }
+            setPlayingChain(null);
             setPlayingFile(file);
             setPreviewFile(null);
             setPdfFile(null);
@@ -869,10 +978,36 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onClose={() => setShowRemoteUpload(false)}
                     onSubmit={handleRemoteUpload}
                 />
+                                {oversizeChoice && (
+                    <OversizeDropChoiceModal
+                        fileName={oversizeChoice.file.name}
+                        sizeGb={`${(oversizeChoice.file.size / 1_000_000_000).toFixed(2)} GB`}
+                        onUseTempCopy={() => {
+                            oversizeChoice.proceed();
+                            setOversizeChoice(null);
+                        }}
+                        onPickInstead={() => { void handleOversizePickInstead(); }}
+                        onClose={() => setOversizeChoice(null)}
+                    />
+                )}
+<SplitUploadModal
+                    open={splitFlow.open}
+                    preparing={splitFlow.preparing}
+                    plan={splitFlow.plan}
+                    edits={splitFlow.edits}
+                    starting={splitFlow.starting}
+                    startedJobId={splitFlow.startedJobId}
+                    error={splitFlow.error}
+                    onClose={splitFlow.close}
+                    onConfirm={splitFlow.start}
+                    onEditBoundaries={(next) => splitFlow.setEdits({ boundaries: next })}
+                />
                 {playingFile && (
                     <MediaPlayer
                                             file={playingFile}
-                                            onClose={() => setPlayingFile(null)}
+                                            chain={playingChain ?? undefined}
+                                            startAtT={playingChain ? playingChainStartT : 0}
+                                            onClose={() => { setPlayingFile(null); setPlayingChain(null); }}
                                             onNext={handleNextPreview}
                                             onPrev={handlePrevPreview}
                                             currentIndex={previewContextIndex}
@@ -997,6 +1132,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                     onPreview={handlePreview}
                     onManualUpload={handleManualUpload}
+                    uploadHighlight={externalDragActive && canUploadHere}
                     onFolderUpload={handleFolderUpload}
                     onSelectionClear={() => setSelectedIds([])}
                     onToggleSelection={handleToggleSelection}
@@ -1031,6 +1167,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <TransferPanel
                 isOpen={showTransferPanel}
+                splitJobs={splitJobRows}
+                onCancelSplitJob={jobId => { void invoke('cmd_cancel_split_job', { id: jobId }); }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}

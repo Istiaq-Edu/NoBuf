@@ -295,6 +295,16 @@ pub async fn cmd_cancel_transfer(
 /// Frontend caches this to pre-validate drops/picks instantly without a round-trip per file.
 #[tauri::command]
 pub async fn cmd_upload_limit(state: State<'_, TelegramState>) -> Result<u64, String> {
+    // Dev-QA override (same knob the split pipeline honors): keeps the
+    // frontend's oversize checks consistent with the backend during tests.
+    if let Ok(v) = std::env::var("NOBUF_FAKE_UPLOAD_CAP_BYTES") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                log::info!("[SPLIT] upload-limit override active: {n}B");
+                return Ok(n);
+            }
+        }
+    }
     let client_opt = { state.client.lock().await.clone() };
     match client_opt {
         Some(client) => crate::commands::utils::upload_limit_bytes(&client).await,
@@ -331,17 +341,12 @@ pub async fn cmd_staging_free_space() -> Result<u64, String> {
 /// Returns the temp file's absolute path on the final chunk, else "".
 /// NOTE: `std::io::Write` is already imported at the top of this file (write_all in scope).
 #[tauri::command]
-pub async fn cmd_stage_dropped_file(
-    upload_id: String,
-    file_name: String,
-    chunk_index: u64,
-    is_last: bool,
-    bytes_b64: String,
-) -> Result<String, String> {
-    use base64::Engine as _;
-
-    // Sanitize: strip any path components — keep the bare filename only.
-    let safe_name = std::path::Path::new(&file_name)
+/// Sanitize a staged-file name: strip path components, keep the bare
+/// filename, truncate the stem (never the extension) so the result fits
+/// Windows' 255-UTF-16-unit filename cap with room for the "<id>-" prefix.
+/// Single source of truth shared by cmd_stage_dropped_file and /stage-drop.
+pub fn sanitize_staged_name(file_name: &str) -> String {
+    let safe_name = std::path::Path::new(file_name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "dropped".to_string());
@@ -373,6 +378,20 @@ pub async fn cmd_stage_dropped_file(
             safe_name
         }
     };
+    safe_name
+}
+
+#[tauri::command]
+pub async fn cmd_stage_dropped_file(
+    upload_id: String,
+    file_name: String,
+    chunk_index: u64,
+    is_last: bool,
+    bytes_b64: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let safe_name = sanitize_staged_name(&file_name);
     let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if safe_id.is_empty() {
         return Err("Invalid upload id".to_string());
@@ -427,6 +446,36 @@ pub async fn cmd_delete_staged_file(path: String) -> Result<(), String> {
     }
 }
 
+/// Startup sweep: any file in %TEMP%\nobuf_dropped older than STALE_STAGED_MAX_AGE
+/// is a leftover from a crashed/killed session (the app deletes its own staged
+/// copies on every normal path; see ed85a8a). Age-gated so a concurrently
+/// running instance can never have an in-flight staging deleted from under it.
+const STALE_STAGED_MAX_AGE_SECS: u64 = 48 * 3600;
+
+pub fn sweep_stale_staged_uploads() {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut removed = 0u32;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() { continue }
+        let age = match meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()) {
+            Some(m) => now.saturating_sub(m.as_secs()),
+            None => continue,
+        };
+        if age >= STALE_STAGED_MAX_AGE_SECS {
+            if std::fs::remove_file(e.path()).is_ok() { removed += 1; }
+        }
+    }
+    if removed > 0 {
+        log::info!("[stage-drop] startup sweep removed {} stale staged file(s) (>=48h old)", removed);
+    }
+}
+
 /// Best-effort delete of a PARTIALLY staged dropped file (stage aborted mid-stream,
 /// e.g. the source vanished or a chunk failed). Derives the same path as
 /// cmd_stage_dropped_file so the frontend never constructs filesystem paths.
@@ -471,18 +520,24 @@ pub fn effective_document_name(display_name: &Option<String>, path: &str) -> Str
         .unwrap_or_else(|| "file".to_string())
 }
 
-#[tauri::command]
-pub async fn cmd_upload_file(
-    path: String,
+/// Shared upload engine: streams a local file to Telegram as a document in
+/// `folder_id`. Extracted verbatim from cmd_upload_file so the split-upload
+/// orchestrator (split_upload.rs) reuses the IDENTICAL pipeline — progress
+/// events, cancellation, bandwidth accounting, display-name handling.
+/// Returns (status string, Telegram message id of the sent document). The
+/// message id is None on the mock path; the command wrapper flattens to the
+/// status string for backward compatibility.
+pub(crate) async fn upload_file_inner(
+    app_handle: &tauri::AppHandle,
+    state: &TelegramState,
+    bw_state: &BandwidthManager,
+    path: &str,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
     display_name: Option<String>,
-    app_handle: tauri::AppHandle,
-    state: State<'_, TelegramState>,
-    bw_state: State<'_, BandwidthManager>,
-) -> Result<String, String> {
+) -> Result<(String, Option<i64>), String> {
     // Security: validate path exists and is a regular file (not a symlink to sensitive data)
-    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {}", e))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {}", e))?;
     if !canonical.is_file() {
         return Err("Path does not point to a regular file".to_string());
     }
@@ -495,7 +550,7 @@ pub async fn cmd_upload_file(
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
         bw_state.add_up(size);
-        return Ok("Mock upload successful".to_string());
+        return Ok(("Mock upload successful".to_string(), None));
     }
     let client = client_opt.unwrap();
 
@@ -507,8 +562,8 @@ pub async fn cmd_upload_file(
     }
 
     // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
-    let file_name = effective_document_name(&display_name, &path);
+    let (mut reader, file_size, bytes_counter) = ProgressReader::new(path).await?;
+    let file_name = effective_document_name(&display_name, path);
 
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
@@ -573,7 +628,7 @@ pub async fn cmd_upload_file(
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
-    client.send_message(&peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&peer, message).await.map_err(map_error)?;
 
     bw_state.add_up(size);
 
@@ -584,7 +639,22 @@ pub async fn cmd_upload_file(
         });
     }
 
-    Ok("File uploaded successfully".to_string())
+    Ok(("File uploaded successfully".to_string(), Some(sent.id() as i64)))
+}
+
+/// Flattening wrapper kept for the original command signature.
+#[tauri::command]
+pub async fn cmd_upload_file(
+    path: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    display_name: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, BandwidthManager>,
+) -> Result<String, String> {
+    let (msg, _) = upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await?;
+    Ok(msg)
 }
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
