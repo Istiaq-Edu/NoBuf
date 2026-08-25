@@ -392,6 +392,10 @@ interface FastStreamPlayerProps {
   // current chain handler without re-binding video events on every render.
   const onPartEndedRef = useRef<(() => void) | undefined>(undefined);
   onPartEndedRef.current = onPartEnded;
+  // Chain-mode end handling: fires once per part mount (reset by React when
+  // MediaPlayer swaps the key), also triggered by the tail-stall watchdog
+  // because MSE 'ended' is unreliable in the final second of a segment.
+  const chainEndedFiredRef = useRef(false);
   // Chain-mode seam-crossing seeks arrive via the parent (MediaPlayer) as a
   // part swap + initialSeekS on remount; no in-player seek plumbing needed.
   const vidRef = useRef<HTMLVideoElement>(null);
@@ -1085,6 +1089,35 @@ interface FastStreamPlayerProps {
     return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sc).padStart(2, '0')}` : `${m}:${String(sc).padStart(2, '0')}`;
   };
 
+  // ── Chain tail-stall watchdog ────────────────────────────────────────────
+  // MSE segments can starve in the final second (readyState never reaches
+  // CAN_PLAY_THROUGH) so the native 'ended' event never fires. In chain mode
+  // only, if we're unpaused, starving, and pinned within 0.6s of the segment
+  // end for ~0.7s straight, treat it as ended and advance to the next part.
+  useEffect(() => {
+    if (!chainInfo) return;
+    let stalledMs = 0;
+    const iv = window.setInterval(() => {
+      if (chainEndedFiredRef.current) { window.clearInterval(iv); return; }
+      const v = vidRef.current;
+      if (!v || v.paused || !isFinite(v.duration) || v.duration <= 0) { stalledMs = 0; return; }
+      const tail = v.duration - v.currentTime;
+      const starving = v.readyState < 3;
+      if (tail <= 0.6 && tail >= 0 && starving) {
+        stalledMs += 250;
+        if (stalledMs >= 700) {
+          console.log('[Player] chain watchdog: tail stall detected → advancing part');
+          chainEndedFiredRef.current = true;
+          v.pause();
+          onPartEndedRef.current?.();
+        }
+      } else {
+        stalledMs = 0;
+      }
+    }, 250);
+    return () => window.clearInterval(iv);
+  }, [chainInfo]);
+
   const formatBytes = (b: number) => {
     if (b < 1024) return `${b} B`;
     if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
@@ -1368,8 +1401,10 @@ interface FastStreamPlayerProps {
     // Chain mode: hand the end to the PARENT instead of showing the replay
     // overlay, so it can swap to the next part (fresh MediaSource — D0).
     const onEnded = () => {
+      if (chainEndedFiredRef.current) return;
       if (onPartEndedRef.current) {
         console.log('[Player] onEnded — chain mode: notifying parent for next part');
+        chainEndedFiredRef.current = true;
         setPlaying(false);
         onPartEndedRef.current();
         return;
