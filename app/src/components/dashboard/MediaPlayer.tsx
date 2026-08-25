@@ -82,6 +82,17 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, isA
                     : undefined
             }
             initialSeekS={chain && partIdx === initial.index && initial.offset > 0.05 ? initial.offset : undefined}
+            chainInfo={
+                chain
+                    ? {
+                        parts: chain.parts.length,
+                        current: partIdx + 1,
+                        stem: chain.stem,
+                        totalDuration: chain.totalDuration,
+                        elapsedBefore: chain.parts.slice(0, partIdx).reduce((s, p) => s + p.duration, 0),
+                    }
+                    : undefined
+            }
             activeFolderId={activeFolderId}
             isAlreadyDownloading={isAlreadyDownloading}
             isPublicChannel={isPublicChannel}

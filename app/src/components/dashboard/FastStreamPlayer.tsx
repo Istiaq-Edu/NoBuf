@@ -285,6 +285,9 @@ interface FastStreamPlayerProps {
   /** Start playback at this offset (seconds into THIS part). Used by chain
    *  mode for seeks that cross a seam; ignored when undefined. */
   initialSeekS?: number;
+  /** Chain-mode display data: which part of how many is playing, plus the
+   *  offset this part's timeline starts at on the virtual (whole-movie) bar. */
+  chainInfo?: { parts: number; current: number; stem: string; totalDuration: number; elapsedBefore: number };
   }
 
   const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
@@ -383,12 +386,14 @@ interface FastStreamPlayerProps {
       className={`${w} px-1.5 py-1 rounded-md text-xs font-mono bg-white/[0.07] text-white/80 border border-white/10 ${focusCls} focus:outline-none text-center`} />
   );
 
-  export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel, onPartEnded, initialSeekS }: FastStreamPlayerProps) {
+  export function FastStreamPlayer({ file, streamUrl, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel, onPartEnded, initialSeekS, chainInfo }: FastStreamPlayerProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   // Latest-callback mirror: the 'ended' listener closure must always see the
   // current chain handler without re-binding video events on every render.
   const onPartEndedRef = useRef<(() => void) | undefined>(undefined);
   onPartEndedRef.current = onPartEnded;
+  // Chain-mode seam-crossing seeks arrive via the parent (MediaPlayer) as a
+  // part swap + initialSeekS on remount; no in-player seek plumbing needed.
   const vidRef = useRef<HTMLVideoElement>(null);
   const videoBoxRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -3796,9 +3801,9 @@ interface FastStreamPlayerProps {
         </div>
       )}
 
-      {/* File name */}
+      {/* File name (+ chain badge in split-chain mode) */}
       <div className={`absolute top-3 left-3 right-3 text-white text-sm truncate transition-opacity duration-300 ${vis ? 'opacity-100' : 'opacity-0'}`} style={{ textShadow: '0 1px 3px rgba(0,0,0,0.5)' }}>
-        {file.name}
+        {chainInfo ? `${chainInfo.stem} — part ${chainInfo.current}/${chainInfo.parts}` : file.name}
       </div>
 
       {/* Download overlay — always rendered for smooth fade transitions */}
