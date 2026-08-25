@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 
 /**
  * SplitUploadModal state machine for the >2GB video split-and-upload flow.
@@ -43,6 +44,18 @@ function errText(e: unknown): string {
     return typeof e === 'string' ? e : String(e);
 }
 
+/**
+ * Phase E: which freshly-loaded split jobs deserve a startup resume notice.
+ * Only 'interrupted' rows count — a crash/power-loss left finished parts on
+ * disk and Telegram, and the user must be told resume is one click away.
+ * Deliberately excludes 'queued' (normal queue state, not an event) and
+ * terminal statuses. Pure + exported so the selection is unit-tested without
+ * Tauri (nobuf-vitest-testing pure-helper pattern).
+ */
+export function selectResumableJobs(jobs: Array<{ id: string; status: string }>): string[] {
+    return jobs.filter(j => j.status === 'interrupted').map(j => j.id);
+}
+
 
 // ---------------------------------------------------------------------------
 // Live split-job rows for the Transfers panel.
@@ -64,6 +77,9 @@ export interface SplitJobRow {
 const splitRows = new Map<string, SplitJobRow>();
 const splitRowListeners = new Set<() => void>();
 let progressListenerAttached = false;
+/** Startup resume notice fires ONCE per webview lifetime, not per remount
+ *  (StrictMode dev double-mounts would otherwise toast twice). */
+let startupNoticeFired = false;
 
 function notifySplitRows() {
     splitRowListeners.forEach(l => l());
@@ -224,6 +240,24 @@ export function useSplitUpload() {
                     });
                 }
                 notifySplitRows();
+                // Phase E startup notice: interrupted jobs mean a crash or
+                // power loss left finished parts behind — tell the user resume
+                // is one click away in the Transfers panel. Once per webview
+                // (StrictMode remounts must not re-toast).
+                if (!startupNoticeFired) {
+                    startupNoticeFired = true;
+                    const resumable = selectResumableJobs(jobs);
+                if (resumable.length === 1) {
+                    const job = jobs.find(j => j.id === resumable[0]);
+                    toast.info(`"${job?.displayName ?? 'Split upload'}" didn't finish — open Transfers to resume it.`, {
+                        description: `${job?.doneParts ?? 0} of ${job?.totalParts ?? '?'} parts already uploaded.`,
+                    });
+                } else if (resumable.length > 1) {
+                    toast.info(`${resumable.length} split uploads didn't finish — open Transfers to resume them.`, {
+                        description: 'Each kept every part uploaded so far.',
+                    });
+                }
+                }
             } catch { /* panel just stays empty */ }
         })();
         return () => { splitRowListeners.delete(listener); };

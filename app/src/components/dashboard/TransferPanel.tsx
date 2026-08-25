@@ -20,6 +20,8 @@ interface TransferPanelProps {
     stagingItems?: { name: string; pct: number }[];
     splitJobs?: { jobId: string; displayName: string; phase: string; doneParts: number; totalParts: number; currentPart: string }[];
     onCancelSplitJob?: (jobId: string) => void;
+    onResumeSplitJob?: (jobId: string) => void;
+    onDiscardSplitJob?: (jobId: string) => void;
     onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
@@ -35,7 +37,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -200,6 +202,30 @@ export function TransferPanel({
                                     >
                                         <X className="w-3.5 h-3.5" />
                                     </button>
+                                )}
+                                {j.phase === 'interrupted' && (onResumeSplitJob || onDiscardSplitJob) && (
+                                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                                        {onResumeSplitJob && (
+                                            <button
+                                                onClick={() => onResumeSplitJob(j.jobId)}
+                                                className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-nobuf-primary/15 text-nobuf-primary hover:bg-nobuf-primary/25 transition-colors"
+                                                title="Resume this split job"
+                                            >
+                                                <RotateCcw className="w-3 h-3" />
+                                                Resume
+                                            </button>
+                                        )}
+                                        {onDiscardSplitJob && (
+                                            <button
+                                                onClick={() => onDiscardSplitJob(j.jobId)}
+                                                className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400/80 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+                                                title="Discard this job — deletes finished parts and temp data"
+                                            >
+                                                <X className="w-3 h-3" />
+                                                Delete
+                                            </button>
+                                        )}
+                                    </div>
                                 )}
                             </div>
                             {j.totalParts > 0 && (

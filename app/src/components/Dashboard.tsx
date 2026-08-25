@@ -1169,6 +1169,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 isOpen={showTransferPanel}
                 splitJobs={splitJobRows}
                 onCancelSplitJob={jobId => { void invoke('cmd_cancel_split_job', { id: jobId }); }}
+                onResumeSplitJob={jobId => {
+                    void invoke('cmd_resume_split_job', { id: jobId })
+                        .then(() => toast.success(`Resuming "${splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'split job'}"`))
+                        .catch(e => toast.error(`Resume failed: ${e}`));
+                }}
+                onDiscardSplitJob={jobId => {
+                    const name = splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'this split job';
+                    if (!window.confirm(`Delete "${name}"? Finished parts already uploaded will be removed from Telegram and cannot be recovered.`)) return;
+                    void invoke('cmd_discard_split_job', { id: jobId })
+                        .then(() => toast.success(`Deleted "${name}" — uploaded parts removed`))
+                        .catch(e => toast.error(`Delete failed: ${e}`));
+                }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}
