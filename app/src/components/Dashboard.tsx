@@ -642,7 +642,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             if (p) {
                 const chains = collapseParts(contextFiles);
                 const hit = chains.find(c => c.kind === 'chain' && (c as SplitChain).stem === p.stem) as SplitChain | undefined;
-                if (hit && hit.parts.some(x => x.id === file.id)) {
+                // Gap rule: parts AFTER the first missing index exist but are
+                // not playable in sequence — tell the user how many.
+                const allWithStem = contextFiles.filter(f => parsePartName(f.name)?.stem === p.stem);
+                const missing = allWithStem.length - (hit ? hit.parts.length : 0);
+                if (hit) {
                     setPlayingChain(hit);
                     setPlayingChainStartT(() => {
                         let acc = 0;
@@ -651,8 +655,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     });
                     setPlayingFile(file);
                     setPreviewFile(null); setPdfFile(null); setArchiveFile(null);
+                    if (missing > 0) toast.info(`Playing ${hit.parts.length} uploaded part${hit.parts.length > 1 ? 's' : ''} — ${missing} later part${missing > 1 ? 's' : ''} not uploaded yet.`);
                     return;
                 }
+                // No chain start: clicking a lone middle/tail part falls back
+                // to playing it individually — no misleading chain UI.
+                setPlayingChain(null);
             }
             setPlayingChain(null);
             setPlayingFile(file);
