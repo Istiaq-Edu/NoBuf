@@ -1176,10 +1176,20 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 }}
                 onDiscardSplitJob={jobId => {
                     const name = splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'this split job';
-                    if (!window.confirm(`Delete "${name}"? Finished parts already uploaded will be removed from Telegram and cannot be recovered.`)) return;
-                    void invoke('cmd_discard_split_job', { id: jobId })
-                        .then(() => toast.success(`Deleted "${name}" — uploaded parts removed`))
-                        .catch(e => toast.error(`Delete failed: ${e}`));
+                    // App-themed confirm (ConfirmContext), NOT window.confirm —
+                    // wry leaves native confirm() at raw WebView2 defaults.
+                    void confirm({
+                        title: `Delete "${name}"?`,
+                        message: 'Finished parts already uploaded will be removed from Telegram and cannot be recovered.',
+                        confirmText: 'Delete',
+                        cancelText: 'Keep Job',
+                        variant: 'danger',
+                    }).then(ok => {
+                        if (!ok) return;
+                        void invoke('cmd_discard_split_job', { id: jobId })
+                            .then(() => toast.success(`Deleted "${name}" — uploaded parts removed`))
+                            .catch(e => toast.error(`Delete failed: ${e}`));
+                    });
                 }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
