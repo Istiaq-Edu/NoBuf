@@ -322,9 +322,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
     // Re-fetch the Premium-aware limit whenever the Telegram connection (re)establishes,
     // so a mid-session account change isn't stuck with the stale mount-time value.
+    // ALSO poll until the first successful load: at mount the client often isn't
+    // signed in yet, the one-shot fetch fails silently, and the default 2GB sticks —
+    // which would route an oversize drop into the regular uploader instead of split.
     useEffect(() => {
+        let cancelled = false;
+        const load = () => invoke<number>('cmd_upload_limit')
+            .then(v => { if (!cancelled) setUploadLimitBytes(v); return true; })
+            .catch(() => false);
         if (!isConnected) return;
-        invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
+        load().then(ok => {
+            if (ok || cancelled) return;
+            const t = setInterval(() => { load().then(ok2 => { if (ok2) clearInterval(t); }); }, 3000);
+            return () => clearInterval(t);
+        });
+        return () => { cancelled = true; };
     }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
