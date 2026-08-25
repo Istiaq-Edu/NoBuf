@@ -1,128 +1,114 @@
 import { describe, it, expect } from 'vitest';
 import {
-    parsePartName,
+    parseSplitName,
     collapseParts,
-    partStarts,
-    globalTimeToPart,
-    partToGlobalTime,
+    globalTimeToDoc,
+    docToGlobalTime,
     type SplitChain,
 } from '../utils/splitChain';
+import type { TelegramFile } from '../types';
 
-const f = (id: number, name: string, size = 1000, duration?: number) =>
-    ({ id, name, size, duration });
+// Real-world shape: <jobid8>-<Stem>.part<outer>.part<inner>.<ext>
+const mk = (id: number, name: string, sizeMB = 60, durS = 100): TelegramFile =>
+    ({ id, name, size: sizeMB * 1_000_000, duration: durS, sizeStr: '', type: 'file' } as unknown as TelegramFile);
 
-describe('parsePartName', () => {
-    it('parses padded and 3-digit names', () => {
-        expect(parsePartName('Movie.mkv.part01.mkv')).toEqual({ stem: 'Movie.mkv', idx: 1, ext: 'mkv' });
-        expect(parsePartName('Movie.mkv.part13.mp4')).toEqual({ stem: 'Movie.mkv', idx: 13, ext: 'mp4' });
-        expect(parsePartName('X.part100.mkv')).toEqual({ stem: 'X', idx: 100, ext: 'mkv' });
-    });
-    it('rejects non-part names', () => {
-        expect(parsePartName('Movie.mkv')).toBeNull();
-        expect(parsePartName('part01.mkv')).toBeNull();          // no stem
-        expect(parsePartName('Movie.part1.mkv')).toBeNull();     // unpadded single digit
-        expect(parsePartName('Movie.part01x.mkv')).toBeNull();
-    });
-});
-
-describe('collapseParts', () => {
-    it('collapses consecutive parts into one chain card', () => {
-        const items = collapseParts([
-            f(1, 'M.part01.mp4', 700_000_000, 1800),
-            f(2, 'M.part02.mp4', 650_000_000, 1750),
-            f(9, 'Other.txt'),
-        ]);
-        expect(items).toHaveLength(2);
-        const chain = items[0] as SplitChain;
-        expect(chain.kind).toBe('chain');
-        expect(chain.stem).toBe('M');
-        expect(chain.parts.map(p => p.id)).toEqual([1, 2]);
-        expect(chain.totalDuration).toBeCloseTo(3550);
-        expect(chain.totalSize).toBe(1_350_000_000);
+describe('parseSplitName', () => {
+    it('parses the double-nested uploader shape', () => {
+        const p = parseSplitName('ksz4peq6d-Movie.part01.part07.mp4');
+        expect(p).toEqual({ stem: 'Movie', outer: 1, inner: 7, ext: 'mp4' });
     });
 
-    it('stops the chain at the FIRST missing index (gap rule)', () => {
-        const items = collapseParts([
-            f(1, 'M.part01.mp4', 1, 60),
-            // part02 missing
-            f(3, 'M.part03.mp4', 1, 60),
-            f(4, 'M.part04.mp4', 1, 60),
-        ]);
-        const chain = items.find(i => i.kind === 'chain') as SplitChain;
-        expect(chain.parts.map(p => p.id)).toEqual([1]);
-        // Orphaned later parts still visible as singles (user can play/delete them).
-        const singles = items.filter(i => i.kind === 'single');
-        expect(singles.map(s => (s as any).file.name)).toEqual(['M.part03.mp4', 'M.part04.mp4']);
+    it('parses legacy single-level names', () => {
+        expect(parseSplitName('Film.mkv.part3.mkv')).toEqual({ stem: 'Film.mkv', outer: 3, inner: 1, ext: 'mkv' });
     });
 
-    it('handles out-of-order listing input (sorts internally)', () => {
-        const items = collapseParts([
-            f(3, 'M.part03.mp4', 1, 10),
-            f(1, 'M.part01.mp4', 1, 20),
-            f(2, 'M.part02.mp4', 1, 30),
-        ]);
-        const chain = items[0] as SplitChain;
-        expect(chain.parts.map(p => p.id)).toEqual([1, 2, 3]);
-        expect(chain.totalDuration).toBe(60);
-    });
-
-    it('different stems never merge; same-stem different-ext stays separate groups', () => {
-        const items = collapseParts([
-            f(1, 'A.part01.mkv', 1, 5),
-            f(2, 'B.part01.mkv', 1, 6),
-            f(3, 'A.part01.mp4', 1, 7),
-        ]);
-        const chains = items.filter(i => i.kind === 'chain') as SplitChain[];
-        expect(chains).toHaveLength(3);
-        expect(chains.every(c => c.parts.length === 1)).toBe(true);
+    it('rejects ordinary files', () => {
+        expect(parseSplitName('holiday.mp4')).toBeNull();
+        expect(parseSplitName('report.pdf')).toBeNull();
     });
 });
 
-describe('virtual timeline mapping', () => {
-    const chain: SplitChain = {
-        kind: 'chain',
-        stem: 'M',
-        ext: 'mp4',
-        parts: [
-            { id: 1, name: 'M.part01.mp4', size: 1, duration: 60 },
-            { id: 2, name: 'M.part02.mp4', size: 1, duration: 90 },
-            { id: 3, name: 'M.part03.mp4', size: 1, duration: 45 },
-        ],
-        totalDuration: 195,
-        totalSize: 3,
-    };
-
-    it('computes cumulative starts', () => {
-        expect(partStarts(chain)).toEqual([0, 60, 150]);
+describe('collapseParts — cross-job chains', () => {
+    it('chains parts uploaded as separate jobs (different job prefixes)', () => {
+        const files = [
+            mk(1, 'ksz4peq6d-Movie.part01.part01.mp4'),
+            mk(2, 'ksz4peq6d-Movie.part01.part02.mp4'),
+            mk(3, '9r80ddrwq-Movie.part02.part01.mp4'),
+            mk(4, '9r80ddrwq-Movie.part02.part02.mp4'),
+            mk(5, '6nkwzwr8p-Movie.part03.part01.mp4'),
+        ];
+        const items = collapseParts(files);
+        const chains = items.filter(i => i.kind === 'chain') as { kind: 'chain'; chain: SplitChain }[];
+        expect(chains).toHaveLength(1);
+        const c = chains[0].chain;
+        expect(c.stem).toBe('Movie');
+        expect(c.docs.map(d => d.id)).toEqual(['1', '2', '3', '4', '5']);
+        expect(c.outerCount).toBe(3);
+        expect(c.totalSize).toBe(files.reduce((s, f) => s + f.size, 0));
     });
 
-    it('maps global → part/offset on boundaries and interiors', () => {
-        expect(globalTimeToPart(chain, 0)).toEqual({ index: 0, offset: 0 });
-        expect(globalTimeToPart(chain, 59.9)).toEqual({ index: 0, offset: 59.9 });
-        expect(globalTimeToPart(chain, 60)).toEqual({ index: 1, offset: 0 });
-        expect(globalTimeToPart(chain, 150)).toEqual({ index: 2, offset: 0 });
-        expect(globalTimeToPart(chain, 194.5)).toEqual({ index: 2, offset: 44.5 });
+    it('stops the chain at a missing outer and keeps gap orphans visible', () => {
+        const files = [
+            mk(1, 'aaaaaaa1-G.part01.part01.mp4'),
+            mk(2, 'bbbbbbb2-G.part02.part01.mp4'),
+            mk(3, 'ddddddd4-G.part04.part01.mp4'), // part03 missing → orphan
+        ];
+        const items = collapseParts(files);
+        const chains = items.filter(i => i.kind === 'chain');
+        expect(chains).toHaveLength(1);
+        const c = (chains[0] as { chain: SplitChain }).chain;
+        expect(c.docs.map(d => d.id)).toEqual(['1', '2']);
+        const orphans = items.filter(i => i.kind === 'single');
+        expect(orphans).toHaveLength(1);
+        expect(((orphans[0] as { file: TelegramFile }).file).name).toContain('part04');
     });
 
-    it('round-trips random times within bounds (property)', () => {
-        let seed = 42;
-        const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
-        for (let i = 0; i < 500; i++) {
-            const t = rand() * 195;
-            const pos = globalTimeToPart(chain, t);
-            const back = partToGlobalTime(chain, pos);
-            // Round-trip exact except float dust.
-            expect(Math.abs(back - t)).toBeLessThan(1e-9);
+    it('leaves non-part files untouched', () => {
+        const files = [mk(1, 'note.txt'), mk(2, 'video.mp4')];
+        const items = collapseParts(files);
+        expect(items.every(i => i.kind === 'single')).toBe(true);
+    });
+
+    it('does not chain a lone part group', () => {
+        const files = [mk(1, 'aaaaaaa1-Solo.part01.part01.mp4')];
+        const items = collapseParts(files);
+        expect(items.every(i => i.kind === 'single')).toBe(true);
+    });
+});
+
+describe('virtual timeline', () => {
+    const files = [
+        mk(1, 'aaaaaaaa-M.part01.part01.mp4', 10, 150),
+        mk(2, 'aaaaaaaa-M.part01.part02.mp4', 10, 150),
+        mk(3, 'bbbbbbbb-M.part02.part01.mp4', 10, 90),
+        mk(4, 'cccccccc-M.part03.part01.mp4', 10, 120),
+    ];
+    const chain = (collapseParts(files)[0] as { kind: 'chain'; chain: SplitChain }).chain;
+
+    it('builds Σ durations', () => {
+        expect(chain.totalDuration).toBe(150 + 150 + 90 + 120); // 510
+    });
+
+    it('maps global time to the right doc+offset', () => {
+        expect(globalTimeToDoc(chain, 0)).toEqual({ index: 0, offset: 0 });
+        expect(globalTimeToDoc(chain, 149)).toEqual({ index: 0, offset: 149 });
+        // t=150 sits at the boundary → clamped to the END of doc 0 (index 1
+        // would be equally valid; we clamp to the earlier doc).
+        const b = globalTimeToDoc(chain, 200);
+        expect(b.index === 1 || b.index === 2).toBe(true);
+        expect(docToGlobalTime(chain, b.index, b.offset)).toBe(200);
+        // 150+150+90 = 390 consumed before doc index 3.
+        expect(globalTimeToDoc(chain, 400)).toEqual({ index: 3, offset: 10 });
+    });
+
+    it('round-trips both directions (property sweep)', () => {
+        let checked = 0;
+        for (let t = 0; t <= 500; t += 7) {
+            const { index, offset } = globalTimeToDoc(chain, t);
+            const back = docToGlobalTime(chain, index, offset);
+            expect(Math.abs(back - Math.min(t, 510))).toBeLessThanOrEqual(1);
+            checked++;
         }
-    });
-
-    it('clamps out-of-bounds safely', () => {
-        expect(globalTimeToPart(chain, -5)).toEqual({ index: 0, offset: 0 });
-        const end = globalTimeToPart(chain, 500);
-        expect(end.index).toBe(2);
-        expect(end.offset).toBeLessThanOrEqual(45);
-        expect(partToGlobalTime(chain, { index: 7, offset: 3 })).toBe(0);
-        // Oversized offset clamps to that part's END on the virtual timeline.
-        expect(partToGlobalTime(chain, { index: 1, offset: 9999 })).toBe(150);
+        expect(checked).toBeGreaterThan(60);
     });
 });

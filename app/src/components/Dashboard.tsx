@@ -17,7 +17,7 @@ import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
-import { parsePartName, collapseParts, type SplitChain } from '../utils/splitChain';
+import { parseSplitName, collapseParts, type SplitChain } from '../utils/splitChain';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
@@ -638,28 +638,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // Chain detection: clicking part K of a split set plays the whole
         // chain starting at K's position on the virtual timeline.
         if (isMedia) {
-            const p = parsePartName(file.name);
+            const p = parseSplitName(file.name);
             if (p) {
-                const chains = collapseParts(contextFiles);
-                const hit = chains.find(c => c.kind === 'chain' && (c as SplitChain).stem === p.stem) as SplitChain | undefined;
-                // Gap rule: parts AFTER the first missing index exist but are
-                // not playable in sequence — tell the user how many.
-                const allWithStem = contextFiles.filter(f => parsePartName(f.name)?.stem === p.stem);
-                const missing = allWithStem.length - (hit ? hit.parts.length : 0);
-                if (hit) {
-                    setPlayingChain(hit);
+                const items = collapseParts(contextFiles);
+                const hit = items.find((i): i is Extract<typeof i, { kind: 'chain' }> => i.kind === 'chain' && i.chain.stem === p.stem);
+                // Gap rule: docs outside the playable prefix exist but are not
+                // chain-playable — tell the user how many.
+                const allWithStem = contextFiles.filter(f => parseSplitName(f.name)?.stem === p.stem);
+                const missing = hit ? Math.max(0, allWithStem.length - hit.chain.docs.length) : 0;
+                if (hit && hit.chain.docs.some(d => String(d.id) === String(file.id))) {
+                    const chainHit: SplitChain = hit.chain;
+                    setPlayingChain(chainHit);
                     setPlayingChainStartT(() => {
                         let acc = 0;
-                        for (const x of hit.parts) { if (x.id === file.id) return acc; acc += x.duration; }
+                        for (const x of chainHit.docs) { if (String(x.id) === String(file.id)) return acc; acc += x.duration; }
                         return acc;
                     });
                     setPlayingFile(file);
                     setPreviewFile(null); setPdfFile(null); setArchiveFile(null);
-                    if (missing > 0) toast.info(`Playing ${hit.parts.length} uploaded part${hit.parts.length > 1 ? 's' : ''} — ${missing} later part${missing > 1 ? 's' : ''} not uploaded yet.`);
+                    if (missing > 0) toast.info(`Playing ${chainHit.docs.length} uploaded segment${chainHit.docs.length > 1 ? 's' : ''} — ${missing} later part${missing > 1 ? 's' : ''} not uploaded yet.`);
                     return;
                 }
-                // No chain start: clicking a lone middle/tail part falls back
-                // to playing it individually — no misleading chain UI.
+                // No playable chain (or clicked a gap orphan): play as single.
                 setPlayingChain(null);
             }
             setPlayingChain(null);

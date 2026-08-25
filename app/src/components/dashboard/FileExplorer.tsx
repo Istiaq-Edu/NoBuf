@@ -229,24 +229,24 @@ export function FileExplorer({
             }
             return sortDirection === 'asc' ? comparison : -comparison;
         });
-        // Split-chain collapse (plan Phase D): consecutive parts sharing a stem
-        // become ONE representative card — part01 carries the group identity
-        // (name "Stem · N parts", size = Σ parts). Clicking it plays the whole
-        // chain; Dashboard's handlePreview resolves the chain from contextFiles.
+        // Split-chain collapse (plan Phase D): consecutive segments sharing a
+        // stem become ONE representative card — the first doc carries the
+        // group identity (name "Stem — N segments", size = Σ). Clicking it
+        // plays the whole chain; Dashboard resolves it from contextFiles.
         const collapsed = collapseParts(base);
         const rep: TelegramFile[] = [];
         for (const item of collapsed) {
             if (item.kind === 'single') { rep.push(item.file); continue; }
-            const c = item;
-            const head = c.parts[0];
+            const c = item.chain;
+            const head = base.find(f => String(f.id) === c.docs[0].id) ?? ({} as TelegramFile);
             rep.push({
                 ...head,
                 id: head.id,
-                name: `${c.stem} — ${c.parts.length} parts`,
+                name: `${c.stem} — ${c.docs.length} parts`,
                 size: c.totalSize,
                 sizeStr: `${(c.totalSize / 1_000_000_000).toFixed(2)} GB`,
-                duration: c.parts.reduce((s, p) => s + p.duration, 0),
-                __chainParts: c.parts.length,
+                duration: c.totalDuration,
+                __chainParts: c.docs.length,
             } as unknown as TelegramFile);
         }
         return rep;

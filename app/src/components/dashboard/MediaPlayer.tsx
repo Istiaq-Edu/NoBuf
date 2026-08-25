@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { TelegramFile } from '../../types';
 import { FastStreamPlayer } from './FastStreamPlayer';
-import { globalTimeToPart, type SplitChain } from '../../utils/splitChain';
+import { globalTimeToDoc, type SplitChain } from '../../utils/splitChain';
 
 interface StreamInfo {
     token: string;
@@ -43,15 +43,15 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, isA
     // remounts FastStreamPlayer (fresh MediaSource — D0 decision). startAtT is
     // a GLOBAL virtual-timeline time → resolved to (initial part, offset) once.
     const initial = useMemo(
-        () => (chain ? globalTimeToPart(chain, startAtT) : { index: 0, offset: 0 }),
+        () => (chain ? globalTimeToDoc(chain, startAtT) : { index: 0, offset: 0 }),
         [chain, startAtT],
     );
     const [partIdx, setPartIdx] = useState(initial.index);
-    useEffect(() => { setPartIdx(globalTimeToPart(chain ?? { kind: 'chain', stem: '', ext: '', parts: [], totalDuration: 0, totalSize: 0 }, 0).index); }, [file.id]); // reset on new file
-    const activePart = chain?.parts[partIdx] ?? null;
+    useEffect(() => { setPartIdx(0); }, [file.id]); // reset on new file
+    const activePart = chain?.docs[partIdx] ?? null;
     const chainFile: TelegramFile | null = useMemo(() => {
         if (!chain || !activePart) return null;
-        return { ...file, id: activePart.id, name: activePart.name, size: activePart.size, duration: activePart.duration };
+        return { ...file, id: file.id, name: activePart.name, size: activePart.size, duration: activePart.duration } as TelegramFile;
     }, [chain, activePart, file]);
 
     const displayFile = chain ? (chainFile ?? file) : file;
@@ -77,7 +77,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, isA
                     ? () => {
                         // Last part finished → no-op lets the built-in replay
                         // overlay take over; otherwise advance to next part.
-                        if (partIdx < (chain?.parts.length ?? 1) - 1) setPartIdx((i: number) => i + 1);
+                        if (partIdx < (chain?.docs.length ?? 1) - 1) setPartIdx((i: number) => i + 1);
                     }
                     : undefined
             }
@@ -85,11 +85,11 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, isA
             chainInfo={
                 chain
                     ? {
-                        parts: chain.parts.length,
+                        parts: chain.docs.length,
                         current: partIdx + 1,
                         stem: chain.stem,
                         totalDuration: chain.totalDuration,
-                        elapsedBefore: chain.parts.slice(0, partIdx).reduce((s, p) => s + p.duration, 0),
+                        elapsedBefore: chain.docs.slice(0, partIdx).reduce((s, p) => s + p.duration, 0),
                     }
                     : undefined
             }
