@@ -244,6 +244,14 @@ Phase E — Transfers window & resume UX
 - Job rows, phase labels, resume banner, startup sweep
 - ✅ Acceptance: full gates (`npx tsc --noEmit`, `npx vitest run`, `cargo test --no-default-features`); QA suite per qa/qa-app skills; E2E: 2.2GB file end-to-end free-cap simulation via fake cap env override
 
+> **STATUS (2026-08-26): Phase E SHIPPED** (commit 5aeb115). Job rows + phase
+> labels landed earlier (1e27b54); startup sweep = `normalize_stale_jobs` at
+> boot (lib.rs); this commit added the last two gaps — Resume/Delete buttons on
+> interrupted rows and the once-per-webview startup resume notice. Full gates
+> green at ship time (tsc 0 / vitest 1164 / cargo 415). The E2E 2.2GB fake-cap
+> run remains a manual QA step for the user; runtime visual check of the new
+> buttons pending user confirmation in `tauri dev`.
+
 ## 6. Out of scope (explicit)
 
 - Trim/exclude segments (nothing is ever discarded)
