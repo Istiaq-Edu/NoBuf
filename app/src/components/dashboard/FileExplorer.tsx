@@ -6,6 +6,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileCard } from './FileCard';
 import { EmptyState } from './EmptyState';
 import { TelegramFile } from '../../types';
+import { collapseParts } from '../../utils/splitChain';
 import { ContextMenu } from './ContextMenu';
 import { FileListItem } from './FileListItem';
 import { useSettings, GridDensity, SortField } from '../../context/SettingsContext';
@@ -213,7 +214,7 @@ export function FileExplorer({
     }, []);
 
     const sortedFiles = useMemo(() => {
-        return [...files].sort((a, b) => {
+        const base = [...files].sort((a, b) => {
             let comparison = 0;
             switch (sortField) {
                 case 'name':
@@ -228,6 +229,27 @@ export function FileExplorer({
             }
             return sortDirection === 'asc' ? comparison : -comparison;
         });
+        // Split-chain collapse (plan Phase D): consecutive parts sharing a stem
+        // become ONE representative card — part01 carries the group identity
+        // (name "Stem · N parts", size = Σ parts). Clicking it plays the whole
+        // chain; Dashboard's handlePreview resolves the chain from contextFiles.
+        const collapsed = collapseParts(base);
+        const rep: TelegramFile[] = [];
+        for (const item of collapsed) {
+            if (item.kind === 'single') { rep.push(item.file); continue; }
+            const c = item;
+            const head = c.parts[0];
+            rep.push({
+                ...head,
+                id: head.id,
+                name: `${c.stem} — ${c.parts.length} parts`,
+                size: c.totalSize,
+                sizeStr: `${(c.totalSize / 1_000_000_000).toFixed(2)} GB`,
+                duration: c.parts.reduce((s, p) => s + p.duration, 0),
+                __chainParts: c.parts.length,
+            } as unknown as TelegramFile);
+        }
+        return rep;
     }, [files, sortField, sortDirection]);
 
     const handlePreviewRequest = useCallback((file: TelegramFile) => {
