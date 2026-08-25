@@ -5,6 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
 import { TelegramFolder, ScanResult } from '../types';
+import { diffRemovedPublicIds } from '../context/VaultContext';
 import { useNetworkStatus } from './useNetworkStatus';
 
 export function useTelegramConnection(onLogoutParent: () => void) {
@@ -56,14 +57,46 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             try {
                 const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
                 applySyncResult(result);
+                // Vault prune (spec §4.4): drop dead folder ids from vault.json.
+                // Works while locked; intersection-only on the backend.
+                if (result.removed.length > 0) {
+                    try {
+                        await invoke('cmd_vault_prune', { kind: 'folder', ids: result.removed });
+                    } catch {
+                        // Non-fatal: stale id survives until next sync.
+                    }
+                }
                 // Sync public channels from [NB-PUB]
                 try {
+                    const prevPublicIds = (await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id);
                     await invoke('cmd_sync_public_channels');
+                    // Public-channel pruning: SQLite sync deletes dead rows but
+                    // never tells the vault — diff previous vs new and prune.
+                    const nextPublic = await invoke<any[]>('cmd_get_public_channels');
+                    const gone = diffRemovedPublicIds(prevPublicIds, nextPublic.map((c: any) => c.channel_id));
+                    if (gone.length > 0) {
+                        try {
+                            await invoke('cmd_vault_prune', { kind: 'public_channel', ids: gone });
+                        } catch {
+                            // Non-fatal: stale id survives until next sync.
+                        }
+                    }
                 } catch (e) {
                     console.warn('[Public Channels] Sync failed:', e);
                 }
                 if (result.added.length > 0 || result.updated.length > 0 || result.removed.length > 0) {
                     showSyncSummary(result);
+                }
+                // Vault cross-device sync (spec §7): pull once per launch.
+                // Merges hidden-ID lists + passcode from Saved Messages.
+                // The response carries the post-sync state — hand it to the
+                // app via a re-emitted event so the UI applies it NOW
+                // (previously the merged state was discarded until restart).
+                try {
+                    const result = await invoke<{ merged: boolean; state: unknown }>('cmd_vault_pull_sync');
+                    window.dispatchEvent(new CustomEvent('nobuf-vault-state', { detail: result.state }));
+                } catch {
+                    // Non-fatal: offline / not connected yet.
                 }
             } catch {
                 // Silent failure for auto-sync — don't disrupt user
@@ -140,6 +173,10 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         setIsConnected(false);
         try {
             await invoke('cmd_clean_cache').catch(() => { });
+            // Vault logout hygiene (spec rev 4): clear both hidden-ID lists,
+            // keep the passcode, re-lock. Backend-side because the frontend
+            // cannot know the IDs while locked (by design).
+            try { await invoke('cmd_vault_wipe_ids'); } catch { /* best effort */ }
             if (store) {
                 await store.delete('api_id');
                 await store.delete('api_hash');

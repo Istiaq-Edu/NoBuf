@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-vault-set-entry-visible"
+description = "Enables the cmd_vault_set_entry_visible command without any pre-configured scope."
+commands.allow = ["cmd_vault_set_entry_visible"]
+
+[[permission]]
+identifier = "deny-cmd-vault-set-entry-visible"
+description = "Denies the cmd_vault_set_entry_visible command without any pre-configured scope."
+commands.deny = ["cmd_vault_set_entry_visible"]

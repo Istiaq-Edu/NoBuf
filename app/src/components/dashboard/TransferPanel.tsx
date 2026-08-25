@@ -17,6 +17,8 @@ interface TransferPanelProps {
     onClose: () => void;
     // Upload props
     uploadItems: QueueItem[];
+    stagingItems?: { name: string; pct: number }[];
+    onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
     onCancelUploadItem: (id: string) => void;
@@ -31,12 +33,12 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
 
-    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length;
+    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length + stagingItems.length;
     const downloadActive = downloadItems.filter(i => i.status === 'pending' || i.status === 'downloading').length;
 
     // Auto-switch to tab with active items
@@ -144,7 +146,32 @@ export function TransferPanel({
 
             {/* Items list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                {items.length === 0 ? (
+                {/* Staging rows: dropped files being copied to %TEMP% before entering the queue */}
+                {effectiveTab === 'uploads' && stagingItems.map(s => (
+                    <div key={s.name} className="flex flex-col gap-1 p-2.5 bg-nobuf-hover rounded-lg">
+                        <div className="flex items-center gap-3 text-sm">
+                            <div className="w-4 h-4 flex-shrink-0 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />
+                            <div className="flex-1 text-nobuf-subtext text-xs line-clamp-2 break-all leading-snug">{s.name}</div>
+                            <span className="text-[10px] text-nobuf-subtext flex-shrink-0">preparing…</span>
+                            {onCancelStaging && (
+                                <button
+                                    onClick={() => onCancelStaging(s.name)}
+                                    className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0"
+                                    title="Stop preparing this file"
+                                >
+                                    <X className="w-3.5 h-3.5" />
+                                </button>
+                            )}
+                        </div>
+                        <div className="w-full bg-nobuf-border h-1 mt-1 rounded-full overflow-hidden">
+                            <div
+                                className="h-full rounded-full bg-nobuf-primary transition-all duration-300"
+                                style={{ width: `${s.pct}%` }}
+                            />
+                        </div>
+                    </div>
+                ))}
+                {items.length === 0 && stagingItems.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-nobuf-subtext">
                         {effectiveTab === 'uploads' ? (
                             <Upload className="w-8 h-8 mb-2 opacity-30" />

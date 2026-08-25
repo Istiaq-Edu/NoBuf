@@ -7,6 +7,7 @@ use crate::TelegramState;
 use crate::models::{FolderMetadata, FileMetadata, ScanResult};
 use crate::bandwidth::BandwidthManager;
 use crate::commands::utils::{resolve_peer, map_error};
+use crate::commands::vault;
 use crate::stream_cache::{self, StreamCacheManager, CacheMeta};
 use crate::download_pool::StreamChunk;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -308,6 +309,22 @@ pub async fn cmd_file_size(path: String) -> Result<u64, String> {
     Ok(meta.len())
 }
 
+/// Free bytes available on the drive hosting the staging dir (%TEMP%\nobuf_dropped).
+/// Lets the frontend reject a drop BEFORE copying GBs into a full disk.
+#[tauri::command]
+pub async fn cmd_staging_free_space() -> Result<u64, String> {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs4::free_space(&dir).map_err(|e| e.to_string())
+}
+
+/// Stage bytes of a dropped browser File into a temp file, chunk by chunk.
+/// upload_id: collision-safe id from the frontend (the QueueItem id).
+/// file_name: original name (sanitized here); chunk_index 0 truncates, others append.
+/// bytes_b64: base64-encoded chunk. A named Tauri arg is serialized through
+/// JSON.stringify, which turns a raw Uint8Array into a ~30-40 MB number array
+/// per 8 MB chunk; base64 keeps it at ~10.7 MB of plain text.
+/// Returns the temp file's absolute path on the final chunk, else "".
 /// Stage bytes of a dropped browser File into a temp file, chunk by chunk.
 /// upload_id: collision-safe id from the frontend (the QueueItem id).
 /// file_name: original name (sanitized here); chunk_index 0 truncates, others append.
@@ -319,30 +336,71 @@ pub async fn cmd_stage_dropped_file(
     file_name: String,
     chunk_index: u64,
     is_last: bool,
-    bytes: Vec<u8>,
+    bytes_b64: String,
 ) -> Result<String, String> {
+    use base64::Engine as _;
+
     // Sanitize: strip any path components — keep the bare filename only.
     let safe_name = std::path::Path::new(&file_name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "dropped".to_string());
+    // Windows caps a single filename component at 255 UTF-16 units; the temp name
+    // also carries "<id>-" and lives under %TEMP%\nobuf_dropped. Truncate the STEM
+    // (never the extension) so the file stays recognizable and openable.
+    let max_name_units = 200u16 as usize;
+    let safe_name = {
+        let units: usize = safe_name.chars().map(|c| c.len_utf16()).sum();
+        if units > max_name_units {
+            let stem = std::path::Path::new(&safe_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let ext = std::path::Path::new(&safe_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            // Budget: keep extension + separator, truncate stem to fit.
+            let stem_budget = max_name_units.saturating_sub(ext.chars().map(|c| c.len_utf16()).sum::<usize>() + 1);
+            let mut truncated: String = String::new();
+            for c in stem.chars() {
+                if truncated.chars().map(|x| x.len_utf16()).sum::<usize>() + c.len_utf16() > stem_budget { break; }
+                truncated.push(c);
+            }
+            if truncated.is_empty() { truncated.push('f'); }
+            if ext.is_empty() { truncated } else { format!("{}.{}", truncated, ext) }
+        } else {
+            safe_name
+        }
+    };
     let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if safe_id.is_empty() {
         return Err("Invalid upload id".to_string());
     }
 
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("Invalid chunk encoding: {}", e))?;
+
     let dir = std::env::temp_dir().join("nobuf_dropped");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}-{}", safe_id, safe_name));
 
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(chunk_index != 0)  // first chunk: overwrite; later: append
-        .truncate(chunk_index == 0)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
-    f.write_all(&bytes).map_err(|e| e.to_string())?;
+    // Multi-MB blocking writes run on a worker thread so the async runtime
+    // isn't stalled while a large drop is being staged.
+    let p = path.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(chunk_index != 0)  // first chunk: overwrite; later: append
+            .truncate(chunk_index == 0)
+            .open(&p)
+            .map_err(|e| e.to_string())?;
+        f.write_all(&bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Staging task failed: {}", e))??;
 
     if is_last {
         Ok(path.to_string_lossy().to_string())
@@ -351,11 +409,74 @@ pub async fn cmd_stage_dropped_file(
     }
 }
 
+/// Delete a staged dropped-file temp file. Invoked by the frontend when a
+/// staged queue item reaches a terminal state (success / cancel / abandoned).
+/// Guard: only paths directly inside the staging dir are accepted, so this can
+/// never become a generic delete-any-file primitive.
+#[tauri::command]
+pub async fn cmd_delete_staged_file(path: String) -> Result<(), String> {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    let p = std::path::PathBuf::from(&path);
+    if p.parent() != Some(dir.as_path()) {
+        return Err("Refusing to delete outside staging dir".to_string());
+    }
+    match std::fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already gone
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Best-effort delete of a PARTIALLY staged dropped file (stage aborted mid-stream,
+/// e.g. the source vanished or a chunk failed). Derives the same path as
+/// cmd_stage_dropped_file so the frontend never constructs filesystem paths.
+#[tauri::command]
+pub async fn cmd_discard_staged_upload(upload_id: String, file_name: String) -> Result<(), String> {
+    // Mirrors cmd_stage_dropped_file's exact naming so the derived path matches.
+    let safe_name = std::path::Path::new(&file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dropped".to_string());
+    let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if safe_id.is_empty() {
+        return Err("Invalid upload id".to_string());
+    }
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}-{}", safe_id, safe_name));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Resolve the document name an uploaded file gets in Telegram.
+/// Staged dropped files pass their ORIGINAL name here (the temp path carries a
+/// random `<id>-` prefix that must never leak into Telegram). Falls back to the
+/// path basename for picker/zip uploads. Pure - unit-tested below.
+pub fn effective_document_name(display_name: &Option<String>, path: &str) -> String {
+    if let Some(n) = display_name.as_deref().map(str::trim) {
+        if !n.is_empty() {
+            // Path::new("..") / "." / "/" yield file_name()==None, which would pass
+            // the raw name through — fall back to the source path's basename instead.
+            if let Some(base) = std::path::Path::new(n).file_name() {
+                return base.to_string_lossy().to_string();
+            }
+        }
+    }
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string())
+}
+
 #[tauri::command]
 pub async fn cmd_upload_file(
     path: String,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
+    display_name: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
@@ -387,10 +508,7 @@ pub async fn cmd_upload_file(
 
     // Create progress-tracking reader
     let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
-    let file_name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+    let file_name = effective_document_name(&display_name, &path);
 
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
@@ -1375,6 +1493,7 @@ pub async fn cmd_get_files(
 #[tauri::command]
 pub async fn cmd_search_global(
     query: String,
+    app: tauri::AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<Vec<FileMetadata>, String> {
     let client_opt = { state.client.lock().await.clone() };
@@ -1385,6 +1504,11 @@ pub async fn cmd_search_global(
     let mut files = Vec::new();
     
     log::info!("Searching global for: {}", query);
+
+    // Vault filter: while locked, drop results whose source peer is vaulted
+    // (filenames + source ids would otherwise leak past the passcode).
+    // Unlocked → None → everything flows.
+    let hidden = vault::hidden_ids_if_locked(&app, vault::is_unlocked_public(&app));
 
     let result = client.invoke(&tl::functions::messages::SearchGlobal {
         q: query,
@@ -1419,6 +1543,9 @@ pub async fn cmd_search_global(
                             tl::enums::Peer::User(u) => Some(u.user_id),
                             tl::enums::Peer::Chat(c) => Some(c.chat_id),
                         };
+                        if !vault::search_result_keeps(&hidden, folder_id) {
+                            continue;
+                        }
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
@@ -1446,6 +1573,9 @@ pub async fn cmd_search_global(
                             tl::enums::Peer::User(u) => Some(u.user_id),
                             tl::enums::Peer::Chat(c) => Some(c.chat_id),
                         };
+                        if !vault::search_result_keeps(&hidden, folder_id) {
+                            continue;
+                        }
                         files.push(FileMetadata {
                             id: m.id as i64, folder_id, name, size,
                             mime_type: Some(mime), file_ext: ext,
@@ -1573,3 +1703,124 @@ pub async fn cmd_scan_folders(
 }
 
 
+
+#[cfg(test)]
+mod staged_drop_tests {
+    use base64::Engine as _;
+    use super::*;
+
+    #[test]
+    fn display_name_wins_when_present_and_non_empty() {
+        let dn = Some("রিপোর্ট.pdf".to_string());
+        assert_eq!(
+            effective_document_name(&dn, "C:\\tmp\\ab12cd34-রিপোর্ট.pdf"),
+            "রিপোর্ট.pdf"
+        );
+    }
+
+    #[test]
+    fn blank_display_name_falls_back_to_path_basename() {
+        // Fallback = the PATH's basename verbatim (picker/zip uploads keep their real
+        // names; only staged drops pass displayName). The <id>- prefix belongs to the
+        // fallback too - stripping it here would corrupt picker filenames.
+        for blank in [Some("".to_string()), Some("   ".to_string()), None] {
+            assert_eq!(effective_document_name(&blank, "C:\\tmp\\k3j2h9x7p-report.pdf"), "k3j2h9x7p-report.pdf");
+        }
+    }
+
+    #[test]
+    fn display_name_is_stripped_to_bare_filename() {
+        let dn = Some("..\\evil\\report.pdf".to_string());
+        assert_eq!(effective_document_name(&dn, "C:\\tmp\\x-report.pdf"), "report.pdf");
+    }
+
+    #[tokio::test]
+    async fn stage_roundtrip_write_then_guarded_delete() {
+        let id = format!("t{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());
+        let payload = b"hello staged drop";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let p1 = cmd_stage_dropped_file(id.clone(), "রিপোর্ট.txt".to_string(), 0, false, b64.clone()).await.unwrap();
+        assert_eq!(p1, "");
+        let full = cmd_stage_dropped_file(id.clone(), "রিপোর্ট.txt".to_string(), 1, true, b64).await.unwrap();
+        assert!(full.contains("nobuf_dropped"));
+        // Two chunks APPEND: final file = chunk0 ++ chunk1.
+        let mut expected = payload.to_vec();
+        expected.extend_from_slice(payload);
+        assert_eq!(std::fs::read(&full).unwrap(), expected);
+        cmd_delete_staged_file(full.clone()).await.unwrap();
+        assert!(!std::path::Path::new(&full).exists());
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_non_base64_payload_without_touching_disk() {
+        let err = cmd_stage_dropped_file("tid".to_string(), "a.bin".to_string(), 0, true, "!!!not-base64!!!".to_string()).await;
+        assert!(err.unwrap_err().contains("Invalid chunk encoding"));
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_paths_outside_staging_dir() {
+        let outside = std::env::temp_dir().join("definitely_not_nobuf_dropped.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        let err = cmd_delete_staged_file(outside.to_string_lossy().to_string()).await;
+        assert!(err.unwrap_err().contains("Refusing to delete outside staging dir"));
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[tokio::test]
+    async fn delete_inside_staging_dir_is_ok_even_when_already_gone() {
+        let ghost = std::env::temp_dir().join("nobuf_dropped").join("ghost-never-existed.bin");
+        cmd_delete_staged_file(ghost.to_string_lossy().to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discard_removes_partially_staged_file_and_matches_staging_path() {
+        // The discard command must derive EXACTLY the path cmd_stage_dropped_file
+        // writes, or it would silently delete the wrong file (drift hazard).
+        let id = format!("d{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"partial bytes");
+        cmd_stage_dropped_file(id.clone(), "partial.bin".to_string(), 0, false, b64.clone()).await.unwrap();
+        let full = cmd_stage_dropped_file(id.clone(), "partial.bin".to_string(), 1, true, b64).await.unwrap();
+        assert!(std::path::Path::new(&full).exists());
+        cmd_discard_staged_upload(id.clone(), "partial.bin".to_string()).await.unwrap();
+        assert!(!std::path::Path::new(&full).exists());
+        // Idempotent: discarding again is Ok (NotFound tolerated).
+        cmd_discard_staged_upload(id, "partial.bin".to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discard_rejects_empty_upload_id() {
+        let err = cmd_discard_staged_upload("".to_string(), "a.txt".to_string()).await;
+        assert!(err.unwrap_err().contains("Invalid upload id"));
+    }
+
+    #[test]
+    fn display_name_dot_dot_falls_back_to_path_basename() {
+        // Path::new("..").file_name() == None — the raw ".." must NOT become the
+        // Telegram document name; fall back to the source path's FULL basename
+        // (same rule as the blank-display-name case above).
+        let dn = Some("..".to_string());
+        assert_eq!(effective_document_name(&dn, "C:\\tmp\\ab12cd34-real.pdf"), "ab12cd34-real.pdf");
+        let dn2 = Some(".".to_string());
+        assert_eq!(effective_document_name(&dn2, "C:\\tmp\\xy-file.bin"), "xy-file.bin");
+    }
+
+    #[tokio::test]
+    async fn stage_truncates_overlong_filenames_but_keeps_extension() {
+        // Windows caps a filename component at 255 UTF-16 units; without truncation
+        // a 300-char name fails CreateFileW with a cryptic Os error mid-drop.
+        let long_stem = "x".repeat(300);
+        let name = format!("{}.pdf", long_stem);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"z");
+        let full = cmd_stage_dropped_file(
+            format!("t{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()),
+            name, 0, true, b64,
+        ).await.expect("staging with an overlong name must succeed");
+        let base = std::path::Path::new(&full)
+            .file_name()
+            .unwrap()
+            .to_string_lossy().to_string();
+        assert!(base.ends_with(".pdf"), "extension preserved: {}", base);
+        assert!(base.chars().map(|c| c.len_utf16()).sum::<usize>() <= 255, "component <= 255 units: {}", base.len());
+        let _ = std::fs::remove_file(&full);
+    }
+}

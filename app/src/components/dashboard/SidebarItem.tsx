@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import { Plus, Pencil, Trash2, Check, X, FolderInput } from 'lucide-react';
+import { Plus, Pencil, Trash2, Check, X, FolderInput, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { PUBLIC_CHANNEL_DRAG_MIME } from '../../types';
 
 interface FolderGroup {
     id: number;
@@ -33,6 +34,14 @@ interface SidebarItemProps {
     isLast?: boolean;
     folderId: number | null;
     collapsed?: boolean;
+    /** Vault (D9/D10): show "Hide in Vault" in the context menu. */
+    onHideInVault?: () => void;
+    /** Vault drop target: a folder-reorder drag dropped here HIDES that folder (D9/D10). */
+    onVaultDropFolder?: (folderId: number) => void;
+    /** Vault drop target: a public-channel drag dropped here HIDES that channel (D9/D10). */
+    onVaultDropPublicChannel?: (channelId: number) => void;
+    /** Count pill (D15). Rendered only when > 0; positioned per collapsed state. */
+    badgeCount?: number;
 }
 
 const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
@@ -40,7 +49,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function SidebarItem({
     icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename, onAssignGroup, currentGroupId, groupColor,
     onFolderDragStart, onFolderDragOver, onFolderDragLeave, onFolderDrop, onFolderDragEnd,
-    reorderIndicator, isFirst, isLast, folderId, collapsed
+    reorderIndicator, isFirst, isLast, folderId, collapsed, onHideInVault, onVaultDropFolder, onVaultDropPublicChannel, badgeCount
 }: SidebarItemProps) {
     const [isOver, setIsOver] = useState(false);
     const [isRenaming, setIsRenaming] = useState(false);
@@ -125,6 +134,14 @@ export function SidebarItem({
     // Determine if a drag event is a folder reorder (vs file drop)
     const isReorderDrag = (e: React.DragEvent) => e.dataTransfer.types.includes(FOLDER_REORDER_MIME);
 
+    // External OS file drags carry 'Files' (and neither internal MIME). Their drops are
+    // captured at the document level (Dashboard) and upload to the CURRENT folder —
+    // highlighting this folder would promise a targeted drop that never happens.
+    const isExternalFilesDrag = (e: React.DragEvent) =>
+        e.dataTransfer.types.includes('Files') &&
+        !e.dataTransfer.types.includes('application/x-telegram-file-id') &&
+        !e.dataTransfer.types.includes(FOLDER_REORDER_MIME);
+
     return (
         <>
             {/* Reorder drop indicator line — rendered as a separate element above/below the button */}
@@ -137,6 +154,7 @@ export function SidebarItem({
                 // CRITICAL: <button> elements are NOT draggable by default in HTML.
                 // Without draggable="true", onDragStart never fires.
                 draggable={isFolder && !isRenaming && !collapsed ? true : false}
+                data-vault-dropzone={onVaultDropFolder ? 'true' : undefined}
                 onClick={onClick}
                 onDoubleClick={() => {
                     if (isFolder && onRename && !isRenaming) {
@@ -154,8 +172,10 @@ export function SidebarItem({
                 onDragEnter={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // Only highlight for file drops (not reorder — reorder has its own indicator)
-                    if (!isReorderDrag(e)) {
+                    // Highlight only for INTERNAL file drops (not reorder — it has its own
+                    // indicator; not external 'Files' drags — their drop is captured away
+                    // to the current-folder uploader, so a highlight here would lie).
+                    if (!isReorderDrag(e) && !isExternalFilesDrag(e)) {
                         setIsOver(true);
                     }
                 }}
@@ -184,6 +204,24 @@ export function SidebarItem({
                     e.preventDefault();
                     e.stopPropagation();
                     setIsOver(false);
+
+                    // Priority 0 (vault drop target): folder-reorder and
+                    // public-channel drags are HIDE actions — consumed here so
+                    // they never fall through to reorder/file logic (§4.2 order).
+                    if ((onVaultDropFolder || onVaultDropPublicChannel) && isReorderDrag(e) && onVaultDropFolder) {
+                        const raw = e.dataTransfer.getData(FOLDER_REORDER_MIME);
+                        if (raw) {
+                            onVaultDropFolder(Number(raw));
+                            return;
+                        }
+                    }
+                    if (onVaultDropPublicChannel && e.dataTransfer.types.includes(PUBLIC_CHANNEL_DRAG_MIME)) {
+                        const raw = e.dataTransfer.getData(PUBLIC_CHANNEL_DRAG_MIME);
+                        if (raw) {
+                            onVaultDropPublicChannel(Number(raw));
+                            return;
+                        }
+                    }
 
                     // Priority 1: folder reorder drop
                     if (isReorderDrag(e) && onFolderDrop) {
@@ -218,6 +256,13 @@ export function SidebarItem({
                     className={`w-4 h-4 shrink-0 transition-colors ${collapsed ? 'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2' : ''} ${isOver ? 'text-nobuf-primary' : ''}`}
                     style={groupColor && !isOver ? { color: groupColor } : undefined}
                 />
+                {badgeCount !== undefined && badgeCount > 0 && (
+                    <span
+                        className={`shrink-0 text-[10px] font-semibold bg-nobuf-primary/20 text-nobuf-primary rounded-full px-1.5 py-0.5 ${collapsed ? 'absolute top-0.5 right-0.5 px-1 py-0' : ''}`}
+                    >
+                        {badgeCount}
+                    </span>
+                )}
                 {isRenaming ? (
                     <div className="flex-1 flex items-center gap-1 min-w-0">
                         <input
@@ -322,6 +367,18 @@ export function SidebarItem({
                                 </div>
                             )}
                         </div>
+                    )}
+                    {onHideInVault && (
+                        <>
+                            <button
+                                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
+                                onClick={() => { setShowContextMenu(false); onHideInVault(); }}
+                            >
+                                <Lock className="w-4 h-4" />
+                                Hide in Vault
+                            </button>
+                            <div className="h-px bg-nobuf-border mx-2 my-1" />
+                        </>
                     )}
                     {onDelete && (
                         <>

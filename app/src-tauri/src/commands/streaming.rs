@@ -374,10 +374,13 @@ pub fn should_retarget_proactive(
         previous_target.is_some_and(|previous| is_backward_reanchor(previous, target))
 }
 
-/// Holds the per-session streaming config (token + port)
+/// Holds the per-session streaming config (token + port) plus the live-bind
+/// flag the frontend reads via cmd_get_stream_info().alive.
 pub struct StreamConfig {
     pub token: String,
     pub port: u16,
+    /// Set true only after start_streaming_server's bind succeeds.
+    pub alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-download-task keyframe-indexing context. Carries the lazily-resolved
@@ -561,6 +564,10 @@ pub struct StreamInfo {
     /// Example (Windows): http://nobuf-stream.localhost
     /// Example (macOS/Linux): nobuf-stream://localhost
     pub video_base_url: String,
+    /// True when the streaming server's bind SUCCEEDED. The token/base_url are
+    /// handed out unconditionally, so this flag is what tells the frontend
+    /// whether connecting is even worth attempting.
+    pub alive: bool,
 }
 
 /// Returns the streaming server's session token and base URL to the frontend.
@@ -588,7 +595,33 @@ pub fn cmd_get_stream_info(config: State<'_, StreamConfig>) -> StreamInfo {
         token: config.token.clone(),
         base_url: format!("http://localhost:{}", config.port),
         video_base_url,
+        alive: config.alive.load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// Self-probe: Rust hits ITS OWN streaming server over loopback and reports
+/// the raw status for `/upload-drop` plus the /__whoami identity payload.
+/// whoami returns THIS process's PID + boot stamp — if the probe answer's PID
+/// differs from the caller's, an IMPOSTOR process owns the port.
+#[tauri::command]
+pub fn cmd_probe_upload_route(port: u16) -> Result<String, String> {
+    let timeout = std::time::Duration::from_secs(5);
+    let drop_status = match ureq::request("HEAD", &format!("http://127.0.0.1:{}/upload-drop", port))
+        .timeout(timeout).call()
+    {
+        Ok(r) => r.status().to_string(),
+        Err(ureq::Error::Status(c, _)) => c.to_string(),
+        Err(e) => format!("ERR:{}", e),
+    };
+    let whoami = match ureq::get(&format!("http://127.0.0.1:{}/__whoami", port)).timeout(timeout).call() {
+        Ok(r) => format!("{} [{}]", r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(c, _)) => format!("{} [no body]", c),
+        Err(e) => format!("ERR:{}", e),
+    };
+    Ok(format!(
+        "drop=HEAD:{} whoami={} caller_pid={}",
+        drop_status, whoami, std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -1451,6 +1484,7 @@ mod tests {
         let config = StreamConfig {
             token: "test-token-123".to_string(),
             port: 14201,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         // Simulate what cmd_get_stream_info returns (without Tauri State wrapper)
@@ -1489,10 +1523,12 @@ mod tests {
         let config_port_1 = StreamConfig {
             token: "test".to_string(),
             port: 14201,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let config_port_2 = StreamConfig {
             token: "test".to_string(),
             port: 8080,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let base_url_1 = format!("http://localhost:{}", config_port_1.port);
@@ -1510,6 +1546,7 @@ mod tests {
             token: "abc".to_string(),
             base_url: "http://localhost:14201".to_string(),
             video_base_url: "http://nobuf-stream.localhost".to_string(),
+            alive: true,
         };
 
         assert_eq!(info.token, "abc");
