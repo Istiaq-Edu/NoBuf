@@ -298,6 +298,27 @@ pub fn run() {
             // Split-upload hygiene: flip crash-stale running jobs to
             // interrupted BEFORE any sweep can classify their temps.
             commands::split_upload::normalize_stale_jobs(app.handle());
+            // Queued rows survive restart by design — but they must not drain
+            // into failures before Telegram auth is live. Kick the promotion
+            // runner only after the client answers get_me (poll up to 10 min).
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<TelegramState>();
+                    for _ in 0..120 {
+                        let maybe_client = state.client.lock().await.clone();
+                        let ready = match maybe_client {
+                            Some(c) => c.get_me().await.is_ok(),
+                            None => false,
+                        };
+                        if ready {
+                            commands::split_upload::promote_queued_jobs(handle).await;
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+            }
             // Reclaim disk from crash-orphaned drop-staged files before anything else.
             crate::commands::fs::sweep_stale_staged_uploads();
 

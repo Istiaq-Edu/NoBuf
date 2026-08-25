@@ -736,14 +736,13 @@ pub async fn cmd_start_split_job(
         return Err("Source file changed since preview — reopen and try again".to_string());
     }
 
-    // Single-pipeline rule (authoritative): if another job is live, this one
-    // is stored as 'queued' instead of running. A promotion runner starts
-    // queued jobs in insertion order whenever the pipeline frees up — so
-    // multiple big files line up like every other transfer in the app.
-    let start_status = {
-        let conn = get_connection(&app_handle)?;
-        if has_active_split_job(&conn) { "queued" } else { "running" }
-    };
+    // Single-pipeline rule (authoritative): EVERY job inserts as 'queued'.
+    // Pipeline ownership is decided afterwards by a single guarded UPDATE
+    // whose NOT EXISTS re-checks liveness inside SQLite's write lock — so
+    // two simultaneous confirms can never both win (one flips zero rows).
+    // A promotion runner starts queued jobs in insertion order whenever the
+    // pipeline frees up.
+    let start_status = "queued";
 
     let job_id = derive_job_id(&plan.source_path, plan.source_size, epoch_secs());
     let job_id8: String = job_id.chars().take(8).collect();
@@ -842,9 +841,24 @@ pub async fn cmd_start_split_job(
         log::info!("[SPLIT] start: job row inserted {}", job_id);
     }
 
+    // Atomic pipeline claim: flip this job to 'running' only if nothing else
+    // is live. The NOT EXISTS re-check runs inside SQLite's write lock, so
+    // two simultaneous confirms resolve to exactly one winner (the loser's
+    // UPDATE matches zero rows). Self is excluded explicitly for clarity.
+    let claimed = {
+        let conn = get_connection(&app_handle)?;
+        let before = conn.total_change_count();
+        let mut stmt = conn
+            .prepare(PIPELINE_CLAIM_SQL)
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, job_id.as_str())).map_err(|e| e.to_string())?;
+        let _ = stmt.iter().next(); // run the UPDATE to completion
+        conn.total_change_count() > before
+    };
+
     let app = app_handle.clone();
     let job_id_spawn = job_id.clone();
-    if start_status == "running" {
+    if claimed {
         tokio::spawn(async move {
             if let Err(e) = run_job(app, job_id_spawn).await {
                 log::warn!("[SPLIT] job ended: {}", e);
@@ -852,15 +866,25 @@ pub async fn cmd_start_split_job(
         });
     } else {
         log::info!("[SPLIT] start: job {} queued (pipeline busy)", job_id);
-        // Kick the promotion runner: if nothing is actually running (e.g. the
-        // active job finished between our check and this insert), this starts
-        // the queue immediately.
+    }
+    // Kick the promotion runner either way: with a free pipeline it starts
+    // the queue head (possibly this very job) immediately; otherwise no-op.
+    {
         let app2 = app_handle.clone();
         tokio::spawn(async move { promote_queued_jobs(app2).await });
     }
 
     Ok(job_id)
 }
+
+/// Single guarded statement that grants pipeline ownership. Shared verbatim
+/// by cmd_start_split_job, the promotion runner, and the semantics test so
+/// they can never drift apart.
+pub(crate) const PIPELINE_CLAIM_SQL: &str = "\
+    UPDATE split_upload_jobs SET status='running', updated_at=strftime('%s','now') \
+    WHERE id=? AND status='queued' AND NOT EXISTS (\
+        SELECT 1 FROM split_upload_jobs j2 \
+        WHERE j2.status IN ('preparing','running') AND j2.id <> split_upload_jobs.id)";
 
 /// Start queued jobs (oldest first) while no other job is running. Called
 /// after a job reaches a terminal state and whenever a queued job is added.
@@ -900,15 +924,18 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let mut stmt = match conn.prepare(
-                "UPDATE split_upload_jobs SET status='running', updated_at=strftime('%s','now') WHERE id=? AND status='queued'",
-            ) {
+            let mut stmt = match conn.prepare(PIPELINE_CLAIM_SQL) {
                 Ok(q) => q,
                 Err(_) => return,
             };
+            // Row-count via total_change_count delta: an UPDATE steps straight
+            // to DONE with no rows, so Cursor::next() yields None regardless
+            // of whether the guard matched. Per-connection counters keep this
+            // race-free against concurrently promoting callers.
+            let before = conn.total_change_count();
             if stmt.bind((1, job_id.as_str())).is_err() { return; }
-            // Guarded flip: only succeeds if the row is still 'queued'.
-            let flipped = stmt.iter().next().map(|r| r.is_ok()).unwrap_or(false);
+            let _ = stmt.iter().next(); // run the UPDATE to completion
+            let flipped = conn.total_change_count() > before;
             if !flipped { continue; }
         }
         log::info!("[SPLIT] promoted queued job {} to running", job_id);
@@ -1036,6 +1063,19 @@ pub async fn cmd_resume_split_job(
     let cur_duration = probe_duration_local(&ffprobe, &source_path).await?;
     if (cur_duration - stored_duration).abs() > 1.0 {
         return Err("Source file changed since the original upload started".to_string());
+    }
+
+    // Resume must respect the single-pipeline rule like any other start:
+    // if another job holds the pipeline, this one waits as 'queued' and the
+    // promotion runner starts it (re-validated) in turn.
+    {
+        let conn = get_connection(&app_handle)?;
+        if has_active_split_job(&conn) {
+            update_status(&app_handle, &id, "queued", Some("Resuming after current job".into()))?;
+            let app2 = app_handle.clone();
+            tokio::spawn(async move { promote_queued_jobs(app2).await });
+            return Ok(());
+        }
     }
 
     update_status(&app_handle, &id, "running", None)?;
@@ -1578,6 +1618,13 @@ mod tests {
         assert_eq!(compute_part_count(2 * GB, 2 * GB), Some(2));
         // Just over cap → 2 parts.
         assert_eq!(compute_part_count(2 * GB + 1, 2 * GB), Some(2));
+        // Way over → ceiling division.
+        assert_eq!(compute_part_count(10 * GB, 2 * GB), Some(6)); // budget 1.936GB ⇒ ceil(10/1.936)=6
+        assert_eq!(compute_part_count(0, 2 * GB), Some(1));
+        // Bogus tiny caps must be rejected, not exploded into millions of parts.
+        assert_eq!(compute_part_count(3_000_000, 1_000_000), None); // below margin floor
+        assert_eq!(compute_part_count(3_000_000, 50_000_000), None); // budget 0 < 1MiB
+    }
 
     #[test]
     fn pathological_plan_rejected_before_snapping() {
@@ -1592,13 +1639,6 @@ mod tests {
             avg < MIN_PART_SECS,
             "fixture sanity: expected sub-minute average, got {avg}"
         );
-    }
-        // Way over → ceiling division.
-        assert_eq!(compute_part_count(10 * GB, 2 * GB), Some(6)); // budget 1.936GB ⇒ ceil(10/1.936)=6
-        assert_eq!(compute_part_count(0, 2 * GB), Some(1));
-        // Bogus tiny caps must be rejected, not exploded into millions of parts.
-        assert_eq!(compute_part_count(3_000_000, 1_000_000), None); // below margin floor
-        assert_eq!(compute_part_count(3_000_000, 50_000_000), None); // budget 0 < 1MiB
     }
 
     #[test]
@@ -1716,6 +1756,65 @@ mod tests {
         );
         assert!(extract_jobid8("unrelated.tmp.nobuf-tmp").is_some() || true);
     }
+
+    // ------------------------------------------------------------------------
+    // Atomic pipeline claim: the guarded UPDATE must flip at most ONE queued
+    // job to running, and only while no other job is live. Pins the SQL
+    // semantics that cmd_start_split_job + promote_queued_jobs rely on
+    // (change-count delta instead of Cursor::next, which is always None for
+    // UPDATEs — the bug this pins).
+    // ------------------------------------------------------------------------
+    #[test]
+    fn atomic_pipeline_claim_semantics() {
+        let conn = sqlite::Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE split_upload_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at INTEGER)",
+        )
+        .unwrap();
+        for id in ["A", "B"] {
+            let mut s = conn
+                .prepare("INSERT INTO split_upload_jobs (id, status) VALUES (?, 'queued')")
+                .unwrap();
+            s.bind((1, id)).unwrap();
+            s.iter().next();
+        }
+
+        let claim_sql = PIPELINE_CLAIM_SQL;
+
+        let claim = |conn: &sqlite::Connection, id: &str| -> bool {
+            let before = conn.total_change_count();
+            let mut stmt = conn.prepare(claim_sql).unwrap();
+            stmt.bind((1, id)).unwrap();
+            stmt.iter().next(); // UPDATE steps straight to DONE; rows are always None here
+            conn.total_change_count() > before
+        };
+
+        // Free pipeline: A wins.
+        assert!(claim(&conn, "A"));
+        let status = {
+            let mut stmt = conn
+                .prepare("SELECT status FROM split_upload_jobs WHERE id='A'")
+                .unwrap();
+            stmt.iter()
+                .next()
+                .and_then(|r| r.ok())
+                .map(|r| vs(&r[0]))
+                .unwrap()
+        };
+        assert_eq!(status, "running");
+
+        // Busy pipeline: B must NOT flip (NOT EXISTS blocks).
+        assert!(!claim(&conn, "B"));
+
+        // Loser re-claiming a taken pipeline matches zero rows again.
+        assert!(!claim(&conn, "A"));
+
+        // After A goes terminal, B promotes.
+        conn.execute("UPDATE split_upload_jobs SET status='done' WHERE id='A'")
+            .unwrap();
+        assert!(claim(&conn, "B"));
+    }
+
 
     // ------------------------------------------------------------------------
     // Integration (gated): needs ffmpeg on PATH or cached + runs ~20s.
