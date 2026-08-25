@@ -391,10 +391,25 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // "Pick instead" aborts staging and opens the native picker — selecting
         // the same file there runs the zero-copy split flow.
         (file, proceed) => {
+            const stageDropCap = 4_294_967_295; // Telegram hard ceiling (backend MAX_DROP_BYTES)
+            if (file.size > stageDropCap) {
+                toast.error(`"${file.name}" is larger than the 4 GB maximum — upload it with the Upload button instead.`);
+                return;
+            }
+            // If a decision dialog is already open, reject this candidate
+            // loudly instead of silently replacing (and losing) the pending one.
+            if (oversizeChoiceRef.current) {
+                toast.error(`Another large video ("${oversizeChoiceRef.current.file.name}") is awaiting your choice — decide on it first, then drop "${file.name}" again.`);
+                return;
+            }
             setOversizeChoice({ file, proceed });
         }
     );
     const [oversizeChoice, setOversizeChoice] = useState<{ file: File; proceed: () => void } | null>(null);
+    // Mirror for use inside the useFileUpload drop callback (stable identity
+    // across renders — state would read stale inside the callback closure).
+    const oversizeChoiceRef = useRef<{ file: File; proceed: () => void } | null>(null);
+    oversizeChoiceRef.current = oversizeChoice;
 
     const handleOversizePickInstead = useCallback(async () => {
         if (!oversizeChoice) return;

@@ -1282,6 +1282,9 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                         update_status_quiet(&app, &job_id, "interrupted", Some("source_missing".into()));
                         return Err("source missing mid-run".to_string());
                     }
+                    // Failed split leaves a partial .nobuf-tmp; schedule it for
+                    // deletion instead of waiting for the next sweep.
+                    delete_temp_later(temp_path.to_string_lossy().to_string());
                     update_status_quiet(&app, &job_id, "interrupted", Some(format!("Split failed: {}", msg)));
                     return Err(format!("ffmpeg failed on part {}: {}", idx, msg));
                 }
@@ -1536,7 +1539,7 @@ fn sweep_orphan_temps(app: &AppHandle) {
     // Prefixes whose temps must NOT be swept.
     let protected: Vec<String> = rows
         .iter()
-        .filter(|(_, _, st)| st == "running" || st == "preparing")
+        .filter(|(_, _, st)| st == "running" || st == "preparing" || st == "queued")
         .map(|(id, _, _)| id.chars().take(8).collect())
         .collect();
     // Distinct dirs (temps may sit next to several jobs' sources).
@@ -1544,8 +1547,25 @@ fn sweep_orphan_temps(app: &AppHandle) {
     dirs.sort();
     dirs.dedup();
     for d in dirs {
-        scan_and_sweep_dir(&d, &protected);
+        scan_and_sweep_dir(&d, &protected, app);
     }
+}
+
+/// Per-victim liveness re-check: a file may have been created by a job whose
+/// status flipped to running AFTER the snapshot above was taken (promotion
+/// window), or its job may have been cancelled mid-upload since. Re-reading
+/// the status closes both races instead of trusting the snapshot.
+fn temp_is_still_live(app: &AppHandle, name: &str) -> bool {
+    let Some(j8) = extract_jobid8(name) else { return false };
+    // Unknown-prefix temps belong to no live row — sweepable.
+    let Ok(conn) = get_connection(app) else { return true };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT status FROM split_upload_jobs WHERE substr(id,1,8)=? AND status IN ('running','preparing','queued') LIMIT 1",
+    ) else { return false };
+    if stmt.bind((1, j8.as_str())).is_err() {
+        return false;
+    }
+    stmt.iter().next().map(|r| r.is_ok()).unwrap_or(false)
 }
 
 /// Startup hygiene: any job still marked running/preparing when a fresh
@@ -1559,7 +1579,7 @@ pub fn normalize_stale_jobs(app: &AppHandle) {
     );
 }
 
-fn scan_and_sweep_dir(dir: &str, live_prefixes: &[String]) {
+fn scan_and_sweep_dir(dir: &str, live_prefixes: &[String], app: &AppHandle) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -1567,7 +1587,12 @@ fn scan_and_sweep_dir(dir: &str, live_prefixes: &[String]) {
             continue;
         }
         let orphan = match extract_jobid8(&name) {
-            Some(j8) => !live_prefixes.iter().any(|p| *p == j8),
+            Some(j8) => {
+                !live_prefixes.iter().any(|p| *p == j8)
+                    // Snapshot may be stale (promotion/cancel raced it):
+                    // re-read the row before condemning this file.
+                    && !temp_is_still_live(app, &name)
+            }
             None => true,
         };
         if orphan {

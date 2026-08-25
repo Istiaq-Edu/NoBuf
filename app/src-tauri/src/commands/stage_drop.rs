@@ -40,6 +40,11 @@ pub(crate) async fn stage_drop_handler(
         Some(s) if s > 0 => s,
         _ => return HttpResponse::BadRequest().body("missing or invalid 'size'"),
     };
+    // Cap at Telegram's hard ceiling (shared with /upload-drop). Without this
+    // any token-holder can stream unboundedly and fill %TEMP% to ENOSPC.
+    if size > crate::commands::upload_drop::MAX_DROP_BYTES {
+        return HttpResponse::BadRequest().body("file exceeds maximum supported size");
+    }
     let id = query_param(&req, "id")
         .map(|i| {
             let safe: String = i.chars().filter(|c| c.is_ascii_alphanumeric()).collect();

@@ -135,6 +135,9 @@ export function useSplitUpload() {
 
     const prepare = useCallback(async (path: string, folderId: number | null) => {
         stagedSourceRef.current = path;
+        // New session: nothing has been handed to Rust yet, so closing this
+        // modal must clean up THIS session's staged copy (if any).
+        jobStartedRef.current = false;
         const live = liveRef.current;
         setOpen(true);
         setPreparing(true);
@@ -163,10 +166,13 @@ export function useSplitUpload() {
         try {
             // Send the plan with user-adjusted boundaries; parts are rebuilt
             // server-side from boundaries (chained-snap preserved).
-            jobStartedRef.current = true;
+            // NOTE: flipped only AFTER invoke resolves — if the start fails
+            // (disk reject, network flap), close() must still delete this
+            // session's staged copy because no job owns it.
             const jobId = await invoke<string>('cmd_start_split_job', {
                 plan: { ...plan, boundaries: edits.boundaries },
             });
+            jobStartedRef.current = true;
             if (liveRef.current !== live) return undefined;
             setStartedJobId(jobId);
             return jobId;

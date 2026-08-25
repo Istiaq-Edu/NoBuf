@@ -41,7 +41,7 @@ pub(crate) fn upload_deps() -> UploadDeps {
     UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None })
 }
 
-const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
+pub(crate) const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
 
 #[derive(Clone, serde::Serialize)]
 struct DropProgressPayload {

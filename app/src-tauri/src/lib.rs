@@ -374,16 +374,12 @@ pub fn run() {
                 }
             }
 
-            // Clean up orphaned upload-staging temp files (dropped files + zipped folders)
-            // from previous sessions. These are never cleaned otherwise if the app crashed
-            // mid-upload. Best-effort — ignore errors (files may be locked/in-use).
-            for stale in ["nobuf_dropped", "nobuf_zip"] {
-                let dir = std::env::temp_dir().join(stale);
-                if dir.exists() {
-                    log::info!("[STARTUP-CLEANUP] Removing orphaned upload staging dir at {:?}...", dir);
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-            }
+            // Clean up orphaned upload-staging temp files (dropped files + zipped
+            // folders) from previous sessions. Age-gated via sweep_stale_staged_
+            // uploads (48h): a blunt wipe here would destroy the staged sources of
+            // jobs still sitting 'queued' in the split queue — they legitimately
+            // survive restart and must keep their input bytes.
+            crate::commands::fs::sweep_stale_staged_uploads();
 
             // Clean up thumbnail cache (unbounded — can grow to hundreds of MBs)
             let thumb_dir = app.path().app_data_dir()
