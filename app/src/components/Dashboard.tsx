@@ -17,6 +17,7 @@ import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
+import { parsePartName, collapseParts, type SplitChain } from '../utils/splitChain';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
@@ -300,6 +301,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         _setInternalDragFileId(id);
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
+    // Chain mode: the split-parts group being played (null = single file).
+    const [playingChain, setPlayingChain] = useState<SplitChain | null>(null);
+    // Virtual-timeline time where playback should start (clicked part K → Σ
+    // durations of parts 1..K-1). Consumed by MediaPlayer on mount.
+    const [playingChainStartT, setPlayingChainStartT] = useState(0);
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveFile, setArchiveFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
@@ -629,7 +635,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const isPdf = isPdfFile(file.name);
         const isArchive = isArchiveFile(file.name);
 
+        // Chain detection: clicking part K of a split set plays the whole
+        // chain starting at K's position on the virtual timeline.
         if (isMedia) {
+            const p = parsePartName(file.name);
+            if (p) {
+                const chains = collapseParts(contextFiles);
+                const hit = chains.find(c => c.kind === 'chain' && (c as SplitChain).stem === p.stem) as SplitChain | undefined;
+                if (hit && hit.parts.some(x => x.id === file.id)) {
+                    setPlayingChain(hit);
+                    setPlayingChainStartT(() => {
+                        let acc = 0;
+                        for (const x of hit.parts) { if (x.id === file.id) return acc; acc += x.duration; }
+                        return acc;
+                    });
+                    setPlayingFile(file);
+                    setPreviewFile(null); setPdfFile(null); setArchiveFile(null);
+                    return;
+                }
+            }
+            setPlayingChain(null);
             setPlayingFile(file);
             setPreviewFile(null);
             setPdfFile(null);
@@ -972,7 +997,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {playingFile && (
                     <MediaPlayer
                                             file={playingFile}
-                                            onClose={() => setPlayingFile(null)}
+                                            chain={playingChain ?? undefined}
+                                            startAtT={playingChain ? playingChainStartT : 0}
+                                            onClose={() => { setPlayingFile(null); setPlayingChain(null); }}
                                             onNext={handleNextPreview}
                                             onPrev={handlePrevPreview}
                                             currentIndex={previewContextIndex}
