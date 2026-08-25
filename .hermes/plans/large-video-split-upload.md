@@ -167,6 +167,15 @@ pattern already in fs.rs:265-281 (Windows AV/indexer locks).
   codec/params boundary, brief black-frame handoff) vs timestampOffset surgery
   into one buffer (fragile across parameter changes, forbidden mimeType
   switches). Spike = 1-day prototype switching two synthetic parts both ways.
+  **D0 DECISION (2026-08-25): Strategy 1 — fresh MediaSource per part.**
+  Rationale: FastStreamPlayer ALREADY recreates players on remux seeks, so
+  seam-swaps reuse an existing lifecycle instead of adding a second one;
+  parts are independent MP4/MKV documents with their own PTS baselines, which
+  timestampOffset surgery fights by design (monotonic-timestamp rules,
+  forbidden mimeType switches); param changes between parts (HDR/audio) stay
+  contained per-part instead of poisoning one buffer. Cost accepted: brief
+  handoff flicker at seams (≤1 buffer cycle target, dual-preload fallback
+  documented in plan §7).
 - Gap rule: chain plays to the FIRST missing index, stops cleanly, shows
   notice. "Upload remaining parts" button renders ONLY when a matching local
   job exists (otherwise a device without the source cannot split — show
