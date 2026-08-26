@@ -1499,6 +1499,37 @@ fn update_status(app: &AppHandle, job_id: &str, status: &str, error: Option<Stri
     stmt.bind((3, epoch_secs())).map_err(|e| e.to_string())?;
     stmt.bind((4, job_id)).map_err(|e| e.to_string())?;
     stmt.iter().next();
+    // Phase E fix: terminal transitions (interrupted/done/failed/cancelled)
+    // previously persisted silently — the Transfers panel row stayed stuck at
+    // the last progress phase ("uploading part k/N") until app restart, because
+    // hydration reads cmd_list_split_jobs only once per webview and no
+    // split-progress event was emitted on these paths. Emit here so the UI
+    // flips to the interrupted row (Resume/Delete) immediately.
+    if matches!(status, "interrupted" | "done" | "failed" | "cancelled" | "source_missing") {
+        let mut total: u32 = 0;
+        let mut done: u32 = 0;
+        if let Ok(mut stmt2) = conn
+            .prepare("SELECT parts_json FROM split_upload_jobs WHERE id = ?")
+        {
+            if stmt2.bind((1, job_id)).is_ok() {
+                if let Some(Ok(row)) = stmt2.iter().next() {
+                    let parts = parse_parts_json(&vs(&row[0]));
+                    total = parts.len() as u32;
+                    done = parts.iter().filter(|p| p.status == "done").count() as u32;
+                }
+            }
+        }
+        let _ = app.emit(
+            "split-progress",
+            SplitProgressPayload {
+                job_id: job_id.to_string(),
+                phase: status.to_string(),
+                part_idx: done,
+                total_parts: total,
+                message: error.unwrap_or_default(),
+            },
+        );
+    }
     Ok(())
 }
 

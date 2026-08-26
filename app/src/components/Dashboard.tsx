@@ -1178,16 +1178,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     const name = splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'this split job';
                     // App-themed confirm (ConfirmContext), NOT window.confirm —
                     // wry leaves native confirm() at raw WebView2 defaults.
+                    // Copy states REALITY: cmd_discard_split_job removes the
+                    // job record + temps only; uploaded parts STAY in Telegram
+                    // (remote deletion is not implemented — flagged follow-up).
                     void confirm({
                         title: `Delete "${name}"?`,
-                        message: 'Finished parts already uploaded will be removed from Telegram and cannot be recovered.',
+                        message: 'This removes the upload job record and temporary files. Parts already uploaded stay in your Telegram — delete them from the file list if you no longer want them.',
                         confirmText: 'Delete',
                         cancelText: 'Keep Job',
                         variant: 'danger',
                     }).then(ok => {
                         if (!ok) return;
                         void invoke('cmd_discard_split_job', { id: jobId })
-                            .then(() => toast.success(`Deleted "${name}" — uploaded parts removed`))
+                            .then(() => toast.success(`Deleted job "${name}"`))
                             .catch(e => toast.error(`Delete failed: ${e}`));
                     });
                 }}

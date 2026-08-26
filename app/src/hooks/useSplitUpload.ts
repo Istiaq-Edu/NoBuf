@@ -247,6 +247,7 @@ export function useSplitUpload() {
                 if (!startupNoticeFired) {
                     startupNoticeFired = true;
                     const resumable = selectResumableJobs(jobs);
+                    console.info(`[SPLIT] startup resume notice: ${resumable.length} interrupted job(s)`);
                 if (resumable.length === 1) {
                     const job = jobs.find(j => j.id === resumable[0]);
                     toast.info(`"${job?.displayName ?? 'Split upload'}" didn't finish — open Transfers to resume it.`, {
