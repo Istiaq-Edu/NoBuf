@@ -116,6 +116,21 @@ describe('staged temp files are excluded from store persistence', () => {
         expect(catchBody).not.toContain('cleanupStagedTemp');
     });
 
+    it('always releases the queue runner even when Retry invalidates the old generation', () => {
+        const s = src('src/hooks/useFileUpload.ts');
+        const finallyStart = s.indexOf('} finally {');
+        const finallyBody = s.slice(finallyStart, finallyStart + 400);
+        expect(finallyBody).toContain('setProcessing(false)');
+        expect(finallyBody).not.toContain('if (isCurrentRun()) setProcessing(false)');
+    });
+
+    it('removing a terminal stream-drop row releases its retained File handle', () => {
+        const s = src('src/hooks/useFileUpload.ts');
+        const removeStart = s.indexOf('const removeItem =');
+        const removeBody = s.slice(removeStart, removeStart + 500);
+        expect(removeBody).toContain('forgetLiveDrop(id)');
+    });
+
     it('drop is rejected while disconnected from Telegram', () => {
         // Without this gate, a drop while offline stages GBs to %TEMP%, fails with a
         // network error, and quitting loses the queue item entirely (staged items are

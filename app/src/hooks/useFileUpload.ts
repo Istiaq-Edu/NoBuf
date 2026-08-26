@@ -316,7 +316,11 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cancelledRef.current.delete(item.id);
             }
         } finally {
-            if (isCurrentRun()) setProcessing(false);
+            // `processing` owns the queue runner, not this generation's row
+            // writes. Retry invalidates the old generation while it is still
+            // settling; withholding this release would wedge every pending
+            // upload for the rest of the session.
+            setProcessing(false);
         }
     };
 
@@ -490,6 +494,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const removeItem = (id: string) => {
         const item = queueMirrorRef.current.find(i => i.id === id);
         if (item) cleanupStagedTemp(item);
+        forgetLiveDrop(id);
         setUploadQueue(q => q.filter(i => i.id !== id));
     };
 
@@ -500,6 +505,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             await invoke('cmd_delete_file', { messageId: item.messageId, folderId: item.folderId });
         }
         cleanupStagedTemp(item);
+        forgetLiveDrop(id);
         setUploadQueue(q => q.filter(i => i.id !== id));
     };
 
