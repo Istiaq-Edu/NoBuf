@@ -266,6 +266,7 @@ pub fn run() {
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+                upload_lock: Arc::new(tokio::sync::Mutex::new(())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
                 rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
@@ -437,6 +438,7 @@ pub fn run() {
             commands::upload_drop::set_upload_deps(commands::upload_drop::UploadDeps {
                 app_handle: Some(app_handle_for_server.clone()),
                 bw: Some(std::sync::Arc::new(bw_for_server)),
+                upload_lock: Some(app.state::<TelegramState>().upload_lock.clone()),
             });
             // The bind-success flag must be reachable from the server thread.
             let running_flag = app.state::<StreamServerRunning>().0.clone();

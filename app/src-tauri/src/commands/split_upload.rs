@@ -1455,6 +1455,8 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
     let mut total = total;
     let tg = app.state::<TelegramState>();
     let bw = app.state::<BandwidthManager>();
+    let upload_state = app.state::<TelegramState>();
+    let _upload_guard = upload_state.upload_lock.lock().await;
 
     for k in 0..parts.len() {
         let idx = parts[k].idx;
@@ -1756,6 +1758,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         };
         apply_retry_indices(&mut latest_parts, &retry_indices);
         persist_parts(&app, &job_id, &latest_parts)?;
+        drop(_upload_guard);
         return run_job(app, job_id).await;
     }
 

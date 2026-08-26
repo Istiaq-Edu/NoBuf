@@ -592,6 +592,11 @@ pub(crate) async fn upload_file_inner(
         return Ok(("Mock upload successful".to_string(), None));
     }
     let client = client_opt.unwrap();
+    let _upload_guard = if !split_owns_tid(&tid) {
+        Some(state.upload_lock.lock().await)
+    } else {
+        None
+    };
 
     // Emit start progress
     if !tid.is_empty() {
@@ -904,6 +909,7 @@ pub async fn cmd_upload_from_url(
         return Err("Not connected to Telegram".to_string());
     }
     let client = client_opt.unwrap();
+    let _upload_guard = state.upload_lock.lock().await;
 
     // Emit upload phase start
     if !tid.is_empty() {

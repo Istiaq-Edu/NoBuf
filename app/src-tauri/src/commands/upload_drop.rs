@@ -29,6 +29,7 @@ use crate::server::StreamTokenData;
 pub struct UploadDeps {
     pub app_handle: Option<tauri::AppHandle>,
     pub bw: Option<Arc<BandwidthManager>>,
+    pub upload_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 static UPLOAD_DEPS: std::sync::OnceLock<UploadDeps> = std::sync::OnceLock::new();
@@ -38,7 +39,7 @@ pub fn set_upload_deps(deps: UploadDeps) {
 }
 
 pub(crate) fn upload_deps() -> UploadDeps {
-    UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None })
+    UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None, upload_lock: None })
 }
 
 pub(crate) const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
@@ -204,6 +205,11 @@ pub(crate) async fn upload_drop_handler(
     }
 
     // --- Stream the request body directly into Telegram -------------------------
+    let deps = upload_deps();
+    let _upload_guard = match deps.upload_lock {
+        Some(lock) => Some(lock.lock_owned().await),
+        None => return HttpResponse::ServiceUnavailable().body("upload queue unavailable"),
+    };
     let reader = BodyReader {
         stream: Box::new(
             payload.map(|r| r.map_err(|e| actix_web::Error::from(e)))
