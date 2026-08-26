@@ -53,14 +53,16 @@ comes from jobId, never from name parsing.
 ## 3. Design
 
 ### A. Real-time progressive listing (seam: one emit + one listener)
-- Rust: in `upload_file_inner` immediately after successful `send_message` (fs.rs:631/642) emit `"documents-changed"` payload `{ folder_id: Option<i64> }`. Covers single + split + future callers; existing explicit invalidations become harmless dedupes.
-- Frontend: ONE listener (bootstrap alongside other global listeners) → `queryClient.invalidateQueries({ queryKey: ['files'] })`, debounced 300 ms (cmd_get_files re-paginates the whole peer per fetch; bursts of parts coalesce).
+- Rust: in `upload_file_inner` immediately after successful `send_message` (fs.rs:631/642) emit `"documents-changed"` payload `{ folder_id: Option<i64> }`. Callers verified (deep-review): exactly two — `cmd_upload_file` (fs.rs:656) and the split orchestrator (split_upload.rs:1341); remote-upload has its OWN send path (no spam risk).
+- Frontend: ONE listener → `queryClient.invalidateQueries({ queryKey: ['files'] })`, debounced 300 ms (cmd_get_files re-paginates the whole peer per fetch; bursts of parts coalesce). Prefix-key invalidation is correct for react-query v5: `['files']` matches all parametrized children (`['files', folderId]`), so a part landing in a non-active folder refreshes that folder's cache too — desired, and cheap because inactive queries only mark stale without refetching.
+- Placement: hook-level via `useQueryClient` inside an existing always-mounted component (Dashboard), mirroring useFileUpload.ts's pattern (:144/:236) — no App.tsx wiring needed. Vite HMR note from QA: Dashboard.tsx edits hot-reload live.
 - Acceptance: part visible in folder ≤ ~1 s after its upload resolves, without focus change or restart.
 
 ### B. Chain removal (deletion, per Q16)
-- Delete: `playingChain`/`playingChainStartT` state + intercept block (Dashboard.tsx:640-669), chain props into MediaPlayer/FastStreamPlayer, virtual-timeline machinery + its property tests (Phase D slices 1-2), "stem — part X/Y" badge (FastStreamPlayer.tsx:3841/:290), gap-rule UX + "Upload remaining parts" (slice 5), grid collapse call + rep naming (FileExplorer.tsx:236-251) — parts flow through as plain docs.
-- KEEP: double-nested naming (slice 6), tail-stall watchdog (slice 7), SplitUploadModal, split backend, `splitChain.ts` file itself becomes unused → delete with its tests.
-- Result: every part renders as an ordinary card; clicking plays solo (the former :662-669 branch becomes the only path). Old chains flatten automatically (no transform). Right-click Play anomaly and navigatePreview leak die with the state they depend on.
+- Deletion surface VERIFIED by direct grep (deep-review pass): exactly 5 files reference chain machinery — `Dashboard.tsx` (state :305/:308, intercept :640-669, props :1008-1010), `FileExplorer.tsx` (collapse at :236-251, virtualizer integration), `MediaPlayer.tsx` (chain/startAtT props, globalTimeToDoc import, partIdx/chainFile/displayFile logic :26-85), `FastStreamPlayer.tsx` (onPartEnded/initialSeekS/chainInfo props :281-290, tail-stall watchdog :1092-1119, seam seek :1291-1295, ended-handoff :1401-1408, badge :3839-3841), `utils/splitChain.ts` + its test.
+- Delete: all of the above chain-only code. MediaPlayer/FastStreamPlayer keep their non-chain signatures (`file`, `onNext/onPrev`, etc.) — strip optional chain props.
+- KEEP: double-nested naming (slice 6), tail-stall watchdog's NON-chain value = none (it only runs under `if (!chainInfo) return;` → delete with the feature), SplitUploadModal, split backend, queue plumbing.
+- Result: every part renders as an ordinary card; clicking plays solo (the former Dashboard.tsx:662-669 branch becomes the only path). Old chains flatten automatically (no transform). Right-click Play anomaly and navigatePreview leak die with the state they depend on.
 
 ### C. Transfers group UI (data plumbing first)
 Backend:
@@ -75,18 +77,19 @@ UI (TransferPanel):
 - Group row: chevron, name, combined % bar (Σ done bytes / Σ sizes; unknown sizes fall back to done-parts ratio), aggregated MB/s, "k/N done", job-level Cancel/Resume/Discard unchanged.
 - Part rows: status word + own % + MB/s while active; actions gated by status — uploading→Cancel(part); failed→Retry; done→Play + Download; cancelled→Re-include (Retry); waiting→none.
 - Remove the phantom `'preparing'` label or wire it for real (choose: remove; backend never emits it).
+- Virtualization: TransferPanel lists are PLAIN `.map()` renders (TransferPanel.tsx:154/242/276 — no virtualizer), so expanded part rows are just more mapped rows; no height constraints. Contrast: FileExplorer IS virtualized (@tanstack/react-virtual :274/:287) — but chain removal means no synthetic rows are spliced there at all.
 
 ### D. Per-part actions
 - **Cancel(part)**: invoke existing `cmd_cancel_transfer("split:<job>:<idx>")` — no new backend for the trigger; run-loop semantics change required (§E2).
-- **Play(part)**: from FOLDER cards it's the ordinary open path post-chain-removal. From TRANSFERS rows (part may predate listing refresh): construct stream URL for `(folderId, messageId)` and open FastStreamPlayer directly — same entry the folder uses after resolving a doc; hidden until `messageId` exists.
-- **Download(part)**: existing `queueDownload(messageId, name, folderId)` — hidden until done.
+- **Play(part)** — CORRECTED MECHANISM (deep-review A1): do NOT construct stream URLs. Render `<MediaPlayer file={{ id: messageId, name, size } as TelegramFile} activeFolderId={jobFolderId} …/>` directly. MediaPlayer already self-serves everything: it fetches `cmd_get_stream_info()` (baseUrl+token, port-agnostic per lib.rs:30) and builds `/stream/{folderId}/{messageId}` itself (MediaPlayer.tsx:35, :59-60). Duration unknown for transfers-opened parts — optional field. Hidden until `messageId` exists.
+- **Download(part)**: existing `queueDownload(messageId, name, folderId)` (useFileDownload.ts:128) — hidden until done.
 - **Delete(part)**: ordinary file deletion on the folder card (already works for any doc; nothing new). Not offered in Transfers rows (folder is the deletion surface) — keeps Q6 satisfied without duplicating destructive flows.
 - **Retry(part)**: new `cmd_retry_split_part(job_id, idx)`: validates job is `interrupted`; flips that part `waiting` (and any `failed` siblings? NO — only the requested one); sets job `running` and spawns `run_job`, which now skips `done` AND `cancelled` parts (skip-set change) — so retry naturally continues remaining eligible parts too, consistent with Resume semantics.
 
 ### E. Orchestrator semantic changes
 1. **Skip-set**: run loop skips `done` + `cancelled` (was `done` only). Job reaches `done` when no eligible parts remain; if ≥1 part was user-cancelled, `error` field records "skipped N cancelled parts" (informational, job still `done`).
 2. **Per-part cancel ≠ job cancel**: in the upload Err branch, distinguish: tid ∈ cancelled_transfers AND job-level token (`split-cancel:<jobId>`) NOT set → mark THAT part `cancelled`, emit part_status, continue to next part. Otherwise current behavior (interrupt job). Q14 honored.
-3. **Auto-retry**: wrap the per-part upload in up to `SPLIT_PART_MAX_ATTEMPTS=3` attempts with backoff 2 s / 8 s / 30 s (const, test-pinned budget = 40 s max per part). Applies to genuine failures only — user-cancel breaks the retry loop immediately. Exhausted → part `failed`, job `interrupted` (manual Resume/Retry surface).
+3. **Auto-retry**: wrap the per-part upload in up to `SPLIT_PART_MAX_ATTEMPTS=3` attempts with backoff 2 s / 8 s / 30 s (const, test-pinned budget = 40 s max per part). Applies to genuine failures only — user-cancel breaks the retry loop immediately. Exhausted → part `failed`, job `interrupted` (manual Resume/Retry surface). Cancellation-during-backoff: each backoff sleep is chunked into 500 ms slices, checking BOTH `split-cancel:<job>` and the part tid between slices — a cancel during backoff takes effect ≤500 ms instead of after up to 30 s (deep-review A2; verified the existing between-parts job-token check pattern at split_upload.rs:1240-1250).
 4. **Resume**: unchanged command; eligibility = `waiting|failed` (cancelled skipped per Q15).
 
 ### F. Edge cases (each → test)
