@@ -1,8 +1,8 @@
 # Plan: Parts-First Uploads — real-time parts, grouped transfer rows, chain removal
 
-Branch: `feature/large-video-split-upload` (extends it) · Status: DRAFT — pending cross-validation
+Branch: `feature/large-video-split-upload` (extends it) · Status: VALIDATED — deep-review + adversarial cross-validation folded in (F1-F8); pending user approval
 Interview basis: 17 locked decisions (2026-08-26, no assumptions). Evidence base: 3 parallel
-read-only investigations with file:line citations (deleg_cc15ed90).
+investigations + independent deep review + adversarial validator (deleg_cc15ed90, deleg_1033cc72).
 
 ## 0. Summary
 
@@ -52,16 +52,17 @@ comes from jobId, never from name parsing.
 
 ## 3. Design
 
-### A. Real-time progressive listing (seam: one emit + one listener)
-- Rust: in `upload_file_inner` immediately after successful `send_message` (fs.rs:631/642) emit `"documents-changed"` payload `{ folder_id: Option<i64> }`. Callers verified (deep-review): exactly two — `cmd_upload_file` (fs.rs:656) and the split orchestrator (split_upload.rs:1341); remote-upload has its OWN send path (no spam risk).
-- Frontend: ONE listener → `queryClient.invalidateQueries({ queryKey: ['files'] })`, debounced 300 ms (cmd_get_files re-paginates the whole peer per fetch; bursts of parts coalesce). Prefix-key invalidation is correct for react-query v5: `['files']` matches all parametrized children (`['files', folderId]`), so a part landing in a non-active folder refreshes that folder's cache too — desired, and cheap because inactive queries only mark stale without refetching.
-- Placement: hook-level via `useQueryClient` inside an existing always-mounted component (Dashboard), mirroring useFileUpload.ts's pattern (:144/:236) — no App.tsx wiring needed. Vite HMR note from QA: Dashboard.tsx edits hot-reload live.
+### A. Real-time progressive listing (seam: emit at upload-success + listener)
+- Rust: emit `"documents-changed"` payload `{ folder_id: Option<i64> }` after successful `send_message` in ALL THREE folder-upload pipelines (adversarial F6 falsified the single-point claim): `upload_file_inner` (fs.rs:631/642 — picker singles + split parts), remote-URL pipeline's own send path (~fs.rs:904 region, fully duplicated implementation), browser-drop actix handler (upload_drop.rs:253). Vault-sync JSON writes to the control channel are correctly excluded.
+- Frontend: ONE listener → `queryClient.invalidateQueries({ queryKey: ['files'] })`, debounced 300 ms (cmd_get_files re-paginates the whole peer per fetch; bursts of parts coalesce). Prefix-key invalidation is correct for react-query v5: `['files']` matches all parametrized children (`['files', folderId]`); default refetchType 'active' refetches only the mounted Dashboard query (:363-371) and merely marks inactive ones stale. Payload folder_id currently unused — kept for future targeted invalidation.
+- Placement: hook-level via `useQueryClient` inside an existing always-mounted component (Dashboard), mirroring useFileUpload.ts's pattern (:144/:236).
 - Acceptance: part visible in folder ≤ ~1 s after its upload resolves, without focus change or restart.
 
 ### B. Chain removal (deletion, per Q16)
 - Deletion surface VERIFIED by direct grep (deep-review pass): exactly 5 files reference chain machinery — `Dashboard.tsx` (state :305/:308, intercept :640-669, props :1008-1010), `FileExplorer.tsx` (collapse at :236-251, virtualizer integration), `MediaPlayer.tsx` (chain/startAtT props, globalTimeToDoc import, partIdx/chainFile/displayFile logic :26-85), `FastStreamPlayer.tsx` (onPartEnded/initialSeekS/chainInfo props :281-290, tail-stall watchdog :1092-1119, seam seek :1291-1295, ended-handoff :1401-1408, badge :3839-3841), `utils/splitChain.ts` + its test.
 - Delete: all of the above chain-only code. MediaPlayer/FastStreamPlayer keep their non-chain signatures (`file`, `onNext/onPrev`, etc.) — strip optional chain props.
-- KEEP: double-nested naming (slice 6), tail-stall watchdog's NON-chain value = none (it only runs under `if (!chainInfo) return;` → delete with the feature), SplitUploadModal, split backend, queue plumbing.
+- KEEP: double-nested naming (slice 6), SplitUploadModal, split backend, queue plumbing. Tail-stall watchdog (FastStreamPlayer.tsx:1092-1119): DELETE — its only trigger is `if (!chainInfo) return` (:1098), zero standalone value (deep-review A3 + adversarial F7 agree).
+- Deletion prop inventory (adversarial F8, complete): FastStreamPlayer loses `onPartEnded`/`initialSeekS`/`chainInfo` props (:281-290, :389), `chainEndedFiredRef` (:398, :1101, :1404-1407), chain initialSeek branch (:1291-1296), chain ended branch (:1401-1410), badge (:3839-3841); MediaPlayer loses `splitChain` import (:5), `chain`/`startAtT` props (:25-31), chain block (:40-90); Dashboard loses state (:305/:308), intercept (:639-669), props (:1008-1009), onClose reset; plus utils/splitChain.ts and __tests__/splitChain.test.ts (the only chain test file).
 - Result: every part renders as an ordinary card; clicking plays solo (the former Dashboard.tsx:662-669 branch becomes the only path). Old chains flatten automatically (no transform). Right-click Play anomaly and navigatePreview leak die with the state they depend on.
 
 ### C. Transfers group UI (data plumbing first)
@@ -88,9 +89,11 @@ UI (TransferPanel):
 
 ### E. Orchestrator semantic changes
 1. **Skip-set**: run loop skips `done` + `cancelled` (was `done` only). Job reaches `done` when no eligible parts remain; if ≥1 part was user-cancelled, `error` field records "skipped N cancelled parts" (informational, job still `done`).
-2. **Per-part cancel ≠ job cancel**: in the upload Err branch, distinguish: tid ∈ cancelled_transfers AND job-level token (`split-cancel:<jobId>`) NOT set → mark THAT part `cancelled`, emit part_status, continue to next part. Otherwise current behavior (interrupt job). Q14 honored.
-3. **Auto-retry**: wrap the per-part upload in up to `SPLIT_PART_MAX_ATTEMPTS=3` attempts with backoff 2 s / 8 s / 30 s (const, test-pinned budget = 40 s max per part). Applies to genuine failures only — user-cancel breaks the retry loop immediately. Exhausted → part `failed`, job `interrupted` (manual Resume/Retry surface). Cancellation-during-backoff: each backoff sleep is chunked into 500 ms slices, checking BOTH `split-cancel:<job>` and the part tid between slices — a cancel during backoff takes effect ≤500 ms instead of after up to 30 s (deep-review A2; verified the existing between-parts job-token check pattern at split_upload.rs:1240-1250).
-4. **Resume**: unchanged command; eligibility = `waiting|failed` (cancelled skipped per Q15).
+2. **Per-part cancel ≠ job cancel — REDESIGNED per adversarial F1**: `upload_file_inner` currently CONSUMES the tid (`cancelled_transfers.remove`) before returning "Transfer cancelled" (fs.rs:601-606, :615-620), so the orchestrator can never observe a part-cancel. Fix: for `split:`-prefixed tids ONLY, skip the `remove()` (leave the evidence); the orchestrator's Err branch then classifies: `tid ∈ set AND split-cancel:<job> ∉ set` → part CANCELLED (orchestrator removes the tid itself, marks part, emits part_status, continues) · otherwise genuine failure / job-cancel (current interrupt path byte-identical). Companion lifecycle steps (F1a/F1b): `cmd_retry_split_part` and resume REMOVE stale part-tids for parts they re-attempt and PURGE any stale `split-cancel:<job>` token before spawning run_job — without this, retried parts insta-cancel forever (masked today by the consumption bug).
+   ⚠️ Known latency (documented, not fixed here): cancellation is checked pre-start and post-upload; the upload task itself is joined, not aborted (fs.rs:608-613) — cancelling a mid-flight part lets its remaining bytes upload first. Same behavior as today's job-cancel.
+3. **Auto-retry**: up to `SPLIT_PART_MAX_ATTEMPTS=3` attempts, backoff 2 s / 8 s / 30 s (const, test-pinned budget = 40 s max per part). Genuine failures only — user-cancel exits the loop immediately. Exhausted → part `failed`, job `interrupted`. Backoff sleeps are cancellation-aware: sliced into 500 ms chunks checking the part tid AND job token between slices (adversarial F5: bare sleeps would ignore cancels for up to 30 s; verified cancel-poll points exist only at fs.rs:601/:615 and split_upload.rs:1237-1247).
+4. **Resume**: eligibility = `waiting|failed` (cancelled skipped per Q15); entry purges stale `split-cancel:<job>` + stale part tids for eligible parts (F3: token persistence would otherwise re-interrupt the resumed job instantly — VERIFIED latent bug on the current branch: `split-cancel:` has zero removal sites).
+5. **Retry admission (adversarial F4)**: `cmd_retry_split_part` reuses resume's single-pipeline admission block verbatim (has_active_split_job check → self-`queued` + promote via promotion runner, pattern at split_upload.rs:1068-1079) — the naive "spawn run_job directly" would run two concurrent pipelines (run_job_impl rejects only still-queued rows, :1177-1195).
 
 ### F. Edge cases (each → test)
 | # | Case | Behavior / test |
@@ -100,13 +103,17 @@ UI (TransferPanel):
 | 3 | ALL parts user-cancelled → run loop finds zero eligible | Job → `done` with "skipped N cancelled" note. Unit test on completion predicate. |
 | 4 | Retry on a fully-done job | Command rejects ("nothing to retry"). Guard test. |
 | 5 | Parts land <300 ms apart | Debounce coalesces to one refetch. Timer test. |
-| 6 | Vault-hidden / public-channel folders | Invalidation by `['files']` prefix hits only ACTIVE queries; vault gating unchanged (enabled flag). Existing suite green. |
+| 6 | Vault-hidden / public-channel folders | Invalidation by `['files']` prefix marks stale + refetches only the mounted query; vault gating unchanged (enabled flag). Existing suite green. |
 | 7 | Old double-nested chain names | Render as plain cards (raw name shown). Snapshot/manual QA. |
 | 8 | Crash between send_message success and parts_json persist | Tiny known window → duplicate upload on resume. Documented limitation, order already optimal (persist immediately after upload). |
 | 9 | Discard job whose parts are in the folder | Parts remain (real docs) — copy already corrected in f5b7f97. Manual QA. |
 | 10 | Play part from Transfers with messageId=null (not yet uploaded) | Action hidden (status gate). Component test. |
 | 11 | Combined % with unknown sizes | Fallback to done-parts fraction. Pure fn + test. |
-| 12 | Retry burst vs single-pipeline rule | `cmd_retry_split_part` respects `has_active_split_job` (queues like resume does). Test. |
+| 12 | Retry burst vs single-pipeline rule | `cmd_retry_split_part` reuses resume's admission block (queued + promotion). Test. (F4) |
+| 13 | Part-cancel mid-upload | upload_file_inner skips tid-removal for `split:` tids; orchestrator classifies cancelled vs failure; siblings continue. Integration test. (F1) |
+| 14 | Resume AFTER job-level cancel (stale tokens) | Resume purges `split-cancel:<job>` + part tids before spawn; job completes remaining parts. Integration test — pins the F3 latent bug fix. |
+| 15 | Cancel lands during auto-retry backoff sleep | 500 ms-sliced sleep observes it ≤500 ms; part classified per E2, no ghost retry attempt. Timer-driven unit test. (F5) |
+| 16 | Remote-URL / browser-drop upload completes | documents-changed fires from their own send paths; folder refreshes without restart. Manual QA per pipeline. (F6) |
 
 ## 4. Phases & acceptance criteria
 
