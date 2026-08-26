@@ -6,7 +6,6 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { FileCard } from './FileCard';
 import { EmptyState } from './EmptyState';
 import { TelegramFile } from '../../types';
-import { collapseParts } from '../../utils/splitChain';
 import { ContextMenu } from './ContextMenu';
 import { FileListItem } from './FileListItem';
 import { useSettings, GridDensity, SortField } from '../../context/SettingsContext';
@@ -229,27 +228,9 @@ export function FileExplorer({
             }
             return sortDirection === 'asc' ? comparison : -comparison;
         });
-        // Split-chain collapse (plan Phase D): consecutive segments sharing a
-        // stem become ONE representative card — the first doc carries the
-        // group identity (name "Stem — N segments", size = Σ). Clicking it
-        // plays the whole chain; Dashboard resolves it from contextFiles.
-        const collapsed = collapseParts(base);
-        const rep: TelegramFile[] = [];
-        for (const item of collapsed) {
-            if (item.kind === 'single') { rep.push(item.file); continue; }
-            const c = item.chain;
-            const head = base.find(f => String(f.id) === c.docs[0].id) ?? ({} as TelegramFile);
-            rep.push({
-                ...head,
-                id: head.id,
-                name: `${c.stem} — ${c.docs.length} parts`,
-                size: c.totalSize,
-                sizeStr: `${(c.totalSize / 1_000_000_000).toFixed(2)} GB`,
-                duration: c.totalDuration,
-                __chainParts: c.docs.length,
-            } as unknown as TelegramFile);
-        }
-        return rep;
+        // Parts-first (plan §B): no chain collapse — every part renders as its
+        // own card and plays standalone from 0:00 (Q12/Q13).
+        return base;
     }, [files, sortField, sortDirection]);
 
     const handlePreviewRequest = useCallback((file: TelegramFile) => {

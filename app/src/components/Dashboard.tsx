@@ -17,7 +17,6 @@ import { MoveToFolderModal } from './dashboard/MoveToFolderModal';
 import { PreviewModal } from './dashboard/PreviewModal';
 import { ArchiveViewerModal } from './dashboard/ArchiveViewerModal';
 import { MediaPlayer } from './dashboard/MediaPlayer';
-import { parseSplitName, collapseParts, type SplitChain } from '../utils/splitChain';
 import { DragDropOverlay } from './dashboard/DragDropOverlay';
 import { RemoteUploadModal } from './dashboard/RemoteUploadModal';
 import { PdfViewer } from './dashboard/PdfViewer';
@@ -302,10 +301,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
     // Chain mode: the split-parts group being played (null = single file).
-    const [playingChain, setPlayingChain] = useState<SplitChain | null>(null);
     // Virtual-timeline time where playback should start (clicked part K → Σ
     // durations of parts 1..K-1). Consumed by MediaPlayer on mount.
-    const [playingChainStartT, setPlayingChainStartT] = useState(0);
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveFile, setArchiveFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
@@ -635,34 +632,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const isPdf = isPdfFile(file.name);
         const isArchive = isArchiveFile(file.name);
 
-        // Chain detection: clicking part K of a split set plays the whole
-        // chain starting at K's position on the virtual timeline.
+        // Parts-first (plan §B): every document — including split parts —
+        // plays SOLO from its own 0:00. Chain interception removed per Q12.
         if (isMedia) {
-            const p = parseSplitName(file.name);
-            if (p) {
-                const items = collapseParts(contextFiles);
-                const hit = items.find((i): i is Extract<typeof i, { kind: 'chain' }> => i.kind === 'chain' && i.chain.stem === p.stem);
-                // Gap rule: docs outside the playable prefix exist but are not
-                // chain-playable — tell the user how many.
-                const allWithStem = contextFiles.filter(f => parseSplitName(f.name)?.stem === p.stem);
-                const missing = hit ? Math.max(0, allWithStem.length - hit.chain.docs.length) : 0;
-                if (hit && hit.chain.docs.some(d => String(d.id) === String(file.id))) {
-                    const chainHit: SplitChain = hit.chain;
-                    setPlayingChain(chainHit);
-                    setPlayingChainStartT(() => {
-                        let acc = 0;
-                        for (const x of chainHit.docs) { if (String(x.id) === String(file.id)) return acc; acc += x.duration; }
-                        return acc;
-                    });
-                    setPlayingFile(file);
-                    setPreviewFile(null); setPdfFile(null); setArchiveFile(null);
-                    if (missing > 0) toast.info(`Playing ${chainHit.docs.length} uploaded segment${chainHit.docs.length > 1 ? 's' : ''} — ${missing} later part${missing > 1 ? 's' : ''} not uploaded yet.`);
-                    return;
-                }
-                // No playable chain (or clicked a gap orphan): play as single.
-                setPlayingChain(null);
-            }
-            setPlayingChain(null);
             setPlayingFile(file);
             setPreviewFile(null);
             setPdfFile(null);
@@ -1005,9 +977,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {playingFile && (
                     <MediaPlayer
                                             file={playingFile}
-                                            chain={playingChain ?? undefined}
-                                            startAtT={playingChain ? playingChainStartT : 0}
-                                            onClose={() => { setPlayingFile(null); setPlayingChain(null); }}
+                                            onClose={() => { setPlayingFile(null); }}
                                             onNext={handleNextPreview}
                                             onPrev={handlePrevPreview}
                                             currentIndex={previewContextIndex}
