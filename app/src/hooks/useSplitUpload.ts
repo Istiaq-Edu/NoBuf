@@ -67,17 +67,18 @@ export function computeCombinedProgress(
     totalParts: number,
 ): { pct: number; speedBps: number } {
     const list = Array.isArray(parts) ? parts : [];
-    const known = list.filter(p => p.sizeBytes > 0);
+    const known = list.filter(p => p.sizeBytes > 0 || typeof p.uploadedBytes === 'number');
     if (known.length > 0 && known.length === list.length) {
         let done = 0;
         let total = 0;
         let speed = 0;
         for (const p of list) {
-            total += p.sizeBytes;
+            const size = p.sizeBytes > 0 ? p.sizeBytes : (p.uploadedBytes ?? 0);
+            total += size;
             speed += p.speedBps ?? 0;
-            if (p.status === 'done') done += p.sizeBytes;
-            else if (typeof p.uploadedBytes === 'number') done += Math.min(p.uploadedBytes, p.sizeBytes);
-            else if (typeof p.pct === 'number') done += p.sizeBytes * Math.min(p.pct, 100) / 100;
+            if (p.status === 'done') done += size;
+            else if (typeof p.uploadedBytes === 'number') done += Math.min(p.uploadedBytes, size);
+            else if (typeof p.pct === 'number') done += size * Math.min(p.pct, 100) / 100;
         }
         return { pct: total > 0 ? (done / total) * 100 : 0, speedBps: speed };
     }
@@ -141,6 +142,16 @@ function notifySplitRows() {
 /** Remove a job's row entirely (Discard/Delete) so it leaves the panel at once. */
 export function removeSplitRow(jobId: string) {
     splitRows.delete(jobId);
+    notifySplitRows();
+}
+
+/** Remove split groups that have reached a terminal state. */
+export function clearFinishedSplitRows() {
+    for (const [jobId, row] of splitRows) {
+        if (row.phase === 'done' || row.phase === 'cancelled' || row.phase === 'interrupted') {
+            splitRows.delete(jobId);
+        }
+    }
     notifySplitRows();
 }
 
@@ -255,6 +266,7 @@ async function ensureProgressListener() {
                         part.idx === parsed.idx
                             ? {
                                 ...part,
+                                sizeBytes: ev.payload.total_bytes > 0 ? ev.payload.total_bytes : part.sizeBytes,
                                 pct: ev.payload.percent,
                                 speedBps: ev.payload.speed_bytes_per_sec,
                                 uploadedBytes: ev.payload.uploaded_bytes,

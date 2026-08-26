@@ -839,7 +839,8 @@ pub async fn cmd_start_split_job(
             end_sec: p.end_sec,
             status: "waiting".to_string(),
             message_id: None,
-            size_bytes: 0,
+            size_bytes: ((plan.source_size as f64)
+                * ((p.end_sec - p.start_sec) / plan.duration_sec.max(1.0))) as u64,
         })
         .collect();
 
@@ -1181,7 +1182,7 @@ pub async fn cmd_retry_split_part(
     // in a retryable state. `done` parts are rejected; `cancelled` parts are
     // RE-INCLUDABLE here (that's the "Re-include" UI action) per Q3/Q15 —
     // deliberate user action only, never automatic.
-    let retried_any = {
+    let (retried_any, was_running) = {
         let conn = get_connection(&app_handle)?;
         let mut stmt = conn
             .prepare("SELECT status, parts_json FROM split_upload_jobs WHERE id = ?")
@@ -1191,7 +1192,7 @@ pub async fn cmd_retry_split_part(
         match c.next() {
             Some(Ok(row)) => {
                 let status = vs(&row[0]);
-                if status != "interrupted" && status != "failed" && status != "source_missing" {
+                if status != "running" && status != "interrupted" && status != "failed" && status != "source_missing" {
                     return Err(format!("Job is {} — nothing to retry", status));
                 }
                 let mut parts = parse_parts_json(&vs(&row[1]));
@@ -1207,13 +1208,24 @@ pub async fn cmd_retry_split_part(
                 }
                 part.status = "waiting".to_string();
                 persist_parts(&app_handle, &id, &parts)?;
-                true
+                (true, status == "running")
             }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
             None => return Err("Job not found".to_string()),
         }
     };
     let _ = retried_any;
+
+    // The current worker owns the pipeline. Queue a retry request for that
+    // worker instead of spawning a second concurrent run against the same
+    // source/job. The worker will reload the parts after its current pass.
+    if was_running {
+        let tg = app_handle.state::<TelegramState>();
+        let mut cancelled = tg.cancelled_transfers.write().await;
+        cancelled.remove(&format!("split:{}:{}", id, idx));
+        cancelled.insert(format!("split-retry:{}:{}", id, idx));
+        return Ok(());
+    }
 
     // Same single-pipeline admission as resume (F4).
     {
@@ -1652,6 +1664,19 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         }
     }
 
+    // A per-part retry can be requested while the worker is still active. Keep
+    // the same pipeline owner and reload the DB snapshot before deciding the
+    // job is complete.
+    let retry_requested = {
+        let tg = app.state::<TelegramState>();
+        let set = tg.cancelled_transfers.read().await;
+        set.iter().any(|t| t == &format!("split-retry:{}:", job_id) || t.starts_with(&format!("split-retry:{}:", job_id)))
+    };
+    if retry_requested {
+        let tg = app.state::<TelegramState>();
+        tg.cancelled_transfers.write().await.retain(|t| !t.starts_with(&format!("split-retry:{}:", job_id)));
+        return run_job(app, job_id).await;
+    }
     update_status_quiet(&app, &job_id, "done", None);
     // Drop-staged sources are %TEMP% copies; once every part is uploaded they
     // are garbage. Picker sources (real user files) are never touched — the

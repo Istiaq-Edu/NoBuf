@@ -201,6 +201,13 @@ describe('computeCombinedProgress (group header, plan §C/Q17)', () => {
         expect(r.speedBps).toBe(500);
     });
 
+    it('uses live uploaded bytes as the denominator when persisted part size is not ready', () => {
+        const r = computeCombinedProgress([
+            mk('uploading', 0, { uploadedBytes: 25, speedBps: 10 }),
+            mk('waiting', 100),
+        ], 0, 2);
+        expect(r.pct).toBeCloseTo(25 / 125 * 100);
+    });
     it('falls back to done-parts fraction when sizes unknown (edge #11)', () => {
         const r = computeCombinedProgress([mk('done', 0), mk('waiting', 0)], 1, 4);
         expect(r.pct).toBeCloseTo(25);

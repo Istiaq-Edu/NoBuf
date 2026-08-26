@@ -34,7 +34,7 @@ import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
-import { removeSplitRow } from '../hooks/useSplitUpload';
+import { removeSplitRow, clearFinishedSplitRows } from '../hooks/useSplitUpload';
 import { SplitUploadModal } from './dashboard/SplitUploadModal';
 import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
@@ -1195,6 +1195,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                             .catch(e => toast.error(`Delete failed: ${e}`));
                     });
                 }}
+                onClearFinishedSplitJobs={clearFinishedSplitRows}
                 onCancelSplitPart={(jobId, idx) => {
                     void invoke('cmd_cancel_transfer', { transferId: `split:${jobId}:${idx}` })
                         .catch(e => toast.error(`Cancel failed: ${e}`));

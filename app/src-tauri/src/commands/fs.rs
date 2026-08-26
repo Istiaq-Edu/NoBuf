@@ -651,9 +651,24 @@ pub(crate) async fn upload_file_inner(
     }
 
     let client_clone = client.clone();
-    let upload_result = tokio::spawn(async move {
+    let mut upload_task = tokio::spawn(async move {
         client_clone.upload_stream(&mut reader, file_size as usize, file_name).await
-    }).await.map_err(|e| format!("Task join error: {}", e))?;
+    });
+    let upload_result = loop {
+        tokio::select! {
+            result = &mut upload_task => {
+                break result.map_err(|e| format!("Task join error: {}", e))?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if !tid.is_empty() => {
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    upload_task.abort();
+                    let _ = upload_task.await;
+                    if let Some(t) = progress_task { t.abort(); }
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    };
 
     // Stop progress reporter
     if let Some(t) = progress_task { t.abort(); }

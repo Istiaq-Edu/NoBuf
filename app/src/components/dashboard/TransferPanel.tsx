@@ -28,6 +28,7 @@ interface TransferPanelProps {
     onCancelSplitJob?: (jobId: string) => void;
     onResumeSplitJob?: (jobId: string) => void;
     onDiscardSplitJob?: (jobId: string) => void;
+    onClearFinishedSplitJobs?: () => void;
     onCancelSplitPart?: (jobId: string, idx: number) => void;
     onRetrySplitPart?: (jobId: string, idx: number) => void;
     onPlaySplitPart?: (jobId: string, idx: number) => void;
@@ -47,7 +48,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -73,7 +74,7 @@ export function TransferPanel({
         ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading')
         : downloadItems.some(i => i.status === 'pending' || i.status === 'downloading');
     const hasFinished = effectiveTab === 'uploads'
-        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled')
+        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled') || splitJobs.some(j => j.phase === 'done' || j.phase === 'cancelled' || j.phase === 'interrupted')
         : downloadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled');
 
     return (
@@ -159,7 +160,7 @@ export function TransferPanel({
                     )}
                     {hasFinished && (
                         <button
-                            onClick={effectiveTab === 'uploads' ? onClearUploadFinished : onClearDownloadFinished}
+                            onClick={effectiveTab === 'uploads' ? () => { onClearUploadFinished(); onClearFinishedSplitJobs?.(); } : onClearDownloadFinished}
                             className="text-[11px] text-nobuf-primary hover:text-nobuf-text transition-colors"
                         >
                             Clear Finished
