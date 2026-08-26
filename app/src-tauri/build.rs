@@ -104,6 +104,7 @@ fn main() {
                 "cmd_start_split_job",
                 "cmd_cancel_split_job",
                 "cmd_resume_split_job",
+                "cmd_retry_split_part",
                 "cmd_list_split_jobs",
                 "cmd_discard_split_job",
                             ])),

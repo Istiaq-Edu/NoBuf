@@ -542,6 +542,7 @@ pub fn run() {
             commands::cmd_start_split_job,
             commands::cmd_cancel_split_job,
             commands::cmd_resume_split_job,
+            commands::cmd_retry_split_part,
             commands::cmd_list_split_jobs,
             commands::cmd_discard_split_job,
             commands::cmd_get_cache_status,

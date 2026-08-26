@@ -253,6 +253,15 @@ pub(crate) async fn upload_drop_handler(
                     match client.send_message(&peer, msg).await {
                         Ok(m) => {
                             log::info!("[drop] tid={tid} SUCCESS: '{name}' ({size}B) sent, message_id={}", m.id());
+                            // documents-changed (parts-first plan §A): the drop
+                            // pipeline has its own send path — emit here too so
+                            // the folder listing refreshes without a restart.
+                            if let Some(h) = upload_deps().app_handle {
+                                let _ = h.emit(
+                                    "documents-changed",
+                                    serde_json::json!({ "folder_id": folder_id }),
+                                );
+                            }
                             HttpResponse::Ok().json(serde_json::json!({ "message_id": m.id() }))
                         }
                         // Distinct marker body: bytes are ALREADY STORED in

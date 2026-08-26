@@ -598,9 +598,15 @@ pub(crate) async fn upload_file_inner(
         None
     };
 
-    // Check cancellation before starting
+    // Check cancellation before starting.
+    // For `split:`-prefixed tids the tid is NOT consumed here: the split
+    // orchestrator's Err branch must still observe it to classify part-cancel
+    // vs genuine failure (parts-first plan §E2). The orchestrator removes it.
+    let preserve_tid = tid.starts_with("split:");
     if state.cancelled_transfers.read().await.contains(&tid) {
-        state.cancelled_transfers.write().await.remove(&tid);
+        if !preserve_tid {
+            state.cancelled_transfers.write().await.remove(&tid);
+        }
         if let Some(t) = progress_task { t.abort(); }
         return Err("Transfer cancelled".to_string());
     }
@@ -613,9 +619,12 @@ pub(crate) async fn upload_file_inner(
     // Stop progress reporter
     if let Some(t) = progress_task { t.abort(); }
 
-    // Check cancellation after upload
+    // Check cancellation after upload. Same `split:`-preservation rule as the
+    // pre-start check above: leave the tid for the orchestrator to consume.
     if state.cancelled_transfers.read().await.contains(&tid) {
-        state.cancelled_transfers.write().await.remove(&tid);
+        if !preserve_tid {
+            state.cancelled_transfers.write().await.remove(&tid);
+        }
         return Err("Transfer cancelled".to_string());
     }
 
@@ -631,6 +640,14 @@ pub(crate) async fn upload_file_inner(
     let sent = client.send_message(&peer, message).await.map_err(map_error)?;
 
     bw_state.add_up(size);
+
+    // documents-changed (parts-first plan §A): universal listing-refresh
+    // signal. Covers picker singles AND every split part (the orchestrator's
+    // tid flows through here).
+    let _ = app_handle.emit(
+        "documents-changed",
+        serde_json::json!({ "folder_id": folder_id }),
+    );
 
     // Emit completion
     if !tid.is_empty() {
@@ -904,6 +921,13 @@ pub async fn cmd_upload_from_url(
     client.send_message(&peer, message).await.map_err(map_error)?;
 
     bw_state.add_up(actual_size);
+
+    // documents-changed (parts-first plan §A/F6): remote-URL pipeline has its
+    // own send path — emit here so URL uploads refresh the listing too.
+    let _ = app_handle.emit(
+        "documents-changed",
+        serde_json::json!({ "folder_id": folder_id }),
+    );
 
     // Cleanup temp file
     let _ = std::fs::remove_file(&temp_path);

@@ -103,10 +103,29 @@ struct JobPartState {
     start_sec: f64,
     #[serde(rename = "endSec")]
     end_sec: f64,
-    /// "waiting" | "done"
+    /// "waiting" | "done" | "cancelled" | "failed"
+    /// (cancelled = user-skipped via per-part cancel, retried never by Resume;
+    /// failed = exhausted auto-retry, eligible for Retry/Resume.)
     status: String,
     #[serde(rename = "messageId")]
     message_id: Option<i64>,
+    /// Actual byte size of the split part (stat'd after ffmpeg). `default`
+    /// keeps pre-existing parts_json rows loadable (plan §C).
+    #[serde(rename = "sizeBytes", default)]
+    size_bytes: u64,
+}
+
+/// Per-part summary surfaced through cmd_list_split_jobs hydration so the
+/// Transfers panel can rebuild per-part rows after a restart (plan §C seam #3).
+#[derive(Debug, Serialize)]
+pub struct PartInfo {
+    pub idx: u32,
+    pub name: String,
+    pub status: String,
+    #[serde(rename = "messageId")]
+    pub message_id: Option<i64>,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: u64,
 }
 
 /// Row shape returned to the frontend transfers window.
@@ -123,6 +142,8 @@ pub struct SplitJobInfo {
     pub total_parts: usize,
     #[serde(rename = "doneParts")]
     pub done_parts: usize,
+    /// Per-part detail for Transfers-panel group rows (hydration seam, §C).
+    pub parts: Vec<PartInfo>,
     #[serde(rename = "tempDir")]
     pub temp_dir: String,
     #[serde(rename = "updatedAt")]
@@ -133,17 +154,38 @@ pub struct SplitJobInfo {
 struct SplitProgressPayload {
     #[serde(rename = "jobId")]
     job_id: String,
-    phase: String, // "splitting" | "uploading" | "done" | "interrupted"
+    phase: String, // "splitting" | "uploading" | "done" | "interrupted" | per-part terminal via part_status
     #[serde(rename = "partIdx")]
     part_idx: u32,
     #[serde(rename = "totalParts")]
     total_parts: u32,
     message: String,
+    /// Terminal per-part flip ("done"|"cancelled"|"failed") riding the existing
+    /// event; None for plain progress. Frontend keys off this instead of
+    /// inferring from part_idx (plan §C).
+    #[serde(rename = "partStatus")]
+    part_status: Option<String>,
 }
 
 // ============================================================================
 // Pure planning math (unit-tested below)
 // ============================================================================
+
+/// Per-part upload attempts before the part is marked `failed` and the job
+/// goes to manual Resume (plan §E3). Budget: 2s + 8s + 30s = 40s max backoff.
+const SPLIT_PART_MAX_ATTEMPTS: u32 = 3;
+/// Backoff before attempt 2 and attempt 3 (attempt 1 fails → 2s wait, etc.).
+const SPLIT_RETRY_BACKOFF_MS: [u64; 2] = [2_000, 8_000];
+/// Total worst-case backoff budget per part (asserted by test).
+const SPLIT_RETRY_BUDGET_MS: u64 = 40_000;
+/// Granularity of cancellation polling inside backoff sleeps (§E3/F5).
+const CANCEL_POLL_MS: u64 = 500;
+
+const SPLIT_RETRY_BACKOFF_TOTAL_MS: u64 = SPLIT_RETRY_BACKOFF_MS[0] + SPLIT_RETRY_BACKOFF_MS[1];
+const _: () = assert!(
+    SPLIT_RETRY_BACKOFF_TOTAL_MS <= SPLIT_RETRY_BUDGET_MS,
+    "retry backoff budget exceeded — update SPLIT_RETRY_BUDGET_MS"
+);
 
 /// How many parts does `size` need under a per-part budget of `cap`?
 /// Unique job id: two SipHash rounds over path|size|time -> 32 hex chars.
@@ -342,6 +384,16 @@ fn parse_parts_json(json: &str) -> Vec<JobPartState> {
 
 fn row_to_info(row: &sqlite::Row) -> SplitJobInfo {
     let parts = parse_parts_json(&vs(&row[13]));
+    let part_infos = parts
+        .iter()
+        .map(|p| PartInfo {
+            idx: p.idx,
+            name: p.name.clone(),
+            status: p.status.clone(),
+            message_id: p.message_id,
+            size_bytes: p.size_bytes,
+        })
+        .collect();
     SplitJobInfo {
         id: vs(&row[0]),
         display_name: vs(&row[6]),
@@ -353,6 +405,7 @@ fn row_to_info(row: &sqlite::Row) -> SplitJobInfo {
         folder_id: voi(&row[7]),
         total_parts: parts.len(),
         done_parts: parts.iter().filter(|p| p.status == "done").count(),
+        parts: part_infos,
         temp_dir: vs(&row[5]),
         updated_at: vi(&row[17]),
     }
@@ -786,6 +839,7 @@ pub async fn cmd_start_split_job(
             end_sec: p.end_sec,
             status: "waiting".to_string(),
             message_id: None,
+            size_bytes: 0,
         })
         .collect();
 
@@ -947,6 +1001,7 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
                 part_idx: 0,
                 total_parts: 0,
                 message: "Queued job starting".into(),
+                part_status: None,
             },
         );
         let a = app.clone();
@@ -1078,12 +1133,120 @@ pub async fn cmd_resume_split_job(
         }
     }
 
+    // F3 fix: purge stale cancellation tokens BEFORE respawning. Cancel
+    // inserts `split-cancel:<job>` + per-part tids and NOTHING ever removed
+    // them — a resume after a job-cancel would hit the between-parts token
+    // check on its first eligible part and instantly re-interrupt.
+    {
+        let tg = app_handle.state::<TelegramState>();
+        let mut set = tg.cancelled_transfers.write().await;
+        set.remove(&format!("split-cancel:{}", id));
+        // Remove any per-part tids left over from the cancelled attempt.
+        let stale_tids: Vec<String> = set
+            .iter()
+            .filter(|t| t.starts_with(&format!("split:{}:", id)))
+            .cloned()
+            .collect();
+        for t in stale_tids {
+            set.remove(&t);
+        }
+    }
+
     update_status(&app_handle, &id, "running", None)?;
 
     let app = app_handle.clone();
     tokio::spawn(async move {
         if let Err(e) = run_job(app, id).await {
             log::warn!("[SPLIT] resumed job ended: {}", e);
+        }
+    });
+    Ok(())
+}
+
+
+/// Retry ONE part of an interrupted job (plan §D). The part is flipped back to
+/// `waiting`; the job then runs with the standard skip-set (done + cancelled),
+/// so retrying part K also continues every other eligible part after it —
+/// consistent with Resume semantics (Q15). Single-pipeline admission is copied
+/// verbatim from resume (adversarial F4): a retry while another job uploads
+/// queues this one instead of spawning a second pipeline.
+#[tauri::command]
+pub async fn cmd_retry_split_part(
+    id: String,
+    idx: u32,
+    app_handle: tauri::AppHandle,
+    _state: State<'_, TelegramState>,
+) -> Result<(), String> {
+    // Validate: job exists, is interrupted/failed-adjacent, and has that part
+    // in a retryable state. `done` parts are rejected; `cancelled` parts are
+    // RE-INCLUDABLE here (that's the "Re-include" UI action) per Q3/Q15 —
+    // deliberate user action only, never automatic.
+    let retried_any = {
+        let conn = get_connection(&app_handle)?;
+        let mut stmt = conn
+            .prepare("SELECT status, parts_json FROM split_upload_jobs WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        let mut c = stmt.iter();
+        match c.next() {
+            Some(Ok(row)) => {
+                let status = vs(&row[0]);
+                if status != "interrupted" && status != "failed" && status != "source_missing" {
+                    return Err(format!("Job is {} — nothing to retry", status));
+                }
+                let mut parts = parse_parts_json(&vs(&row[1]));
+                let part = match parts.iter_mut().find(|p| p.idx == idx) {
+                    Some(p) => p,
+                    None => return Err(format!("No such part index {} in job", idx)),
+                };
+                if part.status == "done" {
+                    return Err("That part already uploaded successfully".to_string());
+                }
+                if part.status == "waiting" {
+                    return Err("That part is already pending upload".to_string());
+                }
+                part.status = "waiting".to_string();
+                persist_parts(&app_handle, &id, &parts)?;
+                true
+            }
+            Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
+            None => return Err("Job not found".to_string()),
+        }
+    };
+    let _ = retried_any;
+
+    // Same single-pipeline admission as resume (F4).
+    {
+        let conn = get_connection(&app_handle)?;
+        if has_active_split_job(&conn) {
+            update_status(&app_handle, &id, "queued", Some("Waiting for current split to finish".into()))?;
+            let app2 = app_handle.clone();
+            tokio::spawn(async move { promote_queued_jobs(app2).await });
+            return Ok(());
+        }
+    }
+
+    // Token hygiene identical to resume (F3).
+    {
+        let tg = app_handle.state::<TelegramState>();
+        let mut set = tg.cancelled_transfers.write().await;
+        set.remove(&format!("split-cancel:{}", id));
+        let stale_tids: Vec<String> = set
+            .iter()
+            .filter(|t| t.starts_with(&format!("split:{}:", id)))
+            .cloned()
+            .collect();
+        for t in stale_tids {
+            set.remove(&t);
+        }
+    }
+
+    update_status(&app_handle, &id, "running", None)?;
+
+    let app = app_handle.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_job(app, id).await {
+            log::warn!("[SPLIT] retried job ended: {}", e);
         }
     });
     Ok(())
@@ -1230,7 +1393,9 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
     let bw = app.state::<BandwidthManager>();
 
     for k in 0..parts.len() {
-        if parts[k].status == "done" {
+        // Skip-set (plan §E1): done parts are complete; `cancelled` parts were
+        // deliberately user-skipped and are NEVER retried automatically (Q15).
+        if parts[k].status == "done" || parts[k].status == "cancelled" {
             continue;
         }
         let idx = parts[k].idx;
@@ -1258,6 +1423,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                 part_idx: idx,
                 total_parts: total,
                 message: parts[k].name.clone(),
+                part_status: None,
             },
         );
 
@@ -1315,6 +1481,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                         end_sec: orig_end,
                         status: "waiting".to_string(),
                         message_id: None,
+                        size_bytes: 0,
                     },
                 );
                 // Rebuild indexes/names for the tail after the inserted cut.
@@ -1326,46 +1493,144 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             break size;
         };
 
-        // --- Upload phase -------------------------------------------------
-        let _ = app.emit(
-            "split-progress",
-            SplitProgressPayload {
-                job_id: job_id.clone(),
-                phase: "uploading".into(),
-                part_idx: idx,
-                total_parts: parts.len() as u32,
-                message: parts[k].name.clone(),
-            },
-        );
+        // --- Upload phase (auto-retry loop, plan §E3) ----------------------
+        // Backoff is sliced into CANCEL_POLL_MS chunks so a user cancel during
+        // a sleep takes effect within ~500 ms instead of after up to 30 s.
         let tid = format!("split:{}:{}", job_id, idx);
-        let upload_res = upload_file_inner(
-            &app,
-            &tg,
-            &bw,
-            &temp_path.to_string_lossy(),
-            load_folder_id(&app, &job_id)?,
-            Some(tid.clone()),
-            Some(parts[k].name.clone()),
-        )
-        .await;
+        let mut attempt: u32 = 0;
+        let upload_outcome: Result<(), String> = loop {
+            attempt += 1;
+            let _ = app.emit(
+                "split-progress",
+                SplitProgressPayload {
+                    job_id: job_id.clone(),
+                    phase: "uploading".into(),
+                    part_idx: idx,
+                    total_parts: parts.len() as u32,
+                    message: parts[k].name.clone(),
+                    part_status: None,
+                },
+            );
+            let res = upload_file_inner(
+                &app,
+                &tg,
+                &bw,
+                &temp_path.to_string_lossy(),
+                load_folder_id(&app, &job_id)?,
+                Some(tid.clone()),
+                Some(parts[k].name.clone()),
+            )
+            .await;
+
+            match res {
+                Ok(_) => break Ok(()),
+                Err(e) => {
+                    let job_cancel = tg
+                        .cancelled_transfers
+                        .read()
+                        .await
+                        .contains(&format!("split-cancel:{}", job_id));
+                    let part_cancel = tg.cancelled_transfers.read().await.contains(&tid);
+                    if part_cancel && !job_cancel {
+                        // Per-part cancel (plan §E2): consume the preserved tid,
+                        // mark ONLY this part, keep the job running.
+                        tg.cancelled_transfers.write().await.remove(&tid);
+                        parts[k].status = "cancelled".to_string();
+                        persist_parts(&app, &job_id, &parts)?;
+                        let _ = app.emit(
+                            "split-progress",
+                            SplitProgressPayload {
+                                job_id: job_id.clone(),
+                                phase: "uploading".into(),
+                                part_idx: idx,
+                                total_parts: parts.len() as u32,
+                                message: "Cancelled by user".into(),
+                                part_status: Some("cancelled".into()),
+                            },
+                        );
+                        break Ok(()); // part resolved as cancelled; not an error
+                    }
+                    let retryable = !job_cancel && !part_cancel && attempt < SPLIT_PART_MAX_ATTEMPTS;
+                    if retryable {
+                        let backoff_ms = SPLIT_RETRY_BACKOFF_MS[((attempt - 1) as usize).min(SPLIT_RETRY_BACKOFF_MS.len() - 1)];
+                        log::warn!(
+                            "[SPLIT] part {} attempt {}/{} failed: {} — retrying in {}ms",
+                            idx, attempt, SPLIT_PART_MAX_ATTEMPTS, e, backoff_ms
+                        );
+                        let mut waited: u64 = 0;
+                        while waited < backoff_ms {
+                            tokio::time::sleep(std::time::Duration::from_millis(CANCEL_POLL_MS)).await;
+                            waited += CANCEL_POLL_MS;
+                            if tg
+                                .cancelled_transfers
+                                .read()
+                                .await
+                                .contains(&format!("split-cancel:{}", job_id))
+                            {
+                                break; // job cancel observed mid-backoff
+                            }
+                        }
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        };
 
         delete_temp_later(temp_path.to_string_lossy().to_string());
 
-        match upload_res {
-            Ok((_, msg_id)) => {
-                parts[k].status = "done".to_string();
-                parts[k].message_id = msg_id;
-                persist_parts(&app, &job_id, &parts)?;
+        match upload_outcome {
+            Ok(()) => {
+                // A part that was cancelled inside the loop above already has
+                // status "cancelled" persisted — don't overwrite it with done.
+                if parts[k].status == "waiting" || parts[k].status == "uploading" {
+                    parts[k].status = "done".to_string();
+                    // messageId for the cancelled case stays None (no send).
+                    parts[k].size_bytes = _final_size;
+                    persist_parts(&app, &job_id, &parts)?;
+                    let _ = app.emit(
+                        "split-progress",
+                        SplitProgressPayload {
+                            job_id: job_id.clone(),
+                            phase: "uploading".into(),
+                            part_idx: idx,
+                            total_parts: parts.len() as u32,
+                            message: String::new(),
+                            part_status: Some("done".into()),
+                        },
+                    );
+                } else {
+                    // Cancelled path: still record the (pre-cancel) size? No —
+                    // the temp may have been deleted; leave size 0 and just persist.
+                    persist_parts(&app, &job_id, &parts)?;
+                }
             }
             Err(e) => {
-                if tg.cancelled_transfers.read().await.contains(&tid)
-                    || tg.cancelled_transfers.read().await.contains(&format!("split-cancel:{}", job_id))
-                {
+                let job_cancel = tg
+                    .cancelled_transfers
+                    .read()
+                    .await
+                    .contains(&format!("split-cancel:{}", job_id));
+                if job_cancel {
                     update_status_quiet(&app, &job_id, "interrupted", Some("Cancelled by user".into()));
                 } else {
+                    // Exhausted auto-retries on a genuine failure.
+                    parts[k].status = "failed".to_string();
+                    persist_parts(&app, &job_id, &parts)?;
                     update_status_quiet(&app, &job_id, "interrupted", Some(e.clone()));
+                    let _ = app.emit(
+                        "split-progress",
+                        SplitProgressPayload {
+                            job_id: job_id.clone(),
+                            phase: "interrupted".into(),
+                            part_idx: idx,
+                            total_parts: parts.len() as u32,
+                            message: e.clone(),
+                            part_status: Some("failed".into()),
+                        },
+                    );
                 }
-                // A cancelled/failed job frees the pipeline: promote next queued.
+                // An interrupted job frees the pipeline: promote next queued.
                 {
                     let a2 = app.clone();
                     tokio::spawn(async move { promote_queued_jobs(a2).await });
@@ -1401,6 +1666,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             part_idx: total,
             total_parts: total,
             message: "All parts uploaded".into(),
+            part_status: None,
         },
     );
     Ok(())
@@ -1527,6 +1793,7 @@ fn update_status(app: &AppHandle, job_id: &str, status: &str, error: Option<Stri
                 part_idx: done,
                 total_parts: total,
                 message: error.unwrap_or_default(),
+                part_status: None,
             },
         );
     }
@@ -1767,14 +2034,14 @@ mod tests {
     #[test]
     fn renumber_tail_rebuilds_names_after_midpart_insertion() {
         let mut parts = vec![
-            JobPartState { idx: 1, name: "Movie.part01.mkv".into(), start_sec: 0.0, end_sec: 300.0, status: "done".into(), message_id: None },
-            JobPartState { idx: 2, name: "Movie.part02.mkv".into(), start_sec: 300.0, end_sec: 600.0, status: "waiting".into(), message_id: None },
+            JobPartState { idx: 1, name: "Movie.part01.mkv".into(), start_sec: 0.0, end_sec: 300.0, status: "done".into(), message_id: None, size_bytes: 0 },
+            JobPartState { idx: 2, name: "Movie.part02.mkv".into(), start_sec: 300.0, end_sec: 600.0, status: "waiting".into(), message_id: None, size_bytes: 0 },
         ];
         // VBR pile-up on part 2 → split it at 450 (tail-only: part 1 untouched).
         parts[1].end_sec = 450.0;
         parts.insert(
             2,
-            JobPartState { idx: 0, name: String::new(), start_sec: 450.0, end_sec: 600.0, status: "waiting".into(), message_id: None },
+            JobPartState { idx: 0, name: String::new(), start_sec: 450.0, end_sec: 600.0, status: "waiting".into(), message_id: None, size_bytes: 0 },
         );
         renumber_tail(&mut parts, 1);
         assert_eq!(parts[0].name, "Movie.part01.mkv"); // uploaded prefix untouched
