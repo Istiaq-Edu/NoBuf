@@ -12,6 +12,15 @@ import { QueueItem } from '../types';
 export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
     return item.path.startsWith('nobuf-drop-stream://');
 }
+
+function parseUploadResult(result: string): { messageId?: number } {
+    try {
+        const parsed = JSON.parse(result) as { messageId?: unknown };
+        return typeof parsed.messageId === 'number' ? { messageId: parsed.messageId } : {};
+    } catch {
+        return {};
+    }
+}
 import { useFileDrop } from './useFileDrop';
 import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
@@ -223,6 +232,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             setUploadQueue(q => q.map(i => i.id === id ? {
                 ...i,
                 status: status as QueueItem['status'],
+                messageId: typeof (e as CustomEvent).detail?.messageId === 'number'
+                    ? (e as CustomEvent).detail.messageId
+                    : i.messageId,
                 progress: status === 'success' ? 100 : undefined,
                 // Drop the stale byte counters too — otherwise error/cancel rows
                 // keep showing a frozen "X / Y" from the last progress event.
@@ -252,11 +264,19 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         try {
             if (item.url) {
                 // Remote upload from URL
-                await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const result = await invoke<string>('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             } else {
                 // Local file upload — displayName carries the ORIGINAL dropped-file name
                 // so the Telegram document isn't named after the <id>-prefixed temp file.
-                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const result = await invoke<string>('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             }
             // Check if cancelled during upload
             if (cancelledRef.current.has(item.id)) {
@@ -459,6 +479,16 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         ));
     };
 
+    const deleteItem = async (id: string): Promise<void> => {
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (!item) return;
+        if (item.messageId !== undefined) {
+            await invoke('cmd_delete_file', { messageId: item.messageId, folderId: item.folderId });
+        }
+        cleanupStagedTemp(item);
+        setUploadQueue(q => q.filter(i => i.id !== id));
+    };
+
     const { isDragging } = useFileDrop();
 
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
@@ -560,6 +590,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         cancelAll,
         cancelItem,
         retryItem,
+        deleteItem,
         isDragging,
         splitFlow,
         splitJobRows: splitFlow.splitJobRows,

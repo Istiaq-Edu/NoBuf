@@ -430,7 +430,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, deleteItem: deleteUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
         // Decision-first: an oversize DROPPED video asks before any temp copy.
         // "Pick instead" aborts staging and opens the native picker — selecting
         // the same file there runs the zero-copy split flow.
@@ -1230,6 +1230,26 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onCancelAllUploads={cancelUploads}
                 onCancelUploadItem={cancelUploadItem}
                 onRetryUploadItem={retryUploadItem}
+                onDeleteUploadItem={id => {
+                    const item = uploadQueue.find(i => i.id === id);
+                    if (!item) return;
+                    if (item.messageId === undefined) {
+                        void deleteUploadItem(id).catch(e => toast.error(`Delete failed: ${e}`));
+                        return;
+                    }
+                    void confirm({
+                        title: 'Delete uploaded file?',
+                        message: 'This removes the upload from Telegram and from the local transfer list.',
+                        confirmText: 'Delete',
+                        cancelText: 'Keep file',
+                        variant: 'danger',
+                    }).then(ok => {
+                        if (!ok) return;
+                        void deleteUploadItem(id)
+                            .then(() => toast.success('Uploaded file deleted'))
+                            .catch(e => toast.error(`Delete failed: ${e}`));
+                    });
+                }}
                 downloadItems={downloadQueue}
                 onClearDownloadFinished={clearDownloads}
                 onCancelAllDownloads={cancelDownloads}

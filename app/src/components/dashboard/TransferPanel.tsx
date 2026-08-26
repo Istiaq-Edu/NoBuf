@@ -38,6 +38,7 @@ interface TransferPanelProps {
     onCancelAllUploads: () => void;
     onCancelUploadItem: (id: string) => void;
     onRetryUploadItem: (id: string) => void;
+    onDeleteUploadItem?: (id: string) => void;
     // Download props
     downloadItems: DownloadItem[];
     onClearDownloadFinished: () => void;
@@ -48,7 +49,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem, onDeleteUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -361,6 +362,11 @@ export function TransferPanel({
                                         title="Retry"
                                     >
                                         <RotateCcw className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+                                {effectiveTab === 'uploads' && onDeleteUploadItem && (item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (
+                                    <button onClick={() => onDeleteUploadItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Delete upload">
+                                        <X className="w-3.5 h-3.5" />
                                     </button>
                                 )}
                             </div>

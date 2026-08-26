@@ -231,14 +231,19 @@ async function startOne(id: string) {
         const xhr = new XMLHttpRequest();
         activeXhrs.set(id, xhr);
 
-        const result = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        const result = await new Promise<{ ok: boolean; error?: string; messageId?: number }>((resolve) => {
             xhr.open('POST', `${info.base_url}/upload-drop?${params.toString()}`, true);
             xhr.timeout = 0; // no timeout: large uploads over slow links are legal
             xhr.onerror = () => resolve({ ok: false, error: 'Network error talking to the local server' });
             xhr.onabort = () => resolve({ ok: false, error: 'Transfer cancelled' });
             xhr.onload = () => {
                 if (xhr.status === 200) {
-                    resolve({ ok: true });
+                    let messageId: number | undefined;
+                    try {
+                        const parsed = JSON.parse(xhr.responseText) as { message_id?: unknown };
+                        if (typeof parsed.message_id === 'number') messageId = parsed.message_id;
+                    } catch { /* success responses from older servers had no JSON */ }
+                    resolve({ ok: true, messageId });
                 } else {
                     // Server errors are plain text (upload_drop.rs bodies); JSON is
                     // the fallback, not the rule. Parse must not swallow the real
@@ -258,7 +263,7 @@ async function startOne(id: string) {
 
         // Terminal state handling mirrors processItem's semantics.
         if (result.ok) {
-            emitDone({ id, status: 'success', messageId: undefined });
+            emitDone({ id, status: 'success', messageId: result.messageId });
         } else if (result.error?.includes('ALREADY_STORED')) {
             // Bytes reached Telegram but the final send/resolve step failed —
             // the document exists server-side. Retrying would duplicate it.

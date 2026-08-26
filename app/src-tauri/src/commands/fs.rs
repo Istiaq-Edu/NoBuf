@@ -724,8 +724,8 @@ pub async fn cmd_upload_file(
     state: State<'_, TelegramState>,
     bw_state: State<'_, BandwidthManager>,
 ) -> Result<String, String> {
-    let (msg, _) = upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await?;
-    Ok(msg)
+    let (message, message_id) = upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await?;
+    Ok(serde_json::json!({ "message": message, "messageId": message_id }).to_string())
 }
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
@@ -972,7 +972,7 @@ pub async fn cmd_upload_from_url(
     let message = InputMessage::new().text("").document(uploaded_file);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
-    client.send_message(&peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&peer, message).await.map_err(map_error)?;
 
     bw_state.add_up(actual_size);
 
@@ -994,7 +994,7 @@ pub async fn cmd_upload_from_url(
     }
 
     log::info!("[REMOTE-UPLOAD] Upload complete ({} bytes)", actual_size);
-    Ok("Remote file uploaded successfully".to_string())
+    Ok(serde_json::json!({ "message": "Remote file uploaded successfully", "messageId": sent.id() }).to_string())
 }
 
 #[tauri::command]

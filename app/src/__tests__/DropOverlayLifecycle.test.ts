@@ -103,13 +103,13 @@ describe('staged temp files are excluded from store persistence', () => {
     });
 
     it('processItem wires cleanup into the retryable-lifecycle paths (success/pending-remove/cancelAll)', () => {
-        // Exactly 4 occurrences: 1 definition + success + pending-item removal +
-        // cancelAll's bulk-pending strip. Cleanup fires ONLY where the item can
+        // Exactly 5 occurrences: 1 definition + success + pending-item removal +
+        // cancelAll's bulk-pending strip + explicit terminal-row Delete. Cleanup fires ONLY where the item can
         // never be retried again; cancelled/errored items KEEP their temp file so
         // Retry works (a cancelled drop whose temp was deleted would fail Retry
         // with "Invalid path").
         const s = src('src/hooks/useFileUpload.ts');
-        expect(s.match(/cleanupStagedTemp\(/g)?.length).toBe(4);
+        expect(s.match(/cleanupStagedTemp\(/g)?.length).toBe(5);
         // The cancel branches must NOT clean up — pinned by absence inside processItem's catch
         const catchStart = s.indexOf("if (errMsg.includes('Transfer cancelled'))");
         const catchBody = s.slice(catchStart, catchStart + 400);
