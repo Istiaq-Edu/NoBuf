@@ -39,6 +39,7 @@ interface TransferPanelProps {
     onCancelUploadItem: (id: string) => void;
     onRetryUploadItem: (id: string) => void;
     onDeleteUploadItem?: (id: string) => void;
+    onRemoveUploadItem?: (id: string) => void;
     // Download props
     downloadItems: DownloadItem[];
     onClearDownloadFinished: () => void;
@@ -49,7 +50,7 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem, onDeleteUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem, onDeleteUploadItem, onRemoveUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
@@ -364,8 +365,8 @@ export function TransferPanel({
                                         <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
                                 )}
-                                {effectiveTab === 'uploads' && onDeleteUploadItem && (item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (
-                                    <button onClick={() => onDeleteUploadItem(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Delete upload">
+                                {effectiveTab === 'uploads' && (item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (item.messageId !== undefined ? onDeleteUploadItem : onRemoveUploadItem) && (
+                                    <button onClick={() => item.messageId !== undefined ? onDeleteUploadItem?.(item.id) : onRemoveUploadItem?.(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title={item.messageId !== undefined ? 'Delete uploaded file' : 'Remove transfer'}>
                                         <X className="w-3.5 h-3.5" />
                                     </button>
                                 )}

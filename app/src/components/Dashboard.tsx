@@ -430,7 +430,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, deleteItem: deleteUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, removeItem: removeUploadItem, deleteItem: deleteUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
         // Decision-first: an oversize DROPPED video asks before any temp copy.
         // "Pick instead" aborts staging and opens the native picker — selecting
         // the same file there runs the zero-copy split flow.
@@ -1228,8 +1228,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 }}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
                 onCancelAllUploads={cancelUploads}
-                onCancelUploadItem={cancelUploadItem}
+                onCancelUploadItem={id => {
+                    const item = uploadQueue.find(i => i.id === id);
+                    if (!item) return;
+                    if (item.status === 'pending') {
+                        cancelUploadItem(id);
+                        return;
+                    }
+                    void confirm({
+                        title: `Cancel upload?`,
+                        message: 'The current upload stops. You can retry it from the beginning or remove it from Transfers.',
+                        confirmText: 'Cancel upload',
+                        cancelText: 'Keep uploading',
+                        variant: 'danger',
+                    }).then(ok => { if (ok) cancelUploadItem(id); });
+                }}
                 onRetryUploadItem={retryUploadItem}
+                onRemoveUploadItem={removeUploadItem}
                 onDeleteUploadItem={id => {
                     const item = uploadQueue.find(i => i.id === id);
                     if (!item) return;
