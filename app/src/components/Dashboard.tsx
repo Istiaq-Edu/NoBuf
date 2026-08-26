@@ -276,6 +276,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [showAbout, setShowAbout] = useState(false);
     const [showRemoteUpload, setShowRemoteUpload] = useState(false);
     const [showTransferPanel, setShowTransferPanel] = useState(false);
+    const [splitDeleteDecision, setSplitDeleteDecision] = useState<{ jobId: string; name: string } | null>(null);
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -487,7 +488,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 listJobs: () => invoke('cmd_list_split_jobs'),
                 resumeJob: (id: string) => invoke('cmd_resume_split_job', { id }),
                 cancelJob: (id: string) => invoke('cmd_cancel_split_job', { id }),
-                discardJob: (id: string) => invoke('cmd_discard_split_job', { id }),
+                discardJob: (id: string, deleteParts = false) => invoke('cmd_discard_split_job', { id, deleteParts }),
             };
         }
     }, [splitFlow]);
@@ -1174,31 +1175,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 }}
                 onDiscardSplitJob={jobId => {
                     const name = splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'this split job';
-                    // App-themed confirm (ConfirmContext), NOT window.confirm —
-                    // wry leaves native confirm() at raw WebView2 defaults.
-                    // Copy states REALITY: cmd_discard_split_job removes the
-                    // job record + temps only; uploaded parts STAY in Telegram
-                    // (remote deletion is not implemented — flagged follow-up).
-                    void confirm({
-                        title: `Delete "${name}"?`,
-                        message: 'This removes the upload job record and temporary files. Parts already uploaded stay in your Telegram — delete them from the file list if you no longer want them.',
-                        confirmText: 'Delete',
-                        cancelText: 'Keep Job',
-                        variant: 'danger',
-                    }).then(ok => {
-                        if (!ok) return;
-                        void invoke('cmd_discard_split_job', { id: jobId })
-                            .then(() => {
-                                removeSplitRow(jobId); // drop the panel row immediately (store has no auto-removal)
-                                toast.success(`Deleted job "${name}"`);
-                            })
-                            .catch(e => toast.error(`Delete failed: ${e}`));
-                    });
+                    setSplitDeleteDecision({ jobId, name });
                 }}
                 onClearFinishedSplitJobs={() => {
-                    const terminal = splitJobRows.filter(j => j.phase === 'done' || j.phase === 'cancelled' || j.phase === 'interrupted');
-                    void Promise.allSettled(terminal.map(async job => {
-                        await invoke('cmd_discard_split_job', { id: job.jobId });
+                    const completed = splitJobRows.filter(j => j.phase === 'done');
+                    void Promise.allSettled(completed.map(async job => {
+                        await invoke('cmd_discard_split_job', { id: job.jobId, deleteParts: false });
                         removeSplitRow(job.jobId);
                     })).then(results => {
                         const failed = results.filter(r => r.status === 'rejected').length;
@@ -1254,6 +1236,38 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onCancelDownloadItem={cancelDownloadItem}
                 onRetryDownloadItem={retryDownloadItem}
             />
+
+            {splitDeleteDecision && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+                    <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-white/10 bg-[#1c1c1c] p-5 shadow-2xl">
+                        <h3 className="text-base font-semibold text-white">Delete “{splitDeleteDecision.name}”?</h3>
+                        <p className="mt-2 text-sm text-nobuf-subtext">Choose what happens to parts already uploaded to Telegram.</p>
+                        <div className="mt-5 flex flex-col gap-2">
+                            <button onClick={() => {
+                                const choice = splitDeleteDecision;
+                                setSplitDeleteDecision(null);
+                                void invoke('cmd_discard_split_job', { id: choice.jobId, deleteParts: false })
+                                    .then(() => { removeSplitRow(choice.jobId); toast.success(`Deleted job “${choice.name}”`); })
+                                    .catch(e => toast.error(`Delete failed: ${e}`));
+                            }} className="rounded-lg border border-white/10 px-3 py-2 text-left text-sm text-white hover:bg-white/5">
+                                <span className="block font-medium">Delete job only</span>
+                                <span className="block text-xs text-nobuf-subtext">Keep parts already uploaded to Telegram.</span>
+                            </button>
+                            <button onClick={() => {
+                                const choice = splitDeleteDecision;
+                                setSplitDeleteDecision(null);
+                                void invoke('cmd_discard_split_job', { id: choice.jobId, deleteParts: true })
+                                    .then(() => { removeSplitRow(choice.jobId); toast.success(`Deleted job and uploaded parts “${choice.name}”`); })
+                                    .catch(e => toast.error(`Delete failed: ${e}`));
+                            }} className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-left text-sm text-red-400 hover:bg-red-500/20">
+                                <span className="block font-medium">Delete job + uploaded parts</span>
+                                <span className="block text-xs text-red-300/70">Permanently delete every uploaded part tracked by this job.</span>
+                            </button>
+                        </div>
+                        <button onClick={() => setSplitDeleteDecision(null)} className="mt-4 w-full rounded-lg px-3 py-2 text-sm text-nobuf-subtext hover:bg-white/5">Keep job</button>
+                    </div>
+                </div>
+            )}
 
             <AnimatePresence>
                 {showSettings && (

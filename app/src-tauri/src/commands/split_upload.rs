@@ -25,7 +25,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::bandwidth::BandwidthManager;
 use crate::commands::fs::upload_file_inner;
-use crate::commands::utils::upload_limit_bytes;
+use crate::commands::utils::{resolve_peer, upload_limit_bytes};
 use crate::commands::TelegramState;
 use crate::no_window::NoWindow;
 
@@ -1317,22 +1317,46 @@ pub fn cmd_list_split_jobs(app: AppHandle) -> Result<Vec<SplitJobInfo>, String> 
 }
 
 #[tauri::command]
-pub fn cmd_discard_split_job(id: String, app: AppHandle) -> Result<(), String> {
-    let temp_dir = {
+pub async fn cmd_discard_split_job(
+    id: String,
+    delete_parts: bool,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<(), String> {
+    let (temp_dir, folder_id, message_ids) = {
         let conn = get_connection(&app)?;
         let mut stmt = conn
-            .prepare("SELECT temp_dir FROM split_upload_jobs WHERE id = ?")
+            .prepare("SELECT temp_dir, folder_id, parts_json FROM split_upload_jobs WHERE id = ?")
             .map_err(|e| e.to_string())?;
         stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
         let mut c = stmt.iter();
         match c.next() {
-            Some(Ok(row)) => vs(&row[0]),
+            Some(Ok(row)) => {
+                let folder_id = match &row[1] {
+                    sqlite::Value::Integer(value) => Some(*value),
+                    _ => None,
+                };
+                let message_ids = parse_parts_json(&vs(&row[2]))
+                    .iter()
+                    .filter_map(|part| part.message_id)
+                    .filter_map(|id| i32::try_from(id).ok())
+                    .collect::<Vec<_>>();
+                (vs(&row[0]), folder_id, message_ids)
+            }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
             None => return Err("Job not found".to_string()),
         }
     };
+    if delete_parts && !message_ids.is_empty() {
+        let client = state.client.lock().await.clone().ok_or("Not connected to Telegram")?;
+        let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
+        client
+            .delete_messages(&peer, &message_ids)
+            .await
+            .map_err(|e| format!("Failed to delete uploaded parts: {}", e))?;
+    }
     // A discarded job will never finish — its drop-staged source is garbage now.
-    // (Read source before the row deletion that follows.)
+    // Read source before deleting the row.
     let src_opt = {
         let conn2 = get_connection(&app)?;
         let mut st2 = conn2.prepare("SELECT source_path FROM split_upload_jobs WHERE id = ?").map_err(|e| e.to_string())?;

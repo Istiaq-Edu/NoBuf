@@ -74,7 +74,7 @@ export function TransferPanel({
         ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading')
         : downloadItems.some(i => i.status === 'pending' || i.status === 'downloading');
     const hasFinished = effectiveTab === 'uploads'
-        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled') || splitJobs.some(j => j.phase === 'done' || j.phase === 'cancelled' || j.phase === 'interrupted')
+        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled') || splitJobs.some(j => j.phase === 'done')
         : downloadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled');
 
     return (
