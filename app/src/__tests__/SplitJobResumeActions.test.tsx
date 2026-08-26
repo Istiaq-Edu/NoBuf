@@ -201,12 +201,30 @@ describe('computeCombinedProgress (group header, plan §C/Q17)', () => {
         expect(r.speedBps).toBe(500);
     });
 
-    it('uses live uploaded bytes as the denominator when persisted part size is not ready', () => {
+    it('uses byte-weighting once every part has a live or persisted size', () => {
         const r = computeCombinedProgress([
-            mk('uploading', 0, { uploadedBytes: 25, speedBps: 10 }),
+            mk('uploading', 25, { uploadedBytes: 25, speedBps: 10 }),
             mk('waiting', 100),
         ], 0, 2);
-        expect(r.pct).toBeCloseTo(25 / 125 * 100);
+        expect(r.pct).toBeCloseTo(20);
+    });
+    it('uses part progress when sizes are unavailable for waiting peers', () => {
+        const r = computeCombinedProgress([
+            mk('uploading', 0, { pct: 80 }),
+            mk('waiting', 0),
+            mk('waiting', 0),
+            mk('waiting', 0),
+        ], 0, 4);
+        expect(r.pct).toBeCloseTo(20);
+    });
+    it('moves with one live part even when waiting placeholders have zero size', () => {
+        const r = computeCombinedProgress([
+            mk('uploading', 100, { uploadedBytes: 50 }),
+            mk('waiting', 0),
+            mk('waiting', 0),
+            mk('waiting', 0),
+        ], 0, 4);
+        expect(r.pct).toBeCloseTo(12.5);
     });
     it('falls back to done-parts fraction when sizes unknown (edge #11)', () => {
         const r = computeCombinedProgress([mk('done', 0), mk('waiting', 0)], 1, 4);

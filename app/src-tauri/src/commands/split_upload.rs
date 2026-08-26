@@ -181,6 +181,17 @@ const SPLIT_RETRY_BUDGET_MS: u64 = 40_000;
 /// Granularity of cancellation polling inside backoff sleeps (§E3/F5).
 const CANCEL_POLL_MS: u64 = 500;
 
+/// Reapply retry intent to a freshly-loaded DB snapshot. The active worker may
+/// have persisted a stale `cancelled` copy after the command wrote `waiting`,
+/// so retry ownership is resolved only at this worker boundary.
+fn apply_retry_indices(parts: &mut [JobPartState], retry_indices: &[u32]) {
+    for part in parts {
+        if retry_indices.contains(&part.idx) && part.status != "done" {
+            part.status = "waiting".to_string();
+        }
+    }
+}
+
 const SPLIT_RETRY_BACKOFF_TOTAL_MS: u64 = SPLIT_RETRY_BACKOFF_MS[0] + SPLIT_RETRY_BACKOFF_MS[1];
 const _: () = assert!(
     SPLIT_RETRY_BACKOFF_TOTAL_MS <= SPLIT_RETRY_BUDGET_MS,
@@ -1192,22 +1203,36 @@ pub async fn cmd_retry_split_part(
         match c.next() {
             Some(Ok(row)) => {
                 let status = vs(&row[0]);
-                if status != "running" && status != "interrupted" && status != "failed" && status != "source_missing" {
+                if status != "running" && status != "uploading" && status != "interrupted" && status != "failed" && status != "source_missing" {
                     return Err(format!("Job is {} — nothing to retry", status));
                 }
                 let mut parts = parse_parts_json(&vs(&row[1]));
-                let part = match parts.iter_mut().find(|p| p.idx == idx) {
-                    Some(p) => p,
-                    None => return Err(format!("No such part index {} in job", idx)),
+                let part_name = {
+                    let part = match parts.iter_mut().find(|p| p.idx == idx) {
+                        Some(p) => p,
+                        None => return Err(format!("No such part index {} in job", idx)),
+                    };
+                    if part.status == "done" {
+                        return Err("That part already uploaded successfully".to_string());
+                    }
+                    if part.status == "waiting" {
+                        return Err("That part is already pending upload".to_string());
+                    }
+                    part.status = "waiting".to_string();
+                    part.name.clone()
                 };
-                if part.status == "done" {
-                    return Err("That part already uploaded successfully".to_string());
-                }
-                if part.status == "waiting" {
-                    return Err("That part is already pending upload".to_string());
-                }
-                part.status = "waiting".to_string();
                 persist_parts(&app_handle, &id, &parts)?;
+                let _ = app_handle.emit(
+                    "split-progress",
+                    SplitProgressPayload {
+                        job_id: id.clone(),
+                        phase: status.clone(),
+                        part_idx: idx,
+                        total_parts: parts.len() as u32,
+                        message: part_name,
+                        part_status: Some("waiting".to_string()),
+                    },
+                );
                 (true, status == "running")
             }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
@@ -1222,7 +1247,10 @@ pub async fn cmd_retry_split_part(
     if was_running {
         let tg = app_handle.state::<TelegramState>();
         let mut cancelled = tg.cancelled_transfers.write().await;
-        cancelled.remove(&format!("split:{}:{}", id, idx));
+        // Do NOT remove the part-cancel token here. The active upload task must
+        // observe it and abort first; retry intent is reconciled by the worker
+        // after cancellation settles. For a not-yet-started part, the pre-split
+        // check below sees retry intent and consumes both tokens atomically.
         cancelled.insert(format!("split-retry:{}:{}", id, idx));
         return Ok(());
     }
@@ -1405,11 +1433,6 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
     let bw = app.state::<BandwidthManager>();
 
     for k in 0..parts.len() {
-        // Skip-set (plan §E1): done parts are complete; `cancelled` parts were
-        // deliberately user-skipped and are NEVER retried automatically (Q15).
-        if parts[k].status == "done" || parts[k].status == "cancelled" {
-            continue;
-        }
         let idx = parts[k].idx;
 
         // A waiting part can be cancelled before this worker reaches it. The
@@ -1417,6 +1440,20 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         // this worker owns an older in-memory snapshot, so the preserved tid
         // is the authoritative skip signal here.
         let part_tid = format!("split:{}:{}", job_id, idx);
+        let retry_tid = format!("split-retry:{}:{}", job_id, idx);
+        if tg.cancelled_transfers.read().await.contains(&retry_tid) {
+            let mut tokens = tg.cancelled_transfers.write().await;
+            tokens.remove(&retry_tid);
+            tokens.remove(&part_tid);
+            parts[k].status = "waiting".to_string();
+            persist_parts(&app, &job_id, &parts)?;
+        }
+
+        // Skip-set (plan §E1): done parts are complete; cancelled parts remain
+        // skipped unless the retry intent above explicitly re-enabled them.
+        if parts[k].status == "done" || parts[k].status == "cancelled" {
+            continue;
+        }
         if tg.cancelled_transfers.read().await.contains(&part_tid) {
             tg.cancelled_transfers.write().await.remove(&part_tid);
             parts[k].status = "cancelled".to_string();
@@ -1522,7 +1559,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         // a sleep takes effect within ~500 ms instead of after up to 30 s.
         let tid = part_tid;
         let mut attempt: u32 = 0;
-        let upload_outcome: Result<(), String> = loop {
+        let upload_outcome: Result<Option<i64>, String> = loop {
             attempt += 1;
             let _ = app.emit(
                 "split-progress",
@@ -1547,7 +1584,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             .await;
 
             match res {
-                Ok(_) => break Ok(()),
+                Ok((_, message_id)) => break Ok(message_id),
                 Err(e) => {
                     let job_cancel = tg
                         .cancelled_transfers
@@ -1572,7 +1609,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                                 part_status: Some("cancelled".into()),
                             },
                         );
-                        break Ok(()); // part resolved as cancelled; not an error
+                        break Ok(None); // part resolved as cancelled; not an error
                     }
                     let retryable = !job_cancel && !part_cancel && attempt < SPLIT_PART_MAX_ATTEMPTS;
                     if retryable {
@@ -1604,12 +1641,12 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         delete_temp_later(temp_path.to_string_lossy().to_string());
 
         match upload_outcome {
-            Ok(()) => {
+            Ok(message_id) => {
                 // A part that was cancelled inside the loop above already has
                 // status "cancelled" persisted — don't overwrite it with done.
                 if parts[k].status == "waiting" || parts[k].status == "uploading" {
                     parts[k].status = "done".to_string();
-                    // messageId for the cancelled case stays None (no send).
+                    parts[k].message_id = message_id;
                     parts[k].size_bytes = _final_size;
                     persist_parts(&app, &job_id, &parts)?;
                     let _ = app.emit(
@@ -1667,15 +1704,45 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
     // A per-part retry can be requested while the worker is still active. Keep
     // the same pipeline owner and reload the DB snapshot before deciding the
     // job is complete.
-    let retry_requested = {
+    let retry_indices: Vec<u32> = {
         let tg = app.state::<TelegramState>();
         let set = tg.cancelled_transfers.read().await;
-        set.iter().any(|t| t == &format!("split-retry:{}:", job_id) || t.starts_with(&format!("split-retry:{}:", job_id)))
+        set.iter()
+            .filter_map(|t| t.strip_prefix(&format!("split-retry:{}:", job_id)))
+            .filter_map(|idx| idx.parse::<u32>().ok())
+            .collect()
     };
-    if retry_requested {
+    if !retry_indices.is_empty() {
         let tg = app.state::<TelegramState>();
         tg.cancelled_transfers.write().await.retain(|t| !t.starts_with(&format!("split-retry:{}:", job_id)));
+        // The active worker may have persisted its stale in-memory `cancelled`
+        // snapshot after the command wrote `waiting`. Reapply retry intent at
+        // the ownership boundary immediately before the next pass reloads DB.
+        let mut latest_parts = {
+            let conn = get_connection(&app)?;
+            let mut stmt = conn
+                .prepare("SELECT parts_json FROM split_upload_jobs WHERE id = ?")
+                .map_err(|e| e.to_string())?;
+            stmt.bind((1, job_id.as_str())).map_err(|e| e.to_string())?;
+            let mut rows = stmt.iter();
+            match rows.next() {
+                Some(Ok(row)) => parse_parts_json(&vs(&row[0])),
+                _ => return Err("job row vanished before retry".to_string()),
+            }
+        };
+        apply_retry_indices(&mut latest_parts, &retry_indices);
+        persist_parts(&app, &job_id, &latest_parts)?;
         return run_job(app, job_id).await;
+    }
+
+    // A job with deliberately skipped parts is not fully complete. Keep its
+    // source available and expose Retry/Clear rather than claiming success and
+    // deleting a drag-staged source that retry still needs.
+    if parts.iter().any(|part| part.status == "cancelled") {
+        update_status_quiet(&app, &job_id, "interrupted", Some("One or more parts were skipped".into()));
+        let a2 = app.clone();
+        tokio::spawn(async move { promote_queued_jobs(a2).await });
+        return Ok(());
     }
     update_status_quiet(&app, &job_id, "done", None);
     // Drop-staged sources are %TEMP% copies; once every part is uploaded they

@@ -34,7 +34,7 @@ import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
-import { removeSplitRow, clearFinishedSplitRows } from '../hooks/useSplitUpload';
+import { removeSplitRow } from '../hooks/useSplitUpload';
 import { SplitUploadModal } from './dashboard/SplitUploadModal';
 import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
@@ -1195,7 +1195,16 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                             .catch(e => toast.error(`Delete failed: ${e}`));
                     });
                 }}
-                onClearFinishedSplitJobs={clearFinishedSplitRows}
+                onClearFinishedSplitJobs={() => {
+                    const terminal = splitJobRows.filter(j => j.phase === 'done' || j.phase === 'cancelled' || j.phase === 'interrupted');
+                    void Promise.allSettled(terminal.map(async job => {
+                        await invoke('cmd_discard_split_job', { id: job.jobId });
+                        removeSplitRow(job.jobId);
+                    })).then(results => {
+                        const failed = results.filter(r => r.status === 'rejected').length;
+                        if (failed > 0) toast.error(`Couldn't clear ${failed} split ${failed === 1 ? 'job' : 'jobs'}`);
+                    });
+                }}
                 onCancelSplitPart={(jobId, idx) => {
                     void invoke('cmd_cancel_transfer', { transferId: `split:${jobId}:${idx}` })
                         .catch(e => toast.error(`Cancel failed: ${e}`));

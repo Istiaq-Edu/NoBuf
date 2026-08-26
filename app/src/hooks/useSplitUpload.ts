@@ -67,13 +67,12 @@ export function computeCombinedProgress(
     totalParts: number,
 ): { pct: number; speedBps: number } {
     const list = Array.isArray(parts) ? parts : [];
-    const known = list.filter(p => p.sizeBytes > 0 || typeof p.uploadedBytes === 'number');
-    if (known.length > 0 && known.length === list.length) {
+    if (list.length > 0 && list.every(p => p.sizeBytes > 0)) {
         let done = 0;
         let total = 0;
         let speed = 0;
         for (const p of list) {
-            const size = p.sizeBytes > 0 ? p.sizeBytes : (p.uploadedBytes ?? 0);
+            const size = p.sizeBytes;
             total += size;
             speed += p.speedBps ?? 0;
             if (p.status === 'done') done += size;
@@ -82,8 +81,17 @@ export function computeCombinedProgress(
         }
         return { pct: total > 0 ? (done / total) * 100 : 0, speedBps: speed };
     }
-    // Fallback: done-parts ratio (sizes not yet persisted or old rows).
-    const pct = totalParts > 0 ? (doneParts / totalParts) * 100 : 0;
+    // Part-weighted fallback. A live pct must move the group even while all
+    // waiting peers are zero-sized placeholders.
+    const completed = list.reduce((sum, part) => {
+        if (part.status === 'done') return sum + 1;
+        if (typeof part.pct === 'number') return sum + Math.max(0, Math.min(100, part.pct)) / 100;
+        if (part.sizeBytes > 0 && typeof part.uploadedBytes === 'number') {
+            return sum + Math.max(0, Math.min(1, part.uploadedBytes / part.sizeBytes));
+        }
+        return sum;
+    }, 0);
+    const pct = totalParts > 0 ? Math.min(100, (Math.max(doneParts, completed) / totalParts) * 100) : 0;
     const speed = list.reduce((s, p) => s + (p.speedBps ?? 0), 0);
     return { pct, speedBps: speed };
 }
@@ -126,6 +134,25 @@ export function countActiveSplitJobs(jobs: Array<{ phase: string }> | undefined)
     return (jobs ?? []).filter(j => ['queued', 'running', 'splitting', 'uploading'].includes(j.phase)).length;
 }
 
+export interface SplitUploadProgressPayload {
+    id: string;
+    percent: number;
+    uploaded_bytes?: number;
+    total_bytes?: number;
+    speed_bytes_per_sec?: number;
+    uploadedBytes?: number;
+    totalBytes?: number;
+    speedBytesPerSec?: number;
+}
+
+export function normalizeSplitUploadProgress(payload: SplitUploadProgressPayload) {
+    return {
+        uploadedBytes: payload.uploaded_bytes ?? payload.uploadedBytes ?? 0,
+        totalBytes: payload.total_bytes ?? payload.totalBytes ?? 0,
+        speedBps: payload.speed_bytes_per_sec ?? payload.speedBytesPerSec ?? 0,
+    };
+}
+
 /** Module-level store so multiple hook instances share one source of truth. */
 const splitRows = new Map<string, SplitJobRow>();
 const splitRowListeners = new Set<() => void>();
@@ -142,16 +169,6 @@ function notifySplitRows() {
 /** Remove a job's row entirely (Discard/Delete) so it leaves the panel at once. */
 export function removeSplitRow(jobId: string) {
     splitRows.delete(jobId);
-    notifySplitRows();
-}
-
-/** Remove split groups that have reached a terminal state. */
-export function clearFinishedSplitRows() {
-    for (const [jobId, row] of splitRows) {
-        if (row.phase === 'done' || row.phase === 'cancelled' || row.phase === 'interrupted') {
-            splitRows.delete(jobId);
-        }
-    }
     notifySplitRows();
 }
 
@@ -252,24 +269,23 @@ async function ensureProgressListener() {
             // Byte-level per-part progress ALREADY FLOWS under split:<job>:<idx>
             // tids (fs.rs emits them for every upload with a tid); nothing
             // consumed them before this listener existed (plan seam #a).
-            await listen<{
-                id: string; percent: number; uploaded_bytes: number;
-                total_bytes: number; speed_bytes_per_sec: number;
-            }>('upload-progress', (ev) => {
-                const parsed = parseSplitUploadTid(ev.payload.id);
+            await listen<SplitUploadProgressPayload>('upload-progress', (ev) => {
+                const payload = ev.payload;
+                const parsed = parseSplitUploadTid(payload.id);
                 if (!parsed) return; // non-split uploads belong to useFileUpload
                 const job = splitRows.get(parsed.jobId);
                 if (!job) return;
+                const { uploadedBytes, totalBytes, speedBps } = normalizeSplitUploadProgress(payload);
                 upsertSplitRow({
                     jobId: parsed.jobId,
                     parts: job.parts.map(part =>
                         part.idx === parsed.idx
                             ? {
                                 ...part,
-                                sizeBytes: ev.payload.total_bytes > 0 ? ev.payload.total_bytes : part.sizeBytes,
-                                pct: ev.payload.percent,
-                                speedBps: ev.payload.speed_bytes_per_sec,
-                                uploadedBytes: ev.payload.uploaded_bytes,
+                                sizeBytes: totalBytes > 0 ? totalBytes : part.sizeBytes,
+                                pct: payload.percent,
+                                speedBps,
+                                uploadedBytes,
                             }
                             : part,
                     ),
