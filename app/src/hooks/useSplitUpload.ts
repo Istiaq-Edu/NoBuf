@@ -165,13 +165,30 @@ function applySplitProgress(p: {
     message: string; partStatus?: string | null;
 }) {
     const prev = splitRows.get(p.jobId);
-    // Terminal per-part flip rides partStatus — update that ONE part only.
+    // Synthesize placeholder part rows from totalParts if hydration never
+    // populated them (job started THIS session — hydration only runs once).
     let parts = prev?.parts ?? [];
-    if (p.partStatus && p.partIdx >= 1) {
-        parts = parts.map(part =>
-            part.idx === p.partIdx ? { ...part, status: p.partStatus! } : part,
-        );
+    if (parts.length === 0 && p.totalParts > 0) {
+        parts = Array.from({ length: p.totalParts }, (_, i) => ({
+            idx: i + 1,
+            name: '',
+            status: 'waiting',
+            messageId: null as number | null,
+            sizeBytes: 0,
+        }));
     }
+    // Live phase marks the CURRENT part splitting/uploading.
+    const liveIdx = p.partStatus ? p.partIdx : (p.phase === 'splitting' || p.phase === 'uploading' ? p.partIdx : 0);
+    parts = parts.map(part => {
+        let next = { ...part };
+        if (p.partStatus && part.idx === p.partIdx) {
+            next.status = p.partStatus; // authoritative terminal flip
+        } else if (!p.partStatus && part.idx === liveIdx && part.status === 'waiting' && (p.phase === 'splitting' || p.phase === 'uploading')) {
+            next.status = p.phase; // transient live status
+        }
+        if (part.idx === liveIdx && !next.name && p.message) next.name = p.message;
+        return next;
+    });
     // Recompute doneParts from actual part statuses when we have them —
     // partIdx is an IN-PROGRESS index during splitting, not a count
     // (investigator-verified misread in the old code).
