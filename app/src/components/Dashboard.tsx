@@ -367,6 +367,33 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         enabled: !!store && !isPublicView && vault.ready,
     });
 
+    // documents-changed (parts-first plan §A): the backend emits this after
+    // EVERY successful send_message across all three upload pipelines (picker,
+    // remote-URL, browser-drop). Debounced 300 ms because cmd_get_files
+    // re-paginates the whole peer per fetch and split parts land in bursts.
+    useEffect(() => {
+        let disposed = false;
+        let timer: number | undefined;
+        (async () => {
+            try {
+                const { listen } = await import('@tauri-apps/api/event');
+                await listen<{ folder_id?: number | null }>('documents-changed', () => {
+                    if (disposed) return;
+                    window.clearTimeout(timer);
+                    timer = window.setTimeout(() => {
+                        if (!disposed) queryClient.invalidateQueries({ queryKey: ['files'] });
+                    }, 300);
+                });
+            } catch (e) {
+                console.warn('[documents-changed] listener attach failed', e);
+            }
+        })();
+        return () => {
+            disposed = true;
+            window.clearTimeout(timer);
+        };
+    }, [queryClient]);
+
     const allFiles = isPublicView ? pubChannelFiles : nbFiles;
     const isLoading = isPublicView ? pubFilesLoading : nbFilesLoading;
 
