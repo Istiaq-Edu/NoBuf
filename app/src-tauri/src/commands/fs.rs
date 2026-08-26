@@ -527,6 +527,34 @@ pub fn effective_document_name(display_name: &Option<String>, path: &str) -> Str
 /// Returns (status string, Telegram message id of the sent document). The
 /// message id is None on the mock path; the command wrapper flattens to the
 /// status string for backward compatibility.
+/// True when this transfer id belongs to the split-upload orchestrator.
+/// fs.rs must NOT consume its cancel marker at the checkpoint checks — the
+/// orchestrator's Err branch observes the tid to classify part-cancel vs
+/// genuine failure (parts-first plan §E2/F1) and removes it itself.
+fn split_owns_tid(tid: &str) -> bool {
+    tid.starts_with("split:")
+}
+
+#[cfg(test)]
+mod split_owns_tid_tests {
+    use super::split_owns_tid;
+
+    #[test]
+    fn split_tids_are_owned_by_the_orchestrator() {
+        assert!(split_owns_tid("split:4d97551e4dfda631253019b92e4b5000:2"));
+        assert!(split_owns_tid("split:abc:1"));
+    }
+
+    #[test]
+    fn non_split_tids_are_consumed_normally() {
+        assert!(!split_owns_tid("upload-123"));
+        assert!(!split_owns_tid(""));
+        // The job-level cancel token is NOT a part tid — it is consumed by no
+        // one (purged by resume/retry instead), so it is not "owned" here.
+        assert!(!split_owns_tid("split-cancel:4d97551e"));
+    }
+}
+
 pub(crate) async fn upload_file_inner(
     app_handle: &tauri::AppHandle,
     state: &TelegramState,
@@ -602,7 +630,7 @@ pub(crate) async fn upload_file_inner(
     // For `split:`-prefixed tids the tid is NOT consumed here: the split
     // orchestrator's Err branch must still observe it to classify part-cancel
     // vs genuine failure (parts-first plan §E2). The orchestrator removes it.
-    let preserve_tid = tid.starts_with("split:");
+    let preserve_tid = split_owns_tid(&tid);
     if state.cancelled_transfers.read().await.contains(&tid) {
         if !preserve_tid {
             state.cancelled_transfers.write().await.remove(&tid);
