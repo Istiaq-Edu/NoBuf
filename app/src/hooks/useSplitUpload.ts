@@ -56,12 +56,57 @@ export function selectResumableJobs(jobs: Array<{ id: string; status: string }>)
     return jobs.filter(j => j.status === 'interrupted').map(j => j.id);
 }
 
+/**
+ * Combined group-header progress (plan §C/Q17). Byte-weighted when part sizes
+ * are known; falls back to the done-parts fraction when any size is unknown
+ * (edge #11). Pure + exported for unit testing.
+ */
+export function computeCombinedProgress(
+    parts: Array<{ status: string; sizeBytes: number; uploadedBytes?: number; pct?: number; speedBps?: number }> | undefined,
+    doneParts: number,
+    totalParts: number,
+): { pct: number; speedBps: number } {
+    const list = Array.isArray(parts) ? parts : [];
+    const known = list.filter(p => p.sizeBytes > 0);
+    if (known.length > 0 && known.length === list.length) {
+        let done = 0;
+        let total = 0;
+        let speed = 0;
+        for (const p of list) {
+            total += p.sizeBytes;
+            speed += p.speedBps ?? 0;
+            if (p.status === 'done') done += p.sizeBytes;
+            else if (typeof p.uploadedBytes === 'number') done += Math.min(p.uploadedBytes, p.sizeBytes);
+            else if (typeof p.pct === 'number') done += p.sizeBytes * Math.min(p.pct, 100) / 100;
+        }
+        return { pct: total > 0 ? (done / total) * 100 : 0, speedBps: speed };
+    }
+    // Fallback: done-parts ratio (sizes not yet persisted or old rows).
+    const pct = totalParts > 0 ? (doneParts / totalParts) * 100 : 0;
+    const speed = list.reduce((s, p) => s + (p.speedBps ?? 0), 0);
+    return { pct, speedBps: speed };
+}
+
 
 // ---------------------------------------------------------------------------
 // Live split-job rows for the Transfers panel.
 // Fed by the backend `split-progress` events; initial state comes from the DB
 // via cmd_list_split_jobs so rows survive app restarts.
 // ---------------------------------------------------------------------------
+
+/** Per-part live state for the expanded group view (parts-first §C). */
+export interface SplitPartRow {
+    idx: number;
+    name: string;
+    status: string;
+    messageId: number | null;
+    sizeBytes: number;
+    /** 0-100, live from upload-progress events (undefined = not yet uploading). */
+    pct?: number;
+    /** bytes/sec, live. */
+    speedBps?: number;
+    uploadedBytes?: number;
+}
 
 export interface SplitJobRow {
     jobId: string;
@@ -71,12 +116,15 @@ export interface SplitJobRow {
     doneParts: number;
     totalParts: number;
     currentPart: string;
+    folderId: number | null;
+    parts: SplitPartRow[];
 }
 
 /** Module-level store so multiple hook instances share one source of truth. */
 const splitRows = new Map<string, SplitJobRow>();
 const splitRowListeners = new Set<() => void>();
 let progressListenerAttached = false;
+let uploadProgressListenerAttached = false;
 /** Startup resume notice fires ONCE per webview lifetime, not per remount
  *  (StrictMode dev double-mounts would otherwise toast twice). */
 let startupNoticeFired = false;
@@ -94,35 +142,96 @@ function upsertSplitRow(row: Partial<SplitJobRow> & { jobId: string }) {
         doneParts: row.doneParts ?? prev?.doneParts ?? 0,
         totalParts: row.totalParts ?? prev?.totalParts ?? 0,
         currentPart: row.currentPart ?? prev?.currentPart ?? '',
+        folderId: row.folderId ?? prev?.folderId ?? null,
+        parts: row.parts ?? prev?.parts ?? [],
     });
     notifySplitRows();
 }
 
-/** Attach ONE Tauri event listener for the lifetime of the webview. */
+/**
+ * Pure tid matcher for split per-part upload-progress events (plan §C).
+ * `split:<jobId>:<idx>` — jobId is a 32-hex string so it can contain no ':'.
+ * Exported + unit-tested (mutation-checked) per nobuf-vitest-testing rules.
+ */
+export function parseSplitUploadTid(tid: string): { jobId: string; idx: number } | null {
+    const m = /^split:(.+):(\d+)$/.exec(tid);
+    if (!m || m[1].includes(':')) return null;
+    const idx = Number(m[2]);
+    return idx > 0 ? { jobId: m[1], idx } : null;
+}
+
+function applySplitProgress(p: {
+    jobId: string; phase: string; partIdx: number; totalParts: number;
+    message: string; partStatus?: string | null;
+}) {
+    const prev = splitRows.get(p.jobId);
+    // Terminal per-part flip rides partStatus — update that ONE part only.
+    let parts = prev?.parts ?? [];
+    if (p.partStatus && p.partIdx >= 1) {
+        parts = parts.map(part =>
+            part.idx === p.partIdx ? { ...part, status: p.partStatus! } : part,
+        );
+    }
+    // Recompute doneParts from actual part statuses when we have them —
+    // partIdx is an IN-PROGRESS index during splitting, not a count
+    // (investigator-verified misread in the old code).
+    const doneCount = parts.length > 0
+        ? parts.filter(x => x.status === 'done').length
+        : undefined;
+    upsertSplitRow({
+        jobId: p.jobId,
+        phase: p.phase,
+        totalParts: p.totalParts || prev?.totalParts || 0,
+        currentPart: p.message,
+        doneParts: doneCount,
+        parts,
+        displayName: prev?.displayName,
+    });
+}
+
+/** Attach ONE Tauri event listener pair for the lifetime of the webview. */
 async function ensureProgressListener() {
-    if (progressListenerAttached) return;
-    progressListenerAttached = true;
     try {
         const { listen } = await import('@tauri-apps/api/event');
-        await listen<{ jobId: string; phase: string; partIdx: number; totalParts: number; message: string }>(
-            'split-progress',
-            (ev) => {
-                const p = ev.payload;
-                const prev = splitRows.get(p.jobId);
+        if (!progressListenerAttached) {
+            progressListenerAttached = true;
+            await listen<{
+                jobId: string; phase: string; partIdx: number; totalParts: number;
+                message: string; partStatus?: string | null;
+            }>('split-progress', (ev) => applySplitProgress(ev.payload));
+        }
+        if (!uploadProgressListenerAttached) {
+            uploadProgressListenerAttached = true;
+            // Byte-level per-part progress ALREADY FLOWS under split:<job>:<idx>
+            // tids (fs.rs emits them for every upload with a tid); nothing
+            // consumed them before this listener existed (plan seam #a).
+            await listen<{
+                id: string; percent: number; uploaded_bytes: number;
+                total_bytes: number; speed_bytes_per_sec: number;
+            }>('upload-progress', (ev) => {
+                const parsed = parseSplitUploadTid(ev.payload.id);
+                if (!parsed) return; // non-split uploads belong to useFileUpload
+                const job = splitRows.get(parsed.jobId);
+                if (!job) return;
                 upsertSplitRow({
-                    jobId: p.jobId,
-                    phase: p.phase,
-                    doneParts: p.partIdx,
-                    totalParts: p.totalParts,
-                    currentPart: p.message,
-                    // display name survives via prev
-                    displayName: prev?.displayName,
+                    jobId: parsed.jobId,
+                    parts: job.parts.map(part =>
+                        part.idx === parsed.idx
+                            ? {
+                                ...part,
+                                pct: ev.payload.percent,
+                                speedBps: ev.payload.speed_bytes_per_sec,
+                                uploadedBytes: ev.payload.uploaded_bytes,
+                            }
+                            : part,
+                    ),
                 });
-            },
-        );
+            });
+        }
     } catch (e) {
         console.warn('[split-rows] listener attach failed', e);
         progressListenerAttached = false;
+        uploadProgressListenerAttached = false;
     }
 }
 
@@ -227,6 +336,8 @@ export function useSplitUpload() {
                 const jobs = await invoke<Array<{
                     id: string; displayName: string; status: string;
                     totalParts: number; doneParts: number; error?: string | null;
+                    folderId?: number | null;
+                    parts?: Array<{ idx: number; name: string; status: string; messageId: number | null; sizeBytes: number }>;
                 }>>('cmd_list_split_jobs');
                 for (const j of jobs) {
                     if (j.status === 'done' || j.status === 'cancelled') continue;
@@ -237,6 +348,8 @@ export function useSplitUpload() {
                         doneParts: j.doneParts ?? 0,
                         totalParts: j.totalParts ?? 0,
                         currentPart: j.error ?? '',
+                        folderId: j.folderId ?? null,
+                        parts: (j.parts ?? []).map(p => ({ ...p })),
                     });
                 }
                 notifySplitRows();

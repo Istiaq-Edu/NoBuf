@@ -1,6 +1,7 @@
 ﻿import { useState } from 'react';
-import { Upload, Download, X, RotateCcw, AlertCircle, Check, Scissors } from 'lucide-react';
+import { Upload, Download, X, RotateCcw, AlertCircle, Check, Scissors, ChevronDown, ChevronRight, Play } from 'lucide-react';
 import { QueueItem, DownloadItem } from '../../types';
+import { SplitJobRow, SplitPartRow, computeCombinedProgress } from '../../hooks/useSplitUpload';
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
@@ -8,6 +9,11 @@ function formatBytes(bytes: number): string {
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+function formatSpeed(bps?: number): string {
+    if (!bps || bps <= 0) return '';
+    return `${formatBytes(bps)}/s`;
 }
 
 type Tab = 'uploads' | 'downloads';
@@ -18,10 +24,14 @@ interface TransferPanelProps {
     // Upload props
     uploadItems: QueueItem[];
     stagingItems?: { name: string; pct: number }[];
-    splitJobs?: { jobId: string; displayName: string; phase: string; doneParts: number; totalParts: number; currentPart: string }[];
+    splitJobs?: SplitJobRow[];
     onCancelSplitJob?: (jobId: string) => void;
     onResumeSplitJob?: (jobId: string) => void;
     onDiscardSplitJob?: (jobId: string) => void;
+    onCancelSplitPart?: (jobId: string, idx: number) => void;
+    onRetrySplitPart?: (jobId: string, idx: number) => void;
+    onPlaySplitPart?: (jobId: string, idx: number) => void;
+    onDownloadSplitPart?: (jobId: string, idx: number) => void;
     onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
@@ -37,10 +47,19 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
+    /** Expanded split-group jobIds (per-part rows visible). */
+    const [expandedJobIds, setExpandedJobIds] = useState<Set<string>>(new Set());
+    const toggleExpanded = (jobId: string) => {
+        setExpandedJobIds(prev => {
+            const next = new Set(prev);
+            if (next.has(jobId)) next.delete(jobId); else next.add(jobId);
+            return next;
+        });
+    };
 
     const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length + stagingItems.length;
     const downloadActive = downloadItems.filter(i => i.status === 'pending' || i.status === 'downloading').length;
@@ -150,49 +169,48 @@ export function TransferPanel({
 
             {/* Items list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                {/* Staging rows: dropped files being copied to %TEMP% before entering the queue */}
+                {/* Split-job GROUP rows: collapsible header (combined % + speed) expanding
+                    to per-part rows with per-part actions (parts-first plan §C). */}
                 {effectiveTab === 'uploads' && splitJobs.map(j => {
-                    // Phase → visual language: spinner=working, dot=waiting, check/x=terminal.
-                    const pctNum = j.totalParts > 0 ? Math.round((j.doneParts / j.totalParts) * 100) : (j.phase === 'queued' ? 0 : j.phase === 'done' ? 100 : 5);
+                    const active = j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading';
+                    const combined = computeCombinedProgress(j.parts, j.doneParts, j.totalParts);
+                    const pctNum = Math.round(combined.pct);
+                    const expanded = expandedJobIds.has(j.jobId);
+                    const hasPartRows = (j.parts?.length ?? 0) > 0;
                     const phaseLabel =
                         j.phase === 'queued' ? 'queued — waiting for current split to finish'
-                        : j.phase === 'preparing' ? 'analyzing video…'
-                        : j.phase === 'splitting' ? `splitting part ${j.doneParts + 1}/${j.totalParts || '?'}`
-                        : j.phase === 'uploading' ? `uploading part ${Math.min(j.doneParts + 1, j.totalParts)}/${j.totalParts} (${pctNum}%)`
-                        : j.phase === 'interrupted' ? 'paused — will resume from last part'
+                        : j.phase === 'splitting' ? `splitting part ${Math.min(j.doneParts + 1, j.totalParts || 1)}/${j.totalParts}`
+                        : j.phase === 'uploading' ? `uploading — ${j.doneParts}/${j.totalParts} done (${pctNum}%)`
+                        : j.phase === 'interrupted' ? 'paused — resume or retry parts below'
                         : j.phase === 'cancelled' ? 'cancelled'
                         : j.phase;
-                    const active = j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading' || j.phase === 'preparing';
                     return (
                         <div key={j.jobId} className={`flex flex-col gap-1 p-2.5 rounded-lg ${active ? 'bg-nobuf-primary/10 border border-nobuf-primary/30' : 'bg-nobuf-hover'}`}>
                             <div className="flex items-center gap-3 text-sm">
-                                <div className="flex-shrink-0">
-                                    {j.phase === 'queued' && (
-                                        <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
-                                            <div className="w-2 h-2 bg-yellow-500 rounded-full" />
-                                        </div>
-                                    )}
-                                    {active && (
-                                        <div className="w-4 h-4 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />
-                                    )}
-                                    {j.phase === 'done' && (
-                                        <div className="w-4 h-4 rounded-full bg-green-500/20 flex items-center justify-center">
-                                            <Check className="w-3 h-3 text-green-500" />
-                                        </div>
-                                    )}
-                                    {(j.phase === 'interrupted') && (
-                                        <div className="w-4 h-4 rounded-full bg-orange-500/20 flex items-center justify-center">
-                                            <AlertCircle className="w-3 h-3 text-orange-400" />
-                                        </div>
-                                    )}
-                                </div>
+                                <button
+                                    className="flex-shrink-0 disabled:opacity-40"
+                                    disabled={!hasPartRows}
+                                    onClick={() => toggleExpanded(j.jobId)}
+                                    title={expanded ? 'Hide individual parts' : 'Show individual parts'}
+                                >
+                                    {hasPartRows && expanded
+                                        ? <ChevronDown className="w-4 h-4 text-nobuf-subtext" />
+                                        : hasPartRows
+                                            ? <ChevronRight className="w-4 h-4 text-nobuf-subtext" />
+                                            : <StatusDot phase={j.phase} />}
+                                </button>
                                 <div className="flex-1 min-w-0">
                                     <div className="text-nobuf-text text-xs truncate break-all leading-snug flex items-center gap-1.5">
                                         <Scissors className="w-3 h-3 text-nobuf-primary shrink-0" />
                                         <span className="truncate">{j.displayName}</span>
                                         <span className="text-[9px] uppercase tracking-wide font-semibold px-1 py-px rounded bg-black/30 text-nobuf-subtext shrink-0">split</span>
                                     </div>
-                                    <div className="text-[10px] text-nobuf-subtext mt-0.5 truncate">{phaseLabel}</div>
+                                    <div className="text-[10px] text-nobuf-subtext mt-0.5 truncate flex items-center gap-2">
+                                        <span>{phaseLabel}</span>
+                                        {active && combined.speedBps > 0 && (
+                                            <span className="text-nobuf-primary">{formatSpeed(combined.speedBps)}</span>
+                                        )}
+                                    </div>
                                 </div>
                                 {onCancelSplitJob && active && (
                                     <button
@@ -209,7 +227,7 @@ export function TransferPanel({
                                             <button
                                                 onClick={() => onResumeSplitJob(j.jobId)}
                                                 className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-nobuf-primary/15 text-nobuf-primary hover:bg-nobuf-primary/25 transition-colors"
-                                                title="Resume this split job"
+                                                title="Resume this split job (skips parts you cancelled)"
                                             >
                                                 <RotateCcw className="w-3 h-3" />
                                                 Resume
@@ -219,7 +237,7 @@ export function TransferPanel({
                                             <button
                                                 onClick={() => onDiscardSplitJob(j.jobId)}
                                                 className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400/80 hover:bg-red-500/20 hover:text-red-400 transition-colors"
-                                                title="Discard this job — deletes finished parts and temp data"
+                                                title="Discard this job — deletes the job record and temp files"
                                             >
                                                 <X className="w-3 h-3" />
                                                 Delete
@@ -236,6 +254,17 @@ export function TransferPanel({
                                     />
                                 </div>
                             )}
+                            {expanded && hasPartRows && j.parts.map(part => (
+                                <SplitPartRowView
+                                    key={`${j.jobId}-${part.idx}`}
+                                    jobPhase={j.phase}
+                                    part={part}
+                                    onCancel={onCancelSplitPart ? () => onCancelSplitPart(j.jobId, part.idx) : undefined}
+                                    onRetry={onRetrySplitPart ? () => onRetrySplitPart(j.jobId, part.idx) : undefined}
+                                    onPlay={onPlaySplitPart ? () => onPlaySplitPart(j.jobId, part.idx) : undefined}
+                                    onDownload={onDownloadSplitPart ? () => onDownloadSplitPart(j.jobId, part.idx) : undefined}
+                                />
+                            ))}
                         </div>
                     );
                 })}
@@ -385,3 +414,99 @@ export function TransferPanel({
         </>
     );
 }
+
+/** Status glyph for a split-group header when there are no part rows to expand. */
+function StatusDot({ phase }: { phase: string }) {
+    const active = phase === 'running' || phase === 'splitting' || phase === 'uploading';
+    if (phase === 'queued') {
+        return (
+            <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
+                <div className="w-2 h-2 bg-yellow-500 rounded-full" />
+            </div>
+        );
+    }
+    if (active) {
+        return <div className="w-4 h-4 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />;
+    }
+    if (phase === 'done') {
+        return (
+            <div className="w-4 h-4 rounded-full bg-green-500/20 flex items-center justify-center">
+                <Check className="w-3 h-3 text-green-500" />
+            </div>
+        );
+    }
+    return (
+        <div className="w-4 h-4 rounded-full bg-orange-500/20 flex items-center justify-center">
+            <AlertCircle className="w-3 h-3 text-orange-400" />
+        </div>
+    );
+}
+
+/**
+ * One per-part row inside an expanded split group. Action gating per plan §C:
+ * uploading → Cancel(part) · failed/cancelled → Retry/Re-include ·
+ * done → Play + Download · waiting → none.
+ */
+export function SplitPartRowView({
+    part, jobPhase, onCancel, onRetry, onPlay, onDownload,
+}: {
+    part: SplitPartRow;
+    jobPhase: string;
+    onCancel?: () => void;
+    onRetry?: () => void;
+    onPlay?: () => void;
+    onDownload?: () => void;
+}) {
+    // While the JOB is running, an in-flight part shows live pct/speed; the
+    // backend's authoritative status word arrives via partStatus flips.
+    const live = part.status === 'uploading' || part.pct !== undefined && part.pct < 100 && jobPhase === 'uploading' && !['done', 'cancelled', 'failed'].includes(part.status);
+    const statusLabel =
+        part.status === 'waiting' ? 'waiting'
+        : part.status === 'uploading' ? `uploading${part.pct !== undefined ? ` ${Math.round(part.pct)}%` : ''}${part.speedBps ? ` · ${formatSpeed(part.speedBps)}` : ''}`
+        : part.status === 'done' ? formatBytes(part.sizeBytes)
+        : part.status === 'cancelled' ? 'skipped'
+        : part.status === 'failed' ? 'failed'
+        : part.status;
+    return (
+        <div
+            data-part-row={part.idx}
+            className={`flex items-center gap-2 pl-7 pr-1 py-1 rounded-md text-[11px] ${live ? 'bg-nobuf-primary/5' : ''}`}
+        >
+            <span className={`font-mono w-8 shrink-0 ${live ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
+                #{String(part.idx).padStart(2, '0')}
+            </span>
+            <span className="flex-1 min-w-0 truncate text-nobuf-text">{part.name}</span>
+            <span className={`shrink-0 tabular-nums ${live ? 'text-nobuf-primary' : part.status === 'failed' ? 'text-red-400' : part.status === 'cancelled' ? 'text-white/40' : 'text-nobuf-subtext'}`}>
+                {statusLabel}
+            </span>
+            <div className="flex items-center gap-1 shrink-0">
+                {live && onCancel && (
+                    <button onClick={onCancel} title="Cancel this part — other parts are unaffected"
+                        className="text-gray-400 hover:text-red-400 transition-colors p-0.5">
+                        <X className="w-3 h-3" />
+                    </button>
+                )}
+                {(part.status === 'failed' || part.status === 'cancelled') && onRetry && (
+                    <button onClick={onRetry}
+                        title={part.status === 'cancelled' ? 'Re-include this part and continue' : 'Retry this part'}
+                        className="flex items-center gap-0.5 text-nobuf-primary hover:text-nobuf-text transition-colors px-1 py-0.5 rounded bg-nobuf-primary/10 hover:bg-nobuf-primary/20">
+                        <RotateCcw className="w-3 h-3" /> Retry
+                    </button>
+                )}
+                {part.status === 'done' && part.messageId != null && onPlay && (
+                    <button onClick={onPlay} title="Play this part from its own beginning"
+                        className="text-nobuf-subtext hover:text-nobuf-primary transition-colors p-0.5">
+                        <Play className="w-3 h-3" />
+                    </button>
+                )}
+                {part.status === 'done' && part.messageId != null && onDownload && (
+                    <button onClick={onDownload} title="Download this part to your PC"
+                        className="text-nobuf-subtext hover:text-green-400 transition-colors p-0.5">
+                        <Download className="w-3 h-3" />
+                    </button>
+                )}
+            </div>
+        </div>
+    );
+}
+

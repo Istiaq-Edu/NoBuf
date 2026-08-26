@@ -1194,6 +1194,35 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                             .catch(e => toast.error(`Delete failed: ${e}`));
                     });
                 }}
+                onCancelSplitPart={(jobId, idx) => {
+                    void invoke('cmd_cancel_transfer', { transferId: `split:${jobId}:${idx}` })
+                        .catch(e => toast.error(`Cancel failed: ${e}`));
+                }}
+                onRetrySplitPart={(jobId, idx) => {
+                    void invoke('cmd_retry_split_part', { id: jobId, idx })
+                        .then(() => toast.success(`Retrying part #${String(idx).padStart(2, '0')}`))
+                        .catch(e => toast.error(`Retry failed: ${e}`));
+                }}
+                onPlaySplitPart={(jobId, idx) => {
+                    const job = splitJobRows.find(j => j.jobId === jobId);
+                    const part = job?.parts.find(p => p.idx === idx);
+                    if (!job || !part?.messageId) return;
+                    // Play ONLY this part from its own 0:00 (plan §D/Q5): a
+                    // synthetic TelegramFile opened through the ordinary solo
+                    // preview path — MediaPlayer self-serves stream info.
+                    setPlayingFile({
+                        id: part.messageId,
+                        name: part.name,
+                        size: part.sizeBytes,
+                        type: 'file',
+                    } as TelegramFile);
+                }}
+                onDownloadSplitPart={(jobId, idx) => {
+                    const job = splitJobRows.find(j => j.jobId === jobId);
+                    const part = job?.parts.find(p => p.idx === idx);
+                    if (!job || !part?.messageId) return;
+                    queueDownload(part.messageId, part.name, job.folderId);
+                }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}
