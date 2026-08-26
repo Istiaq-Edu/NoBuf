@@ -1400,6 +1400,18 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         }
         let idx = parts[k].idx;
 
+        // A waiting part can be cancelled before this worker reaches it. The
+        // command persists the terminal state for immediate UI feedback, but
+        // this worker owns an older in-memory snapshot, so the preserved tid
+        // is the authoritative skip signal here.
+        let part_tid = format!("split:{}:{}", job_id, idx);
+        if tg.cancelled_transfers.read().await.contains(&part_tid) {
+            tg.cancelled_transfers.write().await.remove(&part_tid);
+            parts[k].status = "cancelled".to_string();
+            persist_parts(&app, &job_id, &parts)?;
+            continue;
+        }
+
         // Cooperative cancel between parts.
         if tg
             .cancelled_transfers
@@ -1496,7 +1508,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         // --- Upload phase (auto-retry loop, plan §E3) ----------------------
         // Backoff is sliced into CANCEL_POLL_MS chunks so a user cancel during
         // a sleep takes effect within ~500 ms instead of after up to 30 s.
-        let tid = format!("split:{}:{}", job_id, idx);
+        let tid = part_tid;
         let mut attempt: u32 = 0;
         let upload_outcome: Result<(), String> = loop {
             attempt += 1;
@@ -1749,6 +1761,47 @@ fn persist_parts(app: &AppHandle, job_id: &str, parts: &[JobPartState]) -> Resul
     stmt.bind((2, epoch_secs())).map_err(|e| e.to_string())?;
     stmt.bind((3, job_id)).map_err(|e| e.to_string())?;
     stmt.iter().next();
+    Ok(())
+}
+
+/// Persist a per-part cancellation immediately so a waiting row responds to
+/// the user's click without waiting for the worker to reach that part. The
+/// worker also observes the preserved transfer token before splitting, which
+/// keeps its in-memory parts snapshot consistent with this DB update.
+pub fn mark_part_cancelled(app: &AppHandle, job_id: &str, idx: u32) -> Result<(), String> {
+    let mut parts = {
+        let conn = get_connection(app)?;
+        let mut stmt = conn
+            .prepare("SELECT parts_json FROM split_upload_jobs WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, job_id)).map_err(|e| e.to_string())?;
+        let mut rows = stmt.iter();
+        match rows.next() {
+            Some(Ok(row)) => parse_parts_json(&vs(&row[0])),
+            Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
+            None => return Err("Job not found".to_string()),
+        }
+    };
+    let part = parts
+        .iter_mut()
+        .find(|part| part.idx == idx)
+        .ok_or_else(|| format!("No such part index {} in job", idx))?;
+    if part.status == "done" {
+        return Err("Completed parts cannot be cancelled".to_string());
+    }
+    part.status = "cancelled".to_string();
+    persist_parts(app, job_id, &parts)?;
+    let _ = app.emit(
+        "split-progress",
+        SplitProgressPayload {
+            job_id: job_id.to_string(),
+            phase: "uploading".to_string(),
+            part_idx: idx,
+            total_parts: parts.len() as u32,
+            message: "Cancelled by user".to_string(),
+            part_status: Some("cancelled".to_string()),
+        },
+    );
     Ok(())
 }
 

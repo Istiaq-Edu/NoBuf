@@ -1,7 +1,7 @@
 ﻿import { useState } from 'react';
 import { Upload, Download, X, RotateCcw, AlertCircle, Check, Scissors, ChevronDown, ChevronRight, Play } from 'lucide-react';
 import { QueueItem, DownloadItem } from '../../types';
-import { SplitJobRow, SplitPartRow, computeCombinedProgress } from '../../hooks/useSplitUpload';
+import { SplitJobRow, SplitPartRow, computeCombinedProgress, countActiveSplitJobs } from '../../hooks/useSplitUpload';
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
@@ -61,7 +61,8 @@ export function TransferPanel({
         });
     };
 
-    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length + stagingItems.length;
+    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length
+        + stagingItems.length + countActiveSplitJobs(splitJobs);
     const downloadActive = downloadItems.filter(i => i.status === 'pending' || i.status === 'downloading').length;
 
     // Auto-switch to tab with active items
@@ -444,8 +445,8 @@ function StatusDot({ phase }: { phase: string }) {
 
 /**
  * One per-part row inside an expanded split group. Action gating per plan §C:
- * uploading → Cancel(part) · failed/cancelled → Retry/Re-include ·
- * done → Play + Download · waiting → none.
+ * waiting/splitting/uploading → Cancel(part) · failed/cancelled → Retry/Re-include ·
+ * done → Play + Download.
  */
 export function SplitPartRowView({
     part, jobPhase, onCancel, onRetry, onPlay, onDownload,
@@ -459,9 +460,13 @@ export function SplitPartRowView({
 }) {
     // While the JOB is running, an in-flight part shows live pct/speed; the
     // backend's authoritative status word arrives via partStatus flips.
-    const live = part.status === 'uploading' || part.pct !== undefined && part.pct < 100 && jobPhase === 'uploading' && !['done', 'cancelled', 'failed'].includes(part.status);
+    const live = jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading'
+        ? ['splitting', 'uploading'].includes(part.status)
+        : false;
+    const cancellable = live || (part.status === 'waiting' && (jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading'));
     const statusLabel =
         part.status === 'waiting' ? 'waiting'
+        : part.status === 'splitting' ? 'splitting…'
         : part.status === 'uploading' ? `uploading${part.pct !== undefined ? ` ${Math.round(part.pct)}%` : ''}${part.speedBps ? ` · ${formatSpeed(part.speedBps)}` : ''}`
         : part.status === 'done' ? formatBytes(part.sizeBytes)
         : part.status === 'cancelled' ? 'skipped'
@@ -470,42 +475,53 @@ export function SplitPartRowView({
     return (
         <div
             data-part-row={part.idx}
-            className={`flex items-center gap-2 pl-7 pr-1 py-1 rounded-md text-[11px] ${live ? 'bg-nobuf-primary/5' : ''}`}
+            className={`flex flex-col gap-0.5 pl-7 pr-1 py-1 rounded-md text-[11px] ${live ? 'bg-nobuf-primary/5' : ''}`}
         >
-            <span className={`font-mono w-8 shrink-0 ${live ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
-                #{String(part.idx).padStart(2, '0')}
-            </span>
-            <span className="flex-1 min-w-0 truncate text-nobuf-text">{part.name}</span>
-            <span className={`shrink-0 tabular-nums ${live ? 'text-nobuf-primary' : part.status === 'failed' ? 'text-red-400' : part.status === 'cancelled' ? 'text-white/40' : 'text-nobuf-subtext'}`}>
-                {statusLabel}
-            </span>
-            <div className="flex items-center gap-1 shrink-0">
-                {live && onCancel && (
-                    <button onClick={onCancel} title="Cancel this part — other parts are unaffected"
-                        className="text-gray-400 hover:text-red-400 transition-colors p-0.5">
-                        <X className="w-3 h-3" />
-                    </button>
-                )}
-                {(part.status === 'failed' || part.status === 'cancelled') && onRetry && (
-                    <button onClick={onRetry}
-                        title={part.status === 'cancelled' ? 'Re-include this part and continue' : 'Retry this part'}
-                        className="flex items-center gap-0.5 text-nobuf-primary hover:text-nobuf-text transition-colors px-1 py-0.5 rounded bg-nobuf-primary/10 hover:bg-nobuf-primary/20">
-                        <RotateCcw className="w-3 h-3" /> Retry
-                    </button>
-                )}
-                {part.status === 'done' && part.messageId != null && onPlay && (
-                    <button onClick={onPlay} title="Play this part from its own beginning"
-                        className="text-nobuf-subtext hover:text-nobuf-primary transition-colors p-0.5">
-                        <Play className="w-3 h-3" />
-                    </button>
-                )}
-                {part.status === 'done' && part.messageId != null && onDownload && (
-                    <button onClick={onDownload} title="Download this part to your PC"
-                        className="text-nobuf-subtext hover:text-green-400 transition-colors p-0.5">
-                        <Download className="w-3 h-3" />
-                    </button>
-                )}
+            <div className="flex items-center gap-2">
+                <span className={`font-mono w-8 shrink-0 ${live ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
+                    #{String(part.idx).padStart(2, '0')}
+                </span>
+                <span className="flex-1 min-w-0 truncate text-nobuf-text">{part.name}</span>
+                <span className={`shrink-0 tabular-nums ${live ? 'text-nobuf-primary' : part.status === 'failed' ? 'text-red-400' : part.status === 'cancelled' ? 'text-white/40' : 'text-nobuf-subtext'}`}>
+                    {statusLabel}
+                </span>
+                <div className="flex items-center gap-1 shrink-0">
+                    {cancellable && onCancel && (
+                        <button onClick={onCancel} title={part.status === 'waiting' ? 'Skip this part — it will not be uploaded unless you retry it later' : 'Cancel this part — other parts are unaffected'}
+                            className="text-gray-400 hover:text-red-400 transition-colors p-0.5">
+                            <X className="w-3 h-3" />
+                        </button>
+                    )}
+                    {(part.status === 'failed' || part.status === 'cancelled') && onRetry && (
+                        <button onClick={onRetry}
+                            title={part.status === 'cancelled' ? 'Re-include this part and continue' : 'Retry this part'}
+                            className="flex items-center gap-0.5 text-nobuf-primary hover:text-nobuf-text transition-colors px-1 py-0.5 rounded bg-nobuf-primary/10 hover:bg-nobuf-primary/20">
+                            <RotateCcw className="w-3 h-3" /> Retry
+                        </button>
+                    )}
+                    {part.status === 'done' && part.messageId != null && onPlay && (
+                        <button onClick={onPlay} title="Play this part from its own beginning"
+                            className="text-nobuf-subtext hover:text-nobuf-primary transition-colors p-0.5">
+                            <Play className="w-3 h-3" />
+                        </button>
+                    )}
+                    {part.status === 'done' && part.messageId != null && onDownload && (
+                        <button onClick={onDownload} title="Download this part to your PC"
+                            className="text-nobuf-subtext hover:text-green-400 transition-colors p-0.5">
+                            <Download className="w-3 h-3" />
+                        </button>
+                    )}
+                </div>
             </div>
+            {/* Per-part progress bar while splitting/uploading */}
+            {live && (
+                <div className="w-full bg-nobuf-border h-0.5 rounded-full overflow-hidden">
+                    <div
+                        className={`h-full rounded-full transition-all duration-300 ${part.status === 'splitting' ? 'bg-yellow-400/70 animate-pulse' : 'bg-nobuf-primary'}`}
+                        style={{ width: `${part.status === 'uploading' && part.pct !== undefined ? Math.min(100, Math.round(part.pct)) : part.status === 'splitting' ? 100 : 0}%` }}
+                    />
+                </div>
+            )}
         </div>
     );
 }

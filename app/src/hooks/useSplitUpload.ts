@@ -120,6 +120,11 @@ export interface SplitJobRow {
     parts: SplitPartRow[];
 }
 
+/** Count each active split job once for the Transfers badge. */
+export function countActiveSplitJobs(jobs: Array<{ phase: string }> | undefined): number {
+    return (jobs ?? []).filter(j => ['queued', 'running', 'splitting', 'uploading'].includes(j.phase)).length;
+}
+
 /** Module-level store so multiple hook instances share one source of truth. */
 const splitRows = new Map<string, SplitJobRow>();
 const splitRowListeners = new Set<() => void>();
@@ -131,6 +136,12 @@ let startupNoticeFired = false;
 
 function notifySplitRows() {
     splitRowListeners.forEach(l => l());
+}
+
+/** Remove a job's row entirely (Discard/Delete) so it leaves the panel at once. */
+export function removeSplitRow(jobId: string) {
+    splitRows.delete(jobId);
+    notifySplitRows();
 }
 
 function upsertSplitRow(row: Partial<SplitJobRow> & { jobId: string }) {
@@ -177,14 +188,22 @@ function applySplitProgress(p: {
             sizeBytes: 0,
         }));
     }
-    // Live phase marks the CURRENT part splitting/uploading.
-    const liveIdx = p.partStatus ? p.partIdx : (p.phase === 'splitting' || p.phase === 'uploading' ? p.partIdx : 0);
+    // Live phase marks the CURRENT part splitting/uploading. Transitions:
+    // waiting → splitting → uploading → (terminal via partStatus). A part
+    // stuck on an earlier transient must still advance when the phase moves
+    // on (the "frozen at splitting" bug: only-upgrade-from-waiting locked
+    // the label forever once splitting had been seen).
+    const liveIdx = p.partIdx > 0 ? p.partIdx : 0;
     parts = parts.map(part => {
-        let next = { ...part };
+        const next = { ...part };
         if (p.partStatus && part.idx === p.partIdx) {
             next.status = p.partStatus; // authoritative terminal flip
-        } else if (!p.partStatus && part.idx === liveIdx && part.status === 'waiting' && (p.phase === 'splitting' || p.phase === 'uploading')) {
-            next.status = p.phase; // transient live status
+        } else if (!p.partStatus && part.idx === liveIdx) {
+            if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'splitting') {
+                next.status = 'splitting';
+            } else if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'uploading') {
+                next.status = 'uploading';
+            }
         }
         if (part.idx === liveIdx && !next.name && p.message) next.name = p.message;
         return next;

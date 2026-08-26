@@ -283,11 +283,22 @@ fn cleanup_partial_file(path: &str) {
 
 #[tauri::command]
 pub async fn cmd_cancel_transfer(
+    app: tauri::AppHandle,
     transfer_id: String,
     state: State<'_, TelegramState>,
 ) -> Result<bool, String> {
     log::info!("Cancelling transfer: {}", transfer_id);
-    state.cancelled_transfers.write().await.insert(transfer_id);
+    state.cancelled_transfers.write().await.insert(transfer_id.clone());
+    // Split part that has NOT started yet (status waiting): the run loop only
+    // checks the tid once the part is in-flight, so flip its persisted status
+    // now — the UI updates instantly and the loop skips it when reached.
+    if let Some(rest) = transfer_id.strip_prefix("split:") {
+        if let Some((job_id, idx_str)) = rest.rsplit_once(':') {
+            if let Ok(idx) = idx_str.parse::<u32>() {
+                crate::commands::split_upload::mark_part_cancelled(&app, job_id, idx)?;
+            }
+        }
+    }
     Ok(true)
 }
 

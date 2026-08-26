@@ -15,6 +15,7 @@ import {
     selectResumableJobs,
     parseSplitUploadTid,
     computeCombinedProgress,
+    countActiveSplitJobs,
 } from '../hooks/useSplitUpload';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
@@ -140,13 +141,13 @@ describe('SplitPartRowView (per-part rows inside expanded group, plan §C)', () 
         unmountAll([a, view]);
     });
 
-    it('cancelled/failed parts offer Retry (Re-include); waiting offers nothing', () => {
+    it('cancelled/failed parts offer Retry; a waiting part can be cancelled before it starts', () => {
         const cancelled = render(<SplitPartRowView part={{ ...base, status: 'cancelled' }} jobPhase="interrupted" onRetry={() => {}} />);
         expect(cancelled.container.querySelector('button[title*="Re-include"]')).toBeTruthy();
         const failed = render(<SplitPartRowView part={{ ...base, status: 'failed' }} jobPhase="interrupted" onRetry={() => {}} />);
         expect(failed.container.querySelector('button[title^="Retry this part"]')).toBeTruthy();
-        const waiting = render(<SplitPartRowView part={{ ...base, status: 'waiting' }} jobPhase="running" />);
-        expect(waiting.container.querySelectorAll('button').length).toBe(0);
+        const waiting = render(<SplitPartRowView part={{ ...base, status: 'waiting' }} jobPhase="running" onCancel={() => {}} />);
+        expect(waiting.container.querySelector('button[title^="Skip this part"]')).toBeTruthy();
         unmountAll([cancelled, failed, waiting]);
     });
 
@@ -209,5 +210,14 @@ describe('computeCombinedProgress (group header, plan §C/Q17)', () => {
         expect(computeCombinedProgress([], 0, 0).pct).toBe(0);
         expect(computeCombinedProgress([mk('waiting', 0)], 0, 1).pct).toBe(0);
         expect(Number.isFinite(computeCombinedProgress([mk('done', -5)], 1, 1).pct)).toBe(true);
+    });
+});
+
+describe('countActiveSplitJobs (Transfers badge)', () => {
+    it('counts each active split group once and ignores terminal rows', () => {
+        expect(countActiveSplitJobs([
+            { phase: 'queued' }, { phase: 'splitting' }, { phase: 'uploading' },
+            { phase: 'done' }, { phase: 'interrupted' },
+        ])).toBe(3);
     });
 });

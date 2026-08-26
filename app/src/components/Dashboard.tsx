@@ -34,6 +34,7 @@ import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
+import { removeSplitRow } from '../hooks/useSplitUpload';
 import { SplitUploadModal } from './dashboard/SplitUploadModal';
 import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
@@ -1187,7 +1188,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     }).then(ok => {
                         if (!ok) return;
                         void invoke('cmd_discard_split_job', { id: jobId })
-                            .then(() => toast.success(`Deleted job "${name}"`))
+                            .then(() => {
+                                removeSplitRow(jobId); // drop the panel row immediately (store has no auto-removal)
+                                toast.success(`Deleted job "${name}"`);
+                            })
                             .catch(e => toast.error(`Delete failed: ${e}`));
                     });
                 }}
