@@ -546,6 +546,26 @@ fn split_owns_tid(tid: &str) -> bool {
     tid.starts_with("split:")
 }
 
+fn consume_cancel_marker_on_abort(
+    cancelled: &mut std::collections::HashSet<String>,
+    tid: &str,
+    preserve_cancel: bool,
+) {
+    if !preserve_cancel {
+        cancelled.remove(tid);
+    }
+}
+
+/// Post-send cancellation verdict: which transfer families must reconcile
+/// (delete the just-sent message) when cancellation wins the race against
+/// Telegram message finalization. Normal/URL/drop tids delete the orphan;
+/// split tids keep the marker unconsumed so the orchestrator's Err branch
+/// still classifies the part-cancel — but the message must still be deleted
+/// so no phantom part exists in the folder.
+fn must_reconcile_post_send(tid: &str) -> bool {
+    !tid.is_empty()
+}
+
 pub(crate) async fn acquire_upload_lane(
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     cancelled: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
@@ -576,7 +596,8 @@ pub(crate) async fn acquire_upload_lane(
 
 #[cfg(test)]
 mod split_owns_tid_tests {
-    use super::split_owns_tid;
+    use super::{consume_cancel_marker_on_abort, split_owns_tid};
+    use std::collections::HashSet;
 
     #[test]
     fn split_tids_are_owned_by_the_orchestrator() {
@@ -591,6 +612,21 @@ mod split_owns_tid_tests {
         // The job-level cancel token is NOT a part tid — it is consumed by no
         // one (purged by resume/retry instead), so it is not "owned" here.
         assert!(!split_owns_tid("split-cancel:4d97551e"));
+    }
+
+    #[test]
+    fn normal_cancel_marker_is_consumed_when_active_upload_aborts() {
+        let mut cancelled = HashSet::from(["upload-123".to_string()]);
+        consume_cancel_marker_on_abort(&mut cancelled, "upload-123", false);
+        assert!(!cancelled.contains("upload-123"));
+    }
+
+    #[test]
+    fn split_cancel_marker_is_left_for_orchestrator_classification() {
+        let tid = "split:abc:1";
+        let mut cancelled = HashSet::from([tid.to_string()]);
+        consume_cancel_marker_on_abort(&mut cancelled, tid, true);
+        assert!(cancelled.contains(tid));
     }
 }
 
@@ -700,6 +736,8 @@ pub(crate) async fn upload_file_inner(
                     upload_task.abort();
                     let _ = upload_task.await;
                     if let Some(t) = progress_task { t.abort(); }
+                    let mut cancelled = state.cancelled_transfers.write().await;
+                    consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
                     return Err("Transfer cancelled".to_string());
                 }
             }
@@ -710,11 +748,10 @@ pub(crate) async fn upload_file_inner(
     if let Some(t) = progress_task { t.abort(); }
 
     // Check cancellation after upload. Same `split:`-preservation rule as the
-    // pre-start check above: leave the tid for the orchestrator to consume.
+    // post-start check above: leave the tid for the orchestrator to consume.
     if state.cancelled_transfers.read().await.contains(&tid) {
-        if !preserve_tid {
-            state.cancelled_transfers.write().await.remove(&tid);
-        }
+        let mut cancelled = state.cancelled_transfers.write().await;
+        consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
         return Err("Transfer cancelled".to_string());
     }
 
@@ -728,6 +765,33 @@ pub(crate) async fn upload_file_inner(
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
     let sent = client.send_message(&peer, message).await.map_err(map_error)?;
+
+    // Post-send cancellation reconciliation: a cancel landing between the last
+    // pre-send check and here would otherwise leave a live Telegram message
+    // under a UI row that says cancelled. Delete the orphaned message. For
+    // `split:` tids the marker stays unconsumed (preserve_tid) so the
+    // orchestrator's Err branch still classifies the part-cancel correctly.
+    // NOTE: the write lock is taken only AFTER the delete resolves — holding
+    // it across the network await would serialize every cancel in the app
+    // behind this round-trip (upload_drop.rs does it in this order too).
+    if must_reconcile_post_send(&tid) && state.cancelled_transfers.read().await.contains(&tid) {
+        match client.delete_messages(&peer, &[sent.id()]).await {
+            Ok(_) => {
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
+                return Err("Transfer cancelled".to_string());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[upload] tid={} cancelled but orphan delete failed (message {}): {}",
+                    tid, sent.id(), e
+                );
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
+                return Err(format!("Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", sent.id(), e));
+            }
+        }
+    }
 
     bw_state.add_up(size);
 
@@ -998,9 +1062,32 @@ pub async fn cmd_upload_from_url(
     }
 
     let client_clone = client.clone();
-    let upload_result = tokio::spawn(async move {
+    let mut upload_task = tokio::spawn(async move {
         client_clone.upload_stream(&mut reader_upload, actual_size as usize, filename.clone()).await
-    }).await.map_err(|e| format!("Task join error: {}", e))?;
+    });
+    // Abort-select (parity with upload_file_inner): cancelling a remote-URL
+    // upload used to let the Telegram task run to completion before the
+    // post-upload check noticed — minutes of zombie bandwidth after the UI
+    // said cancelled. The 100ms poll aborts the task the moment the marker
+    // appears.
+    let upload_result = loop {
+        tokio::select! {
+            result = &mut upload_task => {
+                break result.map_err(|e| format!("Task join error: {}", e))?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if !tid.is_empty() => {
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    upload_task.abort();
+                    let _ = upload_task.await;
+                    if let Some(t) = progress_task { t.abort(); }
+                    let mut cancelled = state.cancelled_transfers.write().await;
+                    consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    };
 
     if let Some(t) = progress_task { t.abort(); }
 
@@ -1016,6 +1103,32 @@ pub async fn cmd_upload_from_url(
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
     let sent = client.send_message(&peer, message).await.map_err(map_error)?;
+
+    // Post-send cancellation reconciliation: a cancel landing between the last
+    // pre-send check and here would otherwise leave a live Telegram message
+    // under a UI row that says cancelled. Delete the orphaned message; if the
+    // delete itself fails, surface it so the user can act instead of a silent
+    // phantom file.
+    if must_reconcile_post_send(&tid) && state.cancelled_transfers.read().await.contains(&tid) {
+        match client.delete_messages(&peer, &[sent.id()]).await {
+            Ok(_) => {
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err("Transfer cancelled".to_string());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[remote-upload] tid={} cancelled but orphan delete failed (message {}): {}",
+                    tid, sent.id(), e
+                );
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(format!("Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", sent.id(), e));
+            }
+        }
+    }
 
     bw_state.add_up(actual_size);
 

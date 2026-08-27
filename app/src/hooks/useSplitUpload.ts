@@ -187,6 +187,43 @@ function upsertSplitRow(row: Partial<SplitJobRow> & { jobId: string }) {
     notifySplitRows();
 }
 
+export function splitPlanToQueuedRow(jobId: string, plan: SplitPlan): SplitJobRow {
+    const totalDuration = plan.durationSec > 0 ? plan.durationSec : 1;
+    return {
+        jobId,
+        displayName: plan.displayName,
+        phase: 'queued',
+        doneParts: 0,
+        totalParts: plan.parts.length,
+        currentPart: 'Waiting for the upload lane',
+        folderId: plan.folderId,
+        parts: plan.parts.map(part => ({
+            idx: part.idx,
+            name: part.name,
+            status: 'waiting',
+            messageId: null,
+            sizeBytes: Math.round(plan.sourceSize * ((part.endSec - part.startSec) / totalDuration)),
+        })),
+    };
+}
+
+function registerStartedSplitJob(jobId: string, plan: SplitPlan) {
+    const queued = splitPlanToQueuedRow(jobId, plan);
+    const prev = splitRows.get(jobId);
+    if (!prev) {
+        upsertSplitRow(queued);
+        return;
+    }
+    const liveParts = new Map(prev.parts.map(part => [part.idx, part]));
+    upsertSplitRow({
+        jobId,
+        displayName: queued.displayName,
+        folderId: queued.folderId,
+        totalParts: Math.max(prev.totalParts, queued.totalParts),
+        parts: queued.parts.map(part => ({ ...part, ...liveParts.get(part.idx) })),
+    });
+}
+
 /**
  * Pure tid matcher for split per-part upload-progress events (plan §C).
  * `split:<jobId>:<idx>` — jobId is a 32-hex string so it can contain no ':'.
@@ -199,9 +236,60 @@ export function parseSplitUploadTid(tid: string): { jobId: string; idx: number }
     return idx > 0 ? { jobId: m[1], idx } : null;
 }
 
+/**
+ * Pure part-reducer for split-progress events (extracted for unit tests).
+ * `phaseTerminal` guards the name-fill: terminal-phase events carry the job's
+ * ERROR text in `message` with `partIdx: doneCount` — without the guard that
+ * error string becomes a part's filename (update_status emit, split_upload.rs
+ * §update_status). Exported + mutation-tested per nobuf-vitest-testing rules.
+ */
+export function applySplitProgressToParts(
+    parts: SplitPartRow[],
+    p: { phase: string; partIdx: number; message: string; partStatus?: string | null; messageId?: number | null },
+): SplitPartRow[] {
+    // Live phase marks the CURRENT part splitting/uploading. Transitions:
+    // waiting → splitting → uploading → (terminal via partStatus). A part
+    // stuck on an earlier transient must still advance when the phase moves
+    // on (the "frozen at splitting" bug: only-upgrade-from-waiting locked
+    // the label forever once splitting had been seen).
+    const liveIdx = p.partIdx > 0 ? p.partIdx : 0;
+    const phaseTerminal = p.phase === 'done' || p.phase === 'failed' || p.phase === 'interrupted'
+        || p.phase === 'cancelled' || p.phase === 'source_missing';
+    return parts.map(part => {
+        const next = { ...part };
+        if (p.partStatus && part.idx === p.partIdx) {
+            next.status = p.partStatus; // authoritative terminal flip
+            // Terminal/retry flips invalidate live byte progress: a cancelled
+            // part's abandoned bytes must stop contributing to the aggregate,
+            // and a retried part starts fresh (its next 0% event must not be
+            // "backward" against stale counters). `done` keeps sizeBytes and
+            // GAINS the message id for live Play/Download.
+            if (p.partStatus === 'done') {
+                next.messageId = p.messageId ?? null;
+                next.pct = undefined;
+                next.uploadedBytes = undefined;
+                next.speedBps = undefined;
+            } else if (p.partStatus === 'cancelled' || p.partStatus === 'failed' || p.partStatus === 'waiting') {
+                next.messageId = null;
+                next.pct = undefined;
+                next.uploadedBytes = undefined;
+                next.speedBps = undefined;
+            }
+        } else if (!p.partStatus && part.idx === liveIdx) {
+            if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'splitting') {
+                next.status = 'splitting';
+            } else if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'uploading') {
+                next.status = 'uploading';
+            }
+        }
+        if (part.idx === liveIdx && !next.name && p.message && !phaseTerminal) next.name = p.message;
+        return next;
+    });
+}
+
 function applySplitProgress(p: {
     jobId: string; phase: string; partIdx: number; totalParts: number;
-    message: string; partStatus?: string | null;
+    message: string; partStatus?: string | null; messageId?: number | null;
 }) {
     const prev = splitRows.get(p.jobId);
     // Synthesize placeholder part rows from totalParts if hydration never
@@ -216,26 +304,7 @@ function applySplitProgress(p: {
             sizeBytes: 0,
         }));
     }
-    // Live phase marks the CURRENT part splitting/uploading. Transitions:
-    // waiting → splitting → uploading → (terminal via partStatus). A part
-    // stuck on an earlier transient must still advance when the phase moves
-    // on (the "frozen at splitting" bug: only-upgrade-from-waiting locked
-    // the label forever once splitting had been seen).
-    const liveIdx = p.partIdx > 0 ? p.partIdx : 0;
-    parts = parts.map(part => {
-        const next = { ...part };
-        if (p.partStatus && part.idx === p.partIdx) {
-            next.status = p.partStatus; // authoritative terminal flip
-        } else if (!p.partStatus && part.idx === liveIdx) {
-            if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'splitting') {
-                next.status = 'splitting';
-            } else if ((part.status === 'waiting' || part.status === 'splitting') && p.phase === 'uploading') {
-                next.status = 'uploading';
-            }
-        }
-        if (part.idx === liveIdx && !next.name && p.message) next.name = p.message;
-        return next;
-    });
+    parts = applySplitProgressToParts(parts, p);
     // Recompute doneParts from actual part statuses when we have them —
     // partIdx is an IN-PROGRESS index during splitting, not a count
     // (investigator-verified misread in the old code).
@@ -261,7 +330,7 @@ async function ensureProgressListener() {
             progressListenerAttached = true;
             await listen<{
                 jobId: string; phase: string; partIdx: number; totalParts: number;
-                message: string; partStatus?: string | null;
+                message: string; partStatus?: string | null; messageId?: number | null;
             }>('split-progress', (ev) => applySplitProgress(ev.payload));
         }
         if (!uploadProgressListenerAttached) {
@@ -363,6 +432,7 @@ export function useSplitUpload() {
             });
             jobStartedRef.current = true;
             if (liveRef.current !== live) return undefined;
+            registerStartedSplitJob(jobId, plan);
             setStartedJobId(jobId);
             return jobId;
         } catch (e) {

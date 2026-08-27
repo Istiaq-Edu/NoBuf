@@ -16,6 +16,7 @@ import {
     parseSplitUploadTid,
     computeCombinedProgress,
     countActiveSplitJobs,
+    applySplitProgressToParts,
 } from '../hooks/useSplitUpload';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
@@ -244,5 +245,31 @@ describe('countActiveSplitJobs (Transfers badge)', () => {
             { phase: 'queued' }, { phase: 'splitting' }, { phase: 'uploading' },
             { phase: 'done' }, { phase: 'interrupted' },
         ])).toBe(3);
+    });
+});
+
+describe('applySplitProgressToParts (error-text-never-a-filename guard)', () => {
+    const part = (idx: number, name = '') => ({ idx, name, status: 'waiting', messageId: null as number | null, sizeBytes: 0 });
+    // Mirrors update_status's terminal emit exactly: partIdx = doneCount
+    // (here 1), message = the job's ERROR string, no partStatus.
+    const terminalEmit = (phase: string) => ({
+        phase, partIdx: 1, message: 'Upload failed: Telegram 400 FILE_PARTS_INVALID',
+        partStatus: null as string | null, messageId: null as number | null,
+    });
+
+    it('terminal-phase emit never stamps the error string as a part name', () => {
+        for (const phase of ['done', 'failed', 'interrupted', 'cancelled', 'source_missing']) {
+            const out = applySplitProgressToParts([part(1), part(2)], terminalEmit(phase));
+            expect(out[0].name).toBe('');
+            expect(out[1].name).toBe('');
+        }
+    });
+
+    it('live phases still fill empty part names from the message (progress events)', () => {
+        const out = applySplitProgressToParts(
+            [part(1)],
+            { phase: 'uploading', partIdx: 1, message: 'Movie.part01.mkv', partStatus: null, messageId: null },
+        );
+        expect(out[0].name).toBe('Movie.part01.mkv');
     });
 });

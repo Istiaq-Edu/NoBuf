@@ -266,6 +266,28 @@ pub(crate) async fn upload_drop_handler(
                     let msg = grammers_client::types::InputMessage::new().text("").document(uploaded);
                     match client.send_message(&peer, msg).await {
                         Ok(m) => {
+                            // Post-send cancellation reconciliation: a cancel landing
+                            // between the last pre-send check and here would leave a live
+                            // Telegram message under a UI row that says cancelled. Delete
+                            // the orphan; surface a delete failure instead of a phantom.
+                            if !tid.is_empty() && tg_state.cancelled_transfers.read().await.contains(&tid) {
+                                match client.delete_messages(&peer, &[m.id()]).await {
+                                    Ok(_) => {
+                                        let mut cancelled = tg_state.cancelled_transfers.write().await;
+                                        cancelled.remove(&tid);
+                                        log::info!("[drop] tid={tid} cancelled after send — orphan deleted (message {})", m.id());
+                                        return HttpResponse::BadRequest().body("Transfer cancelled");
+                                    }
+                                    Err(e) => {
+                                        let mut cancelled = tg_state.cancelled_transfers.write().await;
+                                        cancelled.remove(&tid);
+                                        log::warn!("[drop] tid={tid} cancelled but orphan delete failed (message {}): {}", m.id(), e);
+                                        return HttpResponse::BadRequest().body(format!(
+                                            "Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", m.id(), e
+                                        ));
+                                    }
+                                }
+                            }
                             log::info!("[drop] tid={tid} SUCCESS: '{name}' ({size}B) sent, message_id={}", m.id());
                             // documents-changed (parts-first plan §A): the drop
                             // pipeline has its own send path — emit here too so

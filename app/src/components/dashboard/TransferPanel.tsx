@@ -72,12 +72,18 @@ export function TransferPanel({
     const effectiveTab = activeTab;
 
     const items = effectiveTab === 'uploads' ? uploadItems : downloadItems;
+    // Split-only correctness: an active split group alone must still show
+    // Cancel All, count in the item total, and suppress the empty state.
+    const hasActiveSplit = countActiveSplitJobs(splitJobs) > 0;
     const hasPendingOrActive = effectiveTab === 'uploads'
-        ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading')
+        ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading') || hasActiveSplit || stagingItems.length > 0
         : downloadItems.some(i => i.status === 'pending' || i.status === 'downloading');
     const hasFinished = effectiveTab === 'uploads'
         ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled') || splitJobs.some(j => j.phase === 'done')
         : downloadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled');
+    const itemCount = effectiveTab === 'uploads'
+        ? uploadItems.length + splitJobs.length + stagingItems.length
+        : downloadItems.length;
 
     return (
         <>
@@ -149,7 +155,7 @@ export function TransferPanel({
             {/* Actions bar */}
             <div className="flex items-center justify-between px-4 py-2 border-b border-nobuf-border/50">
                 <span className="text-[11px] text-nobuf-subtext">
-                    {items.length} {items.length === 1 ? 'item' : 'items'}
+                    {itemCount} {itemCount === 1 ? 'item' : 'items'}
                 </span>
                 <div className="flex gap-2">
                     {hasPendingOrActive && (
@@ -176,7 +182,7 @@ export function TransferPanel({
                 {/* Split-job GROUP rows: collapsible header (combined % + speed) expanding
                     to per-part rows with per-part actions (parts-first plan §C). */}
                 {effectiveTab === 'uploads' && splitJobs.map(j => {
-                    const active = j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading';
+                    const active = j.phase === 'queued' || j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading';
                     const combined = computeCombinedProgress(j.parts, j.doneParts, j.totalParts);
                     const pctNum = Math.round(combined.pct);
                     const expanded = expandedJobIds.has(j.jobId);
@@ -231,7 +237,7 @@ export function TransferPanel({
                                             <button
                                                 onClick={() => onResumeSplitJob(j.jobId)}
                                                 className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-nobuf-primary/15 text-nobuf-primary hover:bg-nobuf-primary/25 transition-colors"
-                                                title="Resume this split job (skips parts you cancelled)"
+                                                title="Resume this split job from the next unfinished part (skips completed and deliberately cancelled parts)"
                                             >
                                                 <RotateCcw className="w-3 h-3" />
                                                 Resume
@@ -296,7 +302,7 @@ export function TransferPanel({
                         </div>
                     </div>
                 ))}
-                {items.length === 0 && stagingItems.length === 0 ? (
+                {items.length === 0 && stagingItems.length === 0 && splitJobs.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-nobuf-subtext">
                         {effectiveTab === 'uploads' ? (
                             <Upload className="w-8 h-8 mb-2 opacity-30" />
@@ -466,12 +472,15 @@ export function SplitPartRowView({
     onPlay?: () => void;
     onDownload?: () => void;
 }) {
-    // While the JOB is running, an in-flight part shows live pct/speed; the
-    // backend's authoritative status word arrives via partStatus flips.
-    const live = jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading'
+    // While the JOB is running (or queued — waiting parts of a queued group
+    // are skippable before any worker reaches them), an in-flight part shows
+    // live pct/speed; the backend's authoritative status word arrives via
+    // partStatus flips.
+    const jobLive = jobPhase === 'queued' || jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading';
+    const live = jobLive
         ? ['splitting', 'uploading'].includes(part.status)
         : false;
-    const cancellable = live || (part.status === 'waiting' && (jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading'));
+    const cancellable = live || (part.status === 'waiting' && jobLive);
     const statusLabel =
         part.status === 'waiting' ? 'waiting'
         : part.status === 'splitting' ? 'splitting…'

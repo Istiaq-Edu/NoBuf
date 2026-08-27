@@ -1255,7 +1255,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     }
                     void confirm({
                         title: `Cancel upload?`,
-                        message: 'The current upload stops. You can retry it from the beginning or remove it from Transfers.',
+                        message: 'The current upload stops and retries from 0%. If the file already reached Telegram mid-upload, it is removed automatically; if that removal fails you will see an error with the message id.',
                         confirmText: 'Cancel upload',
                         cancelText: 'Keep uploading',
                         variant: 'danger',

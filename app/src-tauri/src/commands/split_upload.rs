@@ -165,6 +165,11 @@ struct SplitProgressPayload {
     /// inferring from part_idx (plan §C).
     #[serde(rename = "partStatus")]
     part_status: Option<String>,
+    /// Telegram message id of a just-uploaded part — populated ONLY on the
+    /// part-done flip so live Transfers rows can offer Play/Download without
+    /// waiting for restart hydration.
+    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    message_id: Option<i64>,
 }
 
 // ============================================================================
@@ -190,6 +195,35 @@ fn apply_retry_indices(parts: &mut [JobPartState], retry_indices: &[u32]) {
             part.status = "waiting".to_string();
         }
     }
+}
+
+/// True when every part is terminally resolved (done or deliberately
+/// cancelled) — no waiting/failed part remains. This is the completion gate:
+/// a VBR re-cut that shifted a tail part beyond the worker's loop range must
+/// NOT let the job fall through to `done` with unresolved parts.
+fn job_parts_complete(parts: &[JobPartState]) -> bool {
+    parts.iter().all(|p| p.status == "done" || p.status == "cancelled")
+}
+
+/// Resume admission: only a job with NO live worker may be resumed. Resuming
+/// `running`/`uploading` would queue a job behind its own live worker; queued
+/// rows are awaiting promotion already; terminal rows have nothing to resume.
+fn job_is_resumable(status: &str) -> bool {
+    matches!(status, "interrupted" | "failed" | "source_missing")
+}
+
+/// Ownership-boundary purge of every cancellation/retry token a job owns:
+/// `split-cancel:<id>`, all `split:<id>:*` part tids, all `split-retry:<id>:*`
+/// intent markers. Must run at EVERY point a fresh worker is about to observe
+/// tokens (promotion, resume, retry, discard) — a resurrected worker seeing a
+/// stale token insta-interrupts or re-skips parts the user just retried.
+async fn purge_job_cancel_tokens(app: &AppHandle, job_id: &str) {
+    let tg = app.state::<TelegramState>();
+    let mut set = tg.cancelled_transfers.write().await;
+    set.remove(&format!("split-cancel:{}", job_id));
+    let job_part_prefix = format!("split:{}:", job_id);
+    let retry_prefix = format!("split-retry:{}:", job_id);
+    set.retain(|t| !t.starts_with(&job_part_prefix) && !t.starts_with(&retry_prefix));
 }
 
 const SPLIT_RETRY_BACKOFF_TOTAL_MS: u64 = SPLIT_RETRY_BACKOFF_MS[0] + SPLIT_RETRY_BACKOFF_MS[1];
@@ -1004,6 +1038,12 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
             let flipped = conn.total_change_count() > before;
             if !flipped { continue; }
         }
+        // Ownership boundary: this job just won the pipeline. Purge every
+        // cancellation/retry token it owns BEFORE the worker spawns — a
+        // promoted worker observing a stale `split-cancel:<id>` (e.g. from a
+        // cancel that hit while the job sat queued) would insta-interrupt,
+        // and stale per-part tids would re-skip parts the user retried.
+        purge_job_cancel_tokens(&app, &job_id).await;
         log::info!("[SPLIT] promoted queued job {} to running", job_id);
         let _ = app.emit(
             "split-progress",
@@ -1014,6 +1054,7 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
                 total_parts: 0,
                 message: "Queued job starting".into(),
                 part_status: None,
+                message_id: None,
             },
         );
         let a = app.clone();
@@ -1066,16 +1107,11 @@ pub async fn cmd_cancel_split_job(
         }
     }
     // If it was QUEUED, no runner exists to observe the token — flip it here.
-    {
-        let conn = get_connection(&app)?;
-        let mut stmt = conn
-            .prepare(
-                "UPDATE split_upload_jobs SET status='cancelled', error='Cancelled before start', updated_at=strftime('%s','now') WHERE id=? AND status='queued'",
-            )
-            .map_err(|e| e.to_string())?;
-        stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
-        let _ = stmt.iter().next();
-    }
+    // NOTE: the terminal write below deliberately lands as `interrupted` for
+    // every path (queued or running): cancel means "pause + resumable" in the
+    // shipped product semantics, and the Transfers row keys Resume/Delete off
+    // `interrupted`. The previous queued-only `cancelled` write was dead code —
+    // this unconditional update overwrote it one line later.
     update_status(&app, &id, "interrupted", Some("Cancelled by user".to_string()))?;
     Ok(())
 }
@@ -1086,26 +1122,35 @@ pub async fn cmd_resume_split_job(
     app_handle: tauri::AppHandle,
     _state: State<'_, TelegramState>,
 ) -> Result<(), String> {
+    // Admission FIRST: only a job with no live worker may be resumed. Resuming
+    // `running`/`uploading` used to queue a job behind its own worker (the
+    // has_active_split_job check below sees the caller's own row as active).
     let (source_path, stored_size, stored_mtime, stored_duration) = {
         let conn = get_connection(&app_handle)?;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT source_path, source_size, source_mtime, source_duration FROM split_upload_jobs WHERE id = ?"
+                "SELECT source_path, source_size, source_mtime, source_duration, status FROM split_upload_jobs WHERE id = ?"
             ))
             .map_err(|e| e.to_string())?;
         stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
         let mut c = stmt.iter();
         match c.next() {
-            Some(Ok(row)) => (
-                vs(&row[0]),
-                vi(&row[1]) as u64,
-                vi(&row[2]),
-                match row[3] {
-                    sqlite::Value::Float(r) => r,
-                    sqlite::Value::Integer(i) => i as f64,
-                    _ => 0.0,
-                },
-            ),
+            Some(Ok(row)) => {
+                let status = vs(&row[4]);
+                if !job_is_resumable(&status) {
+                    return Err(format!("Job is {} — nothing to resume", status));
+                }
+                (
+                    vs(&row[0]),
+                    vi(&row[1]) as u64,
+                    vi(&row[2]),
+                    match row[3] {
+                        sqlite::Value::Float(r) => r,
+                        sqlite::Value::Integer(i) => i as f64,
+                        _ => 0.0,
+                    },
+                )
+            }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
             None => return Err("Job not found".to_string()),
         }
@@ -1132,6 +1177,13 @@ pub async fn cmd_resume_split_job(
         return Err("Source file changed since the original upload started".to_string());
     }
 
+    // F3 fix: purge stale cancellation tokens BEFORE any admission decision —
+    // including the queued branch above. Cancel inserts `split-cancel:<job>` +
+    // per-part tids and NOTHING removes them; a promoted worker observing a
+    // stale token insta-interrupts. Purging here (and again at promotion, the
+    // authoritative ownership boundary) closes every admission route.
+    purge_job_cancel_tokens(&app_handle, &id).await;
+
     // Resume must respect the single-pipeline rule like any other start:
     // if another job holds the pipeline, this one waits as 'queued' and the
     // promotion runner starts it (re-validated) in turn.
@@ -1142,25 +1194,6 @@ pub async fn cmd_resume_split_job(
             let app2 = app_handle.clone();
             tokio::spawn(async move { promote_queued_jobs(app2).await });
             return Ok(());
-        }
-    }
-
-    // F3 fix: purge stale cancellation tokens BEFORE respawning. Cancel
-    // inserts `split-cancel:<job>` + per-part tids and NOTHING ever removed
-    // them — a resume after a job-cancel would hit the between-parts token
-    // check on its first eligible part and instantly re-interrupt.
-    {
-        let tg = app_handle.state::<TelegramState>();
-        let mut set = tg.cancelled_transfers.write().await;
-        set.remove(&format!("split-cancel:{}", id));
-        // Remove any per-part tids left over from the cancelled attempt.
-        let stale_tids: Vec<String> = set
-            .iter()
-            .filter(|t| t.starts_with(&format!("split:{}:", id)))
-            .cloned()
-            .collect();
-        for t in stale_tids {
-            set.remove(&t);
         }
     }
 
@@ -1231,6 +1264,7 @@ pub async fn cmd_retry_split_part(
                         total_parts: parts.len() as u32,
                         message: part_name,
                         part_status: Some("waiting".to_string()),
+                            message_id: None,
                     },
                 );
                 (true, status == "running")
@@ -1255,6 +1289,11 @@ pub async fn cmd_retry_split_part(
         return Ok(());
     }
 
+    // Token hygiene identical to resume (F3), BEFORE admission: covers the
+    // queued branch too — a stale token surviving to promotion would
+    // insta-interrupt the retried job.
+    purge_job_cancel_tokens(&app_handle, &id).await;
+
     // Same single-pipeline admission as resume (F4).
     {
         let conn = get_connection(&app_handle)?;
@@ -1263,21 +1302,6 @@ pub async fn cmd_retry_split_part(
             let app2 = app_handle.clone();
             tokio::spawn(async move { promote_queued_jobs(app2).await });
             return Ok(());
-        }
-    }
-
-    // Token hygiene identical to resume (F3).
-    {
-        let tg = app_handle.state::<TelegramState>();
-        let mut set = tg.cancelled_transfers.write().await;
-        set.remove(&format!("split-cancel:{}", id));
-        let stale_tids: Vec<String> = set
-            .iter()
-            .filter(|t| t.starts_with(&format!("split:{}:", id)))
-            .cloned()
-            .collect();
-        for t in stale_tids {
-            set.remove(&t);
         }
     }
 
@@ -1378,12 +1402,21 @@ pub async fn cmd_discard_split_job(
             }
         }
     }
-    let conn = get_connection(&app)?;
-    let mut stmt = conn
-        .prepare("DELETE FROM split_upload_jobs WHERE id = ?")
-        .map_err(|e| e.to_string())?;
-    stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
-    stmt.iter().next();
+    // Scoped so the statement is dropped BEFORE the await below — a sqlite
+    // Statement is !Send and must not live across an await point.
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn
+            .prepare("DELETE FROM split_upload_jobs WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        stmt.iter().next();
+    }
+    // The job row is gone — its cancellation/retry tokens are garbage. Purge
+    // them so the in-memory set can't grow without bound across a session of
+    // many discarded jobs (and no stale token can ever match a future
+    // re-derived job id).
+    purge_job_cancel_tokens(&app, &id).await;
     Ok(())
 }
 
@@ -1397,10 +1430,13 @@ fn run_job<'a>(app: AppHandle, job_id: String) -> std::pin::Pin<Box<dyn std::fut
 }
 
 async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
-    // A 'queued' row must never execute; promotion flips it to 'running'
-    // before spawning run_job. This guard covers any race where a stale
-    // spawn fires against a still-queued row. (Sync DB access fully scoped;
-    // the connection must not live across an await or the future turns !Send.)
+    // Worker entry guard: ONLY a `running` row may execute. Promotion flips
+    // queued→running before spawning run_job, so `queued` here is a stale
+    // spawn. `interrupted` here is the cancel-vs-promotion race: cancel
+    // flipped the row AFTER promotion claimed it but BEFORE this worker
+    // spawned, and promotion's token purge then wiped the cancel markers —
+    // without this guard the job would upload despite the user's cancel.
+    // The promotion chain still fires below so the queue isn't stranded.
     let job_status = {
         let conn = get_connection(&app)?;
         let mut stmt = conn
@@ -1418,8 +1454,12 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             .unwrap_or_default();
         status
     };
-    if job_status == "queued" {
-        log::info!("[SPLIT] run_job skipped: {} still queued", job_id);
+    if job_status != "running" {
+        log::info!("[SPLIT] run_job skipped: status={job_status} (expected running)");
+        // The pipeline may believe this job owns it — release the slot to the
+        // next queued job (cancel-vs-promotion race, stale spawn, etc.).
+        let a2 = app.clone();
+        tokio::spawn(async move { promote_queued_jobs(a2).await });
         return Ok(());
     }
 
@@ -1457,8 +1497,14 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
     let bw = app.state::<BandwidthManager>();
     let _upload_guard = tg.upload_lock.lock().await;
 
-    for k in 0..parts.len() {
-        let idx = parts[k].idx;
+    // Index-controlled loop: VBR re-cut INSERTS a part at k+1 mid-iteration
+    // (see the cap-exceeded branch below). A `for k in 0..parts.len()` range
+    // is evaluated once at loop start, so the shifted tail lands beyond the
+    // frozen bound and is silently skipped while the job still reports done.
+    // `while k < parts.len()` re-reads the length every iteration.
+    let mut k = 0usize;
+    while k < parts.len() {
+    let idx = parts[k].idx;
 
         // A waiting part can be cancelled before this worker reaches it. The
         // command persists the terminal state for immediate UI feedback, but
@@ -1477,12 +1523,14 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         // Skip-set (plan §E1): done parts are complete; cancelled parts remain
         // skipped unless the retry intent above explicitly re-enabled them.
         if parts[k].status == "done" || parts[k].status == "cancelled" {
+            k += 1;
             continue;
         }
         if tg.cancelled_transfers.read().await.contains(&part_tid) {
             tg.cancelled_transfers.write().await.remove(&part_tid);
             parts[k].status = "cancelled".to_string();
             persist_parts(&app, &job_id, &parts)?;
+            k += 1;
             continue;
         }
 
@@ -1510,6 +1558,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                 total_parts: total,
                 message: parts[k].name.clone(),
                 part_status: None,
+                message_id: None,
             },
         );
 
@@ -1595,6 +1644,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                     total_parts: parts.len() as u32,
                     message: parts[k].name.clone(),
                     part_status: None,
+                    message_id: None,
                 },
             );
             let res = upload_file_inner(
@@ -1632,6 +1682,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                                 total_parts: parts.len() as u32,
                                 message: "Cancelled by user".into(),
                                 part_status: Some("cancelled".into()),
+                                message_id: None,
                             },
                         );
                         break Ok(None); // part resolved as cancelled; not an error
@@ -1683,6 +1734,9 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                             total_parts: parts.len() as u32,
                             message: String::new(),
                             part_status: Some("done".into()),
+                            // Live Transfers rows need the message id for
+                            // Play/Download without a restart re-hydration.
+                            message_id,
                         },
                     );
                 } else {
@@ -1713,6 +1767,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                             total_parts: parts.len() as u32,
                             message: e.clone(),
                             part_status: Some("failed".into()),
+                            message_id: None,
                         },
                     );
                 }
@@ -1724,6 +1779,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                 return Err(format!("part {} upload failed: {}", idx, e));
             }
         }
+        k += 1;
     }
 
     // A per-part retry can be requested while the worker is still active. Keep
@@ -1770,6 +1826,16 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         tokio::spawn(async move { promote_queued_jobs(a2).await });
         return Ok(());
     }
+    // Completion gate (VBR re-cut safety): `done` requires every part
+    // terminally resolved. If an unresolved part slipped through (loop-shape
+    // regression, mid-run insertion edge), keep the job interrupted so Resume
+    // stays available instead of silently declaring victory.
+    if !job_parts_complete(&parts) {
+        update_status_quiet(&app, &job_id, "interrupted", Some("Job ended with unresolved parts".into()));
+        let a2 = app.clone();
+        tokio::spawn(async move { promote_queued_jobs(a2).await });
+        return Ok(());
+    }
     update_status_quiet(&app, &job_id, "done", None);
     // Drop-staged sources are %TEMP% copies; once every part is uploaded they
     // are garbage. Picker sources (real user files) are never touched — the
@@ -1797,6 +1863,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             total_parts: total,
             message: "All parts uploaded".into(),
             part_status: None,
+            message_id: None,
         },
     );
     Ok(())
@@ -1918,6 +1985,7 @@ pub fn mark_part_cancelled(app: &AppHandle, job_id: &str, idx: u32) -> Result<()
             total_parts: parts.len() as u32,
             message: "Cancelled by user".to_string(),
             part_status: Some("cancelled".to_string()),
+            message_id: None,
         },
     );
     Ok(())
@@ -1965,6 +2033,7 @@ fn update_status(app: &AppHandle, job_id: &str, status: &str, error: Option<Stri
                 total_parts: total,
                 message: error.unwrap_or_default(),
                 part_status: None,
+                message_id: None,
             },
         );
     }
@@ -2221,6 +2290,123 @@ mod tests {
         for w in parts.windows(2) {
             assert_eq!(w[0].end_sec, w[1].start_sec);
         }
+    }
+
+    /// Simulates the worker visiting parts[0..visited] of a job whose part list
+    /// grew mid-run (VBR re-cut). A `for k in 0..n` loop captures `n` BEFORE the
+    /// insertion, so the shifted tail never runs — yet the old completion
+    /// fall-through declared the job done anyway. This test pins the fixed
+    /// behavior: the loop must keep visiting until the CURRENT length.
+    #[test]
+    fn vbr_recut_tail_is_still_visited_after_insertion() {
+        // 4-part plan; the loop starts with range 0..4 (what `for k in 0..parts.len()`
+        // freezes at). Insertion at k=2 shifts the original tail out of that range.
+        let mut parts: Vec<JobPartState> = (1..=4)
+            .map(|i| JobPartState {
+                idx: i,
+                name: format!("Movie.part{i:02}.mkv"),
+                start_sec: (i - 1) as f64 * 100.0,
+                end_sec: i as f64 * 100.0,
+                status: "waiting".into(),
+                message_id: None,
+                size_bytes: 0,
+            })
+            .collect();
+
+        // Fixed-range visitor — the OLD (buggy) shape. With insertion at k=2 the
+        // shifted tail at final index 4 is never visited.
+        let mut visited_fixed: Vec<u32> = Vec::new();
+        for k in 0..parts.len() {
+            visited_fixed.push(parts[k].idx);
+            if k == 2 {
+                parts.insert(
+                    3,
+                    JobPartState { idx: 0, name: String::new(), start_sec: 250.0, end_sec: 300.0, status: "waiting".into(), message_id: None, size_bytes: 0 },
+                );
+                renumber_tail(&mut parts, 3);
+            }
+        }
+
+        // The while-shaped visitor (fixed loop) sees every part, including the
+        // shifted original tail and the inserted cut.
+        let mut parts2: Vec<JobPartState> = (1..=4)
+            .map(|i| JobPartState {
+                idx: i,
+                name: format!("Movie.part{i:02}.mkv"),
+                start_sec: (i - 1) as f64 * 100.0,
+                end_sec: i as f64 * 100.0,
+                status: "waiting".into(),
+                message_id: None,
+                size_bytes: 0,
+            })
+            .collect();
+        let mut visited_while: Vec<u32> = Vec::new();
+        let mut k = 0usize;
+        while k < parts2.len() {
+            visited_while.push(parts2[k].idx);
+            if k == 2 {
+                parts2.insert(
+                    3,
+                    JobPartState { idx: 0, name: String::new(), start_sec: 250.0, end_sec: 300.0, status: "waiting".into(), message_id: None, size_bytes: 0 },
+                );
+                renumber_tail(&mut parts2, 3);
+            }
+            k += 1;
+        }
+
+        // The while-visitor must cover strictly more ground than the frozen for-range.
+        assert!(
+            visited_while.len() > visited_fixed.len(),
+            "while-visitor should visit {} parts, for-visitor only {} — insertion lost a tail",
+            visited_while.len(),
+            visited_fixed.len()
+        );
+        // Every part in the FINAL list is visited by the while-visitor…
+        assert_eq!(visited_while.len(), parts2.len());
+        // …and each carries a renumbered, contiguous identity.
+        assert!(parts2.iter().enumerate().all(|(i, p)| p.idx as usize == i + 1));
+    }
+
+    /// The completion gate: a job is only `done` when NO waiting/failed part
+    /// remains. VBR re-cut can leave the shifted tail `waiting` — that must
+    /// block completion exactly like a never-started part.
+    #[test]
+    fn completion_gate_blocks_done_when_any_part_is_unresolved() {
+        // All done → complete.
+        let all_done = vec![
+            JobPartState { idx: 1, name: "a".into(), start_sec: 0.0, end_sec: 1.0, status: "done".into(), message_id: Some(10), size_bytes: 1 },
+            JobPartState { idx: 2, name: "b".into(), start_sec: 1.0, end_sec: 2.0, status: "done".into(), message_id: Some(11), size_bytes: 1 },
+        ];
+        assert!(job_parts_complete(&all_done));
+
+        // One waiting tail after re-cut → NOT complete.
+        let waiting_tail = vec![
+            JobPartState { idx: 1, name: "a".into(), start_sec: 0.0, end_sec: 1.0, status: "done".into(), message_id: Some(10), size_bytes: 1 },
+            JobPartState { idx: 2, name: "b".into(), start_sec: 1.0, end_sec: 2.0, status: "waiting".into(), message_id: None, size_bytes: 0 },
+        ];
+        assert!(!job_parts_complete(&waiting_tail));
+
+        // Cancelled parts are deliberately skipped — they do NOT block done
+        // (they flip the job to interrupted-with-note instead, per plan §E1).
+        let skipped = vec![
+            JobPartState { idx: 1, name: "a".into(), start_sec: 0.0, end_sec: 1.0, status: "done".into(), message_id: Some(10), size_bytes: 1 },
+            JobPartState { idx: 2, name: "b".into(), start_sec: 1.0, end_sec: 2.0, status: "cancelled".into(), message_id: None, size_bytes: 0 },
+        ];
+        assert!(job_parts_complete(&skipped));
+    }
+
+    /// Resume admission guard: a job whose own worker is still live must be
+    /// rejected, not queued behind itself.
+    #[test]
+    fn resume_rejects_running_jobs() {
+        assert!(!job_is_resumable("running"));
+        assert!(!job_is_resumable("uploading"));
+        assert!(!job_is_resumable("queued"));
+        assert!(!job_is_resumable("done"));
+        assert!(!job_is_resumable("cancelled"));
+        assert!(job_is_resumable("interrupted"));
+        assert!(job_is_resumable("failed"));
+        assert!(job_is_resumable("source_missing"));
     }
 
     #[test]

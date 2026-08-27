@@ -144,6 +144,29 @@ export function persistableQueueItems(items: QueueItem[]): QueueItem[] {
 }
 
 /**
+ * A saved queue item's post-restart shape. Only recoverable rows survive:
+ * `pending` (never started — restarts cleanly), `error`/`cancelled` (retryable
+ * from the original source). An `uploading` row is a LIE after a restart —
+ * its task died with the process — so it maps to `cancelled` with an
+ * interruption note, showing Retry instead of a frozen active row.
+ * Stream-direct drops (`nobuf-drop-stream://`) and staged items are
+ * unrecoverable (the File handle and temp file are gone) — they are dropped.
+ * Pure + exported for unit testing.
+ */
+export function reviveSavedUploads(saved: QueueItem[]): QueueItem[] {
+    const revivable = saved.filter(i =>
+        (i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled')
+        && !i.stagedTempPath
+        && !i.path.startsWith('nobuf-drop-stream://')
+    );
+    return revivable.map(i =>
+        i.status === 'uploading'
+            ? { ...i, status: 'cancelled' as const, error: 'Interrupted when the app closed', progress: undefined, uploadedBytes: undefined, speedBytesPerSec: undefined }
+            : i
+    );
+}
+
+/**
  * Best-effort delete of a staged temp file once its queue item reaches a terminal
  * state. Silent by design: NotFound means the sweep/another path already got it,
  * and a locked file must never turn a finished upload into an error toast.
@@ -204,20 +227,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         if (!store || initialized) return;
         store.get<QueueItem[]>('uploadQueue').then((saved) => {
             if (saved && saved.length > 0) {
-                const pending = saved.filter(i => i.status === 'pending');
-                if (pending.length > 0) {
-                    setUploadQueue(pending);
-                    toast.info(`Restored ${pending.length} pending uploads`);
+                const revived = reviveSavedUploads(saved);
+                if (revived.length > 0) {
+                    setUploadQueue(revived);
+                    const interrupted = revived.filter(i => i.error === 'Interrupted when the app closed').length;
+                    toast.info(interrupted > 0
+                        ? `Restored ${revived.length} upload${revived.length === 1 ? '' : 's'} (${interrupted} interrupted)`
+                        : `Restored ${revived.length} pending upload${revived.length === 1 ? '' : 's'}`);
                 }
             }
             setInitialized(true);
         });
     }, [store, initialized]);
 
+    // Persist every RECOVERABLE row (pending / uploading / error / cancelled)
+    // so a crash or restart keeps Retry available — not just never-started
+    // items. Staged temps and stream-drop rows are still excluded (sweep +
+    // dead File handles make them unrecoverable); completed rows are not
+    // persisted (they live in the folder listing, not the queue).
     useEffect(() => {
         if (!store || !initialized) return;
-        const pending = persistableQueueItems(uploadQueue.filter(i => i.status === 'pending'));
-        store.set('uploadQueue', pending).then(() => store.save());
+        const recoverable = persistableQueueItems(uploadQueue.filter(i =>
+            i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled'
+        ));
+        store.set('uploadQueue', recoverable).then(() => store.save());
     }, [store, uploadQueue, initialized]);
 
     useEffect(() => {
