@@ -17,6 +17,8 @@ import {
     computeCombinedProgress,
     countActiveSplitJobs,
     applySplitProgressToParts,
+    shouldRetryHydration,
+    hydrationRetryDelaysMs,
 } from '../hooks/useSplitUpload';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(() => Promise.resolve()) }));
@@ -271,5 +273,24 @@ describe('applySplitProgressToParts (error-text-never-a-filename guard)', () => 
             { phase: 'uploading', partIdx: 1, message: 'Movie.part01.mkv', partStatus: null, messageId: null },
         );
         expect(out[0].name).toBe('Movie.part01.mkv');
+    });
+});
+
+describe('hydration retry backoff (WP5: bounded, surfaced failures)', () => {
+    it('retries while attempts remain', () => {
+        expect(shouldRetryHydration(0)).toBe(true);
+        expect(shouldRetryHydration(1)).toBe(true);
+        expect(shouldRetryHydration(2)).toBe(true);
+    });
+
+    it('gives up after the last scheduled delay', () => {
+        expect(shouldRetryHydration(3)).toBe(false);
+        expect(shouldRetryHydration(99)).toBe(false);
+    });
+
+    it('schedule is bounded and sorted ascending', () => {
+        const delays = hydrationRetryDelaysMs();
+        expect(delays.length).toBeLessThanOrEqual(5);
+        expect([...delays].sort((a, b) => a - b)).toEqual(delays);
     });
 });

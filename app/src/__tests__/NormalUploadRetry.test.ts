@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { retryUploadItem, reviveSavedUploads } from '../hooks/useFileUpload';
+import {
+    orphanedUploadIds,
+    retryUploadItem,
+    reviveSavedUploads,
+} from '../hooks/useFileUpload';
 import { splitPlanToQueuedRow, type SplitPlan } from '../hooks/useSplitUpload';
 import type { QueueItem } from '../types';
 
@@ -111,5 +115,20 @@ describe('reviveSavedUploads (crash recovery shape)', () => {
 
     it('drops terminal success rows (they live in the folder listing, not the queue)', () => {
         expect(reviveSavedUploads([item({ id: 'ok1', status: 'success', messageId: 42 })])).toEqual([]);
+    });
+});
+
+describe('orphanedUploadIds (bounded bookkeeping prune)', () => {
+    it('returns ids with no live queue row', () => {
+        expect(orphanedUploadIds(['a', 'b', 'c'], new Set(['b']))).toEqual(['a', 'c']);
+    });
+
+    it('returns nothing when every tracked id is live', () => {
+        expect(orphanedUploadIds(['a', 'b'], new Set(['a', 'b', 'c']))).toEqual([]);
+    });
+
+    it('handles empty inputs', () => {
+        expect(orphanedUploadIds([], new Set())).toEqual([]);
+        expect(orphanedUploadIds(['a'], new Set())).toEqual(['a']);
     });
 });

@@ -469,13 +469,40 @@ const JOB_COLS: &str =
 // ffprobe / ffmpeg helpers
 // ============================================================================
 
+/// Hard ceiling on any single ffmpeg/ffprobe child process. A hung or
+/// trickle-starved child (network drive stalls, wedged decoder) must never
+/// own the single-slot pipeline forever. Generous: lossless part copies of
+/// multi-hour remuxes can legitimately run long.
+const FFMPEG_TIMEOUT_SECS: u64 = 60 * 60;
+
+/// Run an ffmpeg/ffprobe child to completion under a hard timeout, reaping
+/// it on expiry. Same pattern as server.rs extraction guards (kill_on_drop
+/// + tokio::time::timeout).
+async fn run_ffmpeg_with_timeout(
+    cmd: tokio::process::Command,
+) -> Result<std::process::Output, String> {
+    let mut cmd = cmd;
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(FFMPEG_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(format!("ffmpeg spawn failed: {}", e)),
+        Err(_) => Err(format!(
+            "ffmpeg timed out after {} minutes",
+            FFMPEG_TIMEOUT_SECS / 60
+        )),
+    }
+}
+
 async fn probe_duration_local(ffprobe: &PathBuf, path: &str) -> Result<f64, String> {
-    let out = tokio::process::Command::new(ffprobe)
-        .no_window()
-        .args(["-v", "error", "-print_format", "json", "-show_format", path])
-        .output()
-        .await
-        .map_err(|e| format!("ffprobe spawn failed: {}", e))?;
+    let mut cmd = tokio::process::Command::new(ffprobe);
+    cmd.no_window()
+        .args(["-v", "error", "-print_format", "json", "-show_format", path]);
+    let out = run_ffmpeg_with_timeout(cmd).await?;
     if !out.status.success() {
         return Err(format!(
             "ffprobe failed (not a readable video?): {}",
@@ -502,17 +529,15 @@ async fn probe_stream_shape(
     ffprobe: &PathBuf,
     path: &str,
 ) -> Result<(bool, bool, bool), String> {
-    let out = tokio::process::Command::new(ffprobe)
-        .no_window()
+    let mut cmd = tokio::process::Command::new(ffprobe);
+    cmd.no_window()
         .args([
             "-v", "error",
             "-print_format", "json",
             "-show_entries", "stream=codec_type",
             path,
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("ffprobe spawn failed: {}", e))?;
+        ]);
+    let out = run_ffmpeg_with_timeout(cmd).await?;
     if !out.status.success() {
         return Err(format!(
             "ffprobe failed: {}",
@@ -542,8 +567,8 @@ async fn probe_stream_shape(
 async fn nearest_keyframe_before(ffprobe: &PathBuf, path: &str, t: f64) -> Result<Option<f64>, String> {
     let from = (t - KEYFRAME_LOOKBACK_SECS).max(0.0);
     let interval = format!("{}%{}", from, t);
-    let out = tokio::process::Command::new(ffprobe)
-        .no_window()
+    let mut cmd = tokio::process::Command::new(ffprobe);
+    cmd.no_window()
         .args([
             "-v", "error",
             "-skip_frame", "nokey",
@@ -552,10 +577,8 @@ async fn nearest_keyframe_before(ffprobe: &PathBuf, path: &str, t: f64) -> Resul
             "-of", "csv=p=0",
             "-read_intervals", &interval,
             path,
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("ffprobe spawn failed: {}", e))?;
+        ]);
+    let out = run_ffmpeg_with_timeout(cmd).await?;
     if !out.status.success() {
         // No keyframe data obtainable — caller falls back to unsnapped boundary.
         return Ok(None);
@@ -577,8 +600,8 @@ async fn nearest_keyframe_before(ffprobe: &PathBuf, path: &str, t: f64) -> Resul
 async fn grab_thumb(ffmpeg: &PathBuf, path: &str, ts: f64, height: u32) -> Result<Vec<u8>, String> {
     let ss = format!("{}", ts);
     let vf = format!("scale=-2:{}", height);
-    let out = tokio::process::Command::new(ffmpeg)
-        .no_window()
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.no_window()
         .args([
             "-v", "error",
             "-ss", &ss,
@@ -588,10 +611,8 @@ async fn grab_thumb(ffmpeg: &PathBuf, path: &str, ts: f64, height: u32) -> Resul
             "-f", "image2pipe",
             "-c:v", "mjpeg",
             "pipe:1",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("ffmpeg spawn failed: {}", e))?;
+        ]);
+    let out = run_ffmpeg_with_timeout(cmd).await?;
     if !out.status.success() || out.stdout.is_empty() {
         return Err(format!(
             "thumb extraction failed at {}s: {}",
@@ -679,7 +700,7 @@ pub(crate) async fn split_part_ffmpeg(
     cmd.args(["-c", "copy", "-f", container])
         .arg("-y")
         .arg(out_path);
-    let out = cmd.output().await.map_err(|e| format!("ffmpeg spawn failed: {}", e))?;
+    let out = run_ffmpeg_with_timeout(cmd).await?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -999,7 +1020,10 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
         let next = {
             let conn = match get_connection(&app) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    log::warn!("[SPLIT] promotion aborted: jobs DB unavailable: {}", e);
+                    return;
+                }
             };
             let busy = has_active_split_job(&conn);
             if busy { return; }
@@ -1008,7 +1032,10 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
                 "SELECT id FROM split_upload_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1",
             ) {
                 Ok(q) => q,
-                Err(_) => return,
+                Err(e) => {
+                    log::warn!("[SPLIT] promotion aborted: queued-jobs query failed: {}", e);
+                    return;
+                }
             };
             stmt.iter()
                 .next()
@@ -1022,11 +1049,17 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
         {
             let conn = match get_connection(&app) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    log::warn!("[SPLIT] promotion aborted: jobs DB unavailable: {}", e);
+                    return;
+                }
             };
             let mut stmt = match conn.prepare(PIPELINE_CLAIM_SQL) {
                 Ok(q) => q,
-                Err(_) => return,
+                Err(e) => {
+                    log::warn!("[SPLIT] promotion aborted: claim statement failed: {}", e);
+                    return;
+                }
             };
             // Row-count via total_change_count delta: an UPDATE steps straight
             // to DONE with no rows, so Cursor::next() yields None regardless
@@ -1226,7 +1259,7 @@ pub async fn cmd_retry_split_part(
     // in a retryable state. `done` parts are rejected; `cancelled` parts are
     // RE-INCLUDABLE here (that's the "Re-include" UI action) per Q3/Q15 —
     // deliberate user action only, never automatic.
-    let (retried_any, was_running) = {
+    let was_running = {
         let conn = get_connection(&app_handle)?;
         let mut stmt = conn
             .prepare("SELECT status, parts_json FROM split_upload_jobs WHERE id = ?")
@@ -1267,13 +1300,12 @@ pub async fn cmd_retry_split_part(
                             message_id: None,
                     },
                 );
-                (true, status == "running")
+                status == "running"
             }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
             None => return Err("Job not found".to_string()),
         }
     };
-    let _ = retried_any;
 
     // The current worker owns the pipeline. Queue a retry request for that
     // worker instead of spawning a second concurrent run against the same
@@ -1908,21 +1940,29 @@ fn renumber_tail(parts: &mut [JobPartState], start: usize) {
 /// (Stale 'running' rows are normalized to 'interrupted' at startup, so this
 /// reflects live reality, not leftovers from a crash.)
 pub fn has_active_split_job(conn: &sqlite::Connection) -> bool {
+    // Fail-SAFE: report "busy" on any read error. Every caller gates STARTING
+    // new pipeline work on this (promotion, resume, retry); a false "idle"
+    // from an unreadable DB could double-run the single-slot pipeline, while
+    // a false "busy" only delays a start until the next trigger fires.
     let mut stmt = match conn.prepare(
         "SELECT COUNT(*) FROM split_upload_jobs WHERE status IN ('preparing','running')",
     ) {
         Ok(q) => q,
-        Err(_) => return false,
+        Err(e) => {
+            log::warn!("[SPLIT] active-job probe failed, assuming busy: {}", e);
+            return true;
+        }
     };
-    stmt.iter()
-        .next()
-        .and_then(|r| r.ok())
-        .and_then(|row| match &row[0] {
-            sqlite::Value::Integer(n) => Some(*n),
-            _ => None,
-        })
-        .unwrap_or(0)
-        > 0
+    match stmt.iter().next() {
+        Some(Ok(row)) => match &row[0] {
+            sqlite::Value::Integer(n) => *n > 0,
+            _ => true,
+        },
+        _ => {
+            log::warn!("[SPLIT] active-job count unreadable, assuming busy");
+            true
+        }
+    }
 }
 
 /// Load a job's source_path from the jobs DB. Returns None if the row is gone.
@@ -2493,6 +2533,31 @@ mod tests {
         conn.execute("UPDATE split_upload_jobs SET status='done' WHERE id='A'")
             .unwrap();
         assert!(claim(&conn, "B"));
+    }
+
+    #[test]
+    fn active_job_probe_is_fail_safe() {
+        // A connection with NO table: every prepare/read fails. The probe
+        // must report BUSY (true) — a false "idle" would let promotion,
+        // resume, or retry double-run the single-slot pipeline. The old
+        // fail-open behavior returned false here.
+        let conn = sqlite::Connection::open(":memory:").unwrap();
+        assert!(has_active_split_job(&conn), "unreadable DB must read as busy");
+
+        // Readable schema, no active rows → idle.
+        let conn = sqlite::Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE split_upload_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at INTEGER)",
+        )
+        .unwrap();
+        assert!(!has_active_split_job(&conn));
+
+        // Running row → busy.
+        conn.execute(
+            "INSERT INTO split_upload_jobs (id, status) VALUES ('A', 'running')",
+        )
+        .unwrap();
+        assert!(has_active_split_job(&conn));
     }
 
 

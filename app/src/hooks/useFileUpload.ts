@@ -144,6 +144,19 @@ export function persistableQueueItems(items: QueueItem[]): QueueItem[] {
 }
 
 /**
+ * Ids that no longer have a queue row. Their bookkeeping (run generations,
+ * cancel markers) can be discarded — otherwise those maps/sets grow once
+ * per upload for the whole session. Pure + exported for unit tests.
+ */
+export function orphanedUploadIds(tracked: Iterable<string>, queueIds: Set<string>): string[] {
+    const orphaned: string[] = [];
+    for (const id of tracked) {
+        if (!queueIds.has(id)) orphaned.push(id);
+    }
+    return orphaned;
+}
+
+/**
  * A saved queue item's post-restart shape. Only recoverable rows survive:
  * `pending` (never started — restarts cleanly), `error`/`cancelled` (retryable
  * from the original source). An `uploading` row is a LIE after a restart —
@@ -190,6 +203,21 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     // Live mirror of uploadQueue for once-registered/async callbacks (dedupe on drop).
     const queueMirrorRef = useRef<QueueItem[]>([]);
     queueMirrorRef.current = uploadQueue;
+
+    // Bounded bookkeeping (WP5): run generations and cancel markers for ids
+    // that left the queue (Cancel pending / Remove / Delete) are garbage —
+    // prune them on every queue change so the maps can't grow per-upload
+    // for the whole session. Ids are never reused, so pruning is safe even
+    // while an in-flight invoke for a removed row is still settling.
+    useEffect(() => {
+        const live = new Set(uploadQueue.map(i => i.id));
+        for (const id of orphanedUploadIds(runGenerationRef.current.keys(), live)) {
+            runGenerationRef.current.delete(id);
+        }
+        for (const id of orphanedUploadIds(cancelledRef.current, live)) {
+            cancelledRef.current.delete(id);
+        }
+    }, [uploadQueue]);
 
     // Listen for progress events from Rust
     useEffect(() => {

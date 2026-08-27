@@ -368,6 +368,26 @@ async function ensureProgressListener() {
     }
 }
 
+/**
+ * Backoff schedule for split-rows hydration retries (WP5: a single transient
+ * DB lock at startup must not leave the Transfers panel permanently empty).
+ * Pure + exported for unit tests.
+ */
+export function hydrationRetryDelaysMs(): number[] {
+    return [1500, 6000, 15000];
+}
+
+/**
+ * Pure decision for whether hydration needs another attempt after a failure.
+ * Bounded: after the last delay, hydration gives up and surfaces an error
+ * toast (the panel stays empty but the user knows WHY, and job rows still
+ * appear via live `split-progress` events).
+ */
+export function shouldRetryHydration(attempt: number): boolean {
+    const delays = hydrationRetryDelaysMs();
+    return attempt < delays.length;
+}
+
 export function useSplitUpload() {
     const [open, setOpen] = useState(false);
     const [preparing, setPreparing] = useState(false);
@@ -464,8 +484,15 @@ export function useSplitUpload() {
         void ensureProgressListener();
         const listener = () => forceTick(t => t + 1);
         splitRowListeners.add(listener);
-        // One-time hydration from the jobs DB (survives restarts).
-        (async () => {
+        // Hydration from the jobs DB (survives restarts). Retries with
+        // backoff on failure — a transient DB lock at startup must not
+        // leave the Transfers panel empty for the whole session. Gives up
+        // after the last attempt and tells the user why (live progress
+        // events still populate rows for jobs that emit while we run).
+        let cancelled = false;
+        let attempt = 0;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const hydrate = async () => {
             try {
                 const jobs = await invoke<Array<{
                     id: string; displayName: string; status: string;
@@ -506,9 +533,22 @@ export function useSplitUpload() {
                     });
                 }
                 }
-            } catch { /* panel just stays empty */ }
-        })();
-        return () => { splitRowListeners.delete(listener); };
+            } catch {
+                if (cancelled) return;
+                if (shouldRetryHydration(attempt)) {
+                    timer = setTimeout(hydrate, hydrationRetryDelaysMs()[attempt]);
+                    attempt += 1;
+                } else {
+                    toast.error('Couldn\'t load split uploads. Restart the app if your jobs are missing from Transfers.');
+                }
+            }
+        };
+        void hydrate();
+        return () => {
+            cancelled = true;
+            if (timer) clearTimeout(timer);
+            splitRowListeners.delete(listener);
+        };
     }, []);
 
     const splitJobRows: SplitJobRow[] = Array.from(splitRows.values());
