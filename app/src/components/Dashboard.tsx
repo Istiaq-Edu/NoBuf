@@ -975,12 +975,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     />
                 )}
                 <RemoteUploadModal
+                    key="remote-upload-modal"
                     open={showRemoteUpload}
                     onClose={() => setShowRemoteUpload(false)}
                     onSubmit={handleRemoteUpload}
                 />
                                 {oversizeChoice && (
                     <OversizeDropChoiceModal
+                        key="oversize-drop-choice"
                         fileName={oversizeChoice.file.name}
                         sizeGb={`${(oversizeChoice.file.size / 1_000_000_000).toFixed(2)} GB`}
                         onUseTempCopy={() => {
@@ -992,6 +994,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     />
                 )}
 <SplitUploadModal
+                    key="split-upload-modal"
                     open={splitFlow.open}
                     preparing={splitFlow.preparing}
                     plan={splitFlow.plan}
@@ -1032,6 +1035,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {archiveFile && (
                     <ArchiveViewerModal
+                        key="archive-viewer"
                         file={archiveFile}
                         activeFolderId={activeFolderId}
                         onClose={() => setArchiveFile(null)}
