@@ -546,6 +546,34 @@ fn split_owns_tid(tid: &str) -> bool {
     tid.starts_with("split:")
 }
 
+pub(crate) async fn acquire_upload_lane(
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    cancelled: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    tid: &str,
+    preserve_cancel: bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if tid.is_empty() {
+        return Ok(lock.lock_owned().await);
+    }
+    // Create the FIFO waiter ONCE and keep it pinned while polling the cancel
+    // marker. Recreating lock() each tick drops queue position and causes LIFO.
+    let acquire = lock.lock_owned();
+    tokio::pin!(acquire);
+    loop {
+        tokio::select! {
+            guard = &mut acquire => return Ok(guard),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if cancelled.read().await.contains(tid) {
+                    if !preserve_cancel {
+                        cancelled.write().await.remove(tid);
+                    }
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod split_owns_tid_tests {
     use super::split_owns_tid;
@@ -592,8 +620,11 @@ pub(crate) async fn upload_file_inner(
         return Ok(("Mock upload successful".to_string(), None));
     }
     let client = client_opt.unwrap();
+    // Cancellation must stay responsive while this upload waits behind a split
+    // group. Progress starts only after admission, so a queued row does not
+    // pretend to be actively uploading at 0%.
     let _upload_guard = if !split_owns_tid(&tid) {
-        Some(state.upload_lock.lock().await)
+        Some(acquire_upload_lane(state.upload_lock.clone(), state.cancelled_transfers.clone(), &tid, false).await?)
     } else {
         None
     };
@@ -909,7 +940,13 @@ pub async fn cmd_upload_from_url(
         return Err("Not connected to Telegram".to_string());
     }
     let client = client_opt.unwrap();
-    let _upload_guard = state.upload_lock.lock().await;
+    let _upload_guard = match acquire_upload_lane(state.upload_lock.clone(), state.cancelled_transfers.clone(), &tid, false).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
 
     // Emit upload phase start
     if !tid.is_empty() {
@@ -1976,5 +2013,56 @@ mod staged_drop_tests {
         assert!(base.ends_with(".pdf"), "extension preserved: {}", base);
         assert!(base.chars().map(|c| c.len_utf16()).sum::<usize>() <= 255, "component <= 255 units: {}", base.len());
         let _ = std::fs::remove_file(&full);
+    }
+}
+
+#[cfg(test)]
+mod upload_lane_tests {
+    use super::acquire_upload_lane;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    #[tokio::test]
+    async fn cancellation_polling_preserves_fifo_arrival_order() {
+        let lane = Arc::new(Mutex::new(()));
+        let cancelled = Arc::new(RwLock::new(HashSet::new()));
+        let initial = lane.clone().lock_owned().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for idx in 0..5 {
+            let lane = lane.clone();
+            let cancelled = cancelled.clone();
+            let order = order.clone();
+            tasks.push(tokio::spawn(async move {
+                {
+                    let _guard = acquire_upload_lane(lane, cancelled, &format!("upload-{idx}"), false).await.unwrap();
+                }
+                order.lock().await.push(idx);
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(initial);
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(*order.lock().await, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_exits_without_acquiring_lane() {
+        let lane = Arc::new(Mutex::new(()));
+        let cancelled = Arc::new(RwLock::new(HashSet::new()));
+        let initial = lane.clone().lock_owned().await;
+        let task = {
+            let lane = lane.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move { acquire_upload_lane(lane, cancelled, "queued", false).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancelled.write().await.insert("queued".to_string());
+        let result = task.await.unwrap();
+        assert_eq!(result.err().as_deref(), Some("Transfer cancelled"));
+        assert!(!cancelled.read().await.contains("queued"));
+        drop(initial);
+        assert!(lane.try_lock().is_ok());
     }
 }

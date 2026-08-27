@@ -1227,7 +1227,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     setStagingItems(prev => prev.filter(i => i.name !== name));
                 }}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
-                onCancelAllUploads={cancelUploads}
+                onCancelAllUploads={() => {
+                    void confirm({
+                        title: 'Cancel all uploads?',
+                        message: 'Every active upload will stop. Cancelled uploads can be retried from the beginning; pending uploads will be removed.',
+                        confirmText: 'Cancel all',
+                        cancelText: 'Keep uploading',
+                        variant: 'danger',
+                    }).then(ok => {
+                        if (!ok) return;
+                        cancelUploads();
+                        splitJobRows
+                            .filter(j => ['queued', 'running', 'splitting', 'uploading'].includes(j.phase))
+                            .forEach(j => { void invoke('cmd_cancel_split_job', { id: j.jobId }); });
+                    });
+                }}
                 onCancelUploadItem={id => {
                     const item = uploadQueue.find(i => i.id === id);
                     if (!item) return;

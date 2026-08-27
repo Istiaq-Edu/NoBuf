@@ -157,7 +157,27 @@ pub(crate) async fn upload_drop_handler(
     };
     log::info!("[drop] streaming '{name}' ({size}B -> folder {folder_id:?}) tid={tid}");
 
-    // --- Progress reporter (250ms cadence, mirrors cmd_upload_file) -------------
+    // --- Cancellation pre-check, then queue admission ---------------------------
+    if tg_state.cancelled_transfers.read().await.contains(&tid) {
+        tg_state.cancelled_transfers.write().await.remove(&tid);
+        return HttpResponse::BadRequest().body("Transfer cancelled");
+    }
+    let deps = upload_deps();
+    let lock = match deps.upload_lock {
+        Some(lock) => lock,
+        None => return HttpResponse::ServiceUnavailable().body("upload queue unavailable"),
+    };
+    let _upload_guard = match crate::commands::fs::acquire_upload_lane(
+        lock,
+        tg_state.cancelled_transfers.clone(),
+        &tid,
+        false,
+    ).await {
+        Ok(guard) => guard,
+        Err(e) => return HttpResponse::BadRequest().body(e),
+    };
+
+    // --- Progress reporter starts only after admission --------------------------
     let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress_task = if !tid.is_empty() {
         let counter = consumed.clone();
@@ -197,19 +217,7 @@ pub(crate) async fn upload_drop_handler(
         }));
     }
 
-    // --- Cancellation pre-check (mirrors cmd_upload_file ordering) --------------
-    if tg_state.cancelled_transfers.read().await.contains(&tid) {
-        tg_state.cancelled_transfers.write().await.remove(&tid);
-        if let Some(t) = progress_task { t.abort(); }
-        return HttpResponse::BadRequest().body("Transfer cancelled");
-    }
-
     // --- Stream the request body directly into Telegram -------------------------
-    let deps = upload_deps();
-    let _upload_guard = match deps.upload_lock {
-        Some(lock) => Some(lock.lock_owned().await),
-        None => return HttpResponse::ServiceUnavailable().body("upload queue unavailable"),
-    };
     let reader = BodyReader {
         stream: Box::new(
             payload.map(|r| r.map_err(|e| actix_web::Error::from(e)))
