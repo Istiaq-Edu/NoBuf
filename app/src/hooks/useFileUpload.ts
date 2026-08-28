@@ -12,6 +12,20 @@ import { QueueItem } from '../types';
 export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
     return item.path.startsWith('nobuf-drop-stream://');
 }
+
+export function retryUploadItem(item: QueueItem): QueueItem {
+    if (item.status !== 'error' && item.status !== 'cancelled') return item;
+    return { ...item, status: 'pending', error: undefined, progress: undefined, uploadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined };
+}
+
+function parseUploadResult(result: string): { messageId?: number } {
+    try {
+        const parsed = JSON.parse(result) as { messageId?: unknown };
+        return typeof parsed.messageId === 'number' ? { messageId: parsed.messageId } : {};
+    } catch {
+        return {};
+    }
+}
 import { useFileDrop } from './useFileDrop';
 import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
@@ -130,6 +144,42 @@ export function persistableQueueItems(items: QueueItem[]): QueueItem[] {
 }
 
 /**
+ * Ids that no longer have a queue row. Their bookkeeping (run generations,
+ * cancel markers) can be discarded — otherwise those maps/sets grow once
+ * per upload for the whole session. Pure + exported for unit tests.
+ */
+export function orphanedUploadIds(tracked: Iterable<string>, queueIds: Set<string>): string[] {
+    const orphaned: string[] = [];
+    for (const id of tracked) {
+        if (!queueIds.has(id)) orphaned.push(id);
+    }
+    return orphaned;
+}
+
+/**
+ * A saved queue item's post-restart shape. Only recoverable rows survive:
+ * `pending` (never started — restarts cleanly), `error`/`cancelled` (retryable
+ * from the original source). An `uploading` row is a LIE after a restart —
+ * its task died with the process — so it maps to `cancelled` with an
+ * interruption note, showing Retry instead of a frozen active row.
+ * Stream-direct drops (`nobuf-drop-stream://`) and staged items are
+ * unrecoverable (the File handle and temp file are gone) — they are dropped.
+ * Pure + exported for unit testing.
+ */
+export function reviveSavedUploads(saved: QueueItem[]): QueueItem[] {
+    const revivable = saved.filter(i =>
+        (i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled')
+        && !i.stagedTempPath
+        && !i.path.startsWith('nobuf-drop-stream://')
+    );
+    return revivable.map(i =>
+        i.status === 'uploading'
+            ? { ...i, status: 'cancelled' as const, error: 'Interrupted when the app closed', progress: undefined, uploadedBytes: undefined, speedBytesPerSec: undefined }
+            : i
+    );
+}
+
+/**
  * Best-effort delete of a staged temp file once its queue item reaches a terminal
  * state. Silent by design: NotFound means the sweep/another path already got it,
  * and a locked file must never turn a finished upload into an error toast.
@@ -148,9 +198,26 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const [limitBytes, setLimitBytes] = useState(2_000_000_000);
     useEffect(() => { invoke<number>('cmd_upload_limit').then(setLimitBytes).catch(() => {}); }, []);
     const cancelledRef = useRef<Set<string>>(new Set());
+    // Prevent a cancelled invocation from overwriting a newer Retry attempt.
+    const runGenerationRef = useRef<Map<string, number>>(new Map());
     // Live mirror of uploadQueue for once-registered/async callbacks (dedupe on drop).
     const queueMirrorRef = useRef<QueueItem[]>([]);
     queueMirrorRef.current = uploadQueue;
+
+    // Bounded bookkeeping (WP5): run generations and cancel markers for ids
+    // that left the queue (Cancel pending / Remove / Delete) are garbage —
+    // prune them on every queue change so the maps can't grow per-upload
+    // for the whole session. Ids are never reused, so pruning is safe even
+    // while an in-flight invoke for a removed row is still settling.
+    useEffect(() => {
+        const live = new Set(uploadQueue.map(i => i.id));
+        for (const id of orphanedUploadIds(runGenerationRef.current.keys(), live)) {
+            runGenerationRef.current.delete(id);
+        }
+        for (const id of orphanedUploadIds(cancelledRef.current, live)) {
+            cancelledRef.current.delete(id);
+        }
+    }, [uploadQueue]);
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -188,20 +255,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         if (!store || initialized) return;
         store.get<QueueItem[]>('uploadQueue').then((saved) => {
             if (saved && saved.length > 0) {
-                const pending = saved.filter(i => i.status === 'pending');
-                if (pending.length > 0) {
-                    setUploadQueue(pending);
-                    toast.info(`Restored ${pending.length} pending uploads`);
+                const revived = reviveSavedUploads(saved);
+                if (revived.length > 0) {
+                    setUploadQueue(revived);
+                    const interrupted = revived.filter(i => i.error === 'Interrupted when the app closed').length;
+                    toast.info(interrupted > 0
+                        ? `Restored ${revived.length} upload${revived.length === 1 ? '' : 's'} (${interrupted} interrupted)`
+                        : `Restored ${revived.length} pending upload${revived.length === 1 ? '' : 's'}`);
                 }
             }
             setInitialized(true);
         });
     }, [store, initialized]);
 
+    // Persist every RECOVERABLE row (pending / uploading / error / cancelled)
+    // so a crash or restart keeps Retry available — not just never-started
+    // items. Staged temps and stream-drop rows are still excluded (sweep +
+    // dead File handles make them unrecoverable); completed rows are not
+    // persisted (they live in the folder listing, not the queue).
     useEffect(() => {
         if (!store || !initialized) return;
-        const pending = persistableQueueItems(uploadQueue.filter(i => i.status === 'pending'));
-        store.set('uploadQueue', pending).then(() => store.save());
+        const recoverable = persistableQueueItems(uploadQueue.filter(i =>
+            i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled'
+        ));
+        store.set('uploadQueue', recoverable).then(() => store.save());
     }, [store, uploadQueue, initialized]);
 
     useEffect(() => {
@@ -223,6 +300,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             setUploadQueue(q => q.map(i => i.id === id ? {
                 ...i,
                 status: status as QueueItem['status'],
+                messageId: typeof (e as CustomEvent).detail?.messageId === 'number'
+                    ? (e as CustomEvent).detail.messageId
+                    : i.messageId,
                 progress: status === 'success' ? 100 : undefined,
                 // Drop the stale byte counters too — otherwise error/cancel rows
                 // keep showing a frozen "X / Y" from the last progress event.
@@ -247,18 +327,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         // Stream-direct drops manage their own lifecycle (XHR + server events);
         // they enter the queue as 'uploading' and must never hit cmd_upload_file.
         if (isDropStreamItem(item)) return;
+        const generation = (runGenerationRef.current.get(item.id) ?? 0) + 1;
+        runGenerationRef.current.set(item.id, generation);
+        const isCurrentRun = () => runGenerationRef.current.get(item.id) === generation;
         setProcessing(true);
         setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i));
         try {
             if (item.url) {
                 // Remote upload from URL
-                await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const result = await invoke<string>('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             } else {
                 // Local file upload — displayName carries the ORIGINAL dropped-file name
                 // so the Telegram document isn't named after the <id>-prefixed temp file.
-                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const result = await invoke<string>('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             }
             // Check if cancelled during upload
+            if (!isCurrentRun()) return;
             if (cancelledRef.current.has(item.id)) {
                 // Cancel keeps the staged temp file: the item stays retryable, and
                 // Retry re-uploads from it. Deleted on success or queue removal.
@@ -269,6 +361,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 queryClient.invalidateQueries({ queryKey: ['files', item.folderId] });
             }
         } catch (e) {
+            if (!isCurrentRun()) return;
             if (!cancelledRef.current.has(item.id)) {
                 const errMsg = String(e);
                 if (errMsg.includes('Transfer cancelled')) {
@@ -284,6 +377,10 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cancelledRef.current.delete(item.id);
             }
         } finally {
+            // `processing` owns the queue runner, not this generation's row
+            // writes. Retry invalidates the old generation while it is still
+            // settling; withholding this release would wedge every pending
+            // upload for the rest of the session.
             setProcessing(false);
         }
     };
@@ -434,8 +531,6 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cleanupStagedTemp(item);
                 return q.filter(i => i.id !== id);
             }
-            // Bulk-cancelled pending items (cancelAll) are removed by its filter,
-            // which must not leave their staged temp files behind either.
             return q;
         });
     };
@@ -452,11 +547,27 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             ));
             return;
         }
-        setUploadQueue(q => q.map(i =>
-            i.id === id && (i.status === 'error' || i.status === 'cancelled')
-                ? { ...i, status: 'pending' as const, error: undefined, progress: undefined, uploadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined }
-                : i
-        ));
+        cancelledRef.current.delete(id);
+        runGenerationRef.current.set(id, (runGenerationRef.current.get(id) ?? 0) + 1);
+        setUploadQueue(q => q.map(i => i.id === id ? retryUploadItem(i) : i));
+    };
+
+    const removeItem = (id: string) => {
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (item) cleanupStagedTemp(item);
+        forgetLiveDrop(id);
+        setUploadQueue(q => q.filter(i => i.id !== id));
+    };
+
+    const deleteItem = async (id: string): Promise<void> => {
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (!item) return;
+        if (item.messageId !== undefined) {
+            await invoke('cmd_delete_file', { messageId: item.messageId, folderId: item.folderId });
+        }
+        cleanupStagedTemp(item);
+        forgetLiveDrop(id);
+        setUploadQueue(q => q.filter(i => i.id !== id));
     };
 
     const { isDragging } = useFileDrop();
@@ -560,6 +671,8 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         cancelAll,
         cancelItem,
         retryItem,
+        removeItem,
+        deleteItem,
         isDragging,
         splitFlow,
         splitJobRows: splitFlow.splitJobRows,

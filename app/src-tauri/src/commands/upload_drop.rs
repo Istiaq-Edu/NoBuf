@@ -29,6 +29,7 @@ use crate::server::StreamTokenData;
 pub struct UploadDeps {
     pub app_handle: Option<tauri::AppHandle>,
     pub bw: Option<Arc<BandwidthManager>>,
+    pub upload_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 static UPLOAD_DEPS: std::sync::OnceLock<UploadDeps> = std::sync::OnceLock::new();
@@ -38,7 +39,7 @@ pub fn set_upload_deps(deps: UploadDeps) {
 }
 
 pub(crate) fn upload_deps() -> UploadDeps {
-    UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None })
+    UPLOAD_DEPS.get().cloned().unwrap_or(UploadDeps { app_handle: None, bw: None, upload_lock: None })
 }
 
 pub(crate) const MAX_DROP_BYTES: u64 = 4_294_967_295; // Telegram hard ceiling (u32 part math)
@@ -156,7 +157,27 @@ pub(crate) async fn upload_drop_handler(
     };
     log::info!("[drop] streaming '{name}' ({size}B -> folder {folder_id:?}) tid={tid}");
 
-    // --- Progress reporter (250ms cadence, mirrors cmd_upload_file) -------------
+    // --- Cancellation pre-check, then queue admission ---------------------------
+    if tg_state.cancelled_transfers.read().await.contains(&tid) {
+        tg_state.cancelled_transfers.write().await.remove(&tid);
+        return HttpResponse::BadRequest().body("Transfer cancelled");
+    }
+    let deps = upload_deps();
+    let lock = match deps.upload_lock {
+        Some(lock) => lock,
+        None => return HttpResponse::ServiceUnavailable().body("upload queue unavailable"),
+    };
+    let _upload_guard = match crate::commands::fs::acquire_upload_lane(
+        lock,
+        tg_state.cancelled_transfers.clone(),
+        &tid,
+        false,
+    ).await {
+        Ok(guard) => guard,
+        Err(e) => return HttpResponse::BadRequest().body(e),
+    };
+
+    // --- Progress reporter starts only after admission --------------------------
     let consumed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress_task = if !tid.is_empty() {
         let counter = consumed.clone();
@@ -194,13 +215,6 @@ pub(crate) async fn upload_drop_handler(
         let _ = upload_deps().app_handle.as_ref().map(|h| h.emit("upload-progress", DropProgressPayload {
             id: tid.clone(), percent: 0, uploaded_bytes: 0, total_bytes: size, speed_bytes_per_sec: 0,
         }));
-    }
-
-    // --- Cancellation pre-check (mirrors cmd_upload_file ordering) --------------
-    if tg_state.cancelled_transfers.read().await.contains(&tid) {
-        tg_state.cancelled_transfers.write().await.remove(&tid);
-        if let Some(t) = progress_task { t.abort(); }
-        return HttpResponse::BadRequest().body("Transfer cancelled");
     }
 
     // --- Stream the request body directly into Telegram -------------------------
@@ -252,7 +266,38 @@ pub(crate) async fn upload_drop_handler(
                     let msg = grammers_client::types::InputMessage::new().text("").document(uploaded);
                     match client.send_message(&peer, msg).await {
                         Ok(m) => {
+                            // Post-send cancellation reconciliation: a cancel landing
+                            // between the last pre-send check and here would leave a live
+                            // Telegram message under a UI row that says cancelled. Delete
+                            // the orphan; surface a delete failure instead of a phantom.
+                            if !tid.is_empty() && tg_state.cancelled_transfers.read().await.contains(&tid) {
+                                match client.delete_messages(&peer, &[m.id()]).await {
+                                    Ok(_) => {
+                                        let mut cancelled = tg_state.cancelled_transfers.write().await;
+                                        cancelled.remove(&tid);
+                                        log::info!("[drop] tid={tid} cancelled after send — orphan deleted (message {})", m.id());
+                                        return HttpResponse::BadRequest().body("Transfer cancelled");
+                                    }
+                                    Err(e) => {
+                                        let mut cancelled = tg_state.cancelled_transfers.write().await;
+                                        cancelled.remove(&tid);
+                                        log::warn!("[drop] tid={tid} cancelled but orphan delete failed (message {}): {}", m.id(), e);
+                                        return HttpResponse::BadRequest().body(format!(
+                                            "Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", m.id(), e
+                                        ));
+                                    }
+                                }
+                            }
                             log::info!("[drop] tid={tid} SUCCESS: '{name}' ({size}B) sent, message_id={}", m.id());
+                            // documents-changed (parts-first plan §A): the drop
+                            // pipeline has its own send path — emit here too so
+                            // the folder listing refreshes without a restart.
+                            if let Some(h) = upload_deps().app_handle {
+                                let _ = h.emit(
+                                    "documents-changed",
+                                    serde_json::json!({ "folder_id": folder_id }),
+                                );
+                            }
                             HttpResponse::Ok().json(serde_json::json!({ "message_id": m.id() }))
                         }
                         // Distinct marker body: bytes are ALREADY STORED in

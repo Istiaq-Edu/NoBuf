@@ -103,17 +103,32 @@ describe('staged temp files are excluded from store persistence', () => {
     });
 
     it('processItem wires cleanup into the retryable-lifecycle paths (success/pending-remove/cancelAll)', () => {
-        // Exactly 4 occurrences: 1 definition + success + pending-item removal +
-        // cancelAll's bulk-pending strip. Cleanup fires ONLY where the item can
+        // Exactly 6 occurrences: 1 definition + success + pending-item removal +
+        // cancelAll's bulk-pending strip + explicit terminal-row Delete/Remove. Cleanup fires ONLY where the item can
         // never be retried again; cancelled/errored items KEEP their temp file so
         // Retry works (a cancelled drop whose temp was deleted would fail Retry
         // with "Invalid path").
         const s = src('src/hooks/useFileUpload.ts');
-        expect(s.match(/cleanupStagedTemp\(/g)?.length).toBe(4);
+        expect(s.match(/cleanupStagedTemp\(/g)?.length).toBe(6);
         // The cancel branches must NOT clean up — pinned by absence inside processItem's catch
         const catchStart = s.indexOf("if (errMsg.includes('Transfer cancelled'))");
         const catchBody = s.slice(catchStart, catchStart + 400);
         expect(catchBody).not.toContain('cleanupStagedTemp');
+    });
+
+    it('always releases the queue runner even when Retry invalidates the old generation', () => {
+        const s = src('src/hooks/useFileUpload.ts');
+        const finallyStart = s.indexOf('} finally {');
+        const finallyBody = s.slice(finallyStart, finallyStart + 400);
+        expect(finallyBody).toContain('setProcessing(false)');
+        expect(finallyBody).not.toContain('if (isCurrentRun()) setProcessing(false)');
+    });
+
+    it('removing a terminal stream-drop row releases its retained File handle', () => {
+        const s = src('src/hooks/useFileUpload.ts');
+        const removeStart = s.indexOf('const removeItem =');
+        const removeBody = s.slice(removeStart, removeStart + 500);
+        expect(removeBody).toContain('forgetLiveDrop(id)');
     });
 
     it('drop is rejected while disconnected from Telegram', () => {
