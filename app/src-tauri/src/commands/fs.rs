@@ -949,9 +949,9 @@ pub async fn cmd_upload_from_url(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Check 2GB Telegram limit
-    if content_length > 2 * 1024 * 1024 * 1024 {
-        return Err(format!("File exceeds Telegram's 2GB limit ({} bytes)", content_length));
+    // Telegram per-file limit (premium-aware, see limit_bytes above)
+    if content_length > limit_bytes {
+        return Err(format!("File exceeds Telegram's limit ({} bytes)", content_length));
     }
 
     // Check disk space (rough check — temp dir)
@@ -959,7 +959,7 @@ pub async fn cmd_upload_from_url(
     // The OS will return a write error if disk is full, which we handle below.
 
     let temp_path = temp_dir.join(format!("remote_{}_{}", tid, filename));
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
 
     // Temp-file guard: every `?`/Err return between here and the success path
     // must not strand the downloaded file in %TEMP%. All cancel/cleanup-aware
@@ -1031,9 +1031,9 @@ pub async fn cmd_upload_from_url(
     // pre-download gate only sees the Content-Length header, which chunked
     // responses omit (0) and lying servers understate. A 10GB body would
     // otherwise burn disk + bandwidth and only fail at send time (R4-1).
-    if actual_size > 2 * 1024 * 1024 * 1024 {
+    if actual_size > limit_bytes {
         return Err(format!(
-            "Downloaded file exceeds Telegram's 2GB limit ({} bytes) — the server's Content-Length was wrong",
+            "Downloaded file exceeds Telegram's limit ({} bytes) — the server's Content-Length was wrong",
             actual_size
         ));
     }
