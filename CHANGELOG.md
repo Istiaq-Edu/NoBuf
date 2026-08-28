@@ -2,7 +2,7 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.4.0] - 2026-08-25
+## [1.4.5] - 2026-08-25
 
 ### Bug Fixes
 
@@ -136,6 +136,7 @@ All notable changes to NoBuf will be documented in this file.
 - Record F3 (first-hide race) in consolidated report
 - Record F4 (stale unlock across account switch) in consolidated report
 - Spec rev 6 — locked get_state ID-withholding was a design error, corrected
+- Update CHANGELOG.md for v1.4.0
 
 ### Enhancements
 
