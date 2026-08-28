@@ -936,6 +936,15 @@ pub async fn cmd_upload_from_url(
     let temp_path = temp_dir.join(format!("remote_{}_{}", tid, filename));
     let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
 
+    // Temp-file guard: every `?`/Err return between here and the success path
+    // must not strand the downloaded file in %TEMP%. All cancel/cleanup-aware
+    // exits inside already call remove_file; this wrapper catches the REST
+    // (flush/sync/reader/parse/send errors) and deletes the temp before the
+    // error reaches the frontend. Without it, each failed URL upload leaks a
+    // full copy of the downloaded file (findings R2-F1).
+    let outcome: Result<String, String> = async {
+    let mut file = file;
+
     // Download with progress
     let mut downloaded: u64 = 0;
     let mut reader = resp.into_reader();
@@ -991,6 +1000,17 @@ pub async fn cmd_upload_from_url(
     if actual_size == 0 {
         let _ = std::fs::remove_file(&temp_path);
         return Err("Downloaded file was empty".to_string());
+    }
+
+    // Re-check the Telegram limit against the ACTUAL downloaded size: the
+    // pre-download gate only sees the Content-Length header, which chunked
+    // responses omit (0) and lying servers understate. A 10GB body would
+    // otherwise burn disk + bandwidth and only fail at send time (R4-1).
+    if actual_size > 2 * 1024 * 1024 * 1024 {
+        return Err(format!(
+            "Downloaded file exceeds Telegram's 2GB limit ({} bytes) — the server's Content-Length was wrong",
+            actual_size
+        ));
     }
 
     log::info!("[REMOTE-UPLOAD] Downloaded {} bytes, starting upload to Telegram", actual_size);
@@ -1151,6 +1171,19 @@ pub async fn cmd_upload_from_url(
 
     log::info!("[REMOTE-UPLOAD] Upload complete ({} bytes)", actual_size);
     Ok(serde_json::json!({ "message": "Remote file uploaded successfully", "messageId": sent.id() }).to_string())
+    }
+    .await;
+
+    // Guard exit: on any error path the temp file is garbage. The success arm
+    // already removed it; cancel arms removed it; every other Err exit gets
+    // cleaned here (R2-F1: one ≤2GB leak per failed URL upload otherwise).
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]

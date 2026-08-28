@@ -789,8 +789,14 @@ pub async fn cmd_prepare_split(
     let raw = equal_boundaries(duration, n_parts);
     let mut boundaries: Vec<f64> = Vec::with_capacity(raw.len());
     for b in raw {
+        // Keyframe probe failures (incl. the 60-min timeout) must DEGRADE to
+        // an unsnapped boundary — the split is still valid, just potentially
+        // slightly less optimally cut. Only a totally unreadable source
+        // should abort prepare (findings R4-4).
         let snapped = nearest_keyframe_before(&ffprobe, &path_str, b)
-            .await?
+            .await
+            .ok()
+            .flatten()
             .filter(|s| {
                 // Never collapse a part below MIN_PART_SECS.
                 let prev = boundaries.last().copied().unwrap_or(0.0);
@@ -865,6 +871,22 @@ pub async fn cmd_start_split_job(
 
     let job_id = derive_job_id(&plan.source_path, plan.source_size, epoch_secs());
     let job_id8: String = job_id.chars().take(8).collect();
+
+    // Same-source dedupe (findings R4-3): the id embeds epoch_secs, so
+    // confirming the same file twice seconds apart creates two jobs that
+    // each upload ALL parts — a full duplicate upload. Reject a new job for
+    // a source that already has a live (queued/running) row; terminal rows
+    // (interrupted/done) are allowed through so the user can re-split a
+    // finished file or resume via a fresh confirm.
+    {
+        let conn = get_connection(&app_handle)?;
+        if has_live_job_for_source(&conn, &plan.source_path) {
+            return Err(format!(
+                "This file already has a split job in progress. Finish or cancel it first ({}).",
+                plan.display_name
+            ));
+        }
+    }
 
     // Pre-flight disk space: largest estimated part + slack must fit where
     // temps go (edge case 23). Prefer next-to-source; fall back to AppData.
@@ -981,7 +1003,7 @@ pub async fn cmd_start_split_job(
     let job_id_spawn = job_id.clone();
     if claimed {
         tokio::spawn(async move {
-            if let Err(e) = run_job(app, job_id_spawn).await {
+            if let Err(e) = run_job_supervised(app, job_id_spawn).await {
                 log::warn!("[SPLIT] job ended: {}", e);
             }
         });
@@ -1093,7 +1115,7 @@ async fn promote_queued_jobs_impl(app: AppHandle) {
         let a = app.clone();
         let jid = job_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_job(a, jid).await {
+            if let Err(e) = run_job_supervised(a, jid).await {
                 log::warn!("[SPLIT] promoted job ended: {}", e);
             }
             // Chain: when this job finishes, try to start the next queued one.
@@ -1234,7 +1256,7 @@ pub async fn cmd_resume_split_job(
 
     let app = app_handle.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_job(app, id).await {
+        if let Err(e) = run_job_supervised(app, id).await {
             log::warn!("[SPLIT] resumed job ended: {}", e);
         }
     });
@@ -1341,7 +1363,7 @@ pub async fn cmd_retry_split_part(
 
     let app = app_handle.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_job(app, id).await {
+        if let Err(e) = run_job_supervised(app, id).await {
             log::warn!("[SPLIT] retried job ended: {}", e);
         }
     });
@@ -1459,6 +1481,38 @@ pub async fn cmd_discard_split_job(
 
 fn run_job<'a>(app: AppHandle, job_id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(run_job_impl(app, job_id))
+}
+
+/// Map a caught panic payload to its message — shared by the supervisor and
+/// its test so the mapping is pinned against the SHIPPED code.
+pub fn panic_payload_to_msg(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Worker supervisor: `run_job_impl` runs inside a panic-catching wrapper so
+/// a panicking worker (index out of bounds, unwrap on a poisoned lock, …)
+/// cannot strand the job row in `running` forever — the row flips to
+/// `interrupted` (resumable) instead, the same crash-recovery semantics as an
+/// app restart (which runs `normalize_stale_jobs`). Findings R3-1/R3-2.
+async fn run_job_supervised(app: AppHandle, job_id: String) -> Result<(), String> {
+    let app2 = app.clone();
+    let job_id2 = job_id.clone();
+    let inner = std::panic::AssertUnwindSafe(run_job(app, job_id));
+    match futures::FutureExt::catch_unwind(inner).await {
+        Ok(res) => res,
+        Err(panic) => {
+            let msg = panic_payload_to_msg(panic);
+            log::error!("[SPLIT] worker for job {job_id2} PANICKED: {msg}");
+            update_status_quiet(&app2, &job_id2, "interrupted", Some(format!("Worker crashed: {msg}")));
+            Err(format!("worker panicked: {msg}"))
+        }
+    }
 }
 
 async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
@@ -1962,6 +2016,26 @@ pub fn has_active_split_job(conn: &sqlite::Connection) -> bool {
             log::warn!("[SPLIT] active-job count unreadable, assuming busy");
             true
         }
+    }
+}
+
+/// True when the source path already has a queued/running job row — used by
+/// cmd_start_split_job to reject duplicate confirms (findings R4-3). Shared
+/// with tests so the SQL semantics are pinned against the SHIPPED query,
+/// not a test-local copy.
+pub fn has_live_job_for_source(conn: &sqlite::Connection, source_path: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT COUNT(*) FROM split_upload_jobs \
+         WHERE source_path = ? AND status IN ('queued','running')",
+    ) else {
+        return true; // unreadable DB → assume a live job (fail-safe)
+    };
+    if stmt.bind((1, source_path)).is_err() {
+        return true;
+    }
+    match stmt.iter().next() {
+        Some(Ok(row)) => matches!(&row[0], sqlite::Value::Integer(n) if *n > 0),
+        _ => true,
     }
 }
 
@@ -2558,6 +2632,61 @@ mod tests {
         )
         .unwrap();
         assert!(has_active_split_job(&conn));
+    }
+
+    #[test]
+    fn start_dedupe_query_semantics() {
+        // Pins the same-source dedupe (findings R4-3) against the SHIPPED
+        // has_live_job_for_source: only queued/running rows for the SAME
+        // source path block a fresh job — interrupted/done rows must not
+        // (resume-via-new-confirm is legitimate).
+        let conn = sqlite::Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE split_upload_jobs (id TEXT PRIMARY KEY, source_path TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER)",
+        )
+        .unwrap();
+        let insert = |conn: &sqlite::Connection, id: &str, src: &str, status: &str| {
+            let mut s = conn
+                .prepare("INSERT INTO split_upload_jobs (id, source_path, status) VALUES (?, ?, ?)")
+                .unwrap();
+            s.bind((1, id)).unwrap();
+            s.bind((2, src)).unwrap();
+            s.bind((3, status)).unwrap();
+            s.iter().next();
+        };
+
+        // Terminal rows for the same source do not block.
+        insert(&conn, "old1", "D:/a.mkv", "interrupted");
+        insert(&conn, "old2", "D:/a.mkv", "done");
+        assert!(!has_live_job_for_source(&conn, "D:/a.mkv"));
+
+        // A live row for the same source blocks…
+        insert(&conn, "live", "D:/a.mkv", "queued");
+        assert!(has_live_job_for_source(&conn, "D:/a.mkv"));
+
+        // …and a live row for a DIFFERENT source doesn't.
+        assert!(!has_live_job_for_source(&conn, "D:/b.mkv"));
+
+        // Unreadable DB (no table) reads as live — fail-safe, same rule as
+        // has_active_split_job.
+        let empty = sqlite::Connection::open(":memory:").unwrap();
+        assert!(has_live_job_for_source(&empty, "D:/x.mkv"));
+    }
+
+    #[tokio::test]
+    async fn panic_supervisor_converts_panic_to_err() {
+        // A panicking worker must not unwind through the spawn site — the
+        // catch_unwind layer converts it to Err, which the supervisor maps
+        // to an `interrupted` status write (findings R3-1). Exercises the
+        // SHIPPED mapping helper on all three payload shapes.
+        assert_eq!(panic_payload_to_msg(Box::new("boom")), "boom");
+        assert_eq!(panic_payload_to_msg(Box::new(String::from("kaput"))), "kaput");
+        assert_eq!(panic_payload_to_msg(Box::new(42i64)), "unknown panic");
+
+        // And the catch_unwind layer itself converts a panic into Err:
+        let inner = std::panic::AssertUnwindSafe(async { panic!("boom") });
+        let caught = futures::FutureExt::catch_unwind(inner).await;
+        assert!(caught.is_err(), "catch_unwind must catch the panic");
     }
 
 
