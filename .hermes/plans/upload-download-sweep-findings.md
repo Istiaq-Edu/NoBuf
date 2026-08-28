@@ -152,3 +152,21 @@ Child reports contained 3 false positives out of ~20 claims — the fresh-eyes p
 **Gates:** cargo 427 passed (+2), vitest 1188 passed, tsc clean, diff clean.
 
 **Not fixed (documented):** R6-P3 filmstrip parallelization (P2→deferred: needs buffer_unordered refactor, tracked below); R4-5 CL=0 indeterminate progress; R4-6 redirect filename; R5-F2 legacy-row path guard; R7 hardening items (constant-time compare, header token) — all P3, logged as follow-ups.
+
+---
+
+## Reviewer follow-up round (post-a89b3c6, 2026-08-28)
+
+Independent /review subagent (43 API calls) re-verified the commit's gates
+and mutation cycles, then died at its iteration cap chasing two leads.
+Parent re-verified both from source and fixed:
+
+| ID | Severity | Finding | Verdict | Fix |
+|---|---|---|---|---|
+| RV1 | P2 | `run_job_impl` early `?` exits (ensure_ffmpeg, DB open) return Err WITHOUT a terminal status write → row stranded in `running` → PIPELINE_CLAIM_SQL blocked for ALL jobs until restart | VERIFIED | Supervisor Err-arm: if row still `running` after Err, flip to `interrupted` |
+| RV2 | P2 | URL-path size gates hardcode 2GB; `upload_limit_bytes` gives premium 4GB → premium 3GB URL-upload falsely rejected | VERIFIED | Premium-aware `limit_bytes` (mirrors cmd_upload_limit incl. NOBUF_FAKE_UPLOAD_CAP_BYTES override), both gates use it |
+| RV3 | P3 | Retry-all path called unsupervised `run_job` (line 1903) | VERIFIED | Now `run_job_supervised` — zero unsupervised `run_job(` call sites remain |
+
+Also independently confirmed by reviewer: gates (cargo 427 / vitest 1188 /
+tsc clean / tree clean) and the dedupe mutation cycle (RED → sha256-verified
+byte-exact restore → GREEN).

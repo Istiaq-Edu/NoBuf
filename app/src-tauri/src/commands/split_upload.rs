@@ -1498,14 +1498,30 @@ pub fn panic_payload_to_msg(panic: Box<dyn std::any::Any + Send>) -> String {
 /// Worker supervisor: `run_job_impl` runs inside a panic-catching wrapper so
 /// a panicking worker (index out of bounds, unwrap on a poisoned lock, …)
 /// cannot strand the job row in `running` forever — the row flips to
-/// `interrupted` (resumable) instead, the same crash-recovery semantics as an
-/// app restart (which runs `normalize_stale_jobs`). Findings R3-1/R3-2.
+/// `interrupted` (resumable), the same crash-recovery semantics as an app
+/// restart (which runs `normalize_stale_jobs`). The Err arm catches the
+/// non-panic failure mode with the same consequence: run_job_impl's early
+/// `?` exits (DB open, ensure_ffmpeg, row lookup) return Err WITHOUT a
+/// terminal status write, and a stuck `running` row blocks the pipeline
+/// claim (PIPELINE_CLAIM_SQL) for every other job. Findings R3-1/R3-2 +
+/// reviewer follow-up.
 async fn run_job_supervised(app: AppHandle, job_id: String) -> Result<(), String> {
     let app2 = app.clone();
     let job_id2 = job_id.clone();
     let inner = std::panic::AssertUnwindSafe(run_job(app, job_id));
     match futures::FutureExt::catch_unwind(inner).await {
-        Ok(res) => res,
+        Ok(res) => {
+            if res.is_err() {
+                // Row may be stranded in `running` by an unwritten terminal
+                // status — normalize to `interrupted` only if it's still
+                // running (a proper terminal write already landed otherwise).
+                let status = current_job_status(&app2, &job_id2).unwrap_or_default();
+                if status == "running" {
+                    update_status_quiet(&app2, &job_id2, "interrupted", Some("Worker exited without terminal status".into()));
+                }
+            }
+            res
+        }
         Err(panic) => {
             let msg = panic_payload_to_msg(panic);
             log::error!("[SPLIT] worker for job {job_id2} PANICKED: {msg}");
@@ -1513,6 +1529,23 @@ async fn run_job_supervised(app: AppHandle, job_id: String) -> Result<(), String
             Err(format!("worker panicked: {msg}"))
         }
     }
+}
+
+/// Read a job row's current status — best-effort, empty string on failure
+/// (callers treat unknown like not-running for safety).
+fn current_job_status(app: &AppHandle, job_id: &str) -> Option<String> {
+    let conn = get_connection(app).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT status FROM split_upload_jobs WHERE id = ?")
+        .ok()?;
+    stmt.bind((1, job_id)).ok()?;
+    stmt.iter()
+        .next()
+        .and_then(|r| r.ok())
+        .map(|row| match &row[0] {
+            sqlite::Value::String(x) => x.clone(),
+            _ => String::new(),
+        })
 }
 
 async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
@@ -1900,7 +1933,10 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
         apply_retry_indices(&mut latest_parts, &retry_indices);
         persist_parts(&app, &job_id, &latest_parts)?;
         drop(_upload_guard);
-        return run_job(app, job_id).await;
+        // Supervised like every other worker spawn: a panic or an early-`?`
+        // Err in the retried run must flip the row out of `running`, not
+        // strand it (reviewer follow-up on the unsupervised retry path).
+        return run_job_supervised(app, job_id).await;
     }
 
     // A job with deliberately skipped parts is not fully complete. Keep its

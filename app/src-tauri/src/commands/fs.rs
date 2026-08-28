@@ -884,6 +884,31 @@ pub async fn cmd_upload_from_url(
     let temp_dir = std::env::temp_dir().join("nobuf_remote_upload");
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
+    // Premium-aware per-file limit — both gates below check against this, so a
+    // 3GB file on a premium account passes (upload_limit_bytes: 4GB premium,
+    // 2GB free). Overrides: NOBUF_FAKE_UPLOAD_CAP_BYTES dev/QA knob (mirrors
+    // cmd_upload_limit), free-tier fallback when not connected.
+    let limit_bytes: u64 = {
+        if let Ok(v) = std::env::var("NOBUF_FAKE_UPLOAD_CAP_BYTES") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    log::info!("[REMOTE-UPLOAD] upload-limit override active: {n}B");
+                    n
+                } else {
+                    2_000_000_000
+                }
+            } else {
+                2_000_000_000
+            }
+        } else {
+            let client_opt = { state.client.lock().await.clone() };
+            match client_opt {
+                Some(client) => crate::commands::utils::upload_limit_bytes(&client).await?,
+                None => 2_000_000_000,
+            }
+        }
+    };
+
     // Phase 1: Download from URL to temp file
     let url = validate_url(&url)?;
     log::info!("[REMOTE-UPLOAD] Downloading from {}", url);
