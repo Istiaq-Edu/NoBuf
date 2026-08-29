@@ -90,7 +90,16 @@ pub fn parse_channel_link(link: &str) -> Result<(String, String), String> {
         }
         return Ok(("invite_hash".to_string(), hash));
     }
-    
+
+    // Legacy invite format: t.me/joinchat/<hash> — same semantics as t.me/+<hash>.
+    if path.starts_with("joinchat/") {
+        let hash = path["joinchat/".len()..].to_string();
+        if hash.is_empty() {
+            return Err("Empty invite hash".to_string());
+        }
+        return Ok(("invite_hash".to_string(), hash));
+    }
+
     if path.starts_with("c/") {
         return Err("Private channel links (t.me/c/...) require an invite link to join. Ask the channel admin for a t.me/+... invite link.".to_string());
     }
@@ -1120,6 +1129,55 @@ pub async fn cmd_sync_public_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_channel_link_accepts_legacy_joinchat_invite() {
+        // t.me/joinchat/<hash> is Telegram's legacy invite format, equivalent
+        // to t.me/+<hash>. It used to fall through to the username branch and
+        // fail the charset check with "Invalid username format".
+        assert_eq!(
+            parse_channel_link("https://t.me/joinchat/cYEZsXNEvQ9mZGNl").unwrap(),
+            ("invite_hash".to_string(), "cYEZsXNEvQ9mZGNl".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("t.me/joinchat/abc123").unwrap(),
+            ("invite_hash".to_string(), "abc123".to_string())
+        );
+        // Plain https://t.me/joinchat (no hash) is username-shaped; it parses
+        // as a username and the resolve call fails later with "No channel
+        // found" — acceptable, not an invite misclassification.
+        assert_eq!(
+            parse_channel_link("https://t.me/joinchat").unwrap(),
+            ("username".to_string(), "joinchat".to_string())
+        );
+        // Trailing slash with no hash is an empty invite — must error.
+        assert!(parse_channel_link("https://t.me/joinchat/").is_err());
+    }
+
+    #[test]
+    fn parse_channel_link_accepts_plus_invite_and_username() {
+        assert_eq!(
+            parse_channel_link("https://t.me/+JVFkVGMNwTdhY2Nh").unwrap(),
+            ("invite_hash".to_string(), "JVFkVGMNwTdhY2Nh".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("t.me/+abc").unwrap(),
+            ("invite_hash".to_string(), "abc".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("https://t.me/somechannel").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("@somechannel").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+        // Query strings must be stripped from usernames.
+        assert_eq!(
+            parse_channel_link("https://t.me/somechannel?foo=bar").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+    }
 
     fn test_channel(id: i64, broadcast: bool) -> grammers_tl_types::enums::Chat {
         grammers_tl_types::enums::Chat::Channel(grammers_tl_types::types::Channel {
