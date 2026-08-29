@@ -740,9 +740,19 @@ pub async fn cmd_remove_public_channel(
     if leave_on_telegram {
         let client_opt = { state.client.lock().await.clone() };
         if let Some(client) = client_opt {
-            client.invoke(&grammers_tl_types::functions::channels::LeaveChannel {
+            if let Err(e) = client.invoke(&grammers_tl_types::functions::channels::LeaveChannel {
                 channel: build_input_channel(channel_id, access_hash),
-            }).await.map_err(map_error)?;
+            }).await {
+                // The leave is best-effort: the row must still be removed from
+                // NoBuf (the user's actual intent). CHANNEL_PRIVATE /
+                // USER_NOT_PARTICIPANT mean we're already out — the exact
+                // state the user asked for. Anything else is a real failure
+                // worth surfacing, but still must not strand the local state.
+                let msg = e.to_string();
+                if !(msg.contains("CHANNEL_PRIVATE") || msg.contains("USER_NOT_PARTICIPANT")) {
+                    log::warn!("[Public Channels] LeaveChannel for {} failed (removing anyway): {}", channel_id, msg);
+                }
+            }
         }
     }
 
