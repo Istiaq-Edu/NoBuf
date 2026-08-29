@@ -2,7 +2,50 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.4.5] - 2026-08-25
+## [1.4.5] - 2026-08-28
+
+### Bug Fixes
+
+- **split-upload:** Themed confirm dialog for job delete — window.confirm hits raw WebView2 defaults
+- **split-upload:** Live interrupted-row updates + honest discard copy (QA round 1 findings)
+- **split-upload:** Synthesize part rows from totalParts for jobs started mid-session
+- **split-upload:** Keep transfer rows live and cancellable
+- **split-upload:** Repair aggregate progress retry and clearing
+- **split-upload:** Reconcile live progress and retry state
+- **uploads:** Confirm cancel and make retry single-click
+- **uploads:** Release queue after retry invalidation
+- **uploads:** Serialize split groups with normal uploads
+- **uploads:** Preserve FIFO and cancel queued transfers
+- **dashboard:** Key every AnimatePresence child
+- **uploads:** Harden split pipeline against races and mislabeled names
+- **uploads:** Surface pipeline errors, bound bookkeeping, reap hung ffmpeg
+- **uploads:** Harden URL temp cleanup, panic recovery, dedupe, and size gates
+- **uploads:** Supervisor Err-guard, premium-aware URL gates, supervised retry
+- **uploads:** Actually wire premium-aware limit into URL gates; drop dead mut
+
+### Documentation
+
+- **plan:** Record Phase E shipped (5aeb115); E2E fake-cap run left as manual QA
+- **plan:** Sketch resumable-transfers branch — locked decisions, three legs, reuse map
+- **plan:** Parts-first uploads — progressive listing, grouped transfer rows, chain removal (17 locked interview decisions + 3 investigation evidence bases)
+- **plan:** Parts-first — fold in deep-review corrections (Play-via-MediaPlayer not URL construction, exact 5-file chain deletion surface incl. tail-stall watchdog, retry-backoff cancel slicing, react-query prefix semantics, caller census, virtualization notes)
+- **plan:** Fold adversarial validation into parts-first plan (F1-F8)
+
+### Features
+
+- **split-upload:** Phase E — resume/discard actions on interrupted jobs + startup resume notice
+- **split-upload:** Phase A — per-part backend truth, retry, tid lifecycle, documents-changed
+- **split-upload:** Phase B — grouped per-part rows in Transfers panel
+- **parts-first:** Phase C — chain removal; every part plays solo from 0:00
+- **parts-first:** Phase D — documents-changed listener refreshes folder listing progressively
+- **split-upload:** Add scoped delete flow
+- **uploads:** Add retry and delete actions
+
+### Testing
+
+- **split-upload:** Split_owns_tid predicate + truth table — mutation-killed F1 regression guard
+
+## [1.4.0] - 2026-08-25
 
 ### Bug Fixes
 
@@ -97,6 +140,15 @@ All notable changes to NoBuf will be documented in this file.
 - **vault-sync:** Finding E verified-fixed (runtime unlock flag in pull response); R2 dual-blob steady state documented
 - **vault-sync:** Pull_sync always re-pushes — one-way sync stalled propagation
 - **vault-sync:** Rev-clock recency (F1) + message-id adoption (F2) + best-effort post-pull push (F3)
+- **split-upload:** Record Telegram message ids per part; sweep only terminal-job temps; normalize stale running jobs at startup
+- **split-upload:** Hash-based unique job ids (base64-truncate collided on dir prefix); record Telegram message ids per part; fail loudly on job-row insert errors; reject sub-margin caps; startup normalization for stale jobs
+- **split-upload:** Delete drop-staged temp copies on modal-close/job-done/job-discard (interrupted jobs keep them for resume)
+- **split-upload:** Backdrop click no longer closes split modal (explicit X/Cancel/Done/Escape only); Esc guarded during prepare/start; fake cap now covers frontend upload-limit checks
+- **split-upload:** Reject sub-minute-average plans before snapping (QA-cap pathological case, user-repro 6127s/70MB)
+- **split-upload:** Oversize drops while a split is already active now reject loudly instead of vanishing; drop dead pending-choice state
+- **split-upload:** Atomic pipeline claim + queue survives restart; un-nest dead test
+- **split-upload:** Multi-angle review sweep fixes (queue/lifecycle/security)
+- **split-upload:** Poll cmd_upload_limit until first success
 
 ### Documentation
 
@@ -137,6 +189,9 @@ All notable changes to NoBuf will be documented in this file.
 - Record F4 (stale unlock across account switch) in consolidated report
 - Spec rev 6 — locked get_state ID-withholding was a design error, corrected
 - Update CHANGELOG.md for v1.4.0
+- Update CHANGELOG.md for v1.4.5
+- **split-upload:** Validated plan for >2GB lossless split-and-upload
+- **plan:** Record Phase D D0 spike decision (Strategy 1 — fresh MediaSource per part)
 
 ### Enhancements
 
@@ -243,6 +298,24 @@ All notable changes to NoBuf will be documented in this file.
 - **vault:** Phase 5 — settings, hotkey, logout wipe, edge-case sweep
 - **vault:** Back button — view history stack with TopBar arrow
 - **vault:** Cross-device sync via Saved Messages (spec §7)
+- **split-upload:** Lossless >2GB split engine with resumable jobs
+- **split-upload:** Phase A backend split core
+- **split-upload:** Split screen UI (filmstrip + draggable cut handles) wired into oversize-video upload flow
+- **split-upload:** Oversize videos dropped via drag-and-drop now enter the split screen (staged to temp, then same prepare/modal/job chain)
+- **split-upload:** Fast raw-binary /stage-drop route for drop->split staging (base64 IPC stager kept as fallback); sanitize_staged_name extracted as shared helper
+- **split-upload:** Drop-time warning about temp copy + highlighted Upload-button alternative; transfers panel auto-opens during split processing
+- **split-upload:** Decision-first oversize drop — choice modal before any temp copy, with highlighted zero-copy picker lane
+- **split-upload:** Startup sweep reclaims crash-orphaned drop-staged files older than 48h
+- **split-upload:** Confirm-before-close on active split modal (X/Cancel/Esc route through a Discard? overlay when plan/prepare/start is live)
+- **split-upload:** Authoritative single-pipeline gate in cmd_start_split_job — second job during an active upload now fails loudly instead of competing
+- **split-upload:** Job queue — extra big files line up as 'queued' and auto-start in order; live split rows with phase indicators in Transfers panel
+- **split-upload:** Phase D slice 1 — chain model + virtual timeline (pure, tested)
+- **split-upload:** Phase D slice 2 — chained part playback (Strategy 1)
+- **split-upload:** Phase D slice 3 — chain HUD (part k/N badge)
+- **split-upload:** Phase D slice 4 — grid collapse of split chains
+- **split-upload:** Phase D slice 5 — gap rule UX
+- **split-upload:** Phase D slice 6 — real-world chain naming (double-nested)
+- **split-upload:** Phase D slice 7 — chain tail-stall watchdog
 
 ### Miscellaneous Tasks
 
@@ -256,6 +329,11 @@ All notable changes to NoBuf will be documented in this file.
 - Bump Tauri dependency versions
 - Remove log file from git, add to gitignore
 - **vault-sync:** Clear 3 compiler warnings (vestigial import, dead struct, dead hex helper)
+- **split-upload:** Tidy integration test source-hash gate
+- **split-upload:** Dev-only QA seam to bypass native file picker in split flow
+- **split-upload:** Extend dev QA seam with job list/resume/cancel/discard controls
+- Ignore app/tmp (split QA fixtures) — no media files in git
+- Ignore app/.npm-cache (package-manager cache, purged from history)
 
 ### Other
 
@@ -353,6 +431,7 @@ All notable changes to NoBuf will be documented in this file.
 - Final-sweep fixes: zombie-retry purge + ALREADY_STORED no-duplicate-retry
 - Origin/dev into feature/vault-hide-channels (drag-drop upload overhaul, QR 2FA fixes)
 - Cleanups
+- Merge remote-tracking branch 'origin/dev' into feature/large-video-split-upload
 
 ### Performance
 
