@@ -110,7 +110,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // Ref mirror so the hotkey's stable callback can navigate without
         // re-binding the window listener on every render.
         useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
-        const { publicChannels, removeChannel, syncFromRemote } = usePublicChannels();
+        const { publicChannels, removeChannel } = usePublicChannels();
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
 
@@ -1072,7 +1072,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 activeView={activeView}
                 publicChannels={visiblePublicChannels}
                 onSelectPublicChannel={(channelId) => navigateTo({ type: 'public', channelId })}
-                onPublicChannelsChanged={() => syncFromRemote.mutate()}
+                onPublicChannelsChanged={() => queryClient.invalidateQueries({ queryKey: ['publicChannels'] })}
                 onRemovePublicChannel={handleRemovePublicChannel}
                 onOpenVault={() => navigateTo({ type: 'vault' })}
                 onHideInVault={handleHideInVault}

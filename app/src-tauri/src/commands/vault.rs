@@ -662,13 +662,24 @@ mod tests {
 
     #[test]
     fn search_call_site_wraps_both_push_sites_in_fs_source() {
-        // Guards the WIRING, not just the predicate: if either push site in
+        // Guards the WIRING, not just the predicate: if the result push in
         // cmd_search_global loses its `search_result_keeps` guard, the locked
         // vault leaks via global search and this test fails. Source-level
         // because the loop bodies are Telegram-mocked and unreachable headless.
+        // (Historically the Messages/Slice arms duplicated the body → 2 push
+        // sites; the all-arms messages_from_history consolidation collapsed
+        // them to 1. The invariant is "every push is guarded", not a count.)
         let src = include_str!("fs.rs");
-        let guards = src.matches("if !vault::search_result_keeps(&hidden, folder_id) {").count();
-        assert_eq!(guards, 2, "cmd_search_global must guard every result push with the vault filter");
+        let start = src.find("pub async fn cmd_search_global").expect("cmd_search_global exists");
+        let end = src[start..]
+            .find("#[tauri::command]")
+            .map(|i| start + i)
+            .expect("a following command exists");
+        let body = &src[start..end];
+        let guards = body.matches("if !vault::search_result_keeps(&hidden, folder_id) {").count();
+        let pushes = body.matches("files.push(FileMetadata {").count();
+        assert_eq!(guards, pushes, "cmd_search_global must guard every result push with the vault filter");
+        assert!(guards >= 1, "cmd_search_global must have at least one guarded push");
     }
 
     #[test]

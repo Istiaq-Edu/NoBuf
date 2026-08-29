@@ -59,13 +59,6 @@ export function usePublicChannels() {
         onError: (e: string) => toast.error(e),
     });
 
-    const syncFromRemote = useMutation({
-        mutationFn: () => invoke<PublicChannel[]>('cmd_sync_public_channels'),
-        onSuccess: (data) => {
-            queryClient.setQueryData(['publicChannels'], data);
-        },
-    });
-
     return {
         publicChannels,
         isLoading,
@@ -73,7 +66,6 @@ export function usePublicChannels() {
         joinByLink,
         addJoined,
         removeChannel,
-        syncFromRemote,
     };
 }
 
