@@ -186,3 +186,17 @@ bounds converted window-relative).
 Note: QA initially mis-clicked a video file (coordinate DPI drift between AX
 captures), opening the player and its cache dialog — recovered via Esc /
 "Close & Discard Cache". No state was affected.
+
+## Bugs 3-5 in the same invite/remove flow (user-reported, live links)
+
+| Commit | Bug | Root cause |
+|---|---|---|
+| b150a0d | `t.me/joinchat/<hash>` rejected "Invalid username format" | Parser had no `joinchat/` branch; legacy invite format fell to username charset check |
+| 3690903 | Peekable channel dead-ended: "Please join the channel first" while killing the preview card that hosts the Join button | `ChatInvite::Peek` arm errored instead of rendering the preview card from the Chat it carries |
+| 0fac7ba | Removal blocked: "rpc error 400: CHANNEL_PRIVATE caused by channels.leaveChannel" when user already left on Telegram | `leaveChannel` failure aborted via `?` BEFORE the DB DELETE — stuck row, no UI escape. Leave is now best-effort; CHANNEL_PRIVATE/USER_NOT_PARTICIPANT = already in requested state |
+
+All three are the same class as the original P0: **remote-side action errors
+strand local state** (join errors strand the add; leave errors strand the
+remove; parser/peek errors strand the entry point). The fix pattern is
+consistent: local intent is the source of truth; remote mutations are
+best-effort with honest errors only when they change the outcome.
