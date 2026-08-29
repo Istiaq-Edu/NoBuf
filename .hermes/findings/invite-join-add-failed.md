@@ -113,3 +113,36 @@ could not identify channel") with no DB insert. Fix: `chats_from_updates`
 helper (both variants) + `USER_ALREADY_PARTICIPANT` recovery +
 `CheckChatInvite` identification fallback + honest group-invite error.
 Mutation-tested, full gates green.
+
+## Post-commit review (2026-08-29, reviewer subagent died at 30s — parent absorbed)
+
+**External verification — grammers reference implementation:**
+`grammers-client/src/client/chats.rs:328-345` `updates_to_chat()` handles
+exactly `Combined` + `Updates` for ImportChatInvite responses — the identical
+arm set to our `chats_from_updates`. The library authors solved the same
+problem the same way. Independent confirmation of the root cause and fix shape.
+
+**Verified claims (re-derived from grammers source):**
+- `RpcError::Display` (mtsender/errors.rs:110-121) = `"rpc error {code}: {name}"`
+  → `USER_ALREADY_PARTICIPANT` IS present in the error string → the
+  `msg.contains(...)` recovery fires. **Previously unverified, now closed.**
+- `map_error` (utils.rs:137-153) handles FLOOD_WAIT for both the
+  ImportChatInvite and the fallback CheckChatInvite invocation.
+- The fallback `CheckChatInvite` errors (`INVITE_HASH_EXPIRED`,
+  `INVITE_HASH_EMPTY`) propagate via `map_error` — correct: no join happened,
+  no partial state.
+
+**Known minor gaps (documented, accepted):**
+1. `CheckChatInvite::Already` with non-Channel chat (basic group) → falls to
+   the generic "may be a group" error rather than the resolve path's explicit
+   "Already joined but not a channel". Consistency nit, not correctness.
+2. Legacy code smell retained (pre-existing, out of scope): dedup INSERT at
+   :381-393 does `stmt.next()` then discards the result — an INSERT failing
+   would surface as Ok with no row. Pre-existing pattern across the file, same
+   class as cmd_add_joined_channel:460. Not introduced by this fix; left
+   untouched per surgical-change rule.
+3. Live-packet capture of the actual failing response shape not possible
+   offline; Combined remains inferred from Telegram semantics + the grammers
+   reference. The fix covers all shapes regardless.
+
+**Final status:** complete. Awaiting user's live QA (re-add the invite link).
