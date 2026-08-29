@@ -248,6 +248,20 @@ pub async fn cmd_resolve_channel_link(
     }
 }
 
+// Chats carried by an Updates response. `messages.ImportChatInvite` can answer
+// with either `updates` or `updatesCombined` (the server merges update batches
+// when the join produces more updates than a single object carries); matching
+// only one variant silently dropped the joined channel and made the add step
+// fail AFTER the join had already happened.
+fn chats_from_updates(updates: &grammers_tl_types::enums::Updates) -> &[grammers_tl_types::enums::Chat] {
+    use grammers_tl_types::enums::Updates;
+    match updates {
+        Updates::Updates(u) => &u.chats,
+        Updates::Combined(u) => &u.chats,
+        _ => &[],
+    }
+}
+
 // ─── Join channel by link + DB insert ─────────────────────────────
 
 #[tauri::command]
@@ -287,20 +301,52 @@ pub async fn cmd_join_channel_by_link(
         }
         "invite_hash" => {
             let result = client.invoke(&grammers_tl_types::functions::messages::ImportChatInvite {
-                hash: value,
-            }).await.map_err(map_error)?;
+                hash: value.clone(),
+            }).await;
 
             let mut found: Option<(i64, i64, String)> = None;
-            if let grammers_tl_types::enums::Updates::Updates(u) = result {
-                for chat in &u.chats {
-                    if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+            match result {
+                Ok(updates) => {
+                    for chat in chats_from_updates(&updates) {
+                        if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                            if c.broadcast {
+                                found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A retry of an already-used invite link answers
+                    // USER_ALREADY_PARTICIPANT — the join happened on an earlier
+                    // attempt. Recover below instead of failing after the mutation.
+                    let msg = e.to_string();
+                    if !msg.contains("USER_ALREADY_PARTICIPANT") {
+                        return Err(map_error(e));
+                    }
+                }
+            }
+
+            // The join happened (or we were already a member) but the response
+            // carried no usable broadcast channel. Identify the exact chat via
+            // the invite hash itself: as a member, CheckChatInvite answers
+            // chatInviteAlready with the full Chat object.
+            if found.is_none() {
+                let check = client.invoke(&grammers_tl_types::functions::messages::CheckChatInvite {
+                    hash: value,
+                }).await.map_err(map_error)?;
+                if let grammers_tl_types::enums::ChatInvite::Already(already) = check {
+                    if let grammers_tl_types::enums::Chat::Channel(c) = already.chat {
                         if c.broadcast {
                             found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
                         }
                     }
                 }
             }
-            let (cid, ah, t) = found.ok_or("Joined but could not identify channel")?;
+
+            let (cid, ah, t) = found.ok_or(
+                "Joined, but NoBuf could not add it — it may be a group (NoBuf only supports \
+                 channels). Leave it in Telegram if you joined it by accident."
+            )?;
             (cid, ah, t, None, true)
         }
         _ => return Err("Unknown link type".to_string()),
@@ -1031,4 +1077,164 @@ pub async fn cmd_sync_public_channels(
         result.push(row_to_public_channel(&row));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_channel(id: i64, broadcast: bool) -> grammers_tl_types::enums::Chat {
+        grammers_tl_types::enums::Chat::Channel(grammers_tl_types::types::Channel {
+            creator: false,
+            left: false,
+            broadcast,
+            verified: false,
+            megagroup: false,
+            restricted: false,
+            signatures: false,
+            min: false,
+            scam: false,
+            has_link: false,
+            has_geo: false,
+            slowmode_enabled: false,
+            call_active: false,
+            call_not_empty: false,
+            fake: false,
+            gigagroup: false,
+            noforwards: false,
+            join_to_send: false,
+            join_request: false,
+            forum: false,
+            stories_hidden: false,
+            stories_hidden_min: false,
+            stories_unavailable: false,
+            signature_profiles: false,
+            autotranslation: false,
+            broadcast_messages_allowed: false,
+            monoforum: false,
+            forum_tabs: false,
+            id,
+            access_hash: Some(id * 111),
+            title: format!("Channel {}", id),
+            username: None,
+            photo: grammers_tl_types::enums::ChatPhoto::Empty,
+            date: 0,
+            restriction_reason: None,
+            admin_rights: None,
+            banned_rights: None,
+            default_banned_rights: None,
+            participants_count: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            emoji_status: None,
+            level: None,
+            subscription_until_date: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+            linked_monoforum_id: None,
+        })
+    }
+
+    #[test]
+    fn chats_from_updates_extracts_from_updates_variant() {
+        let chats = vec![test_channel(1, true)];
+        let updates = grammers_tl_types::enums::Updates::Updates(
+            grammers_tl_types::types::Updates {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq: 0,
+            },
+        );
+        assert_eq!(chats_from_updates(&updates).len(), 1);
+        assert!(matches!(&chats_from_updates(&updates)[0],
+            grammers_tl_types::enums::Chat::Channel(c) if c.id == 1));
+    }
+
+    #[test]
+    fn chats_from_updates_extracts_from_combined_variant() {
+        // The P0 bug: ImportChatInvite answered UpdatesCombined and the old
+        // single-variant match dropped the joined channel entirely.
+        let chats = vec![test_channel(2, true)];
+        let updates = grammers_tl_types::enums::Updates::Combined(
+            grammers_tl_types::types::UpdatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq_start: 0,
+                seq: 0,
+            },
+        );
+        assert_eq!(chats_from_updates(&updates).len(), 1);
+        assert!(matches!(&chats_from_updates(&updates)[0],
+            grammers_tl_types::enums::Chat::Channel(c) if c.id == 2));
+    }
+
+    #[test]
+    fn chats_from_updates_empty_for_non_carrying_variants() {
+        // Every other Updates variant carries no chats and must yield empty,
+        // never panic, never unwrap None.
+        let short_msg = grammers_tl_types::types::UpdateShortMessage {
+            out: false, mentioned: false, media_unread: false, silent: false,
+            id: 0, user_id: 0, message: String::new(), pts: 0, pts_count: 0,
+            date: 0, fwd_from: None, via_bot_id: None, reply_to: None,
+            entities: None, ttl_period: None,
+        };
+        let short_chat = grammers_tl_types::types::UpdateShortChatMessage {
+            out: false, mentioned: false, media_unread: false, silent: false,
+            id: 0, from_id: 0, chat_id: 0, message: String::new(), pts: 0, pts_count: 0,
+            date: 0, fwd_from: None, via_bot_id: None, reply_to: None,
+            entities: None, ttl_period: None,
+        };
+        let short = grammers_tl_types::types::UpdateShort {
+            update: grammers_tl_types::enums::Update::MessageId(
+                grammers_tl_types::types::UpdateMessageId { id: 0, random_id: 0 }),
+            date: 0,
+        };
+        let short_sent = grammers_tl_types::types::UpdateShortSentMessage {
+            out: false, id: 0, pts: 0, pts_count: 0, date: 0,
+            media: None, entities: None, ttl_period: None,
+        };
+        let cases = vec![
+            grammers_tl_types::enums::Updates::TooLong,
+            grammers_tl_types::enums::Updates::UpdateShortMessage(short_msg),
+            grammers_tl_types::enums::Updates::UpdateShortChatMessage(short_chat),
+            grammers_tl_types::enums::Updates::UpdateShort(short),
+            grammers_tl_types::enums::Updates::UpdateShortSentMessage(short_sent),
+        ];
+        for updates in &cases {
+            assert!(chats_from_updates(updates).is_empty(),
+                "expected empty chats for {:?}", updates);
+        }
+    }
+
+    #[test]
+    fn invite_join_broadcast_pick_prefers_broadcast_channel() {
+        // Mirrors the extraction loop in cmd_join_channel_by_link: a megagroup
+        // (broadcast=false) must not be picked as the joined channel.
+        let chats = vec![test_channel(3, false), test_channel(4, true)];
+        let updates = grammers_tl_types::enums::Updates::Combined(
+            grammers_tl_types::types::UpdatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq_start: 0,
+                seq: 0,
+            },
+        );
+        let found = chats_from_updates(&updates).iter().find_map(|chat| {
+            if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                if c.broadcast { Some((c.id, c.access_hash.unwrap_or(0), c.title.clone())) } else { None }
+            } else {
+                None
+            }
+        });
+        let (cid, _ah, _t) = found.expect("broadcast channel must be found");
+        assert_eq!(cid, 4);
+    }
 }
