@@ -454,9 +454,39 @@ pub async fn cmd_list_joined_channels(
 
 // ─── Add a joined channel to NoBuf ───────────────────────────────
 
+// Fetch a channel by id + access_hash directly. Used when the caller already
+// knows the access_hash (e.g. from a CheckChatInvite preview): deterministic,
+// no dependency on the dialog list. Channels joined via invite link are
+// auto-archived by Telegram and absent from the main dialog list, so a
+// dialog scan cannot find them even for members.
+async fn resolve_channel_by_hash(
+    client: &Client,
+    channel_id: i64,
+    access_hash: i64,
+) -> Result<(String, Option<String>, i64), String> {
+    let result = client.invoke(&grammers_tl_types::functions::channels::GetChannels {
+        id: vec![build_input_channel(channel_id, access_hash)],
+    }).await.map_err(map_error)?;
+
+    match result {
+        grammers_tl_types::enums::messages::Chats::Chats(c) => c.chats.into_iter().next(),
+        grammers_tl_types::enums::messages::Chats::Slice(c) => c.chats.into_iter().next(),
+    }
+    .and_then(|chat| match chat {
+        grammers_tl_types::enums::Chat::Channel(c) => {
+            // getChannels may answer with a min-channel whose access_hash was
+            // stripped; trust the hash the caller passed over a None here.
+            Some((c.title, c.username, c.access_hash.filter(|h| *h != 0).unwrap_or(access_hash)))
+        }
+        _ => None,
+    })
+    .ok_or_else(|| format!("Channel {} not found", channel_id))
+}
+
 #[tauri::command]
 pub async fn cmd_add_joined_channel(
     channel_id: i64,
+    access_hash: Option<i64>,
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<PublicChannel, String> {
@@ -474,26 +504,34 @@ pub async fn cmd_add_joined_channel(
         }
     }
 
-    // Resolve the channel from peer cache or dialog scan
-    let peer = {
-        let cache = state.peer_cache.read().await;
-        cache.get(&channel_id).cloned()
-    };
-
-    let (name, username, access_hash) = if let Some(Peer::Channel(c)) = peer {
-        (c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0))
+    // Resolve the channel: direct fetch by access_hash when the caller has one
+    // (preview of an already-joined channel), else peer cache, else dialog scan.
+    // The direct fetch matters because channels joined via invite link are
+    // auto-archived by Telegram and never appear in the main dialog list the
+    // scan walks (folder_id: None), so the scan alone errors
+    // "Channel not found in your dialogs" even though we are a member.
+    let (name, username, ah) = if let Some(ah) = access_hash {
+        resolve_channel_by_hash(&client, channel_id, ah).await?
     } else {
-        let mut dialogs = client.iter_dialogs();
-        let mut found = None;
-        while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
-            if let Peer::Channel(c) = &dialog.peer {
-                if c.raw.id == channel_id {
-                    found = Some((c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0)));
-                    break;
+        let peer = {
+            let cache = state.peer_cache.read().await;
+            cache.get(&channel_id).cloned()
+        };
+        if let Some(Peer::Channel(c)) = peer {
+            (c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0))
+        } else {
+            let mut dialogs = client.iter_dialogs();
+            let mut found = None;
+            while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+                if let Peer::Channel(c) = &dialog.peer {
+                    if c.raw.id == channel_id {
+                        found = Some((c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0)));
+                        break;
+                    }
                 }
             }
+            found.ok_or("Channel not found in your dialogs")?
         }
-        found.ok_or("Channel not found in your dialogs")?
     };
 
     let now = std::time::SystemTime::now()
@@ -509,7 +547,7 @@ pub async fn cmd_add_joined_channel(
         channel_id,
         name.replace("'", "''"),
         username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
-        access_hash,
+        ah,
         if is_private { 1 } else { 0 },
         now,
     )).map_err(|e| e.to_string())?;
@@ -518,7 +556,7 @@ pub async fn cmd_add_joined_channel(
         channel_id,
         name,
         username,
-        access_hash,
+        access_hash: ah,
         is_private,
         added_at: now,
         is_member: true,

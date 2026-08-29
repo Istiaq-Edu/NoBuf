@@ -68,7 +68,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         if (!preview?.channel_id) return;
         setJoining(true);
         try {
-            await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: preview.channel_id });
+            await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: preview.channel_id, accessHash: preview.access_hash });
             toast.success('Channel added to NoBuf.');
             onAdded();
             handleClose();
@@ -99,7 +99,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
 
     const handleAddFromBrowse = async (channel: JoinedChannel) => {
         try {
-            await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: channel.channel_id });
+            await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: channel.channel_id, accessHash: channel.access_hash });
             toast.success(`${channel.name} added to NoBuf.`);
             onAdded();
             setJoinedChannels(prev => prev.map(c =>
