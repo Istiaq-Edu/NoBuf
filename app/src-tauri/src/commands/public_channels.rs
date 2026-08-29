@@ -248,8 +248,25 @@ pub async fn cmd_resolve_channel_link(
                         Err("Already joined but not a channel".to_string())
                     }
                 }
-                grammers_tl_types::enums::ChatInvite::Peek(_) => {
-                    Err("This channel allows peeking but NoBuf does not support peek-only access. Please join the channel first.".to_string())
+                grammers_tl_types::enums::ChatInvite::Peek(peek) => {
+                    // Peekable channel (previewable without joining): the
+                    // response carries the full Chat, so we can still show a
+                    // preview card — with the id/hash needed for a join.
+                    if let grammers_tl_types::enums::Chat::Channel(c) = &peek.chat {
+                        Ok(ChannelPreview {
+                            title: c.title.clone(),
+                            about: None,
+                            participants_count: 0,
+                            is_channel: c.broadcast,
+                            is_private: true,
+                            already_joined: false,
+                            channel_id: Some(c.id),
+                            access_hash: c.access_hash,
+                            username: None,
+                        })
+                    } else {
+                        Err("This invite points to a group (NoBuf only supports channels).".to_string())
+                    }
                 }
             }
         }
