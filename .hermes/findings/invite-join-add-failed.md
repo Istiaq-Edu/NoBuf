@@ -146,3 +146,24 @@ problem the same way. Independent confirmation of the root cause and fix shape.
    reference. The fix covers all shapes regardless.
 
 **Final status:** complete. Awaiting user's live QA (re-add the invite link).
+
+## Round 2 — live QA finding: "Channel not found in your dialogs" (FIXED, aad5237)
+
+**Symptom:** preview of the invite link works, clicking Add errors.
+**Path:** preview → `cmd_add_joined_channel` → dialog scan → miss.
+**Root cause:** the add command resolved the channel by scanning the **main
+dialog list** (iter_dialogs, folder_id: None — grammers dialogs.rs:25).
+Channels joined via invite link are **auto-archived** by Telegram — archived
+chats don't appear in the main list, so the scan missed a channel the user is
+provably a member of. Preview worked because CheckChatInvite needs no dialogs.
+**Fix:** `cmd_add_joined_channel` now takes `access_hash` (both frontend paths
+already had it — preview payload and Browse rows). With a hash, resolution is
+a direct `channels.getChannels` call — archived-chat-proof. Dialog scan
+retained as fallback for hash-less callers. Min-channel guard: a stripped/zero
+hash in the response falls back to the caller-provided hash.
+**Verified:** cargo 431/431, vitest 1188/1188, tsc clean.
+
+Note: the original e89c122 fix (Updates::Combined) remains correct and
+necessary — but this second bug was the one that fired for this user's live
+repro: already-joined state means preview → "Add to NoBuf" path, which never
+reached the join command at all.
