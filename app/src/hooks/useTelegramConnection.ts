@@ -70,6 +70,11 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 try {
                     const prevPublicIds = (await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id);
                     await invoke('cmd_sync_public_channels');
+                    // The sync command rewrote SQLite behind React Query's back;
+                    // invalidate so the sidebar reflects the reconciled list NOW
+                    // instead of showing the pre-sync snapshot until an
+                    // unrelated refetch.
+                    queryClient.invalidateQueries({ queryKey: ['publicChannels'] });
                     // Public-channel pruning: SQLite sync deletes dead rows but
                     // never tells the vault — diff previous vs new and prune.
                     const nextPublic = await invoke<any[]>('cmd_get_public_channels');
