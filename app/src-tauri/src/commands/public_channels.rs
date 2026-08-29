@@ -90,7 +90,16 @@ pub fn parse_channel_link(link: &str) -> Result<(String, String), String> {
         }
         return Ok(("invite_hash".to_string(), hash));
     }
-    
+
+    // Legacy invite format: t.me/joinchat/<hash> — same semantics as t.me/+<hash>.
+    if path.starts_with("joinchat/") {
+        let hash = path["joinchat/".len()..].to_string();
+        if hash.is_empty() {
+            return Err("Empty invite hash".to_string());
+        }
+        return Ok(("invite_hash".to_string(), hash));
+    }
+
     if path.starts_with("c/") {
         return Err("Private channel links (t.me/c/...) require an invite link to join. Ask the channel admin for a t.me/+... invite link.".to_string());
     }
@@ -239,12 +248,43 @@ pub async fn cmd_resolve_channel_link(
                         Err("Already joined but not a channel".to_string())
                     }
                 }
-                grammers_tl_types::enums::ChatInvite::Peek(_) => {
-                    Err("This channel allows peeking but NoBuf does not support peek-only access. Please join the channel first.".to_string())
+                grammers_tl_types::enums::ChatInvite::Peek(peek) => {
+                    // Peekable channel (previewable without joining): the
+                    // response carries the full Chat, so we can still show a
+                    // preview card — with the id/hash needed for a join.
+                    if let grammers_tl_types::enums::Chat::Channel(c) = &peek.chat {
+                        Ok(ChannelPreview {
+                            title: c.title.clone(),
+                            about: None,
+                            participants_count: 0,
+                            is_channel: c.broadcast,
+                            is_private: true,
+                            already_joined: false,
+                            channel_id: Some(c.id),
+                            access_hash: c.access_hash,
+                            username: None,
+                        })
+                    } else {
+                        Err("This invite points to a group (NoBuf only supports channels).".to_string())
+                    }
                 }
             }
         }
         _ => Err("Unknown link type".to_string()),
+    }
+}
+
+// Chats carried by an Updates response. `messages.ImportChatInvite` can answer
+// with either `updates` or `updatesCombined` (the server merges update batches
+// when the join produces more updates than a single object carries); matching
+// only one variant silently dropped the joined channel and made the add step
+// fail AFTER the join had already happened.
+fn chats_from_updates(updates: &grammers_tl_types::enums::Updates) -> &[grammers_tl_types::enums::Chat] {
+    use grammers_tl_types::enums::Updates;
+    match updates {
+        Updates::Updates(u) => &u.chats,
+        Updates::Combined(u) => &u.chats,
+        _ => &[],
     }
 }
 
@@ -287,20 +327,52 @@ pub async fn cmd_join_channel_by_link(
         }
         "invite_hash" => {
             let result = client.invoke(&grammers_tl_types::functions::messages::ImportChatInvite {
-                hash: value,
-            }).await.map_err(map_error)?;
+                hash: value.clone(),
+            }).await;
 
             let mut found: Option<(i64, i64, String)> = None;
-            if let grammers_tl_types::enums::Updates::Updates(u) = result {
-                for chat in &u.chats {
-                    if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+            match result {
+                Ok(updates) => {
+                    for chat in chats_from_updates(&updates) {
+                        if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                            if c.broadcast {
+                                found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A retry of an already-used invite link answers
+                    // USER_ALREADY_PARTICIPANT — the join happened on an earlier
+                    // attempt. Recover below instead of failing after the mutation.
+                    let msg = e.to_string();
+                    if !msg.contains("USER_ALREADY_PARTICIPANT") {
+                        return Err(map_error(e));
+                    }
+                }
+            }
+
+            // The join happened (or we were already a member) but the response
+            // carried no usable broadcast channel. Identify the exact chat via
+            // the invite hash itself: as a member, CheckChatInvite answers
+            // chatInviteAlready with the full Chat object.
+            if found.is_none() {
+                let check = client.invoke(&grammers_tl_types::functions::messages::CheckChatInvite {
+                    hash: value,
+                }).await.map_err(map_error)?;
+                if let grammers_tl_types::enums::ChatInvite::Already(already) = check {
+                    if let grammers_tl_types::enums::Chat::Channel(c) = already.chat {
                         if c.broadcast {
                             found = Some((c.id, c.access_hash.unwrap_or(0), c.title.clone()));
                         }
                     }
                 }
             }
-            let (cid, ah, t) = found.ok_or("Joined but could not identify channel")?;
+
+            let (cid, ah, t) = found.ok_or(
+                "Joined, but NoBuf could not add it — it may be a group (NoBuf only supports \
+                 channels). Leave it in Telegram if you joined it by accident."
+            )?;
             (cid, ah, t, None, true)
         }
         _ => return Err("Unknown link type".to_string()),
@@ -408,9 +480,39 @@ pub async fn cmd_list_joined_channels(
 
 // ─── Add a joined channel to NoBuf ───────────────────────────────
 
+// Fetch a channel by id + access_hash directly. Used when the caller already
+// knows the access_hash (e.g. from a CheckChatInvite preview): deterministic,
+// no dependency on the dialog list. Channels joined via invite link are
+// auto-archived by Telegram and absent from the main dialog list, so a
+// dialog scan cannot find them even for members.
+async fn resolve_channel_by_hash(
+    client: &Client,
+    channel_id: i64,
+    access_hash: i64,
+) -> Result<(String, Option<String>, i64), String> {
+    let result = client.invoke(&grammers_tl_types::functions::channels::GetChannels {
+        id: vec![build_input_channel(channel_id, access_hash)],
+    }).await.map_err(map_error)?;
+
+    match result {
+        grammers_tl_types::enums::messages::Chats::Chats(c) => c.chats.into_iter().next(),
+        grammers_tl_types::enums::messages::Chats::Slice(c) => c.chats.into_iter().next(),
+    }
+    .and_then(|chat| match chat {
+        grammers_tl_types::enums::Chat::Channel(c) => {
+            // getChannels may answer with a min-channel whose access_hash was
+            // stripped; trust the hash the caller passed over a None here.
+            Some((c.title, c.username, c.access_hash.filter(|h| *h != 0).unwrap_or(access_hash)))
+        }
+        _ => None,
+    })
+    .ok_or_else(|| format!("Channel {} not found", channel_id))
+}
+
 #[tauri::command]
 pub async fn cmd_add_joined_channel(
     channel_id: i64,
+    access_hash: Option<i64>,
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<PublicChannel, String> {
@@ -428,26 +530,34 @@ pub async fn cmd_add_joined_channel(
         }
     }
 
-    // Resolve the channel from peer cache or dialog scan
-    let peer = {
-        let cache = state.peer_cache.read().await;
-        cache.get(&channel_id).cloned()
-    };
-
-    let (name, username, access_hash) = if let Some(Peer::Channel(c)) = peer {
-        (c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0))
+    // Resolve the channel: direct fetch by access_hash when the caller has one
+    // (preview of an already-joined channel), else peer cache, else dialog scan.
+    // The direct fetch matters because channels joined via invite link are
+    // auto-archived by Telegram and never appear in the main dialog list the
+    // scan walks (folder_id: None), so the scan alone errors
+    // "Channel not found in your dialogs" even though we are a member.
+    let (name, username, ah) = if let Some(ah) = access_hash {
+        resolve_channel_by_hash(&client, channel_id, ah).await?
     } else {
-        let mut dialogs = client.iter_dialogs();
-        let mut found = None;
-        while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
-            if let Peer::Channel(c) = &dialog.peer {
-                if c.raw.id == channel_id {
-                    found = Some((c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0)));
-                    break;
+        let peer = {
+            let cache = state.peer_cache.read().await;
+            cache.get(&channel_id).cloned()
+        };
+        if let Some(Peer::Channel(c)) = peer {
+            (c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0))
+        } else {
+            let mut dialogs = client.iter_dialogs();
+            let mut found = None;
+            while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+                if let Peer::Channel(c) = &dialog.peer {
+                    if c.raw.id == channel_id {
+                        found = Some((c.raw.title.clone(), c.raw.username.clone(), c.raw.access_hash.unwrap_or(0)));
+                        break;
+                    }
                 }
             }
+            found.ok_or("Channel not found in your dialogs")?
         }
-        found.ok_or("Channel not found in your dialogs")?
     };
 
     let now = std::time::SystemTime::now()
@@ -463,7 +573,7 @@ pub async fn cmd_add_joined_channel(
         channel_id,
         name.replace("'", "''"),
         username.as_ref().map(|s| format!("'{}'", s.replace("'", "''"))).unwrap_or("NULL".to_string()),
-        access_hash,
+        ah,
         if is_private { 1 } else { 0 },
         now,
     )).map_err(|e| e.to_string())?;
@@ -472,7 +582,7 @@ pub async fn cmd_add_joined_channel(
         channel_id,
         name,
         username,
-        access_hash,
+        access_hash: ah,
         is_private,
         added_at: now,
         is_member: true,
@@ -630,9 +740,19 @@ pub async fn cmd_remove_public_channel(
     if leave_on_telegram {
         let client_opt = { state.client.lock().await.clone() };
         if let Some(client) = client_opt {
-            client.invoke(&grammers_tl_types::functions::channels::LeaveChannel {
+            if let Err(e) = client.invoke(&grammers_tl_types::functions::channels::LeaveChannel {
                 channel: build_input_channel(channel_id, access_hash),
-            }).await.map_err(map_error)?;
+            }).await {
+                // The leave is best-effort: the row must still be removed from
+                // NoBuf (the user's actual intent). CHANNEL_PRIVATE /
+                // USER_NOT_PARTICIPANT mean we're already out — the exact
+                // state the user asked for. Anything else is a real failure
+                // worth surfacing, but still must not strand the local state.
+                let msg = e.to_string();
+                if !(msg.contains("CHANNEL_PRIVATE") || msg.contains("USER_NOT_PARTICIPANT")) {
+                    log::warn!("[Public Channels] LeaveChannel for {} failed (removing anyway): {}", channel_id, msg);
+                }
+            }
         }
     }
 
@@ -1031,4 +1151,213 @@ pub async fn cmd_sync_public_channels(
         result.push(row_to_public_channel(&row));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_channel_link_accepts_legacy_joinchat_invite() {
+        // t.me/joinchat/<hash> is Telegram's legacy invite format, equivalent
+        // to t.me/+<hash>. It used to fall through to the username branch and
+        // fail the charset check with "Invalid username format".
+        assert_eq!(
+            parse_channel_link("https://t.me/joinchat/cYEZsXNEvQ9mZGNl").unwrap(),
+            ("invite_hash".to_string(), "cYEZsXNEvQ9mZGNl".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("t.me/joinchat/abc123").unwrap(),
+            ("invite_hash".to_string(), "abc123".to_string())
+        );
+        // Plain https://t.me/joinchat (no hash) is username-shaped; it parses
+        // as a username and the resolve call fails later with "No channel
+        // found" — acceptable, not an invite misclassification.
+        assert_eq!(
+            parse_channel_link("https://t.me/joinchat").unwrap(),
+            ("username".to_string(), "joinchat".to_string())
+        );
+        // Trailing slash with no hash is an empty invite — must error.
+        assert!(parse_channel_link("https://t.me/joinchat/").is_err());
+    }
+
+    #[test]
+    fn parse_channel_link_accepts_plus_invite_and_username() {
+        assert_eq!(
+            parse_channel_link("https://t.me/+JVFkVGMNwTdhY2Nh").unwrap(),
+            ("invite_hash".to_string(), "JVFkVGMNwTdhY2Nh".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("t.me/+abc").unwrap(),
+            ("invite_hash".to_string(), "abc".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("https://t.me/somechannel").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+        assert_eq!(
+            parse_channel_link("@somechannel").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+        // Query strings must be stripped from usernames.
+        assert_eq!(
+            parse_channel_link("https://t.me/somechannel?foo=bar").unwrap(),
+            ("username".to_string(), "somechannel".to_string())
+        );
+    }
+
+    fn test_channel(id: i64, broadcast: bool) -> grammers_tl_types::enums::Chat {
+        grammers_tl_types::enums::Chat::Channel(grammers_tl_types::types::Channel {
+            creator: false,
+            left: false,
+            broadcast,
+            verified: false,
+            megagroup: false,
+            restricted: false,
+            signatures: false,
+            min: false,
+            scam: false,
+            has_link: false,
+            has_geo: false,
+            slowmode_enabled: false,
+            call_active: false,
+            call_not_empty: false,
+            fake: false,
+            gigagroup: false,
+            noforwards: false,
+            join_to_send: false,
+            join_request: false,
+            forum: false,
+            stories_hidden: false,
+            stories_hidden_min: false,
+            stories_unavailable: false,
+            signature_profiles: false,
+            autotranslation: false,
+            broadcast_messages_allowed: false,
+            monoforum: false,
+            forum_tabs: false,
+            id,
+            access_hash: Some(id * 111),
+            title: format!("Channel {}", id),
+            username: None,
+            photo: grammers_tl_types::enums::ChatPhoto::Empty,
+            date: 0,
+            restriction_reason: None,
+            admin_rights: None,
+            banned_rights: None,
+            default_banned_rights: None,
+            participants_count: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            emoji_status: None,
+            level: None,
+            subscription_until_date: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+            linked_monoforum_id: None,
+        })
+    }
+
+    #[test]
+    fn chats_from_updates_extracts_from_updates_variant() {
+        let chats = vec![test_channel(1, true)];
+        let updates = grammers_tl_types::enums::Updates::Updates(
+            grammers_tl_types::types::Updates {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq: 0,
+            },
+        );
+        assert_eq!(chats_from_updates(&updates).len(), 1);
+        assert!(matches!(&chats_from_updates(&updates)[0],
+            grammers_tl_types::enums::Chat::Channel(c) if c.id == 1));
+    }
+
+    #[test]
+    fn chats_from_updates_extracts_from_combined_variant() {
+        // The P0 bug: ImportChatInvite answered UpdatesCombined and the old
+        // single-variant match dropped the joined channel entirely.
+        let chats = vec![test_channel(2, true)];
+        let updates = grammers_tl_types::enums::Updates::Combined(
+            grammers_tl_types::types::UpdatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq_start: 0,
+                seq: 0,
+            },
+        );
+        assert_eq!(chats_from_updates(&updates).len(), 1);
+        assert!(matches!(&chats_from_updates(&updates)[0],
+            grammers_tl_types::enums::Chat::Channel(c) if c.id == 2));
+    }
+
+    #[test]
+    fn chats_from_updates_empty_for_non_carrying_variants() {
+        // Every other Updates variant carries no chats and must yield empty,
+        // never panic, never unwrap None.
+        let short_msg = grammers_tl_types::types::UpdateShortMessage {
+            out: false, mentioned: false, media_unread: false, silent: false,
+            id: 0, user_id: 0, message: String::new(), pts: 0, pts_count: 0,
+            date: 0, fwd_from: None, via_bot_id: None, reply_to: None,
+            entities: None, ttl_period: None,
+        };
+        let short_chat = grammers_tl_types::types::UpdateShortChatMessage {
+            out: false, mentioned: false, media_unread: false, silent: false,
+            id: 0, from_id: 0, chat_id: 0, message: String::new(), pts: 0, pts_count: 0,
+            date: 0, fwd_from: None, via_bot_id: None, reply_to: None,
+            entities: None, ttl_period: None,
+        };
+        let short = grammers_tl_types::types::UpdateShort {
+            update: grammers_tl_types::enums::Update::MessageId(
+                grammers_tl_types::types::UpdateMessageId { id: 0, random_id: 0 }),
+            date: 0,
+        };
+        let short_sent = grammers_tl_types::types::UpdateShortSentMessage {
+            out: false, id: 0, pts: 0, pts_count: 0, date: 0,
+            media: None, entities: None, ttl_period: None,
+        };
+        let cases = vec![
+            grammers_tl_types::enums::Updates::TooLong,
+            grammers_tl_types::enums::Updates::UpdateShortMessage(short_msg),
+            grammers_tl_types::enums::Updates::UpdateShortChatMessage(short_chat),
+            grammers_tl_types::enums::Updates::UpdateShort(short),
+            grammers_tl_types::enums::Updates::UpdateShortSentMessage(short_sent),
+        ];
+        for updates in &cases {
+            assert!(chats_from_updates(updates).is_empty(),
+                "expected empty chats for {:?}", updates);
+        }
+    }
+
+    #[test]
+    fn invite_join_broadcast_pick_prefers_broadcast_channel() {
+        // Mirrors the extraction loop in cmd_join_channel_by_link: a megagroup
+        // (broadcast=false) must not be picked as the joined channel.
+        let chats = vec![test_channel(3, false), test_channel(4, true)];
+        let updates = grammers_tl_types::enums::Updates::Combined(
+            grammers_tl_types::types::UpdatesCombined {
+                updates: vec![],
+                users: vec![],
+                chats,
+                date: 0,
+                seq_start: 0,
+                seq: 0,
+            },
+        );
+        let found = chats_from_updates(&updates).iter().find_map(|chat| {
+            if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                if c.broadcast { Some((c.id, c.access_hash.unwrap_or(0), c.title.clone())) } else { None }
+            } else {
+                None
+            }
+        });
+        let (cid, _ah, _t) = found.expect("broadcast channel must be found");
+        assert_eq!(cid, 4);
+    }
 }

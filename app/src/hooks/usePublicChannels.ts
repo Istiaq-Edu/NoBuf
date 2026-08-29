@@ -34,7 +34,8 @@ export function usePublicChannels() {
     });
 
     const addJoined = useMutation({
-        mutationFn: (channelId: number) => invoke<PublicChannel>('cmd_add_joined_channel', { channelId }),
+        mutationFn: ({ channelId, accessHash }: { channelId: number; accessHash?: number | null }) =>
+            invoke<PublicChannel>('cmd_add_joined_channel', { channelId, accessHash: accessHash ?? null }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['publicChannels'] });
             invoke('cmd_update_nb_pub_sync').catch((e: any) => { console.warn('[Public Channels] Sync update failed:', e); toast.error('Sync update failed — changes are local only.'); });
