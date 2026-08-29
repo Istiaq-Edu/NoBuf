@@ -30,6 +30,9 @@ pub struct TelegramState {
     /// Set of transfer IDs that have been cancelled. Checked cooperatively
     /// in upload/download chunk loops. Cleared on logout.
     pub cancelled_transfers: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Single shared upload lane. Split jobs hold it for the whole group;
+    /// ordinary uploads hold it for one file.
+    pub upload_lock: Arc<tokio::sync::Mutex<()>>,
     /// Paths of partial download files — cleaned up on app close.
     pub partial_downloads: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// 2 permits: /stream and fMP4 segment download run concurrently. The global rate
@@ -177,6 +180,8 @@ pub mod network;
 pub mod streaming;
 pub mod api_settings;
 pub mod sprite;
+pub mod split_upload;
+pub mod stage_drop;
 pub mod archive;
 pub mod folder_groups;
 pub mod public_channels;
@@ -196,5 +201,6 @@ pub use archive::*;
 pub use folder_groups::*;
 pub use public_channels::*;
 pub use sprite::*;
+pub use split_upload::*;
 pub use opensubtitles::*;
 pub use vault_sync::*;

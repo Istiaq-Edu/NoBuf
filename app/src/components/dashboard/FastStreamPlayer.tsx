@@ -1069,6 +1069,7 @@ interface FastStreamPlayerProps {
     return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sc).padStart(2, '0')}` : `${m}:${String(sc).padStart(2, '0')}`;
   };
 
+
   const formatBytes = (b: number) => {
     if (b < 1024) return `${b} B`;
     if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
@@ -1342,7 +1343,9 @@ interface FastStreamPlayerProps {
       }
     };
     const onPause = () => setPlaying(false);
-    const onEnded = () => { console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true; };
+    const onEnded = () => {
+      console.log('[Player] onEnded — setting videoEnded=true'); setPlaying(false); setVideoEnded(true); videoEndedRef.current = true;
+    };
     const onWait = () => { if (!suppressLoadingSpinnerRef.current) setLoad(true); };
     const onPlay2 = () => setLoad(false);
     const onRemuxSeekPresentation = (event: Event) => {

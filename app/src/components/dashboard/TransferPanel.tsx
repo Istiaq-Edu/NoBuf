@@ -1,6 +1,7 @@
 ﻿import { useState } from 'react';
-import { Upload, Download, X, RotateCcw, AlertCircle, Check } from 'lucide-react';
+import { Upload, Download, X, RotateCcw, AlertCircle, Check, Scissors, ChevronDown, ChevronRight, Play } from 'lucide-react';
 import { QueueItem, DownloadItem } from '../../types';
+import { SplitJobRow, SplitPartRow, computeCombinedProgress, countActiveSplitJobs } from '../../hooks/useSplitUpload';
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
@@ -8,6 +9,11 @@ function formatBytes(bytes: number): string {
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+function formatSpeed(bps?: number): string {
+    if (!bps || bps <= 0) return '';
+    return `${formatBytes(bps)}/s`;
 }
 
 type Tab = 'uploads' | 'downloads';
@@ -18,11 +24,22 @@ interface TransferPanelProps {
     // Upload props
     uploadItems: QueueItem[];
     stagingItems?: { name: string; pct: number }[];
+    splitJobs?: SplitJobRow[];
+    onCancelSplitJob?: (jobId: string) => void;
+    onResumeSplitJob?: (jobId: string) => void;
+    onDiscardSplitJob?: (jobId: string) => void;
+    onClearFinishedSplitJobs?: () => void;
+    onCancelSplitPart?: (jobId: string, idx: number) => void;
+    onRetrySplitPart?: (jobId: string, idx: number) => void;
+    onPlaySplitPart?: (jobId: string, idx: number) => void;
+    onDownloadSplitPart?: (jobId: string, idx: number) => void;
     onCancelStaging?: (name: string) => void;
     onClearUploadFinished: () => void;
     onCancelAllUploads: () => void;
     onCancelUploadItem: (id: string) => void;
     onRetryUploadItem: (id: string) => void;
+    onDeleteUploadItem?: (id: string) => void;
+    onRemoveUploadItem?: (id: string) => void;
     // Download props
     downloadItems: DownloadItem[];
     onClearDownloadFinished: () => void;
@@ -33,24 +50,40 @@ interface TransferPanelProps {
 
 export function TransferPanel({
     isOpen, onClose,
-    uploadItems, stagingItems = [], onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem,
+    uploadItems, stagingItems = [], splitJobs = [], onCancelSplitJob, onResumeSplitJob, onDiscardSplitJob, onClearFinishedSplitJobs, onCancelSplitPart, onRetrySplitPart, onPlaySplitPart, onDownloadSplitPart, onCancelStaging, onClearUploadFinished, onCancelAllUploads, onCancelUploadItem, onRetryUploadItem, onDeleteUploadItem, onRemoveUploadItem,
     downloadItems, onClearDownloadFinished, onCancelAllDownloads, onCancelDownloadItem, onRetryDownloadItem,
 }: TransferPanelProps) {
     const [activeTab, setActiveTab] = useState<Tab>('uploads');
+    /** Expanded split-group jobIds (per-part rows visible). */
+    const [expandedJobIds, setExpandedJobIds] = useState<Set<string>>(new Set());
+    const toggleExpanded = (jobId: string) => {
+        setExpandedJobIds(prev => {
+            const next = new Set(prev);
+            if (next.has(jobId)) next.delete(jobId); else next.add(jobId);
+            return next;
+        });
+    };
 
-    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length + stagingItems.length;
+    const uploadActive = uploadItems.filter(i => i.status === 'pending' || i.status === 'uploading').length
+        + stagingItems.length + countActiveSplitJobs(splitJobs);
     const downloadActive = downloadItems.filter(i => i.status === 'pending' || i.status === 'downloading').length;
 
     // Auto-switch to tab with active items
     const effectiveTab = activeTab;
 
     const items = effectiveTab === 'uploads' ? uploadItems : downloadItems;
+    // Split-only correctness: an active split group alone must still show
+    // Cancel All, count in the item total, and suppress the empty state.
+    const hasActiveSplit = countActiveSplitJobs(splitJobs) > 0;
     const hasPendingOrActive = effectiveTab === 'uploads'
-        ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading')
+        ? uploadItems.some(i => i.status === 'pending' || i.status === 'uploading') || hasActiveSplit || stagingItems.length > 0
         : downloadItems.some(i => i.status === 'pending' || i.status === 'downloading');
     const hasFinished = effectiveTab === 'uploads'
-        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled')
+        ? uploadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled') || splitJobs.some(j => j.phase === 'done')
         : downloadItems.some(i => i.status === 'success' || i.status === 'error' || i.status === 'cancelled');
+    const itemCount = effectiveTab === 'uploads'
+        ? uploadItems.length + splitJobs.length + stagingItems.length
+        : downloadItems.length;
 
     return (
         <>
@@ -122,7 +155,7 @@ export function TransferPanel({
             {/* Actions bar */}
             <div className="flex items-center justify-between px-4 py-2 border-b border-nobuf-border/50">
                 <span className="text-[11px] text-nobuf-subtext">
-                    {items.length} {items.length === 1 ? 'item' : 'items'}
+                    {itemCount} {itemCount === 1 ? 'item' : 'items'}
                 </span>
                 <div className="flex gap-2">
                     {hasPendingOrActive && (
@@ -135,7 +168,7 @@ export function TransferPanel({
                     )}
                     {hasFinished && (
                         <button
-                            onClick={effectiveTab === 'uploads' ? onClearUploadFinished : onClearDownloadFinished}
+                            onClick={effectiveTab === 'uploads' ? () => { onClearUploadFinished(); onClearFinishedSplitJobs?.(); } : onClearDownloadFinished}
                             className="text-[11px] text-nobuf-primary hover:text-nobuf-text transition-colors"
                         >
                             Clear Finished
@@ -146,7 +179,105 @@ export function TransferPanel({
 
             {/* Items list */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
-                {/* Staging rows: dropped files being copied to %TEMP% before entering the queue */}
+                {/* Split-job GROUP rows: collapsible header (combined % + speed) expanding
+                    to per-part rows with per-part actions (parts-first plan §C). */}
+                {effectiveTab === 'uploads' && splitJobs.map(j => {
+                    const active = j.phase === 'queued' || j.phase === 'running' || j.phase === 'splitting' || j.phase === 'uploading';
+                    const combined = computeCombinedProgress(j.parts, j.doneParts, j.totalParts);
+                    const pctNum = Math.round(combined.pct);
+                    const expanded = expandedJobIds.has(j.jobId);
+                    const hasPartRows = (j.parts?.length ?? 0) > 0;
+                    const phaseLabel =
+                        j.phase === 'queued' ? 'queued — waiting for current split to finish'
+                        : j.phase === 'splitting' ? `splitting part ${Math.min(j.doneParts + 1, j.totalParts || 1)}/${j.totalParts}`
+                        : j.phase === 'uploading' ? `uploading — ${j.doneParts}/${j.totalParts} done (${pctNum}%)`
+                        : j.phase === 'interrupted' ? 'paused — resume or retry parts below'
+                        : j.phase === 'cancelled' ? 'cancelled'
+                        : j.phase;
+                    return (
+                        <div key={j.jobId} className={`flex flex-col gap-1 p-2.5 rounded-lg ${active ? 'bg-nobuf-primary/10 border border-nobuf-primary/30' : 'bg-nobuf-hover'}`}>
+                            <div className="flex items-center gap-3 text-sm">
+                                <button
+                                    className="flex-shrink-0 disabled:opacity-40"
+                                    disabled={!hasPartRows}
+                                    onClick={() => toggleExpanded(j.jobId)}
+                                    title={expanded ? 'Hide individual parts' : 'Show individual parts'}
+                                >
+                                    {hasPartRows && expanded
+                                        ? <ChevronDown className="w-4 h-4 text-nobuf-subtext" />
+                                        : hasPartRows
+                                            ? <ChevronRight className="w-4 h-4 text-nobuf-subtext" />
+                                            : <StatusDot phase={j.phase} />}
+                                </button>
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-nobuf-text text-xs truncate break-all leading-snug flex items-center gap-1.5">
+                                        <Scissors className="w-3 h-3 text-nobuf-primary shrink-0" />
+                                        <span className="truncate">{j.displayName}</span>
+                                        <span className="text-[9px] uppercase tracking-wide font-semibold px-1 py-px rounded bg-black/30 text-nobuf-subtext shrink-0">split</span>
+                                    </div>
+                                    <div className="text-[10px] text-nobuf-subtext mt-0.5 truncate flex items-center gap-2">
+                                        <span>{phaseLabel}</span>
+                                        {active && combined.speedBps > 0 && (
+                                            <span className="text-nobuf-primary">{formatSpeed(combined.speedBps)}</span>
+                                        )}
+                                    </div>
+                                </div>
+                                {onCancelSplitJob && active && (
+                                    <button
+                                        onClick={() => onCancelSplitJob(j.jobId)}
+                                        className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0"
+                                        title="Cancel this split job"
+                                    >
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
+                                {j.phase === 'interrupted' && (onResumeSplitJob || onDiscardSplitJob) && (
+                                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                                        {onResumeSplitJob && (
+                                            <button
+                                                onClick={() => onResumeSplitJob(j.jobId)}
+                                                className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-nobuf-primary/15 text-nobuf-primary hover:bg-nobuf-primary/25 transition-colors"
+                                                title="Resume this split job from the next unfinished part (skips completed and deliberately cancelled parts)"
+                                            >
+                                                <RotateCcw className="w-3 h-3" />
+                                                Resume
+                                            </button>
+                                        )}
+                                        {onDiscardSplitJob && (
+                                            <button
+                                                onClick={() => onDiscardSplitJob(j.jobId)}
+                                                className="flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400/80 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+                                                title="Discard this job — deletes the job record and temp files"
+                                            >
+                                                <X className="w-3 h-3" />
+                                                Delete
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                            {j.totalParts > 0 && (
+                                <div className="w-full bg-nobuf-border h-1 mt-1 rounded-full overflow-hidden">
+                                    <div
+                                        className={`h-full rounded-full transition-all duration-300 ${j.phase === 'interrupted' ? 'bg-orange-400' : 'bg-nobuf-primary'}`}
+                                        style={{ width: `${pctNum}%` }}
+                                    />
+                                </div>
+                            )}
+                            {expanded && hasPartRows && j.parts.map(part => (
+                                <SplitPartRowView
+                                    key={`${j.jobId}-${part.idx}`}
+                                    jobPhase={j.phase}
+                                    part={part}
+                                    onCancel={onCancelSplitPart ? () => onCancelSplitPart(j.jobId, part.idx) : undefined}
+                                    onRetry={onRetrySplitPart ? () => onRetrySplitPart(j.jobId, part.idx) : undefined}
+                                    onPlay={onPlaySplitPart ? () => onPlaySplitPart(j.jobId, part.idx) : undefined}
+                                    onDownload={onDownloadSplitPart ? () => onDownloadSplitPart(j.jobId, part.idx) : undefined}
+                                />
+                            ))}
+                        </div>
+                    );
+                })}
                 {effectiveTab === 'uploads' && stagingItems.map(s => (
                     <div key={s.name} className="flex flex-col gap-1 p-2.5 bg-nobuf-hover rounded-lg">
                         <div className="flex items-center gap-3 text-sm">
@@ -171,7 +302,7 @@ export function TransferPanel({
                         </div>
                     </div>
                 ))}
-                {items.length === 0 && stagingItems.length === 0 ? (
+                {items.length === 0 && stagingItems.length === 0 && splitJobs.length === 0 ? (
                     <div className="flex flex-col items-center justify-center h-full text-nobuf-subtext">
                         {effectiveTab === 'uploads' ? (
                             <Upload className="w-8 h-8 mb-2 opacity-30" />
@@ -240,6 +371,11 @@ export function TransferPanel({
                                         <RotateCcw className="w-3.5 h-3.5" />
                                     </button>
                                 )}
+                                {effectiveTab === 'uploads' && (item.status === 'success' || item.status === 'error' || item.status === 'cancelled') && (item.messageId !== undefined ? onDeleteUploadItem : onRemoveUploadItem) && (
+                                    <button onClick={() => item.messageId !== undefined ? onDeleteUploadItem?.(item.id) : onRemoveUploadItem?.(item.id)} className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title={item.messageId !== undefined ? 'Delete uploaded file' : 'Remove transfer'}>
+                                        <X className="w-3.5 h-3.5" />
+                                    </button>
+                                )}
                             </div>
 
                             {/* Progress bar */}
@@ -293,3 +429,117 @@ export function TransferPanel({
         </>
     );
 }
+
+/** Status glyph for a split-group header when there are no part rows to expand. */
+function StatusDot({ phase }: { phase: string }) {
+    const active = phase === 'running' || phase === 'splitting' || phase === 'uploading';
+    if (phase === 'queued') {
+        return (
+            <div className="w-4 h-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
+                <div className="w-2 h-2 bg-yellow-500 rounded-full" />
+            </div>
+        );
+    }
+    if (active) {
+        return <div className="w-4 h-4 rounded-full border-2 border-nobuf-primary border-t-transparent animate-spin" />;
+    }
+    if (phase === 'done') {
+        return (
+            <div className="w-4 h-4 rounded-full bg-green-500/20 flex items-center justify-center">
+                <Check className="w-3 h-3 text-green-500" />
+            </div>
+        );
+    }
+    return (
+        <div className="w-4 h-4 rounded-full bg-orange-500/20 flex items-center justify-center">
+            <AlertCircle className="w-3 h-3 text-orange-400" />
+        </div>
+    );
+}
+
+/**
+ * One per-part row inside an expanded split group. Action gating per plan §C:
+ * waiting/splitting/uploading → Cancel(part) · failed/cancelled → Retry/Re-include ·
+ * done → Play + Download.
+ */
+export function SplitPartRowView({
+    part, jobPhase, onCancel, onRetry, onPlay, onDownload,
+}: {
+    part: SplitPartRow;
+    jobPhase: string;
+    onCancel?: () => void;
+    onRetry?: () => void;
+    onPlay?: () => void;
+    onDownload?: () => void;
+}) {
+    // While the JOB is running (or queued — waiting parts of a queued group
+    // are skippable before any worker reaches them), an in-flight part shows
+    // live pct/speed; the backend's authoritative status word arrives via
+    // partStatus flips.
+    const jobLive = jobPhase === 'queued' || jobPhase === 'running' || jobPhase === 'splitting' || jobPhase === 'uploading';
+    const live = jobLive
+        ? ['splitting', 'uploading'].includes(part.status)
+        : false;
+    const cancellable = live || (part.status === 'waiting' && jobLive);
+    const statusLabel =
+        part.status === 'waiting' ? 'waiting'
+        : part.status === 'splitting' ? 'splitting…'
+        : part.status === 'uploading' ? `uploading${part.pct !== undefined ? ` ${Math.round(part.pct)}%` : ''}${part.speedBps ? ` · ${formatSpeed(part.speedBps)}` : ''}`
+        : part.status === 'done' ? formatBytes(part.sizeBytes)
+        : part.status === 'cancelled' ? 'skipped'
+        : part.status === 'failed' ? 'failed'
+        : part.status;
+    return (
+        <div
+            data-part-row={part.idx}
+            className={`flex flex-col gap-0.5 pl-7 pr-1 py-1 rounded-md text-[11px] ${live ? 'bg-nobuf-primary/5' : ''}`}
+        >
+            <div className="flex items-center gap-2">
+                <span className={`font-mono w-8 shrink-0 ${live ? 'text-nobuf-primary' : 'text-nobuf-subtext'}`}>
+                    #{String(part.idx).padStart(2, '0')}
+                </span>
+                <span className="flex-1 min-w-0 truncate text-nobuf-text">{part.name}</span>
+                <span className={`shrink-0 tabular-nums ${live ? 'text-nobuf-primary' : part.status === 'failed' ? 'text-red-400' : part.status === 'cancelled' ? 'text-white/40' : 'text-nobuf-subtext'}`}>
+                    {statusLabel}
+                </span>
+                <div className="flex items-center gap-1 shrink-0">
+                    {cancellable && onCancel && (
+                        <button onClick={onCancel} title={part.status === 'waiting' ? 'Skip this part — it will not be uploaded unless you retry it later' : 'Cancel this part — other parts are unaffected'}
+                            className="text-gray-400 hover:text-red-400 transition-colors p-0.5">
+                            <X className="w-3 h-3" />
+                        </button>
+                    )}
+                    {(part.status === 'failed' || part.status === 'cancelled') && onRetry && (
+                        <button onClick={onRetry}
+                            title={part.status === 'cancelled' ? 'Re-include this part and continue' : 'Retry this part'}
+                            className="flex items-center gap-0.5 text-nobuf-primary hover:text-nobuf-text transition-colors px-1 py-0.5 rounded bg-nobuf-primary/10 hover:bg-nobuf-primary/20">
+                            <RotateCcw className="w-3 h-3" /> Retry
+                        </button>
+                    )}
+                    {part.status === 'done' && part.messageId != null && onPlay && (
+                        <button onClick={onPlay} title="Play this part from its own beginning"
+                            className="text-nobuf-subtext hover:text-nobuf-primary transition-colors p-0.5">
+                            <Play className="w-3 h-3" />
+                        </button>
+                    )}
+                    {part.status === 'done' && part.messageId != null && onDownload && (
+                        <button onClick={onDownload} title="Download this part to your PC"
+                            className="text-nobuf-subtext hover:text-green-400 transition-colors p-0.5">
+                            <Download className="w-3 h-3" />
+                        </button>
+                    )}
+                </div>
+            </div>
+            {/* Per-part progress bar while splitting/uploading */}
+            {live && (
+                <div className="w-full bg-nobuf-border h-0.5 rounded-full overflow-hidden">
+                    <div
+                        className={`h-full rounded-full transition-all duration-300 ${part.status === 'splitting' ? 'bg-yellow-400/70 animate-pulse' : 'bg-nobuf-primary'}`}
+                        style={{ width: `${part.status === 'uploading' && part.pct !== undefined ? Math.min(100, Math.round(part.pct)) : part.status === 'splitting' ? 100 : 0}%` }}
+                    />
+                </div>
+            )}
+        </div>
+    );
+}
+

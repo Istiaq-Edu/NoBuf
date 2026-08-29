@@ -266,6 +266,7 @@ pub fn run() {
                 runner_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 peer_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 cancelled_transfers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+                upload_lock: Arc::new(tokio::sync::Mutex::new(())),
                 partial_downloads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
                 rate_limiter: Arc::new(tokio::sync::Mutex::new(0u64)),
@@ -295,6 +296,33 @@ pub fn run() {
                 last_qr_export_ts: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 proactive_keyframe_index: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             });
+            // Split-upload hygiene: flip crash-stale running jobs to
+            // interrupted BEFORE any sweep can classify their temps.
+            commands::split_upload::normalize_stale_jobs(app.handle());
+            // Queued rows survive restart by design — but they must not drain
+            // into failures before Telegram auth is live. Kick the promotion
+            // runner only after the client answers get_me (poll up to 10 min).
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<TelegramState>();
+                    for _ in 0..120 {
+                        let maybe_client = state.client.lock().await.clone();
+                        let ready = match maybe_client {
+                            Some(c) => c.get_me().await.is_ok(),
+                            None => false,
+                        };
+                        if ready {
+                            commands::split_upload::promote_queued_jobs(handle).await;
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+            }
+            // Reclaim disk from crash-orphaned drop-staged files before anything else.
+            crate::commands::fs::sweep_stale_staged_uploads();
+
             // Load and apply persisted network settings (chunk size, keep-alive, speed limits)
             commands::utils::load_and_apply_network_settings(app.handle(), app.state::<TelegramState>().inner());
             app.manage(bandwidth::BandwidthManager::new(app.handle()));
@@ -347,16 +375,12 @@ pub fn run() {
                 }
             }
 
-            // Clean up orphaned upload-staging temp files (dropped files + zipped folders)
-            // from previous sessions. These are never cleaned otherwise if the app crashed
-            // mid-upload. Best-effort — ignore errors (files may be locked/in-use).
-            for stale in ["nobuf_dropped", "nobuf_zip"] {
-                let dir = std::env::temp_dir().join(stale);
-                if dir.exists() {
-                    log::info!("[STARTUP-CLEANUP] Removing orphaned upload staging dir at {:?}...", dir);
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-            }
+            // Clean up orphaned upload-staging temp files (dropped files + zipped
+            // folders) from previous sessions. Age-gated via sweep_stale_staged_
+            // uploads (48h): a blunt wipe here would destroy the staged sources of
+            // jobs still sitting 'queued' in the split queue — they legitimately
+            // survive restart and must keep their input bytes.
+            crate::commands::fs::sweep_stale_staged_uploads();
 
             // Clean up thumbnail cache (unbounded — can grow to hundreds of MBs)
             let thumb_dir = app.path().app_data_dir()
@@ -414,6 +438,7 @@ pub fn run() {
             commands::upload_drop::set_upload_deps(commands::upload_drop::UploadDeps {
                 app_handle: Some(app_handle_for_server.clone()),
                 bw: Some(std::sync::Arc::new(bw_for_server)),
+                upload_lock: Some(app.state::<TelegramState>().upload_lock.clone()),
             });
             // The bind-success flag must be reachable from the server thread.
             let running_flag = app.state::<StreamServerRunning>().0.clone();
@@ -515,6 +540,13 @@ pub fn run() {
             commands::cmd_update_api_settings,
             commands::cmd_regenerate_api_key,
             commands::cmd_generate_sprite_sheet,
+            commands::cmd_prepare_split,
+            commands::cmd_start_split_job,
+            commands::cmd_cancel_split_job,
+            commands::cmd_resume_split_job,
+            commands::cmd_retry_split_part,
+            commands::cmd_list_split_jobs,
+            commands::cmd_discard_split_job,
             commands::cmd_get_cache_status,
             commands::cmd_delete_cache,
             commands::cmd_start_background_cache,

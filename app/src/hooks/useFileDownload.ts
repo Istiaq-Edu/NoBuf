@@ -115,7 +115,7 @@ export function useFileDownload(store: Store | null) {
                     setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'cancelled' } : i));
                 } else {
                     setDownloadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'error', error: errMsg } : i));
-                    toast.error(`Download failed: ${item.filename}`);
+                    toast.error(`Download failed for ${item.filename}: ${errMsg}`);
                 }
             } else {
                 cancelledRef.current.delete(item.id);

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-retry-split-part"
+description = "Enables the cmd_retry_split_part command without any pre-configured scope."
+commands.allow = ["cmd_retry_split_part"]
+
+[[permission]]
+identifier = "deny-cmd-retry-split-part"
+description = "Denies the cmd_retry_split_part command without any pre-configured scope."
+commands.deny = ["cmd_retry_split_part"]

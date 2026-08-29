@@ -283,11 +283,22 @@ fn cleanup_partial_file(path: &str) {
 
 #[tauri::command]
 pub async fn cmd_cancel_transfer(
+    app: tauri::AppHandle,
     transfer_id: String,
     state: State<'_, TelegramState>,
 ) -> Result<bool, String> {
     log::info!("Cancelling transfer: {}", transfer_id);
-    state.cancelled_transfers.write().await.insert(transfer_id);
+    state.cancelled_transfers.write().await.insert(transfer_id.clone());
+    // Split part that has NOT started yet (status waiting): the run loop only
+    // checks the tid once the part is in-flight, so flip its persisted status
+    // now — the UI updates instantly and the loop skips it when reached.
+    if let Some(rest) = transfer_id.strip_prefix("split:") {
+        if let Some((job_id, idx_str)) = rest.rsplit_once(':') {
+            if let Ok(idx) = idx_str.parse::<u32>() {
+                crate::commands::split_upload::mark_part_cancelled(&app, job_id, idx)?;
+            }
+        }
+    }
     Ok(true)
 }
 
@@ -295,6 +306,16 @@ pub async fn cmd_cancel_transfer(
 /// Frontend caches this to pre-validate drops/picks instantly without a round-trip per file.
 #[tauri::command]
 pub async fn cmd_upload_limit(state: State<'_, TelegramState>) -> Result<u64, String> {
+    // Dev-QA override (same knob the split pipeline honors): keeps the
+    // frontend's oversize checks consistent with the backend during tests.
+    if let Ok(v) = std::env::var("NOBUF_FAKE_UPLOAD_CAP_BYTES") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                log::info!("[SPLIT] upload-limit override active: {n}B");
+                return Ok(n);
+            }
+        }
+    }
     let client_opt = { state.client.lock().await.clone() };
     match client_opt {
         Some(client) => crate::commands::utils::upload_limit_bytes(&client).await,
@@ -331,17 +352,12 @@ pub async fn cmd_staging_free_space() -> Result<u64, String> {
 /// Returns the temp file's absolute path on the final chunk, else "".
 /// NOTE: `std::io::Write` is already imported at the top of this file (write_all in scope).
 #[tauri::command]
-pub async fn cmd_stage_dropped_file(
-    upload_id: String,
-    file_name: String,
-    chunk_index: u64,
-    is_last: bool,
-    bytes_b64: String,
-) -> Result<String, String> {
-    use base64::Engine as _;
-
-    // Sanitize: strip any path components — keep the bare filename only.
-    let safe_name = std::path::Path::new(&file_name)
+/// Sanitize a staged-file name: strip path components, keep the bare
+/// filename, truncate the stem (never the extension) so the result fits
+/// Windows' 255-UTF-16-unit filename cap with room for the "<id>-" prefix.
+/// Single source of truth shared by cmd_stage_dropped_file and /stage-drop.
+pub fn sanitize_staged_name(file_name: &str) -> String {
+    let safe_name = std::path::Path::new(file_name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "dropped".to_string());
@@ -373,6 +389,20 @@ pub async fn cmd_stage_dropped_file(
             safe_name
         }
     };
+    safe_name
+}
+
+#[tauri::command]
+pub async fn cmd_stage_dropped_file(
+    upload_id: String,
+    file_name: String,
+    chunk_index: u64,
+    is_last: bool,
+    bytes_b64: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let safe_name = sanitize_staged_name(&file_name);
     let safe_id: String = upload_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     if safe_id.is_empty() {
         return Err("Invalid upload id".to_string());
@@ -427,6 +457,36 @@ pub async fn cmd_delete_staged_file(path: String) -> Result<(), String> {
     }
 }
 
+/// Startup sweep: any file in %TEMP%\nobuf_dropped older than STALE_STAGED_MAX_AGE
+/// is a leftover from a crashed/killed session (the app deletes its own staged
+/// copies on every normal path; see ed85a8a). Age-gated so a concurrently
+/// running instance can never have an in-flight staging deleted from under it.
+const STALE_STAGED_MAX_AGE_SECS: u64 = 48 * 3600;
+
+pub fn sweep_stale_staged_uploads() {
+    let dir = std::env::temp_dir().join("nobuf_dropped");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut removed = 0u32;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() { continue }
+        let age = match meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()) {
+            Some(m) => now.saturating_sub(m.as_secs()),
+            None => continue,
+        };
+        if age >= STALE_STAGED_MAX_AGE_SECS {
+            if std::fs::remove_file(e.path()).is_ok() { removed += 1; }
+        }
+    }
+    if removed > 0 {
+        log::info!("[stage-drop] startup sweep removed {} stale staged file(s) (>=48h old)", removed);
+    }
+}
+
 /// Best-effort delete of a PARTIALLY staged dropped file (stage aborted mid-stream,
 /// e.g. the source vanished or a chunk failed). Derives the same path as
 /// cmd_stage_dropped_file so the frontend never constructs filesystem paths.
@@ -471,18 +531,116 @@ pub fn effective_document_name(display_name: &Option<String>, path: &str) -> Str
         .unwrap_or_else(|| "file".to_string())
 }
 
-#[tauri::command]
-pub async fn cmd_upload_file(
-    path: String,
+/// Shared upload engine: streams a local file to Telegram as a document in
+/// `folder_id`. Extracted verbatim from cmd_upload_file so the split-upload
+/// orchestrator (split_upload.rs) reuses the IDENTICAL pipeline — progress
+/// events, cancellation, bandwidth accounting, display-name handling.
+/// Returns (status string, Telegram message id of the sent document). The
+/// message id is None on the mock path; the command wrapper flattens to the
+/// status string for backward compatibility.
+/// True when this transfer id belongs to the split-upload orchestrator.
+/// fs.rs must NOT consume its cancel marker at the checkpoint checks — the
+/// orchestrator's Err branch observes the tid to classify part-cancel vs
+/// genuine failure (parts-first plan §E2/F1) and removes it itself.
+fn split_owns_tid(tid: &str) -> bool {
+    tid.starts_with("split:")
+}
+
+fn consume_cancel_marker_on_abort(
+    cancelled: &mut std::collections::HashSet<String>,
+    tid: &str,
+    preserve_cancel: bool,
+) {
+    if !preserve_cancel {
+        cancelled.remove(tid);
+    }
+}
+
+/// Post-send cancellation verdict: which transfer families must reconcile
+/// (delete the just-sent message) when cancellation wins the race against
+/// Telegram message finalization. Normal/URL/drop tids delete the orphan;
+/// split tids keep the marker unconsumed so the orchestrator's Err branch
+/// still classifies the part-cancel — but the message must still be deleted
+/// so no phantom part exists in the folder.
+fn must_reconcile_post_send(tid: &str) -> bool {
+    !tid.is_empty()
+}
+
+pub(crate) async fn acquire_upload_lane(
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    cancelled: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    tid: &str,
+    preserve_cancel: bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if tid.is_empty() {
+        return Ok(lock.lock_owned().await);
+    }
+    // Create the FIFO waiter ONCE and keep it pinned while polling the cancel
+    // marker. Recreating lock() each tick drops queue position and causes LIFO.
+    let acquire = lock.lock_owned();
+    tokio::pin!(acquire);
+    loop {
+        tokio::select! {
+            guard = &mut acquire => return Ok(guard),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if cancelled.read().await.contains(tid) {
+                    if !preserve_cancel {
+                        cancelled.write().await.remove(tid);
+                    }
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod split_owns_tid_tests {
+    use super::{consume_cancel_marker_on_abort, split_owns_tid};
+    use std::collections::HashSet;
+
+    #[test]
+    fn split_tids_are_owned_by_the_orchestrator() {
+        assert!(split_owns_tid("split:4d97551e4dfda631253019b92e4b5000:2"));
+        assert!(split_owns_tid("split:abc:1"));
+    }
+
+    #[test]
+    fn non_split_tids_are_consumed_normally() {
+        assert!(!split_owns_tid("upload-123"));
+        assert!(!split_owns_tid(""));
+        // The job-level cancel token is NOT a part tid — it is consumed by no
+        // one (purged by resume/retry instead), so it is not "owned" here.
+        assert!(!split_owns_tid("split-cancel:4d97551e"));
+    }
+
+    #[test]
+    fn normal_cancel_marker_is_consumed_when_active_upload_aborts() {
+        let mut cancelled = HashSet::from(["upload-123".to_string()]);
+        consume_cancel_marker_on_abort(&mut cancelled, "upload-123", false);
+        assert!(!cancelled.contains("upload-123"));
+    }
+
+    #[test]
+    fn split_cancel_marker_is_left_for_orchestrator_classification() {
+        let tid = "split:abc:1";
+        let mut cancelled = HashSet::from([tid.to_string()]);
+        consume_cancel_marker_on_abort(&mut cancelled, tid, true);
+        assert!(cancelled.contains(tid));
+    }
+}
+
+pub(crate) async fn upload_file_inner(
+    app_handle: &tauri::AppHandle,
+    state: &TelegramState,
+    bw_state: &BandwidthManager,
+    path: &str,
     folder_id: Option<i64>,
     transfer_id: Option<String>,
     display_name: Option<String>,
-    app_handle: tauri::AppHandle,
-    state: State<'_, TelegramState>,
-    bw_state: State<'_, BandwidthManager>,
-) -> Result<String, String> {
+) -> Result<(String, Option<i64>), String> {
     // Security: validate path exists and is a regular file (not a symlink to sensitive data)
-    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("Invalid path: {}", e))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| format!("Invalid path: {}", e))?;
     if !canonical.is_file() {
         return Err("Path does not point to a regular file".to_string());
     }
@@ -495,9 +653,17 @@ pub async fn cmd_upload_file(
     if client_opt.is_none() {
         log::info!("[MOCK] Uploaded file {} to {:?}", path, folder_id);
         bw_state.add_up(size);
-        return Ok("Mock upload successful".to_string());
+        return Ok(("Mock upload successful".to_string(), None));
     }
     let client = client_opt.unwrap();
+    // Cancellation must stay responsive while this upload waits behind a split
+    // group. Progress starts only after admission, so a queued row does not
+    // pretend to be actively uploading at 0%.
+    let _upload_guard = if !split_owns_tid(&tid) {
+        Some(acquire_upload_lane(state.upload_lock.clone(), state.cancelled_transfers.clone(), &tid, false).await?)
+    } else {
+        None
+    };
 
     // Emit start progress
     if !tid.is_empty() {
@@ -507,8 +673,8 @@ pub async fn cmd_upload_file(
     }
 
     // Create progress-tracking reader
-    let (mut reader, file_size, bytes_counter) = ProgressReader::new(&path).await?;
-    let file_name = effective_document_name(&display_name, &path);
+    let (mut reader, file_size, bytes_counter) = ProgressReader::new(path).await?;
+    let file_name = effective_document_name(&display_name, path);
 
     // Spawn a progress reporter task that emits events every 250ms
     let cancelled = state.cancelled_transfers.clone();
@@ -543,24 +709,49 @@ pub async fn cmd_upload_file(
         None
     };
 
-    // Check cancellation before starting
+    // Check cancellation before starting.
+    // For `split:`-prefixed tids the tid is NOT consumed here: the split
+    // orchestrator's Err branch must still observe it to classify part-cancel
+    // vs genuine failure (parts-first plan §E2). The orchestrator removes it.
+    let preserve_tid = split_owns_tid(&tid);
     if state.cancelled_transfers.read().await.contains(&tid) {
-        state.cancelled_transfers.write().await.remove(&tid);
+        if !preserve_tid {
+            state.cancelled_transfers.write().await.remove(&tid);
+        }
         if let Some(t) = progress_task { t.abort(); }
         return Err("Transfer cancelled".to_string());
     }
 
     let client_clone = client.clone();
-    let upload_result = tokio::spawn(async move {
+    let mut upload_task = tokio::spawn(async move {
         client_clone.upload_stream(&mut reader, file_size as usize, file_name).await
-    }).await.map_err(|e| format!("Task join error: {}", e))?;
+    });
+    let upload_result = loop {
+        tokio::select! {
+            result = &mut upload_task => {
+                break result.map_err(|e| format!("Task join error: {}", e))?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if !tid.is_empty() => {
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    upload_task.abort();
+                    let _ = upload_task.await;
+                    if let Some(t) = progress_task { t.abort(); }
+                    let mut cancelled = state.cancelled_transfers.write().await;
+                    consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    };
 
     // Stop progress reporter
     if let Some(t) = progress_task { t.abort(); }
 
-    // Check cancellation after upload
+    // Check cancellation after upload. Same `split:`-preservation rule as the
+    // post-start check above: leave the tid for the orchestrator to consume.
     if state.cancelled_transfers.read().await.contains(&tid) {
-        state.cancelled_transfers.write().await.remove(&tid);
+        let mut cancelled = state.cancelled_transfers.write().await;
+        consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
         return Err("Transfer cancelled".to_string());
     }
 
@@ -573,9 +764,44 @@ pub async fn cmd_upload_file(
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
 
-    client.send_message(&peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&peer, message).await.map_err(map_error)?;
+
+    // Post-send cancellation reconciliation: a cancel landing between the last
+    // pre-send check and here would otherwise leave a live Telegram message
+    // under a UI row that says cancelled. Delete the orphaned message. For
+    // `split:` tids the marker stays unconsumed (preserve_tid) so the
+    // orchestrator's Err branch still classifies the part-cancel correctly.
+    // NOTE: the write lock is taken only AFTER the delete resolves — holding
+    // it across the network await would serialize every cancel in the app
+    // behind this round-trip (upload_drop.rs does it in this order too).
+    if must_reconcile_post_send(&tid) && state.cancelled_transfers.read().await.contains(&tid) {
+        match client.delete_messages(&peer, &[sent.id()]).await {
+            Ok(_) => {
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
+                return Err("Transfer cancelled".to_string());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[upload] tid={} cancelled but orphan delete failed (message {}): {}",
+                    tid, sent.id(), e
+                );
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, preserve_tid);
+                return Err(format!("Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", sent.id(), e));
+            }
+        }
+    }
 
     bw_state.add_up(size);
+
+    // documents-changed (parts-first plan §A): universal listing-refresh
+    // signal. Covers picker singles AND every split part (the orchestrator's
+    // tid flows through here).
+    let _ = app_handle.emit(
+        "documents-changed",
+        serde_json::json!({ "folder_id": folder_id }),
+    );
 
     // Emit completion
     if !tid.is_empty() {
@@ -584,7 +810,22 @@ pub async fn cmd_upload_file(
         });
     }
 
-    Ok("File uploaded successfully".to_string())
+    Ok(("File uploaded successfully".to_string(), Some(sent.id() as i64)))
+}
+
+/// Flattening wrapper kept for the original command signature.
+#[tauri::command]
+pub async fn cmd_upload_file(
+    path: String,
+    folder_id: Option<i64>,
+    transfer_id: Option<String>,
+    display_name: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, TelegramState>,
+    bw_state: State<'_, BandwidthManager>,
+) -> Result<String, String> {
+    let (message, message_id) = upload_file_inner(&app_handle, &state, bw_state.inner(), &path, folder_id, transfer_id, display_name).await?;
+    Ok(serde_json::json!({ "message": message, "messageId": message_id }).to_string())
 }
 
 /// Upload a file from a remote URL. Downloads to a temp file first, then
@@ -643,6 +884,31 @@ pub async fn cmd_upload_from_url(
     let temp_dir = std::env::temp_dir().join("nobuf_remote_upload");
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
+    // Premium-aware per-file limit — both gates below check against this, so a
+    // 3GB file on a premium account passes (upload_limit_bytes: 4GB premium,
+    // 2GB free). Overrides: NOBUF_FAKE_UPLOAD_CAP_BYTES dev/QA knob (mirrors
+    // cmd_upload_limit), free-tier fallback when not connected.
+    let limit_bytes: u64 = {
+        if let Ok(v) = std::env::var("NOBUF_FAKE_UPLOAD_CAP_BYTES") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    log::info!("[REMOTE-UPLOAD] upload-limit override active: {n}B");
+                    n
+                } else {
+                    2_000_000_000
+                }
+            } else {
+                2_000_000_000
+            }
+        } else {
+            let client_opt = { state.client.lock().await.clone() };
+            match client_opt {
+                Some(client) => crate::commands::utils::upload_limit_bytes(&client).await?,
+                None => 2_000_000_000,
+            }
+        }
+    };
+
     // Phase 1: Download from URL to temp file
     let url = validate_url(&url)?;
     log::info!("[REMOTE-UPLOAD] Downloading from {}", url);
@@ -683,9 +949,9 @@ pub async fn cmd_upload_from_url(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Check 2GB Telegram limit
-    if content_length > 2 * 1024 * 1024 * 1024 {
-        return Err(format!("File exceeds Telegram's 2GB limit ({} bytes)", content_length));
+    // Telegram per-file limit (premium-aware, see limit_bytes above)
+    if content_length > limit_bytes {
+        return Err(format!("File exceeds Telegram's limit ({} bytes)", content_length));
     }
 
     // Check disk space (rough check — temp dir)
@@ -693,7 +959,16 @@ pub async fn cmd_upload_from_url(
     // The OS will return a write error if disk is full, which we handle below.
 
     let temp_path = temp_dir.join(format!("remote_{}_{}", tid, filename));
-    let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let file = std::fs::File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+    // Temp-file guard: every `?`/Err return between here and the success path
+    // must not strand the downloaded file in %TEMP%. All cancel/cleanup-aware
+    // exits inside already call remove_file; this wrapper catches the REST
+    // (flush/sync/reader/parse/send errors) and deletes the temp before the
+    // error reaches the frontend. Without it, each failed URL upload leaks a
+    // full copy of the downloaded file (findings R2-F1).
+    let outcome: Result<String, String> = async {
+    let mut file = file;
 
     // Download with progress
     let mut downloaded: u64 = 0;
@@ -752,6 +1027,17 @@ pub async fn cmd_upload_from_url(
         return Err("Downloaded file was empty".to_string());
     }
 
+    // Re-check the Telegram limit against the ACTUAL downloaded size: the
+    // pre-download gate only sees the Content-Length header, which chunked
+    // responses omit (0) and lying servers understate. A 10GB body would
+    // otherwise burn disk + bandwidth and only fail at send time (R4-1).
+    if actual_size > limit_bytes {
+        return Err(format!(
+            "Downloaded file exceeds Telegram's limit ({} bytes) — the server's Content-Length was wrong",
+            actual_size
+        ));
+    }
+
     log::info!("[REMOTE-UPLOAD] Downloaded {} bytes, starting upload to Telegram", actual_size);
 
     // Phase 2: Upload to Telegram (same as cmd_upload_file)
@@ -763,6 +1049,13 @@ pub async fn cmd_upload_from_url(
         return Err("Not connected to Telegram".to_string());
     }
     let client = client_opt.unwrap();
+    let _upload_guard = match acquire_upload_lane(state.upload_lock.clone(), state.cancelled_transfers.clone(), &tid, false).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
 
     // Emit upload phase start
     if !tid.is_empty() {
@@ -814,9 +1107,32 @@ pub async fn cmd_upload_from_url(
     }
 
     let client_clone = client.clone();
-    let upload_result = tokio::spawn(async move {
+    let mut upload_task = tokio::spawn(async move {
         client_clone.upload_stream(&mut reader_upload, actual_size as usize, filename.clone()).await
-    }).await.map_err(|e| format!("Task join error: {}", e))?;
+    });
+    // Abort-select (parity with upload_file_inner): cancelling a remote-URL
+    // upload used to let the Telegram task run to completion before the
+    // post-upload check noticed — minutes of zombie bandwidth after the UI
+    // said cancelled. The 100ms poll aborts the task the moment the marker
+    // appears.
+    let upload_result = loop {
+        tokio::select! {
+            result = &mut upload_task => {
+                break result.map_err(|e| format!("Task join error: {}", e))?;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if !tid.is_empty() => {
+                if state.cancelled_transfers.read().await.contains(&tid) {
+                    upload_task.abort();
+                    let _ = upload_task.await;
+                    if let Some(t) = progress_task { t.abort(); }
+                    let mut cancelled = state.cancelled_transfers.write().await;
+                    consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err("Transfer cancelled".to_string());
+                }
+            }
+        }
+    };
 
     if let Some(t) = progress_task { t.abort(); }
 
@@ -831,9 +1147,42 @@ pub async fn cmd_upload_from_url(
     let message = InputMessage::new().text("").document(uploaded_file);
 
     let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
-    client.send_message(&peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&peer, message).await.map_err(map_error)?;
+
+    // Post-send cancellation reconciliation: a cancel landing between the last
+    // pre-send check and here would otherwise leave a live Telegram message
+    // under a UI row that says cancelled. Delete the orphaned message; if the
+    // delete itself fails, surface it so the user can act instead of a silent
+    // phantom file.
+    if must_reconcile_post_send(&tid) && state.cancelled_transfers.read().await.contains(&tid) {
+        match client.delete_messages(&peer, &[sent.id()]).await {
+            Ok(_) => {
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err("Transfer cancelled".to_string());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[remote-upload] tid={} cancelled but orphan delete failed (message {}): {}",
+                    tid, sent.id(), e
+                );
+                let mut cancelled = state.cancelled_transfers.write().await;
+                consume_cancel_marker_on_abort(&mut cancelled, &tid, false);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(format!("Cancelled, but the uploaded file (message {}) could not be deleted from Telegram: {}", sent.id(), e));
+            }
+        }
+    }
 
     bw_state.add_up(actual_size);
+
+    // documents-changed (parts-first plan §A/F6): remote-URL pipeline has its
+    // own send path — emit here so URL uploads refresh the listing too.
+    let _ = app_handle.emit(
+        "documents-changed",
+        serde_json::json!({ "folder_id": folder_id }),
+    );
 
     // Cleanup temp file
     let _ = std::fs::remove_file(&temp_path);
@@ -846,7 +1195,20 @@ pub async fn cmd_upload_from_url(
     }
 
     log::info!("[REMOTE-UPLOAD] Upload complete ({} bytes)", actual_size);
-    Ok("Remote file uploaded successfully".to_string())
+    Ok(serde_json::json!({ "message": "Remote file uploaded successfully", "messageId": sent.id() }).to_string())
+    }
+    .await;
+
+    // Guard exit: on any error path the temp file is garbage. The success arm
+    // already removed it; cancel arms removed it; every other Err exit gets
+    // cleaned here (R2-F1: one ≤2GB leak per failed URL upload otherwise).
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1822,5 +2184,56 @@ mod staged_drop_tests {
         assert!(base.ends_with(".pdf"), "extension preserved: {}", base);
         assert!(base.chars().map(|c| c.len_utf16()).sum::<usize>() <= 255, "component <= 255 units: {}", base.len());
         let _ = std::fs::remove_file(&full);
+    }
+}
+
+#[cfg(test)]
+mod upload_lane_tests {
+    use super::acquire_upload_lane;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    #[tokio::test]
+    async fn cancellation_polling_preserves_fifo_arrival_order() {
+        let lane = Arc::new(Mutex::new(()));
+        let cancelled = Arc::new(RwLock::new(HashSet::new()));
+        let initial = lane.clone().lock_owned().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for idx in 0..5 {
+            let lane = lane.clone();
+            let cancelled = cancelled.clone();
+            let order = order.clone();
+            tasks.push(tokio::spawn(async move {
+                {
+                    let _guard = acquire_upload_lane(lane, cancelled, &format!("upload-{idx}"), false).await.unwrap();
+                }
+                order.lock().await.push(idx);
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(initial);
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(*order.lock().await, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_exits_without_acquiring_lane() {
+        let lane = Arc::new(Mutex::new(()));
+        let cancelled = Arc::new(RwLock::new(HashSet::new()));
+        let initial = lane.clone().lock_owned().await;
+        let task = {
+            let lane = lane.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move { acquire_upload_lane(lane, cancelled, "queued", false).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancelled.write().await.insert("queued".to_string());
+        let result = task.await.unwrap();
+        assert_eq!(result.err().as_deref(), Some("Transfer cancelled"));
+        assert!(!cancelled.read().await.contains("queued"));
+        drop(initial);
+        assert!(lane.try_lock().is_ok());
     }
 }

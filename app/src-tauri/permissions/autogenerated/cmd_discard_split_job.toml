@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-discard-split-job"
+description = "Enables the cmd_discard_split_job command without any pre-configured scope."
+commands.allow = ["cmd_discard_split_job"]
+
+[[permission]]
+identifier = "deny-cmd-discard-split-job"
+description = "Denies the cmd_discard_split_job command without any pre-configured scope."
+commands.deny = ["cmd_discard_split_job"]

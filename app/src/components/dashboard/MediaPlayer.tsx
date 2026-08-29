@@ -22,7 +22,7 @@ interface MediaPlayerProps {
     isPublicChannel?: boolean;
 }
 
-export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onContinueToDownload, isAlreadyDownloading, isPublicChannel }: MediaPlayerProps) {
+export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, isAlreadyDownloading, isPublicChannel }: MediaPlayerProps) {
     const [streamInfo, setStreamInfo] = useState<StreamInfo | null>(null);
 
     useEffect(() => {
@@ -30,6 +30,7 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
     }, []);
 
     const folderIdParam = activeFolderId !== null ? activeFolderId.toString() : 'home';
+
     const streamUrl = streamInfo
         ? `${streamInfo.base_url}/stream/${folderIdParam}/${file.id}?token=${streamInfo.token}`
         : null;
@@ -40,13 +41,13 @@ export function MediaPlayer({ file, onClose, onNext, onPrev, activeFolderId, onC
 
     return (
         <FastStreamPlayer
+            key="media-player"
             file={file}
             streamUrl={streamUrl}
             onClose={onClose}
             onNext={onNext}
             onPrev={onPrev}
             activeFolderId={activeFolderId}
-            onContinueToDownload={onContinueToDownload}
             isAlreadyDownloading={isAlreadyDownloading}
             isPublicChannel={isPublicChannel}
         />

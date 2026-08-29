@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-list-split-jobs"
+description = "Enables the cmd_list_split_jobs command without any pre-configured scope."
+commands.allow = ["cmd_list_split_jobs"]
+
+[[permission]]
+identifier = "deny-cmd-list-split-jobs"
+description = "Denies the cmd_list_split_jobs command without any pre-configured scope."
+commands.deny = ["cmd_list_split_jobs"]

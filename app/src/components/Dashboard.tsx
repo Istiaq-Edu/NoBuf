@@ -32,7 +32,11 @@ import { useConfirm } from '../context/ConfirmContext';
 // Hooks
 import { useTelegramConnection } from '../hooks/useTelegramConnection';
 import { useFileOperations } from '../hooks/useFileOperations';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { useFileUpload } from '../hooks/useFileUpload';
+import { removeSplitRow } from '../hooks/useSplitUpload';
+import { SplitUploadModal } from './dashboard/SplitUploadModal';
+import { OversizeDropChoiceModal } from './dashboard/OversizeDropChoiceModal';
 import { useFileDownload } from '../hooks/useFileDownload';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useSettings } from '../context/SettingsContext';
@@ -272,6 +276,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [showAbout, setShowAbout] = useState(false);
     const [showRemoteUpload, setShowRemoteUpload] = useState(false);
     const [showTransferPanel, setShowTransferPanel] = useState(false);
+    const [splitDeleteDecision, setSplitDeleteDecision] = useState<{ jobId: string; name: string } | null>(null);
     const [searchTerm, setSearchTerm] = useState("");
     const [searchResults, setSearchResults] = useState<TelegramFile[]>([]);
     const [isSearching, setIsSearching] = useState(false);
@@ -297,6 +302,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         _setInternalDragFileId(id);
     };
     const [playingFile, setPlayingFile] = useState<TelegramFile | null>(null);
+    // Chain mode: the split-parts group being played (null = single file).
+    // Virtual-timeline time where playback should start (clicked part K → Σ
+    // durations of parts 1..K-1). Consumed by MediaPlayer on mount.
     const [pdfFile, setPdfFile] = useState<TelegramFile | null>(null);
     const [archiveFile, setArchiveFile] = useState<TelegramFile | null>(null);
     const [previewContextFiles, setPreviewContextFiles] = useState<TelegramFile[]>([]);
@@ -319,9 +327,21 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [uploadLimitBytes, setUploadLimitBytes] = useState(2_000_000_000);
     // Re-fetch the Premium-aware limit whenever the Telegram connection (re)establishes,
     // so a mid-session account change isn't stuck with the stale mount-time value.
+    // ALSO poll until the first successful load: at mount the client often isn't
+    // signed in yet, the one-shot fetch fails silently, and the default 2GB sticks —
+    // which would route an oversize drop into the regular uploader instead of split.
     useEffect(() => {
+        let cancelled = false;
+        const load = () => invoke<number>('cmd_upload_limit')
+            .then(v => { if (!cancelled) setUploadLimitBytes(v); return true; })
+            .catch(() => false);
         if (!isConnected) return;
-        invoke<number>('cmd_upload_limit').then(setUploadLimitBytes).catch(() => {});
+        load().then(ok => {
+            if (ok || cancelled) return;
+            const t = setInterval(() => { load().then(ok2 => { if (ok2) clearInterval(t); }); }, 3000);
+            return () => clearInterval(t);
+        });
+        return () => { cancelled = true; };
     }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
     const canUploadHere = !isReadOnly;
@@ -348,6 +368,33 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }))),
         enabled: !!store && !isPublicView && vault.ready,
     });
+
+    // documents-changed (parts-first plan §A): the backend emits this after
+    // EVERY successful send_message across all three upload pipelines (picker,
+    // remote-URL, browser-drop). Debounced 300 ms because cmd_get_files
+    // re-paginates the whole peer per fetch and split parts land in bursts.
+    useEffect(() => {
+        let disposed = false;
+        let timer: number | undefined;
+        (async () => {
+            try {
+                const { listen } = await import('@tauri-apps/api/event');
+                await listen<{ folder_id?: number | null }>('documents-changed', () => {
+                    if (disposed) return;
+                    window.clearTimeout(timer);
+                    timer = window.setTimeout(() => {
+                        if (!disposed) queryClient.invalidateQueries({ queryKey: ['files'] });
+                    }, 300);
+                });
+            } catch (e) {
+                console.warn('[documents-changed] listener attach failed', e);
+            }
+        })();
+        return () => {
+            disposed = true;
+            window.clearTimeout(timer);
+        };
+    }, [queryClient]);
 
     const allFiles = isPublicView ? pubChannelFiles : nbFiles;
     const isLoading = isPublicView ? pubFilesLoading : nbFilesLoading;
@@ -383,7 +430,68 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     } = useFileOperations(activeFolderId, selectedIds, setSelectedIds, displayedFiles);
 
-    const { uploadQueue, setUploadQueue, handleManualUpload, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, isDragging } = useFileUpload(activeFolderId, store);
+    const { uploadQueue, setUploadQueue, handleManualUpload, processPickedPaths, handleFolderUpload, handleRemoteUpload, stageAndQueue, cancelAll: cancelUploads, cancelItem: cancelUploadItem, retryItem: retryUploadItem, removeItem: removeUploadItem, deleteItem: deleteUploadItem, isDragging , splitJobRows, splitFlow } = useFileUpload(activeFolderId, store,
+        // Decision-first: an oversize DROPPED video asks before any temp copy.
+        // "Pick instead" aborts staging and opens the native picker — selecting
+        // the same file there runs the zero-copy split flow.
+        (file, proceed) => {
+            const stageDropCap = 4_294_967_295; // Telegram hard ceiling (backend MAX_DROP_BYTES)
+            if (file.size > stageDropCap) {
+                toast.error(`"${file.name}" is larger than the 4 GB maximum — upload it with the Upload button instead.`);
+                return;
+            }
+            // If a decision dialog is already open, reject this candidate
+            // loudly instead of silently replacing (and losing) the pending one.
+            if (oversizeChoiceRef.current) {
+                toast.error(`Another large video ("${oversizeChoiceRef.current.file.name}") is awaiting your choice — decide on it first, then drop "${file.name}" again.`);
+                return;
+            }
+            setOversizeChoice({ file, proceed });
+        }
+    );
+    const [oversizeChoice, setOversizeChoice] = useState<{ file: File; proceed: () => void } | null>(null);
+    // Mirror for use inside the useFileUpload drop callback (stable identity
+    // across renders — state would read stale inside the callback closure).
+    const oversizeChoiceRef = useRef<{ file: File; proceed: () => void } | null>(null);
+    oversizeChoiceRef.current = oversizeChoice;
+
+    const handleOversizePickInstead = useCallback(async () => {
+        if (!oversizeChoice) return;
+        setOversizeChoice(null);
+        try {
+            const selected = await openFileDialog({ multiple: false, directory: false });
+            if (selected) {
+                const p = Array.isArray(selected) ? selected[0] : selected;
+                await processPickedPaths([p]);
+            } else {
+                toast.info('No file picked — nothing uploaded.');
+            }
+        } catch (e) {
+            toast.error(`Picker failed: ${e}`);
+        }
+    }, [oversizeChoice]);
+
+    // While an oversize drop is being staged or split-processed, surface the
+    // Transfers panel so the user sees the copy/prepare progress. Closes are
+    // left to the user — no forced-hide.
+    useEffect(() => {
+        if (splitFlow.phase !== 'idle') setShowTransferPanel(true);
+    }, [splitFlow.phase]);
+
+    // DEV-ONLY: QA seam for the split-upload flow (dead-code-eliminated in
+    // release builds). Lets tests bypass the native file picker while still
+    // exercising prepare -> modal -> confirm -> orchestrator end-to-end.
+    useEffect(() => {
+        if (import.meta.env.DEV) {
+            (window as any).__NOBUF_SPLIT_DEV__ = {
+                prepare: (path: string, folderId: number | null) => splitFlow.prepare(path, folderId),
+                listJobs: () => invoke('cmd_list_split_jobs'),
+                resumeJob: (id: string) => invoke('cmd_resume_split_job', { id }),
+                cancelJob: (id: string) => invoke('cmd_cancel_split_job', { id }),
+                discardJob: (id: string, deleteParts = false) => invoke('cmd_discard_split_job', { id, deleteParts }),
+            };
+        }
+    }, [splitFlow]);
     const { downloadQueue, queueDownload, queueDownloadWithSavePath, clearFinished: clearDownloads, cancelAll: cancelDownloads, cancelItem: cancelDownloadItem, retryItem: retryDownloadItem } = useFileDownload(store);
 
     // Sync active download progress to cacheSession badge so the percentage stays accurate
@@ -553,6 +661,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const isPdf = isPdfFile(file.name);
         const isArchive = isArchiveFile(file.name);
 
+        // Parts-first (plan §B): every document — including split parts —
+        // plays SOLO from its own 0:00. Chain interception removed per Q12.
         if (isMedia) {
             setPlayingFile(file);
             setPreviewFile(null);
@@ -865,14 +975,41 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     />
                 )}
                 <RemoteUploadModal
+                    key="remote-upload-modal"
                     open={showRemoteUpload}
                     onClose={() => setShowRemoteUpload(false)}
                     onSubmit={handleRemoteUpload}
                 />
+                                {oversizeChoice && (
+                    <OversizeDropChoiceModal
+                        key="oversize-drop-choice"
+                        fileName={oversizeChoice.file.name}
+                        sizeGb={`${(oversizeChoice.file.size / 1_000_000_000).toFixed(2)} GB`}
+                        onUseTempCopy={() => {
+                            oversizeChoice.proceed();
+                            setOversizeChoice(null);
+                        }}
+                        onPickInstead={() => { void handleOversizePickInstead(); }}
+                        onClose={() => setOversizeChoice(null)}
+                    />
+                )}
+<SplitUploadModal
+                    key="split-upload-modal"
+                    open={splitFlow.open}
+                    preparing={splitFlow.preparing}
+                    plan={splitFlow.plan}
+                    edits={splitFlow.edits}
+                    starting={splitFlow.starting}
+                    startedJobId={splitFlow.startedJobId}
+                    error={splitFlow.error}
+                    onClose={splitFlow.close}
+                    onConfirm={splitFlow.start}
+                    onEditBoundaries={(next) => splitFlow.setEdits({ boundaries: next })}
+                />
                 {playingFile && (
                     <MediaPlayer
                                             file={playingFile}
-                                            onClose={() => setPlayingFile(null)}
+                                            onClose={() => { setPlayingFile(null); }}
                                             onNext={handleNextPreview}
                                             onPrev={handlePrevPreview}
                                             currentIndex={previewContextIndex}
@@ -898,6 +1035,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 )}
                 {archiveFile && (
                     <ArchiveViewerModal
+                        key="archive-viewer"
                         file={archiveFile}
                         activeFolderId={activeFolderId}
                         onClose={() => setArchiveFile(null)}
@@ -997,6 +1135,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDownload={(id, name) => queueDownload(id, name, activeFolderId)}
                     onPreview={handlePreview}
                     onManualUpload={handleManualUpload}
+                    uploadHighlight={externalDragActive && canUploadHere}
                     onFolderUpload={handleFolderUpload}
                     onSelectionClear={() => setSelectedIds([])}
                     onToggleSelection={handleToggleSelection}
@@ -1031,6 +1170,56 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
             <TransferPanel
                 isOpen={showTransferPanel}
+                splitJobs={splitJobRows}
+                onCancelSplitJob={jobId => { void invoke('cmd_cancel_split_job', { id: jobId }); }}
+                onResumeSplitJob={jobId => {
+                    void invoke('cmd_resume_split_job', { id: jobId })
+                        .then(() => toast.success(`Resuming "${splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'split job'}"`))
+                        .catch(e => toast.error(`Resume failed: ${e}`));
+                }}
+                onDiscardSplitJob={jobId => {
+                    const name = splitJobRows.find(j => j.jobId === jobId)?.displayName ?? 'this split job';
+                    setSplitDeleteDecision({ jobId, name });
+                }}
+                onClearFinishedSplitJobs={() => {
+                    const completed = splitJobRows.filter(j => j.phase === 'done');
+                    void Promise.allSettled(completed.map(async job => {
+                        await invoke('cmd_discard_split_job', { id: job.jobId, deleteParts: false });
+                        removeSplitRow(job.jobId);
+                    })).then(results => {
+                        const failed = results.filter(r => r.status === 'rejected').length;
+                        if (failed > 0) toast.error(`Couldn't clear ${failed} split ${failed === 1 ? 'job' : 'jobs'}`);
+                    });
+                }}
+                onCancelSplitPart={(jobId, idx) => {
+                    void invoke('cmd_cancel_transfer', { transferId: `split:${jobId}:${idx}` })
+                        .catch(e => toast.error(`Cancel failed: ${e}`));
+                }}
+                onRetrySplitPart={(jobId, idx) => {
+                    void invoke('cmd_retry_split_part', { id: jobId, idx })
+                        .then(() => toast.success(`Retrying part #${String(idx).padStart(2, '0')}`))
+                        .catch(e => toast.error(`Retry failed: ${e}`));
+                }}
+                onPlaySplitPart={(jobId, idx) => {
+                    const job = splitJobRows.find(j => j.jobId === jobId);
+                    const part = job?.parts.find(p => p.idx === idx);
+                    if (!job || !part?.messageId) return;
+                    // Play ONLY this part from its own 0:00 (plan §D/Q5): a
+                    // synthetic TelegramFile opened through the ordinary solo
+                    // preview path — MediaPlayer self-serves stream info.
+                    setPlayingFile({
+                        id: part.messageId,
+                        name: part.name,
+                        size: part.sizeBytes,
+                        type: 'file',
+                    } as TelegramFile);
+                }}
+                onDownloadSplitPart={(jobId, idx) => {
+                    const job = splitJobRows.find(j => j.jobId === jobId);
+                    const part = job?.parts.find(p => p.idx === idx);
+                    if (!job || !part?.messageId) return;
+                    queueDownload(part.messageId, part.name, job.folderId);
+                }}
                 onClose={() => setShowTransferPanel(false)}
                 uploadItems={uploadQueue}
                 stagingItems={stagingItems}
@@ -1042,15 +1231,96 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     setStagingItems(prev => prev.filter(i => i.name !== name));
                 }}
                 onClearUploadFinished={() => setUploadQueue(q => q.filter(i => i.status !== 'success' && i.status !== 'error' && i.status !== 'cancelled'))}
-                onCancelAllUploads={cancelUploads}
-                onCancelUploadItem={cancelUploadItem}
+                onCancelAllUploads={() => {
+                    void confirm({
+                        title: 'Cancel all uploads?',
+                        message: 'Every active upload will stop. Cancelled uploads can be retried from the beginning; pending uploads will be removed.',
+                        confirmText: 'Cancel all',
+                        cancelText: 'Keep uploading',
+                        variant: 'danger',
+                    }).then(ok => {
+                        if (!ok) return;
+                        cancelUploads();
+                        splitJobRows
+                            .filter(j => ['queued', 'running', 'splitting', 'uploading'].includes(j.phase))
+                            .forEach(j => { void invoke('cmd_cancel_split_job', { id: j.jobId }); });
+                    });
+                }}
+                onCancelUploadItem={id => {
+                    const item = uploadQueue.find(i => i.id === id);
+                    if (!item) return;
+                    if (item.status === 'pending') {
+                        cancelUploadItem(id);
+                        return;
+                    }
+                    void confirm({
+                        title: `Cancel upload?`,
+                        message: 'The current upload stops and retries from 0%. If the file already reached Telegram mid-upload, it is removed automatically; if that removal fails you will see an error with the message id.',
+                        confirmText: 'Cancel upload',
+                        cancelText: 'Keep uploading',
+                        variant: 'danger',
+                    }).then(ok => { if (ok) cancelUploadItem(id); });
+                }}
                 onRetryUploadItem={retryUploadItem}
+                onRemoveUploadItem={removeUploadItem}
+                onDeleteUploadItem={id => {
+                    const item = uploadQueue.find(i => i.id === id);
+                    if (!item) return;
+                    if (item.messageId === undefined) {
+                        void deleteUploadItem(id).catch(e => toast.error(`Delete failed: ${e}`));
+                        return;
+                    }
+                    void confirm({
+                        title: 'Delete uploaded file?',
+                        message: 'This removes the upload from Telegram and from the local transfer list.',
+                        confirmText: 'Delete',
+                        cancelText: 'Keep file',
+                        variant: 'danger',
+                    }).then(ok => {
+                        if (!ok) return;
+                        void deleteUploadItem(id)
+                            .then(() => toast.success('Uploaded file deleted'))
+                            .catch(e => toast.error(`Delete failed: ${e}`));
+                    });
+                }}
                 downloadItems={downloadQueue}
                 onClearDownloadFinished={clearDownloads}
                 onCancelAllDownloads={cancelDownloads}
                 onCancelDownloadItem={cancelDownloadItem}
                 onRetryDownloadItem={retryDownloadItem}
             />
+
+            {splitDeleteDecision && (
+                <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+                    <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-white/10 bg-[#1c1c1c] p-5 shadow-2xl">
+                        <h3 className="text-base font-semibold text-white">Delete “{splitDeleteDecision.name}”?</h3>
+                        <p className="mt-2 text-sm text-nobuf-subtext">Choose what happens to parts already uploaded to Telegram.</p>
+                        <div className="mt-5 flex flex-col gap-2">
+                            <button onClick={() => {
+                                const choice = splitDeleteDecision;
+                                setSplitDeleteDecision(null);
+                                void invoke('cmd_discard_split_job', { id: choice.jobId, deleteParts: false })
+                                    .then(() => { removeSplitRow(choice.jobId); toast.success(`Deleted job “${choice.name}”`); })
+                                    .catch(e => toast.error(`Delete failed: ${e}`));
+                            }} className="rounded-lg border border-white/10 px-3 py-2 text-left text-sm text-white hover:bg-white/5">
+                                <span className="block font-medium">Delete job only</span>
+                                <span className="block text-xs text-nobuf-subtext">Keep parts already uploaded to Telegram.</span>
+                            </button>
+                            <button onClick={() => {
+                                const choice = splitDeleteDecision;
+                                setSplitDeleteDecision(null);
+                                void invoke('cmd_discard_split_job', { id: choice.jobId, deleteParts: true })
+                                    .then(() => { removeSplitRow(choice.jobId); toast.success(`Deleted job and uploaded parts “${choice.name}”`); })
+                                    .catch(e => toast.error(`Delete failed: ${e}`));
+                            }} className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-left text-sm text-red-400 hover:bg-red-500/20">
+                                <span className="block font-medium">Delete job + uploaded parts</span>
+                                <span className="block text-xs text-red-300/70">Permanently delete every uploaded part tracked by this job.</span>
+                            </button>
+                        </div>
+                        <button onClick={() => setSplitDeleteDecision(null)} className="mt-4 w-full rounded-lg px-3 py-2 text-sm text-nobuf-subtext hover:bg-white/5">Keep job</button>
+                    </div>
+                </div>
+            )}
 
             <AnimatePresence>
                 {showSettings && (

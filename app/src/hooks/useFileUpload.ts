@@ -5,14 +5,124 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { forgetLiveDrop, cancelDropStream, retryDropStream } from './useDropStreamUpload';
+import { stageOne as stageOneExport, StagingCancelledError } from './useDroppedFileUpload';
 import { QueueItem } from '../types';
 
 /** True when a queue item is a stream-direct drop (never touches cmd_upload_file). */
 export function isDropStreamItem(item: Pick<QueueItem, 'path'>): boolean {
     return item.path.startsWith('nobuf-drop-stream://');
 }
+
+export function retryUploadItem(item: QueueItem): QueueItem {
+    if (item.status !== 'error' && item.status !== 'cancelled') return item;
+    return { ...item, status: 'pending', error: undefined, progress: undefined, uploadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined };
+}
+
+function parseUploadResult(result: string): { messageId?: number } {
+    try {
+        const parsed = JSON.parse(result) as { messageId?: unknown };
+        return typeof parsed.messageId === 'number' ? { messageId: parsed.messageId } : {};
+    } catch {
+        return {};
+    }
+}
 import { useFileDrop } from './useFileDrop';
+import { useSplitUpload } from './useSplitUpload';
 import type { Store } from '@tauri-apps/plugin-store';
+
+/**
+ * Fast drop-staging: POST the File as raw binary to the local actix server's
+ * /stage-drop route. Progress rides the standard `upload-progress` event
+ * channel (server emits it), so callers can also listen there; the `pct`
+ * callback here is driven by xhr.upload.onprogress for immediate feedback.
+ * Throws when the route/server is unavailable so callers can fall back to
+ * the chunked IPC stager. Returns the staged absolute path.
+ */
+async function stageViaHttp(file: File, onPct?: (pct: number) => void): Promise<string> {
+    const { getStreamInfo } = await import('./useDropStreamUpload');
+    let info;
+    try {
+        info = await getStreamInfo();
+    } catch (e) {
+        throw new Error(`stream-info unavailable: ${e}`);
+    }
+    const rootUrl = info.base_url.replace('localhost', '127.0.0.1');
+    const params = new URLSearchParams({
+        token: info.token ?? '',
+        name: file.name,
+        size: String(file.size),
+        id: Math.random().toString(36).slice(2, 11),
+        tid: '',
+    });
+    return await new Promise<string>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${rootUrl}/stage-drop?${params.toString()}`, true);
+        xhr.timeout = 0;
+        if (xhr.upload && onPct) {
+            xhr.upload.onprogress = (ev) => {
+                if (ev.lengthComputable) onPct(Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+            };
+        }
+        xhr.onerror = () => reject(new Error('network error talking to local server'));
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                try {
+                    const parsed = JSON.parse(xhr.responseText);
+                    if (parsed?.path) resolve(parsed.path as string);
+                    else reject(new Error('stage-drop returned no path'));
+                } catch {
+                    reject(new Error('stage-drop returned invalid JSON'));
+                }
+            } else {
+                reject(new Error(xhr.responseText || `stage-drop HTTP ${xhr.status}`));
+            }
+        };
+        xhr.send(file);
+    });
+}
+
+type SplitFlowLite = {
+    open: boolean;
+    prepare: (path: string, folderId: number | null) => void;
+};
+
+/**
+ * Stage a dropped oversize video (fast /stage-drop route, chunked IPC fallback)
+ * and open the split screen. Invoked only AFTER the user accepts the temp-copy
+ * choice in OversizeDropChoiceModal (or directly when no choice UI is wired).
+ */
+export async function runSplitStaging(
+    f: File,
+    activeFolderId: number | null,
+    onStagingProgress: ((fileName: string, pct: number) => void) | undefined,
+    splitFlow: SplitFlowLite,
+): Promise<void> {
+    try {
+        onStagingProgress?.(f.name, 0);
+        const tempPath = await stageViaHttp(f, pct => onStagingProgress?.(f.name, pct));
+        onStagingProgress?.(f.name, 100);
+        if (tempPath) {
+            splitFlow.prepare(tempPath, activeFolderId);
+        }
+    } catch (httpErr) {
+        console.warn('[drop-split] fast staging unavailable, falling back to chunked IPC:', httpErr);
+        try {
+            const id = Math.random().toString(36).slice(2, 11);
+            const tempPath = await stageOneExport(f, id, pct => onStagingProgress?.(f.name, pct));
+            onStagingProgress?.(f.name, 100);
+            if (tempPath) {
+                splitFlow.prepare(tempPath, activeFolderId);
+            }
+        } catch (e) {
+            if (e instanceof StagingCancelledError) {
+                toast.info(`Stopped preparing ${f.name}.`);
+            } else {
+                toast.error(`Couldn't read ${f.name}: ${e}`);
+            }
+        }
+    }
+}
+
 
 interface ProgressPayload {
     id: string;
@@ -34,6 +144,42 @@ export function persistableQueueItems(items: QueueItem[]): QueueItem[] {
 }
 
 /**
+ * Ids that no longer have a queue row. Their bookkeeping (run generations,
+ * cancel markers) can be discarded — otherwise those maps/sets grow once
+ * per upload for the whole session. Pure + exported for unit tests.
+ */
+export function orphanedUploadIds(tracked: Iterable<string>, queueIds: Set<string>): string[] {
+    const orphaned: string[] = [];
+    for (const id of tracked) {
+        if (!queueIds.has(id)) orphaned.push(id);
+    }
+    return orphaned;
+}
+
+/**
+ * A saved queue item's post-restart shape. Only recoverable rows survive:
+ * `pending` (never started — restarts cleanly), `error`/`cancelled` (retryable
+ * from the original source). An `uploading` row is a LIE after a restart —
+ * its task died with the process — so it maps to `cancelled` with an
+ * interruption note, showing Retry instead of a frozen active row.
+ * Stream-direct drops (`nobuf-drop-stream://`) and staged items are
+ * unrecoverable (the File handle and temp file are gone) — they are dropped.
+ * Pure + exported for unit testing.
+ */
+export function reviveSavedUploads(saved: QueueItem[]): QueueItem[] {
+    const revivable = saved.filter(i =>
+        (i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled')
+        && !i.stagedTempPath
+        && !i.path.startsWith('nobuf-drop-stream://')
+    );
+    return revivable.map(i =>
+        i.status === 'uploading'
+            ? { ...i, status: 'cancelled' as const, error: 'Interrupted when the app closed', progress: undefined, uploadedBytes: undefined, speedBytesPerSec: undefined }
+            : i
+    );
+}
+
+/**
  * Best-effort delete of a staged temp file once its queue item reaches a terminal
  * state. Silent by design: NotFound means the sweep/another path already got it,
  * and a locked file must never turn a finished upload into an error toast.
@@ -43,7 +189,8 @@ export function cleanupStagedTemp(item: Pick<QueueItem, 'stagedTempPath'>): void
     invoke('cmd_delete_staged_file', { path: item.stagedTempPath }).catch(() => {});
 }
 
-export function useFileUpload(activeFolderId: number | null, store: Store | null) {
+export function useFileUpload(activeFolderId: number | null, store: Store | null,
+    onOversizeDropChoice?: (file: File, proceed: () => void) => void) {
     const queryClient = useQueryClient();
     const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
     const [processing, setProcessing] = useState(false);
@@ -51,9 +198,26 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     const [limitBytes, setLimitBytes] = useState(2_000_000_000);
     useEffect(() => { invoke<number>('cmd_upload_limit').then(setLimitBytes).catch(() => {}); }, []);
     const cancelledRef = useRef<Set<string>>(new Set());
+    // Prevent a cancelled invocation from overwriting a newer Retry attempt.
+    const runGenerationRef = useRef<Map<string, number>>(new Map());
     // Live mirror of uploadQueue for once-registered/async callbacks (dedupe on drop).
     const queueMirrorRef = useRef<QueueItem[]>([]);
     queueMirrorRef.current = uploadQueue;
+
+    // Bounded bookkeeping (WP5): run generations and cancel markers for ids
+    // that left the queue (Cancel pending / Remove / Delete) are garbage —
+    // prune them on every queue change so the maps can't grow per-upload
+    // for the whole session. Ids are never reused, so pruning is safe even
+    // while an in-flight invoke for a removed row is still settling.
+    useEffect(() => {
+        const live = new Set(uploadQueue.map(i => i.id));
+        for (const id of orphanedUploadIds(runGenerationRef.current.keys(), live)) {
+            runGenerationRef.current.delete(id);
+        }
+        for (const id of orphanedUploadIds(cancelledRef.current, live)) {
+            cancelledRef.current.delete(id);
+        }
+    }, [uploadQueue]);
 
     // Listen for progress events from Rust
     useEffect(() => {
@@ -91,20 +255,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         if (!store || initialized) return;
         store.get<QueueItem[]>('uploadQueue').then((saved) => {
             if (saved && saved.length > 0) {
-                const pending = saved.filter(i => i.status === 'pending');
-                if (pending.length > 0) {
-                    setUploadQueue(pending);
-                    toast.info(`Restored ${pending.length} pending uploads`);
+                const revived = reviveSavedUploads(saved);
+                if (revived.length > 0) {
+                    setUploadQueue(revived);
+                    const interrupted = revived.filter(i => i.error === 'Interrupted when the app closed').length;
+                    toast.info(interrupted > 0
+                        ? `Restored ${revived.length} upload${revived.length === 1 ? '' : 's'} (${interrupted} interrupted)`
+                        : `Restored ${revived.length} pending upload${revived.length === 1 ? '' : 's'}`);
                 }
             }
             setInitialized(true);
         });
     }, [store, initialized]);
 
+    // Persist every RECOVERABLE row (pending / uploading / error / cancelled)
+    // so a crash or restart keeps Retry available — not just never-started
+    // items. Staged temps and stream-drop rows are still excluded (sweep +
+    // dead File handles make them unrecoverable); completed rows are not
+    // persisted (they live in the folder listing, not the queue).
     useEffect(() => {
         if (!store || !initialized) return;
-        const pending = persistableQueueItems(uploadQueue.filter(i => i.status === 'pending'));
-        store.set('uploadQueue', pending).then(() => store.save());
+        const recoverable = persistableQueueItems(uploadQueue.filter(i =>
+            i.status === 'pending' || i.status === 'uploading' || i.status === 'error' || i.status === 'cancelled'
+        ));
+        store.set('uploadQueue', recoverable).then(() => store.save());
     }, [store, uploadQueue, initialized]);
 
     useEffect(() => {
@@ -126,6 +300,9 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             setUploadQueue(q => q.map(i => i.id === id ? {
                 ...i,
                 status: status as QueueItem['status'],
+                messageId: typeof (e as CustomEvent).detail?.messageId === 'number'
+                    ? (e as CustomEvent).detail.messageId
+                    : i.messageId,
                 progress: status === 'success' ? 100 : undefined,
                 // Drop the stale byte counters too — otherwise error/cancel rows
                 // keep showing a frozen "X / Y" from the last progress event.
@@ -150,18 +327,30 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
         // Stream-direct drops manage their own lifecycle (XHR + server events);
         // they enter the queue as 'uploading' and must never hit cmd_upload_file.
         if (isDropStreamItem(item)) return;
+        const generation = (runGenerationRef.current.get(item.id) ?? 0) + 1;
+        runGenerationRef.current.set(item.id, generation);
+        const isCurrentRun = () => runGenerationRef.current.get(item.id) === generation;
         setProcessing(true);
         setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i));
         try {
             if (item.url) {
                 // Remote upload from URL
-                await invoke('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const result = await invoke<string>('cmd_upload_from_url', { url: item.url, folderId: item.folderId, transferId: item.id });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             } else {
                 // Local file upload — displayName carries the ORIGINAL dropped-file name
                 // so the Telegram document isn't named after the <id>-prefixed temp file.
-                await invoke('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const result = await invoke<string>('cmd_upload_file', { path: item.path, folderId: item.folderId, transferId: item.id, displayName: item.displayName ?? null });
+                const parsed = parseUploadResult(result);
+                if (parsed.messageId !== undefined) {
+                    setUploadQueue(q => q.map(i => i.id === item.id ? { ...i, messageId: parsed.messageId } : i));
+                }
             }
             // Check if cancelled during upload
+            if (!isCurrentRun()) return;
             if (cancelledRef.current.has(item.id)) {
                 // Cancel keeps the staged temp file: the item stays retryable, and
                 // Retry re-uploads from it. Deleted on success or queue removal.
@@ -172,6 +361,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 queryClient.invalidateQueries({ queryKey: ['files', item.folderId] });
             }
         } catch (e) {
+            if (!isCurrentRun()) return;
             if (!cancelledRef.current.has(item.id)) {
                 const errMsg = String(e);
                 if (errMsg.includes('Transfer cancelled')) {
@@ -187,8 +377,61 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cancelledRef.current.delete(item.id);
             }
         } finally {
+            // `processing` owns the queue runner, not this generation's row
+            // writes. Retry invalidates the old generation while it is still
+            // settling; withholding this release would wedge every pending
+            // upload for the rest of the session.
             setProcessing(false);
         }
+    };
+
+    const splitFlow = useSplitUpload();
+
+    // Post-dialog logic shared by the Upload button and the oversize-drop
+    // "pick instead" lane (which re-opens the picker for one file).
+    const processPickedPaths = async (paths: string[]) => {
+                // Pre-validate against the Premium-aware size limit (consistent with drop path).
+                const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
+                const kept: string[] = [];
+                const oversizedNames: string[] = [];
+                let splitCandidate: string | null = null;
+                for (const p of paths) {
+                    try {
+                        const size = await invoke<number>('cmd_file_size', { path: p });
+                        if (size > limitBytes) {
+                            const name = p.split(/[/\\]/).pop() || p;
+                            if (VIDEO_RE.test(name)) {
+                                // First oversize video opens the split screen; extra ones rejected.
+                                if (!splitCandidate) splitCandidate = p;
+                                else oversizedNames.push(name);
+                            } else {
+                                oversizedNames.push(name);
+                            }
+                            continue;
+                        }
+                    } catch { /* if size probe fails, let the upload flow surface the error */ }
+                    kept.push(p);
+                }
+                if (oversizedNames.length > 0) {
+                    const gb = Math.round(limitBytes / 1_000_000_000);
+                    // Name the files (spec §3.3 style), matching the drop path's wording.
+                    const names = oversizedNames.slice(0, 3).join(', ') + (oversizedNames.length > 3 ? ` +${oversizedNames.length - 3} more` : '');
+                    toast.error(`${names} ${oversizedNames.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
+                }
+                if (splitCandidate) {
+                    splitFlow.prepare(splitCandidate, activeFolderId);
+                }
+                if (kept.length > 0) {
+                    const newItems: QueueItem[] = kept.map((path: string) => ({
+                        id: Math.random().toString(36).substr(2, 9),
+                        path,
+                        folderId: activeFolderId,
+                        status: 'pending'
+                    }));
+                    setUploadQueue(prev => [...prev, ...newItems]);
+                    toast.info(`Queued ${kept.length} files for upload`);
+                }
+                if (kept.length === 0 && !splitCandidate) return;
     };
 
     const handleManualUpload = async () => {
@@ -196,31 +439,7 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             const selected = await open({ multiple: true, directory: false });
             if (selected) {
                 const paths = Array.isArray(selected) ? selected : [selected];
-                // Pre-validate against the Premium-aware size limit (consistent with drop path).
-                const kept: string[] = [];
-                const oversized: string[] = [];
-                for (const p of paths) {
-                    try {
-                        const size = await invoke<number>('cmd_file_size', { path: p });
-                        if (size > limitBytes) { oversized.push(p.split(/[/\\]/).pop() || p); continue; }
-                    } catch { /* if size probe fails, let the upload flow surface the error */ }
-                    kept.push(p);
-                }
-                if (oversized.length > 0) {
-                    const gb = Math.round(limitBytes / 1_000_000_000);
-                    // Name the files (spec §3.3 style), matching the drop path's wording.
-                    const names = oversized.slice(0, 3).join(', ') + (oversized.length > 3 ? ` +${oversized.length - 3} more` : '');
-                    toast.error(`${names} ${oversized.length === 1 ? 'exceeds' : 'exceed'} the ${gb} GB limit.`);
-                }
-                if (kept.length === 0) return;
-                const newItems: QueueItem[] = kept.map((path: string) => ({
-                    id: Math.random().toString(36).substr(2, 9),
-                    path,
-                    folderId: activeFolderId,
-                    status: 'pending'
-                }));
-                setUploadQueue(prev => [...prev, ...newItems]);
-                toast.info(`Queued ${kept.length} files for upload`);
+                await processPickedPaths(paths);
             }
         } catch {
             toast.error("Failed to open file dialog");
@@ -312,8 +531,6 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
                 cleanupStagedTemp(item);
                 return q.filter(i => i.id !== id);
             }
-            // Bulk-cancelled pending items (cancelAll) are removed by its filter,
-            // which must not leave their staged temp files behind either.
             return q;
         });
     };
@@ -330,21 +547,80 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
             ));
             return;
         }
-        setUploadQueue(q => q.map(i =>
-            i.id === id && (i.status === 'error' || i.status === 'cancelled')
-                ? { ...i, status: 'pending' as const, error: undefined, progress: undefined, uploadedBytes: undefined, totalBytes: undefined, speedBytesPerSec: undefined }
-                : i
-        ));
+        cancelledRef.current.delete(id);
+        runGenerationRef.current.set(id, (runGenerationRef.current.get(id) ?? 0) + 1);
+        setUploadQueue(q => q.map(i => i.id === id ? retryUploadItem(i) : i));
+    };
+
+    const removeItem = (id: string) => {
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (item) cleanupStagedTemp(item);
+        forgetLiveDrop(id);
+        setUploadQueue(q => q.filter(i => i.id !== id));
+    };
+
+    const deleteItem = async (id: string): Promise<void> => {
+        const item = queueMirrorRef.current.find(i => i.id === id);
+        if (!item) return;
+        if (item.messageId !== undefined) {
+            await invoke('cmd_delete_file', { messageId: item.messageId, folderId: item.folderId });
+        }
+        cleanupStagedTemp(item);
+        forgetLiveDrop(id);
+        setUploadQueue(q => q.filter(i => i.id !== id));
     };
 
     const { isDragging } = useFileDrop();
 
     const stageAndQueue = async (files: File[], limitBytes: number, hasFolder: boolean,
         onStagingProgress?: (fileName: string, pct: number) => void) => {
+        // SPLIT BRANCH — oversize VIDEOS route into the split screen. A dropped
+        // File has no filesystem path (WebView2 constraint), so it is copied to
+        // %TEMP% once, then handed to the same prepare → modal → confirm chain
+        // the picker flow uses. Fast path: raw-binary POST to the local actix
+        // server (/stage-drop) — no base64, no per-chunk IPC. Falls back to
+        // the legacy chunked IPC stager when the route is absent/unreachable.
+        const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|wmv|flv|ts|m2ts|mpg|mpeg)$/i;
+        const splitCandidates = files.filter(f => f.size > limitBytes && VIDEO_RE.test(f.name));
+        if (splitCandidates.length > 0 && splitFlow.open !== true) {
+            const f = splitCandidates[0];
+            if (splitCandidates.length > 1) {
+                toast.error(`${splitCandidates.length - 1} more large video(s) skipped \u2014 split them one at a time.`);
+            }
+            // DECISION FIRST: ask before copying anything. onOversizeDropChoice,
+            // when provided, receives the candidate + a proceed() callback that
+            // runs the original stage-and-open flow.
+            if (onOversizeDropChoice) {
+                const proceed = () => { void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow); };
+                onOversizeDropChoice(f, proceed);
+                // The non-split remainder still uploads normally.
+            } else {
+                void runSplitStaging(f, activeFolderId, onStagingProgress, splitFlow);
+            }
+            const remaining2 = files.filter(x => !splitCandidates.includes(x));
+            files = remaining2;
+            if (files.length === 0) return;
+        } else if (splitCandidates.length > 0) {
+            // A split screen/job is already active. These candidates must be
+            // rejected LOUDLY — falling through to the generic remainder filter
+            // used to make them vanish silently (no upload, no message).
+            const names = splitCandidates.slice(0, 3).map(x => x.name).join(', ')
+                + (splitCandidates.length > 3 ? ` +${splitCandidates.length - 3} more` : '');
+            toast.error(
+                `Split already in progress \u2014 ${names} not queued. Finish or cancel it first.`,
+                { duration: 7000 },
+            );
+            files = files.filter(x => !splitCandidates.includes(x));
+            if (files.length === 0) return;
+        }
+
         // B′: dropped files stream DIRECTLY to Telegram over the local actix
         // server — no %TEMP% staging, no preparing phase. Falls back to the old
         // staging path when the availability probe in streamDroppedFiles throws
         // (server down / route absent).
+        const remaining = files.filter(f => !splitCandidates.includes(f));
+        files = remaining;
+        if (files.length === 0) return;
         try {
             const { streamDroppedFiles } = await import('./useDropStreamUpload');
             // Dedupe keys computed BEFORE the call: streamDroppedFiles skips
@@ -388,13 +664,17 @@ export function useFileUpload(activeFolderId: number | null, store: Store | null
     return {
         uploadQueue,
         setUploadQueue,
-        handleManualUpload,
+        handleManualUpload, processPickedPaths,
         handleFolderUpload,
         handleRemoteUpload,
         stageAndQueue,
         cancelAll,
         cancelItem,
         retryItem,
-        isDragging
+        removeItem,
+        deleteItem,
+        isDragging,
+        splitFlow,
+        splitJobRows: splitFlow.splitJobRows,
     };
 }

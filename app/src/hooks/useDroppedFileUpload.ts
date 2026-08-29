@@ -36,7 +36,8 @@ export function cancelStaging(fileName: string) {
     stagingCancelled.add(fileName);
 }
 
-async function stageOne(file: File, id: string, onProgress?: (pct: number) => void): Promise<string> {
+/** Chunked File → %TEMP% stager; exported for the drop→split flow (no path exists until staged). */
+export async function stageOne(file: File, id: string, onProgress?: (pct: number) => void): Promise<string> {
     const total = file.size;
     let offset = 0;
     let chunkIndex = 0;
