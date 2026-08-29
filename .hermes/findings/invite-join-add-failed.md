@@ -167,3 +167,22 @@ Note: the original e89c122 fix (Updates::Combined) remains correct and
 necessary — but this second bug was the one that fired for this user's live
 repro: already-joined state means preview → "Add to NoBuf" path, which never
 reached the join command at all.
+
+## Live GUI QA (2026-08-29 ~23:40, agent-driven, app.exe built 23:19:58 post-fix)
+
+Binary freshness verified: process start 23:21:36 > build 23:19:58 > commit
+aad5237 23:14. Driven via cua-driver AX tree (no vision needed; desktop-absolute
+bounds converted window-relative).
+
+| # | Test | Result |
+|---|---|---|
+| T1 | Paste invite link → Preview | PASS — card with Y monogram, Private badge, "Add to NoBuf" (already-joined state) |
+| T2 | Click Add to NoBuf | PASS — insert succeeded; DB row id=2096618915 "Your dolls✨", access_hash=5761689359615634395, is_private=1 (first user-driven add at 23:20:16 + agent-driven re-add at 23:46:44 after DB row removal) |
+| T3 | Channel row in sidebar + files load | PASS — click opens channel view, "Read-only channel" banner, file grid paginates (57.54/56.13/47.4 MB…) |
+| T4 | Remove → re-add cycle | PASS — row deleted from DB (no Telegram mutation), re-added through full UI (Preview → Add → insert at 23:46:44) |
+| T5 | Dedup guard | PASS — second add attempt → "This channel is already added to NoBuf." info toast, no duplicate row |
+| — | Public t.me/name link regression | NOT RUN — no suitable test channel available; path unchanged by both fixes (resolve-then-join, no partial-failure window) |
+
+Note: QA initially mis-clicked a video file (coordinate DPI drift between AX
+captures), opening the player and its cache dialog — recovered via Esc /
+"Close & Discard Cache". No state was affected.
