@@ -285,6 +285,172 @@ pub fn cmd_get_adopted_folders(app: AppHandle) -> Result<Vec<AdoptedFolder>, Str
     load_adopted_folders(&app)
 }
 
+/// List channels eligible for adoption: broadcast channels AND megagroups the
+/// logged-in account created or administers (post_messages). Covers the main
+/// dialog list AND the archive folder (folder_id=1) — your own channels are
+/// frequently archived and invisible to iter_dialogs.
+/// Excludes: [NB]-tagged channels (regular folders), [NB-PUB], already-adopted.
+#[tauri::command]
+pub async fn cmd_list_owned_channels(
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<Vec<crate::models::JoinedChannel>, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    if client_opt.is_none() {
+        return Ok(Vec::new());
+    }
+    let client = client_opt.unwrap();
+
+    // Exclusion sets
+    let adopted_ids: std::collections::HashSet<i64> = load_adopted_folders(&app)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.channel_id)
+        .collect();
+
+    let mut results: Vec<crate::models::JoinedChannel> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // Main dialog list (broadcast channels — existing pattern)
+    {
+        let mut dialogs = client.iter_dialogs();
+        while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+            if let Peer::Channel(c) = &dialog.peer {
+                if let Some(jc) = evaluate_for_adoption(
+                    &c.raw.title, c.raw.id, c.raw.access_hash.unwrap_or(0),
+                    c.raw.creator, &c.raw.admin_rights, c.raw.broadcast,
+                    &adopted_ids, &mut seen,
+                ) {
+                    results.push(jc);
+                }
+            }
+        }
+    }
+
+    // Archive folder scan (folder_id=1) — raw invoke; grammers' iterator
+    // hardcodes folder_id: None. Manual pagination like DialogIter::next.
+    // Megagroups arrive here as Peer::Group via the raw Chat enum, so we
+    // evaluate the raw Chat::Channel directly (broadcast OR megagroup).
+    {
+        let mut offset_date: i32 = 0;
+        let mut offset_id: i32 = 0;
+        let mut offset_peer = grammers_tl_types::enums::InputPeer::Empty;
+        loop {
+            let resp = client.invoke(&grammers_tl_types::functions::messages::GetDialogs {
+                exclude_pinned: true,
+                folder_id: Some(1),
+                offset_date,
+                offset_id,
+                offset_peer: offset_peer.clone(),
+                limit: 100,
+                hash: 0,
+            }).await;
+            let (dialogs, chats) = match resp {
+                Ok(grammers_tl_types::enums::messages::Dialogs::Dialogs(d)) => {
+                    (d.dialogs, d.chats)
+                }
+                Ok(grammers_tl_types::enums::messages::Dialogs::Slice(d)) => {
+                    (d.dialogs, d.chats)
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    // Archive scan is best-effort: FOLDER_ID_INVALID or
+                    // CHANNEL_TOO_LARGE degrade to the main list only.
+                    log::warn!("[ADOPT] archive dialog scan failed: {}", e);
+                    break;
+                }
+            };
+            let count = dialogs.len();
+            // Evaluate every channel-shaped chat in this page (dialog entries
+            // may reference them; we don't need the pairing).
+            for chat in &chats {
+                if let Some((id, hash, title, creator, rights, broadcast)) = channel_info_from_chat(chat) {
+                    if let Some(jc) = evaluate_for_adoption(
+                        &title, id, hash, creator, &rights, broadcast,
+                        &adopted_ids, &mut seen,
+                    ) {
+                        results.push(jc);
+                    }
+                }
+            }
+            if count < 100 {
+                break;
+            }
+            // Advance pagination offsets from the last dialog entry.
+            // Dialog::Folder entries carry no message; Dialog::Dialog does.
+            let mut advanced = false;
+            for d in dialogs.iter().rev() {
+                if let grammers_tl_types::enums::Dialog::Dialog(dd) = d {
+                    offset_id = dd.top_message;
+                    offset_date = 0; // top_message-anchored paging suffices here
+                    offset_peer = match &dd.peer {
+                        grammers_tl_types::enums::Peer::Channel(pc) =>
+                            grammers_tl_types::enums::InputPeer::Channel(grammers_tl_types::types::InputPeerChannel {
+                                channel_id: pc.channel_id,
+                                access_hash: 0,
+                            }),
+                        _ => grammers_tl_types::enums::InputPeer::Empty,
+                    };
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(results)
+}
+
+/// Shared eligibility evaluation for a raw channel. Returns None when the
+/// channel is excluded ([NB]-tagged, [NB-PUB], already adopted, not eligible).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_for_adoption(
+    title: &str,
+    id: i64,
+    access_hash: i64,
+    creator: bool,
+    admin_rights: &Option<grammers_tl_types::enums::ChatAdminRights>,
+    _broadcast: bool,
+    adopted_ids: &std::collections::HashSet<i64>,
+    seen: &mut std::collections::HashSet<i64>,
+) -> Option<crate::models::JoinedChannel> {
+    if !seen.insert(id) {
+        return None;
+    }
+    let title_lower = title.to_lowercase();
+    // Regular [NB] folders are NOT adoptable (never duplicate). [NB-PUB] needs
+    // its own check: "[nb-pub]" does NOT contain the substring "[nb]" (the
+    // dash breaks it), so it would slip through the tag check alone.
+    if title_lower.contains("[nb-pub]") {
+        return None;
+    }
+    if title_lower.contains("[nb]") {
+        return None;
+    }
+    if adopted_ids.contains(&id) {
+        return None;
+    }
+    let is_admin_post = can_adopt_flags(creator, admin_rights);
+    if !is_admin_post {
+        return None;
+    }
+    Some(crate::models::JoinedChannel {
+        channel_id: id,
+        name: title.to_string(),
+        username: None,
+        access_hash,
+        already_added: false,
+        is_nb_folder: false,
+        is_creator: creator,
+        is_admin_post,
+    })
+}
+
+
 /// Really delete the channel from Telegram. Only for adopted folders — the
 /// frontend gates this behind a separate, stronger danger dialog. Errors
 /// (e.g. CHANNEL_TOO_LARGE for >1000 members) surface to the toast honestly.
@@ -312,4 +478,74 @@ pub async fn cmd_delete_channel_permanently(
     }
     state.peer_cache.write().await.remove(&channel_id);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rights(post: bool) -> Option<grammers_tl_types::enums::ChatAdminRights> {
+        Some(grammers_tl_types::enums::ChatAdminRights::Rights(grammers_tl_types::types::ChatAdminRights {
+            change_info: false,
+            post_messages: post,
+            edit_messages: false,
+            delete_messages: false,
+            ban_users: false,
+            invite_users: false,
+            pin_messages: false,
+            add_admins: false,
+            anonymous: false,
+            manage_call: false,
+            other: false,
+            manage_topics: false,
+            post_stories: false,
+            edit_stories: false,
+            delete_stories: false,
+            manage_direct_messages: false,
+        }))
+    }
+
+    #[test]
+    fn eligibility_creator_passes_without_rights() {
+        assert!(can_adopt_flags(true, &None));
+    }
+
+    #[test]
+    fn eligibility_post_admin_passes() {
+        assert!(can_adopt_flags(false, &rights(true)));
+    }
+
+    #[test]
+    fn eligibility_comment_only_admin_fails() {
+        assert!(!can_adopt_flags(false, &rights(false)));
+    }
+
+    #[test]
+    fn eligibility_plain_member_fails() {
+        assert!(!can_adopt_flags(false, &None));
+    }
+
+    #[test]
+    fn evaluation_excludes_nb_tagged_and_adopted() {
+        let mut seen = std::collections::HashSet::new();
+        let adopted = std::collections::HashSet::new();
+        // [NB]-tagged → excluded even when creator
+        assert!(evaluate_for_adoption("My Folder [NB]", 1, 1, true, &None, true, &adopted, &mut seen).is_none());
+        // [NB-PUB] → excluded (title contains [nb])
+        assert!(evaluate_for_adoption("[NB-PUB]", 2, 1, true, &None, true, &adopted, &mut seen).is_none());
+        // already adopted → excluded
+        let mut adopted2 = std::collections::HashSet::new();
+        adopted2.insert(3);
+        assert!(evaluate_for_adoption("Mine", 3, 1, true, &None, true, &adopted2, &mut seen).is_none());
+        // creator, plain title → included with flags
+        let jc = evaluate_for_adoption("My Channel", 4, 7, true, &None, true, &adopted, &mut seen).unwrap();
+        assert_eq!(jc.channel_id, 4);
+        assert!(jc.is_creator);
+        assert!(jc.is_admin_post);
+        assert!(!jc.is_nb_folder);
+        // duplicate id → seen-guard blocks
+        assert!(evaluate_for_adoption("My Channel", 4, 7, true, &None, true, &adopted, &mut seen).is_none());
+        // non-eligible (plain member) → excluded
+        assert!(evaluate_for_adoption("Not Mine", 5, 1, false, &None, true, &adopted, &mut seen).is_none());
+    }
 }

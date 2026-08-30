@@ -585,6 +585,7 @@ pub fn run() {
             commands::cmd_unadopt_channel,
             commands::cmd_get_adopted_folders,
             commands::cmd_delete_channel_permanently,
+            commands::cmd_list_owned_channels,
             commands::cmd_vault_get_state,
             commands::cmd_vault_hide,
             commands::cmd_vault_unhide,

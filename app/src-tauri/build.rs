@@ -88,6 +88,7 @@ fn main() {
                                 "cmd_unadopt_channel",
                                 "cmd_get_adopted_folders",
                                 "cmd_delete_channel_permanently",
+                                "cmd_list_owned_channels",
                                 "cmd_opensubtitles_validate_key",
                                 "cmd_opensubtitles_search",
                                 "cmd_opensubtitles_download",

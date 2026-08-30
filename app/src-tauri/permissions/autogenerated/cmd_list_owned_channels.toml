@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-list-owned-channels"
+description = "Enables the cmd_list_owned_channels command without any pre-configured scope."
+commands.allow = ["cmd_list_owned_channels"]
+
+[[permission]]
+identifier = "deny-cmd-list-owned-channels"
+description = "Denies the cmd_list_owned_channels command without any pre-configured scope."
+commands.deny = ["cmd_list_owned_channels"]

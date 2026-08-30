@@ -5,7 +5,16 @@ use sqlite::{Connection, Value};
 use std::path::PathBuf;
 use crate::commands::TelegramState;
 use crate::commands::utils::map_error;
-use crate::models::{PublicChannel, ChannelPreview, JoinedChannel, ForwardResult, FileMetadata};
+use crate::models::{PublicChannel, ChannelPreview, JoinedChannel, ForwardResult, FileMetadata, AdoptedFolder};
+
+/// [NB-PUB] sync payload. New builds write {channels, adopted}; the reader
+/// falls back to a plain Vec<PublicChannel> for messages written by old builds.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct NbPubSync {
+    pub channels: Vec<PublicChannel>,
+    #[serde(default)]
+    pub adopted: Vec<AdoptedFolder>,
+}
 
 // ─── SQLite helpers ──────────────────────────────────────────────
 
@@ -979,7 +988,13 @@ pub async fn cmd_update_nb_pub_sync(
         result
     };
 
-    let json_data = serde_json::to_string(&channels).map_err(|e| e.to_string())?;
+    // Wrapper payload: {channels, adopted} — new builds write both. Old builds
+    // fail to parse the wrapper and gracefully keep their local list (the
+    // existing from_slice error arm), so no migration needed.
+    let adopted = crate::commands::adopted_folders::load_adopted_folders(&app)
+        .unwrap_or_default();
+    let payload = NbPubSync { channels, adopted };
+    let json_data = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let json_bytes = json_data.as_bytes().to_vec();
 
     let nb_pub_id = find_or_create_nb_pub_channel(&client, &app, &state).await?;
@@ -1162,15 +1177,21 @@ pub async fn cmd_sync_public_channels(
             tokio::time::sleep(delay).await;
         }
 
-    let remote_channels: Vec<PublicChannel> = match serde_json::from_slice(&file_data) {
-        Ok(ch) => ch,
-        Err(e) => {
-            // Corrupt/foreign JSON in [NB-PUB] must not brick the sidebar:
-            // log and keep the local list, exactly like the other fallbacks.
-            log::warn!("[NB-PUB] sync JSON parse failed ({}); keeping local list", e);
-            return cmd_get_public_channels(app);
-        }
-    };
+    // Wrapper payload {channels, adopted} with legacy fallback: old messages
+    // hold a plain Vec<PublicChannel> — parse those too, adopted = empty.
+    let (remote_channels, remote_adopted): (Vec<PublicChannel>, Vec<crate::models::AdoptedFolder>) =
+        match serde_json::from_slice::<NbPubSync>(&file_data) {
+            Ok(payload) => (payload.channels, payload.adopted),
+            Err(wrapper_err) => match serde_json::from_slice::<Vec<PublicChannel>>(&file_data) {
+                Ok(ch) => (ch, Vec::new()),
+                Err(_) => {
+                    // Corrupt/foreign JSON in [NB-PUB] must not brick the sidebar:
+                    // log and keep the local list, exactly like the other fallbacks.
+                    log::warn!("[NB-PUB] sync JSON parse failed ({}); keeping local list", wrapper_err);
+                    return cmd_get_public_channels(app);
+                }
+            },
+        };
 
     // Reconcile with local DB
     let conn = get_connection(&app)?;
@@ -1207,6 +1228,41 @@ pub async fn cmd_sync_public_channels(
                 stmt.next().map_err(|e| e.to_string())?;
             }
         }
+
+    // ─── Adopted-folder reconcile ───────────────────────────────────
+    // Same last-writer-wins semantics as channels. Rights are re-verified
+    // per device: a remote adoption for a channel this account cannot write
+    // to is skipped (logged), never blindly inserted.
+    if !remote_adopted.is_empty() {
+        let client_ref = &client;
+        for rec in &remote_adopted {
+            match crate::commands::adopted_folders::fetch_channel_fresh(client_ref, rec.channel_id, rec.access_hash).await {
+                Some((fresh_hash, title, creator, rights)) => {
+                    if crate::commands::adopted_folders::can_adopt_flags(creator, &rights) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let mut stmt = conn.prepare(
+                            "INSERT INTO adopted_folders (channel_id, access_hash, title, adopted_at) VALUES (?, ?, ?, ?) ON CONFLICT(channel_id) DO UPDATE SET access_hash = ?, title = ?"
+                        ).map_err(|e| e.to_string())?;
+                        stmt.bind((1, rec.channel_id)).map_err(|e| e.to_string())?;
+                        stmt.bind((2, fresh_hash)).map_err(|e| e.to_string())?;
+                        stmt.bind((3, title.as_str())).map_err(|e| e.to_string())?;
+                        stmt.bind((4, now)).map_err(|e| e.to_string())?;
+                        stmt.bind((5, fresh_hash)).map_err(|e| e.to_string())?;
+                        stmt.bind((6, title.as_str())).map_err(|e| e.to_string())?;
+                        stmt.next().map_err(|e| e.to_string())?;
+                    } else {
+                        log::warn!("[NB-PUB] remote adoption {} lacks rights here — skipped", rec.channel_id);
+                    }
+                }
+                None => {
+                    log::warn!("[NB-PUB] remote adoption {} unreachable here — skipped", rec.channel_id);
+                }
+            }
+        }
+    }
 
     set_setting(&app, "nb_pub_message_id", &msg.id.to_string());
 
@@ -1532,5 +1588,65 @@ mod tests {
             },
         );
         assert_eq!(crate::commands::utils::messages_from_history(&slice).len(), 1);
+    }
+
+    // ─── NbPubSync wrapper: new shape + legacy fallback ────────────
+
+    fn sample_public_channel() -> crate::models::PublicChannel {
+        crate::models::PublicChannel {
+            channel_id: 42,
+            name: "Test Channel".to_string(),
+            username: Some("testchannel".to_string()),
+            access_hash: 111,
+            is_private: false,
+            added_at: 1_700_000_000,
+            is_member: true,
+        }
+    }
+
+    fn sample_adopted() -> crate::models::AdoptedFolder {
+        crate::models::AdoptedFolder {
+            channel_id: 99,
+            access_hash: 222,
+            title: "My Channel".to_string(),
+            adopted_at: 1_700_000_001,
+        }
+    }
+
+    #[test]
+    fn nb_pub_wrapper_round_trips_channels_and_adopted() {
+        let payload = NbPubSync {
+            channels: vec![sample_public_channel()],
+            adopted: vec![sample_adopted()],
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+        let parsed: NbPubSync = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.channels.len(), 1);
+        assert_eq!(parsed.channels[0].channel_id, 42);
+        assert_eq!(parsed.adopted.len(), 1);
+        assert_eq!(parsed.adopted[0].channel_id, 99);
+        assert_eq!(parsed.adopted[0].access_hash, 222);
+    }
+
+    #[test]
+    fn nb_pub_wrapper_adopts_default_empty_when_field_missing() {
+        // Wrapper without the adopted field (future-proofing / partial writes)
+        let json = br#"{"channels":[{"channel_id":42,"name":"X","username":null,"access_hash":1,"is_private":false,"added_at":1,"is_member":true}]}"#;
+        let parsed: NbPubSync = serde_json::from_slice(json).unwrap();
+        assert!(parsed.adopted.is_empty());
+        assert_eq!(parsed.channels.len(), 1);
+    }
+
+    #[test]
+    fn legacy_plain_array_still_parses_as_channels() {
+        // Old builds wrote a bare Vec<PublicChannel>; the sync reader's
+        // fallback path parses this shape. Prove the shapes stay separable:
+        // the wrapper parse must FAIL on it (so the fallback triggers).
+        let json = serde_json::to_vec(&vec![sample_public_channel()]).unwrap();
+        let wrapper_parse = serde_json::from_slice::<NbPubSync>(&json);
+        assert!(wrapper_parse.is_err(), "wrapper must not accept legacy arrays");
+        let legacy_parse = serde_json::from_slice::<Vec<crate::models::PublicChannel>>(&json);
+        assert!(legacy_parse.is_ok());
+        assert_eq!(legacy_parse.unwrap().len(), 1);
     }
 }
