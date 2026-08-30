@@ -1,0 +1,739 @@
+use grammers_client::types::Peer;
+use tauri::{State, AppHandle, Manager};
+use sqlite::{Connection, Value};
+use crate::commands::TelegramState;
+use crate::commands::utils::map_error;
+use crate::models::{ChatInfo, PickableChat};
+
+// ─── SQLite helpers ──────────────────────────────────────────────
+// Same DB file as groups/public_channels/adopted (house pattern: one
+// nobuf_groups.db, lazily-created tables per module).
+
+fn db_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("nobuf_groups.db"))
+}
+
+pub fn get_connection(app: &AppHandle) -> Result<Connection, String> {
+    let path = db_path(app)?;
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute("CREATE TABLE IF NOT EXISTS normal_chats (
+        chat_id     INTEGER PRIMARY KEY,
+        peer_kind   TEXT NOT NULL,
+        access_hash INTEGER,
+        title       TEXT NOT NULL,
+        added_at    INTEGER NOT NULL,
+        group_id    INTEGER
+    )").map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+fn vi(v: &Value) -> i64 {
+    match v { Value::Integer(i) => *i, _ => 0 }
+}
+
+fn voi(v: &Value) -> Option<i64> {
+    match v { Value::Integer(i) => Some(*i), _ => None }
+}
+
+fn vs(v: &Value) -> String {
+    match v { Value::String(s) => s.clone(), _ => String::new() }
+}
+
+fn row_to_chat_info(row: &[Value]) -> ChatInfo {
+    ChatInfo {
+        chat_id: vi(&row[0]),
+        peer_kind: vs(&row[1]),
+        access_hash: voi(&row[2]),
+        title: vs(&row[3]),
+        added_at: vi(&row[4]),
+        group_id: voi(&row[5]),
+    }
+}
+
+/// Load all stored chats (used by cmd_list_chats and the startup cache seed).
+pub fn load_normal_chats(app: &AppHandle) -> Result<Vec<ChatInfo>, String> {
+    let conn = get_connection(app)?;
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, peer_kind, access_hash, title, added_at, group_id FROM normal_chats ORDER BY rowid"
+    ).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let row: Vec<Value> = (0..6).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        out.push(row_to_chat_info(&row));
+    }
+    Ok(out)
+}
+
+// ─── Picker eligibility (pure logic, unit-tested) ────────────────
+
+/// Classify a dialog peer for the chat picker.
+/// Returns Some((peer_kind, access_hash, title)) for eligible chats,
+/// None for everything the picker excludes.
+///
+/// peer_kind: 'user' (DM with a person/bot), 'basic_group' (small group),
+/// 'group' (supergroup/megagroup — channel-shaped, needs access_hash).
+pub fn classify_dialog_peer(
+    peer: &Peer,
+    self_id: i64,
+    adopted_ids: &std::collections::HashSet<i64>,
+    added_ids: &std::collections::HashSet<i64>,
+) -> Option<(String, Option<i64>, String, bool)> {
+    use grammers_tl_types::enums::Chat;
+    match peer {
+        // DMs: any non-self user (bots included — D2).
+        Peer::User(u) => {
+            let id = u.raw.id();
+            if id == self_id {
+                return None; // Saved Messages has its own entry (D14)
+            }
+            match &u.raw {
+                grammers_tl_types::enums::User::User(raw) => {
+                    let name = u.full_name();
+                    let title = if name.is_empty() {
+                        raw.first_name.clone().unwrap_or_else(|| "Unknown".to_string())
+                    } else {
+                        name
+                    };
+                    Some((
+                        "user".to_string(),
+                        raw.access_hash,
+                        title,
+                        added_ids.contains(&id),
+                    ))
+                }
+                _ => None, // User::Empty — deleted account stub
+            }
+        }
+        // Groups: basic groups and megagroups both arrive as Peer::Group.
+        Peer::Group(g) => match &g.raw {
+            // Megagroup (supergroup): channel-shaped, carries an access_hash.
+            Chat::Channel(c) => {
+                if adopted_ids.contains(&c.id) {
+                    return None; // already a folder — one entity, one sidebar entry
+                }
+                if crate::commands::adopted_folders::title_matches_nb_folder(&c.title) {
+                    return None; // [NB]/[NB-PUB] folder titles stay folders
+                }
+                Some((
+                    "group".to_string(),
+                    c.access_hash,
+                    c.title.clone(),
+                    added_ids.contains(&c.id),
+                ))
+            }
+            // Basic group with real data.
+            Chat::Chat(c) => Some((
+                "basic_group".to_string(),
+                None, // basic chats have no access_hash in TL
+                c.title.clone(),
+                added_ids.contains(&c.id),
+            )),
+            // Dead/stub dialogs: chats you left or were kicked from, or
+            // placeholder objects. Instant-CHAT_GONE rows — never offer them.
+            Chat::Forbidden(_) | Chat::Empty(_) => None,
+            _ => None,
+        },
+        // Broadcast channels have their own flows (public add / adoption).
+        Peer::Channel(_) => None,
+    }
+}
+
+// ─── Commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn cmd_list_chats(app: AppHandle) -> Result<Vec<ChatInfo>, String> {
+    load_normal_chats(&app)
+}
+
+/// List dialogs eligible for the Chats section picker: non-broadcast peers
+/// (DMs incl. bots, basic groups, supergroups), excluding self, adopted
+/// megagroups, [NB]-titled groups, and dead (Forbidden/Empty) dialogs.
+/// Already-added chats are INCLUDED with already_added=true (the modal
+/// renders them disabled). Search is client-side (AddChannelModal pattern).
+#[tauri::command]
+pub async fn cmd_pick_chats(
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<Vec<PickableChat>, String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let added_ids: std::collections::HashSet<i64> = load_normal_chats(&app)?
+        .into_iter()
+        .map(|c| c.chat_id)
+        .collect();
+
+    let adopted_ids: std::collections::HashSet<i64> =
+        crate::commands::adopted_folders::load_adopted_folders(&app)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.channel_id)
+            .collect();
+
+    let me = client.get_me().await.map_err(map_error)?;
+    let self_id = me.raw.id();
+
+    let mut out = Vec::new();
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+        if let Some((peer_kind, access_hash, title, already_added)) =
+            classify_dialog_peer(&dialog.peer, self_id, &adopted_ids, &added_ids)
+        {
+            let id = dialog_id(&dialog.peer);
+            let kind_label = pickable_kind_label(&dialog.peer);
+            out.push(PickableChat {
+                chat_id: id,
+                peer_kind,
+                access_hash,
+                title,
+                already_added,
+                kind_label,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn dialog_id(peer: &Peer) -> i64 {
+    use grammers_tl_types::enums::Chat;
+    match peer {
+        Peer::User(u) => u.raw.id(),
+        Peer::Group(g) => match &g.raw {
+            // Megagroups are keyed by their channel id.
+            Chat::Channel(c) => c.id,
+            // Basic groups: raw chat id from the Chat enum (NOT Group::id(),
+            // which returns a packed PeerId — grammers group.rs:61-71).
+            Chat::Chat(c) => c.id as i64,
+            Chat::Forbidden(c) => c.id as i64,
+            Chat::Empty(c) => c.id as i64,
+            _ => 0,
+        },
+        Peer::Channel(c) => c.raw.id,
+    }
+}
+
+fn pickable_kind_label(peer: &Peer) -> String {
+    use grammers_tl_types::enums::Chat;
+    match peer {
+        Peer::User(u) => match &u.raw {
+            grammers_tl_types::enums::User::User(raw) if raw.bot => "Bot".to_string(),
+            _ => "Direct message".to_string(),
+        },
+        Peer::Group(g) => match &g.raw {
+            Chat::Channel(_) => "Supergroup".to_string(),
+            _ => "Group".to_string(),
+        },
+        Peer::Channel(_) => "Channel".to_string(),
+    }
+}
+
+/// Add a chat to the Chats section. INSERT OR IGNORE + re-SELECT so a
+/// double-click on the picker row is idempotent; also seeds the peer cache
+/// immediately so the chat is usable before any dialog scan runs.
+#[tauri::command]
+pub async fn cmd_add_chat(
+    chat_id: i64,
+    peer_kind: String,
+    access_hash: Option<i64>,
+    title: String,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<ChatInfo, String> {
+    if !matches!(peer_kind.as_str(), "user" | "basic_group" | "group") {
+        return Err(format!("Invalid peer_kind: {}", peer_kind));
+    }
+    if peer_kind != "basic_group" && access_hash.is_none() {
+        return Err(format!("access_hash required for peer_kind {}", peer_kind));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO normal_chats (chat_id, peer_kind, access_hash, title, added_at, group_id) VALUES (?, ?, ?, ?, ?, NULL)"
+        ).map_err(|e| e.to_string())?;
+        stmt.bind((1, chat_id)).map_err(|e| e.to_string())?;
+        stmt.bind((2, peer_kind.as_str())).map_err(|e| e.to_string())?;
+        match access_hash {
+            Some(h) => stmt.bind((3, h)).map_err(|e| e.to_string())?,
+            None => stmt.bind((3, Value::Null)).map_err(|e| e.to_string())?,
+        }
+        stmt.bind((4, title.as_str())).map_err(|e| e.to_string())?;
+        stmt.bind((5, now)).map_err(|e| e.to_string())?;
+        stmt.next().map_err(|e| e.to_string())?;
+    }
+
+    // Seed the peer cache so uploads/downloads work even if the chat is
+    // archived (invisible to the dialog scan). Unconditional: the stored row
+    // is the authority for this dialog (plan §1.1, review2 V2-16).
+    seed_chat_cache_entry(&state, chat_id, &peer_kind, access_hash, &title).await;
+
+    load_normal_chats(&app)?
+        .into_iter()
+        .find(|c| c.chat_id == chat_id)
+        .ok_or_else(|| "Chat insert failed".to_string())
+}
+
+/// Unlist a chat from the Chats section. No Telegram-side action (D11) —
+/// the chat and its history stay fully intact.
+#[tauri::command]
+pub async fn cmd_remove_chat(
+    chat_id: i64,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<bool, String> {
+    {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn.prepare("DELETE FROM normal_chats WHERE chat_id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, chat_id)).map_err(|e| e.to_string())?;
+        stmt.next().map_err(|e| e.to_string())?;
+    }
+    state.peer_cache.write().await.remove(&chat_id);
+    Ok(true)
+}
+
+// ─── Peer cache seeding (R2 will call this at startup too) ───────
+
+/// Insert a synthetic peer for a stored chat row so seam ops (upload/
+/// download/stream via resolve_peer) work even when the dialog is archived
+/// or the scan hasn't run yet.
+pub async fn seed_chat_cache_entry(
+    state: &TelegramState,
+    chat_id: i64,
+    peer_kind: &str,
+    access_hash: Option<i64>,
+    title: &str,
+) {
+    use grammers_tl_types::types as tl_types;
+    let peer = match peer_kind {
+        "user" => {
+            let hash = access_hash.unwrap_or(0);
+            let raw_user = tl_types::User {
+                is_self: false,
+                contact: false,
+                mutual_contact: false,
+                deleted: false,
+                bot: false,
+                bot_chat_history: false,
+                bot_nochats: false,
+                verified: false,
+                restricted: false,
+                min: false,
+                bot_inline_geo: false,
+                support: false,
+                scam: false,
+                apply_min_photo: false,
+                fake: false,
+                bot_attach_menu: false,
+                premium: false,
+                attach_menu_enabled: false,
+                bot_can_edit: false,
+                close_friend: false,
+                stories_hidden: false,
+                stories_unavailable: false,
+                contact_require_premium: false,
+                bot_business: false,
+                bot_has_main_app: false,
+                bot_forum_view: false,
+                // Only id/access_hash/name matter downstream.
+                id: chat_id,
+                access_hash: Some(hash),
+                first_name: Some(title.to_string()),
+                last_name: None,
+                username: None,
+                phone: None,
+                photo: None,
+                status: None,
+                bot_info_version: None,
+                restriction_reason: None,
+                bot_inline_placeholder: None,
+                lang_code: None,
+                emoji_status: None,
+                usernames: None,
+                stories_max_id: None,
+                color: None,
+                profile_color: None,
+                bot_active_users: None,
+                bot_verification_icon: None,
+                send_paid_messages_stars: None,
+            };
+            Peer::User(grammers_client::types::User { raw: grammers_tl_types::enums::User::User(raw_user) })
+        }
+        "basic_group" => {
+            let raw_chat = tl_types::Chat {
+                creator: false,
+                left: false,
+                deactivated: false,
+                call_active: false,
+                call_not_empty: false,
+                noforwards: false,
+                id: chat_id,
+                title: title.to_string(),
+                photo: grammers_tl_types::enums::ChatPhoto::Empty,
+                participants_count: 0,
+                date: 0,
+                version: 0,
+                migrated_to: None,
+                admin_rights: None,
+                default_banned_rights: None,
+            };
+            Peer::Group(grammers_client::types::Group { raw: grammers_tl_types::enums::Chat::Chat(raw_chat) })
+        }
+        "group" => {
+            let hash = access_hash.unwrap_or(0);
+            let raw_channel = tl_types::Channel {
+                creator: false,
+                left: false,
+                broadcast: false,
+                verified: false,
+                megagroup: true,
+                restricted: false,
+                signatures: false,
+                min: false,
+                scam: false,
+                has_link: false,
+                has_geo: false,
+                slowmode_enabled: false,
+                call_active: false,
+                call_not_empty: false,
+                fake: false,
+                gigagroup: false,
+                noforwards: false,
+                join_to_send: false,
+                join_request: false,
+                forum: false,
+                stories_hidden: false,
+                stories_hidden_min: false,
+                stories_unavailable: false,
+                signature_profiles: false,
+                autotranslation: false,
+                broadcast_messages_allowed: false,
+                monoforum: false,
+                forum_tabs: false,
+                id: chat_id,
+                access_hash: Some(hash),
+                title: title.to_string(),
+                username: None,
+                photo: grammers_tl_types::enums::ChatPhoto::Empty,
+                date: 0,
+                restriction_reason: None,
+                admin_rights: None,
+                banned_rights: None,
+                default_banned_rights: None,
+                participants_count: None,
+                usernames: None,
+                stories_max_id: None,
+                color: None,
+                profile_color: None,
+                emoji_status: None,
+                level: None,
+                subscription_until_date: None,
+                bot_verification_icon: None,
+                send_paid_messages_stars: None,
+                linked_monoforum_id: None,
+            };
+            Peer::Group(grammers_client::types::Group { raw: grammers_tl_types::enums::Chat::Channel(raw_channel) })
+        }
+        _ => return,
+    };
+    state.peer_cache.write().await.insert(chat_id, peer);
+}
+
+/// Seed the cache from every stored chat row (startup / post-login).
+/// Unconditional overwrite per plan §1.1 (V2-16): the stored row is the
+/// authority; richer dialog-scan entries get refreshed on the next scan.
+pub async fn seed_chat_peer_cache(state: &TelegramState, app: &AppHandle) {
+    let rows = match load_normal_chats(app) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[CHATS] cache seeding skipped: {}", e);
+            return;
+        }
+    };
+    let count = rows.len();
+    for c in rows {
+        seed_chat_cache_entry(state, c.chat_id, &c.peer_kind, c.access_hash, &c.title).await;
+    }
+    log::info!("[CHATS] seeded {} chat peers into cache", count);
+}
+
+// ─── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Build a minimal raw Chat::Chat (basic group).
+    fn basic_chat(id: i64, title: &str) -> grammers_tl_types::enums::Chat {
+        grammers_tl_types::enums::Chat::Chat(grammers_tl_types::types::Chat {
+            creator: false,
+            left: false,
+            deactivated: false,
+            call_active: false,
+            call_not_empty: false,
+            noforwards: false,
+            id,
+            title: title.to_string(),
+            photo: grammers_tl_types::enums::ChatPhoto::Empty,
+            participants_count: 10,
+            date: 0,
+            version: 0,
+            migrated_to: None,
+            admin_rights: None,
+            default_banned_rights: None,
+        })
+    }
+
+    fn forbidden_chat(id: i64) -> grammers_tl_types::enums::Chat {
+        grammers_tl_types::enums::Chat::Forbidden(grammers_tl_types::types::ChatForbidden {
+            id,
+            title: "Gone".to_string(),
+        })
+    }
+
+    fn megagroup(id: i64, title: &str, hash: i64) -> Peer {
+        Peer::Group(grammers_client::types::Group {
+            raw: grammers_tl_types::enums::Chat::Channel(grammers_tl_types::types::Channel {
+                creator: false,
+                left: false,
+                broadcast: false,
+                verified: false,
+                megagroup: true,
+                restricted: false,
+                signatures: false,
+                min: false,
+                scam: false,
+                has_link: false,
+                has_geo: false,
+                slowmode_enabled: false,
+                call_active: false,
+                call_not_empty: false,
+                fake: false,
+                gigagroup: false,
+                noforwards: false,
+                join_to_send: false,
+                join_request: false,
+                forum: false,
+                stories_hidden: false,
+                stories_hidden_min: false,
+                stories_unavailable: false,
+                signature_profiles: false,
+                autotranslation: false,
+                broadcast_messages_allowed: false,
+                monoforum: false,
+                forum_tabs: false,
+                id,
+                access_hash: Some(hash),
+                title: title.to_string(),
+                username: None,
+                photo: grammers_tl_types::enums::ChatPhoto::Empty,
+                date: 0,
+                restriction_reason: None,
+                admin_rights: None,
+                banned_rights: None,
+                default_banned_rights: None,
+                participants_count: None,
+                usernames: None,
+                stories_max_id: None,
+                color: None,
+                profile_color: None,
+                emoji_status: None,
+                level: None,
+                subscription_until_date: None,
+                bot_verification_icon: None,
+                send_paid_messages_stars: None,
+                linked_monoforum_id: None,
+            }),
+        })
+    }
+
+    fn user(id: i64, first: &str, bot: bool) -> Peer {
+        let mut raw = minimal_user(id, first);
+        raw.bot = bot;
+        Peer::User(grammers_client::types::User {
+            raw: grammers_tl_types::enums::User::User(raw),
+        })
+    }
+
+    /// Full-field tl User with sane defaults (the struct has 46 fields).
+    fn minimal_user(id: i64, first: &str) -> grammers_tl_types::types::User {
+        grammers_tl_types::types::User {
+            is_self: false,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            id,
+            access_hash: Some(777),
+            first_name: Some(first.to_string()),
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+        }
+    }
+
+    fn empty_sets() -> (HashSet<i64>, HashSet<i64>) {
+        (HashSet::new(), HashSet::new())
+    }
+
+    #[test]
+    fn self_is_excluded() {
+        let (adopted, added) = empty_sets();
+        assert!(classify_dialog_peer(&user(42, "Me", false), 42, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn broadcast_channel_is_excluded() {
+        let (adopted, added) = empty_sets();
+        let peer = Peer::Channel(grammers_client::types::Channel {
+            raw: grammers_tl_types::types::Channel {
+                creator: false, left: false, broadcast: true, verified: false, megagroup: false,
+                restricted: false, signatures: false, min: false, scam: false, has_link: false,
+                has_geo: false, slowmode_enabled: false, call_active: false, call_not_empty: false,
+                fake: false, gigagroup: false, noforwards: false, join_to_send: false,
+                join_request: false, forum: false, stories_hidden: false, stories_hidden_min: false,
+                stories_unavailable: false, signature_profiles: false, autotranslation: false,
+                broadcast_messages_allowed: false, monoforum: false, forum_tabs: false,
+                id: 100, access_hash: Some(1), title: "News".into(), username: None,
+                photo: grammers_tl_types::enums::ChatPhoto::Empty, date: 0, restriction_reason: None,
+                admin_rights: None, banned_rights: None, default_banned_rights: None,
+                participants_count: None, usernames: None, stories_max_id: None, color: None,
+                profile_color: None, emoji_status: None, level: None, subscription_until_date: None,
+                bot_verification_icon: None, send_paid_messages_stars: None, linked_monoforum_id: None,
+            },
+        });
+        assert!(classify_dialog_peer(&peer, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn forbidden_and_empty_groups_are_excluded() {
+        let (adopted, added) = empty_sets();
+        let forbidden = Peer::Group(grammers_client::types::Group { raw: forbidden_chat(5) });
+        assert!(classify_dialog_peer(&forbidden, 1, &adopted, &added).is_none());
+        let empty = Peer::Group(grammers_client::types::Group {
+            raw: grammers_tl_types::enums::Chat::Empty(grammers_tl_types::types::ChatEmpty { id: 6 }),
+        });
+        assert!(classify_dialog_peer(&empty, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn adopted_megagroup_is_excluded() {
+        let mut adopted = HashSet::new();
+        adopted.insert(900);
+        let (_, added) = empty_sets();
+        let peer = megagroup(900, "My Group", 42);
+        assert!(classify_dialog_peer(&peer, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn nb_titled_megagroup_is_excluded() {
+        let (adopted, added) = empty_sets();
+        let peer = megagroup(901, "Stuff [NB]", 42);
+        assert!(classify_dialog_peer(&peer, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn plain_megagroup_is_included_with_hash() {
+        let (adopted, added) = empty_sets();
+        let peer = megagroup(902, "Friends", 42);
+        let (kind, hash, title, already) = classify_dialog_peer(&peer, 1, &adopted, &added).unwrap();
+        assert_eq!(kind, "group");
+        assert_eq!(hash, Some(42));
+        assert_eq!(title, "Friends");
+        assert!(!already);
+    }
+
+    #[test]
+    fn basic_group_is_included_hashless() {
+        let (adopted, added) = empty_sets();
+        let peer = Peer::Group(grammers_client::types::Group { raw: basic_chat(7, "Old Gang") });
+        let (kind, hash, title, already) = classify_dialog_peer(&peer, 1, &adopted, &added).unwrap();
+        assert_eq!(kind, "basic_group");
+        assert_eq!(hash, None);
+        assert_eq!(title, "Old Gang");
+        assert!(!already);
+    }
+
+    #[test]
+    fn user_dm_is_included_and_flagged_when_added() {
+        let (adopted, mut added) = empty_sets();
+        added.insert(50);
+        let (kind, hash, _title, already) =
+            classify_dialog_peer(&user(50, "Alice", false), 1, &adopted, &added).unwrap();
+        assert_eq!(kind, "user");
+        assert_eq!(hash, Some(777));
+        assert!(already);
+
+        let (kind2, _, _, already2) =
+            classify_dialog_peer(&user(51, "Bob", false), 1, &adopted, &added).unwrap();
+        assert_eq!(kind2, "user");
+        assert!(!already2);
+    }
+
+    #[test]
+    fn bots_are_included() {
+        let (adopted, added) = empty_sets();
+        let (kind, _, _, _) =
+            classify_dialog_peer(&user(60, "HelperBot", true), 1, &adopted, &added).unwrap();
+        assert_eq!(kind, "user");
+    }
+
+    #[test]
+    fn dialog_id_uses_raw_chat_id_not_packed() {
+        // Group::id() would return a packed PeerId; dialog_id must return the
+        // raw chat id so the picker's chat_id matches what cmd_add_chat stores
+        // and what resolve_peer caches.
+        let peer = Peer::Group(grammers_client::types::Group { raw: basic_chat(1234, "X") });
+        assert_eq!(dialog_id(&peer), 1234);
+
+        let mg = megagroup(5678, "Y", 1);
+        assert_eq!(dialog_id(&mg), 5678);
+
+        let u = user(99, "Z", false);
+        assert_eq!(dialog_id(&u), 99);
+    }
+}

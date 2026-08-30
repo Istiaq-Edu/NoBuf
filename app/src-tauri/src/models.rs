@@ -118,6 +118,31 @@ pub struct AdoptedFolder {
     pub adopted_at: i64,
 }
 
+/// A normal chat (DM / basic group / supergroup) added to the Chats section.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatInfo {
+    pub chat_id: i64,
+    /// 'user' | 'basic_group' | 'group' (supergroup/megagroup).
+    pub peer_kind: String,
+    pub access_hash: Option<i64>,
+    pub title: String,
+    pub added_at: i64,
+    pub group_id: Option<i64>,
+}
+
+/// A dialog eligible for the chat picker (already-added rows included,
+/// flagged, so the modal can render them disabled).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PickableChat {
+    pub chat_id: i64,
+    pub peer_kind: String,
+    pub access_hash: Option<i64>,
+    pub title: String,
+    pub already_added: bool,
+    /// 'Direct message' | 'Bot' | 'Group' | 'Supergroup'
+    pub kind_label: String,
+}
+
 /// Result of forwarding files to a [NB] folder.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ForwardResult {
