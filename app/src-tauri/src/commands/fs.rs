@@ -46,10 +46,13 @@ fn extract_duration_from_media(d: &Media) -> Option<f64> {
 
 /// Rename a NoBuf folder (channel). Updates the Telegram channel title
 /// and appends the [NB] tag if missing. Updates peer cache.
+/// Adopted folders (F1): real rename WITHOUT re-appending [NB] — the original
+/// title is the single truth.
 #[tauri::command]
 pub async fn cmd_rename_folder(
     folder_id: i64,
     new_name: String,
+    app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<FolderMetadata, String> {
     let client_opt = { state.client.lock().await.clone() };
@@ -61,26 +64,28 @@ pub async fn cmd_rename_folder(
 
     let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
 
-    // Adopted folders: real rename WITHOUT re-appending [NB], and megagroups
-    // (Peer::Group) must pass too — grammers routes non-broadcast channels there.
-    let (input_channel, is_adopted) = match &peer {
+    // F1: adoption records are the source of truth for is_adopted — the peer
+    // kind (Channel vs Group) says nothing about it.
+    let is_adopted = crate::commands::adopted_folders::load_adopted_folders(&app)
+        .map(|records| records.iter().any(|r| r.channel_id == folder_id))
+        .unwrap_or(false);
+
+    // Megagroups (Peer::Group) must pass too — grammers routes non-broadcast
+    // channels there; both carry an access_hash in the raw Chat::Channel.
+    let input_channel = match &peer {
         Peer::Channel(c) => {
-            let ic = tl::enums::InputChannel::Channel(tl::types::InputChannel {
+            tl::enums::InputChannel::Channel(tl::types::InputChannel {
                 channel_id: c.raw.id,
                 access_hash: c.raw.access_hash.ok_or("No access hash for channel")?,
-            });
-            (ic, false)
+            })
         },
         Peer::Group(g) => {
-            // Megagroups adopted as folders: the raw Chat is still Chat::Channel
-            // with an access_hash — build the InputChannel from it.
             match &g.raw {
                 tl::enums::Chat::Channel(c) => {
-                    let ic = tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    tl::enums::InputChannel::Channel(tl::types::InputChannel {
                         channel_id: c.id,
                         access_hash: c.access_hash.ok_or("No access hash for channel")?,
-                    });
-                    (ic, false)
+                    })
                 },
                 _ => return Err("Only channels (folders) can be renamed.".to_string()),
             }
@@ -103,13 +108,23 @@ pub async fn cmd_rename_folder(
         title: tagged_name.clone(),
     }).await.map_err(|e| format!("Failed to rename channel: {}", e))?;
 
-    // Update peer cache with the new name
+    // Update peer cache with the new name (F5: Peer::Group too — adopted
+    // megagroups are cached as Group)
     {
         let mut cache = state.peer_cache.write().await;
         if let Some(existing_peer) = cache.get(&folder_id).cloned() {
-            if let Peer::Channel(mut c) = existing_peer {
-                c.raw.title = tagged_name.clone();
-                cache.insert(folder_id, Peer::Channel(c));
+            match existing_peer {
+                Peer::Channel(mut c) => {
+                    c.raw.title = tagged_name.clone();
+                    cache.insert(folder_id, Peer::Channel(c));
+                },
+                Peer::Group(mut g) => {
+                    if let tl::enums::Chat::Channel(ref mut c) = g.raw {
+                        c.title = tagged_name.clone();
+                    }
+                    cache.insert(folder_id, Peer::Group(g));
+                },
+                _ => {}
             }
         }
     }
@@ -204,13 +219,15 @@ pub async fn cmd_delete_folder(
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<bool, String> {
-    // Adopted-folder guard
-    {
-        if let Ok(records) = crate::commands::adopted_folders::load_adopted_folders(&app) {
+    // Adopted-folder guard (F23: fail CLOSED — a DB error must not let the
+    // destructive delete path run on an adopted channel)
+    match crate::commands::adopted_folders::load_adopted_folders(&app) {
+        Ok(records) => {
             if records.iter().any(|r| r.channel_id == folder_id) {
                 return Err("ADOPTED_FOLDER: Use 'Remove from NoBuf' instead — this channel stays on Telegram.".to_string());
             }
         }
+        Err(e) => return Err(format!("Cannot verify folder status ({}). Refusing to delete — use 'Remove from NoBuf' if this is an adopted channel.", e)),
     }
 
     let client_opt = {
@@ -2037,6 +2054,13 @@ pub async fn cmd_scan_folders(
         }
     }
 
+    // Release the peer-cache write guard BEFORE any further peer_cache use
+    // (the log line below reads it; the adopted helpers write it).
+    // F7 fix: the drop used to sit INSIDE the non-empty guard — every user
+    // with zero adoption records kept the write guard alive across the
+    // read().await below and deadlocked startup (reproduced with a tokio repro).
+    drop(peer_cache);
+
     // ─── Adopted-folder merge (pre-diff, critical ordering) ────────
     // Adoption records are folders regardless of the [NB] tag. Rights are
     // re-verified per record: lost rights or a dead channel (CHANNEL_PRIVATE)
@@ -2044,18 +2068,25 @@ pub async fn cmd_scan_folders(
     let adopted_records = crate::commands::adopted_folders::load_adopted_folders(&app)
         .unwrap_or_default();
     if !adopted_records.is_empty() {
-        // Release the peer-cache lock before the await points below (adopted
-        // helpers take their own lock).
-        drop(peer_cache);
         for rec in &adopted_records {
             match crate::commands::adopted_folders::fetch_channel_fresh(&client, rec.channel_id, rec.access_hash).await {
-                Some((fresh_hash, title, creator, rights)) => {
+                crate::commands::adopted_folders::Fresh::Ok { access_hash: fresh_hash, title, username, creator, rights, broadcast } => {
                     if crate::commands::adopted_folders::can_adopt_flags(creator, &rights) {
+                        // F3: a channel titled with [NB] is ALREADY a regular folder
+                        // via the title scan above — pushing it again would duplicate
+                        // the entry (first-push wins in applySyncResult and loses
+                        // menu gating). Keep the record, skip the push.
+                        if crate::commands::adopted_folders::title_matches_nb_folder(&title) {
+                            log::info!(" -> ADOPTED {} now [NB]-titled; treated as regular folder", rec.channel_id);
+                            continue;
+                        }
                         log::info!(" -> ADOPTED: '{}' (ID: {})", title, rec.channel_id);
                         found_folders.push(FolderMetadata { id: rec.channel_id, name: title.clone(), parent_id: None, is_adopted: true });
                         // Keep the stored hash current + peer cache seeded
                         // (archived adopted channels never appear in dialogs).
-                        crate::commands::adopted_folders::seed_peer_cache(&state, rec.channel_id, fresh_hash, &title, true).await;
+                        // Real broadcast flag (F11) + username (F12) so seeded
+                        // megagroups cache as Peer::Group and Copy Link works.
+                        crate::commands::adopted_folders::seed_peer_cache(&state, rec.channel_id, fresh_hash, &title, broadcast, username).await;
                     } else {
                         log::warn!("[ADOPTED] {} lost rights — auto-unadopt", rec.channel_id);
                         if let Ok(conn) = crate::commands::adopted_folders::adopted_get_connection(&app) {
@@ -2063,11 +2094,16 @@ pub async fn cmd_scan_folders(
                         }
                     }
                 }
-                None => {
+                crate::commands::adopted_folders::Fresh::Gone => {
                     log::warn!("[ADOPTED] {} unreachable (deleted or stale hash) — auto-unadopt", rec.channel_id);
                     if let Ok(conn) = crate::commands::adopted_folders::adopted_get_connection(&app) {
                         let _ = crate::commands::adopted_folders::delete_adopted_row(&conn, rec.channel_id);
                     }
+                }
+                // F8: transient errors (FLOOD_WAIT, network) must NOT delete a
+                // valid adoption record — keep it and retry next scan.
+                crate::commands::adopted_folders::Fresh::Unreachable(e) => {
+                    log::warn!("[ADOPTED] {} transient fetch error ({}); keeping record", rec.channel_id, e);
                 }
             }
         }

@@ -20,6 +20,8 @@ export interface ScanResult {
     added: TelegramFolder[];
     updated: TelegramFolder[];
     removed: number[];
+    /** All currently-valid folders found on Telegram (backend full state). */
+    current?: TelegramFolder[];
 }
 
 export interface QueueItem {

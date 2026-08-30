@@ -63,9 +63,9 @@ pub fn can_adopt_flags(creator: bool, admin_rights: &Option<grammers_tl_types::e
     matches!(admin_rights, Some(grammers_tl_types::enums::ChatAdminRights::Rights(r)) if r.post_messages)
 }
 
-/// Extract (id, access_hash, title, creator, admin_rights, broadcast) from a raw Chat enum.
+/// Extract (id, access_hash, title, creator, admin_rights, broadcast, username) from a raw Chat enum.
 /// Returns None for non-Channel chats (basic groups, forbidden, empty).
-pub fn channel_info_from_chat(chat: &grammers_tl_types::enums::Chat) -> Option<(i64, i64, String, bool, Option<grammers_tl_types::enums::ChatAdminRights>, bool)> {
+pub fn channel_info_from_chat(chat: &grammers_tl_types::enums::Chat) -> Option<(i64, i64, String, bool, Option<grammers_tl_types::enums::ChatAdminRights>, bool, Option<String>)> {
     match chat {
         grammers_tl_types::enums::Chat::Channel(c) => Some((
             c.id,
@@ -74,19 +74,43 @@ pub fn channel_info_from_chat(chat: &grammers_tl_types::enums::Chat) -> Option<(
             c.creator,
             c.admin_rights.clone(),
             c.broadcast,
+            c.username.clone(),
         )),
         _ => None,
     }
 }
 
+/// Result of re-fetching a channel for rights verification.
+/// `Gone` = the channel is definitively dead/inaccessible (auto-unadopt).
+/// `Unreachable` = transient error (FLOOD_WAIT, network) — keep the record.
+pub enum Fresh {
+    Ok {
+        access_hash: i64,
+        title: String,
+        username: Option<String>,
+        creator: bool,
+        rights: Option<grammers_tl_types::enums::ChatAdminRights>,
+        broadcast: bool,
+    },
+    Gone,
+    Unreachable(String),
+}
+
+/// True when a title marks a regular [NB] folder (or the [NB-PUB] sync channel).
+/// NOTE: "[nb-pub]" does NOT contain the substring "[nb]" — both checks needed.
+pub fn title_matches_nb_folder(title: &str) -> bool {
+    let t = title.to_lowercase();
+    t.contains("[nb-pub]") || t.contains("[nb]")
+}
+
 /// Re-fetch a channel by id + access_hash to verify current rights.
-/// Returns None when the channel is gone/stale (CHANNEL_PRIVATE & friends) —
-/// the caller treats that as auto-unadopt.
+/// Only definitive channel-gone errors map to `Gone` (auto-unadopt);
+/// transient errors map to `Unreachable` so callers keep the record (F8).
 pub async fn fetch_channel_fresh(
     client: &Client,
     channel_id: i64,
     access_hash: i64,
-) -> Option<(i64, String, bool, Option<grammers_tl_types::enums::ChatAdminRights>)> {
+) -> Fresh {
     let result = client.invoke(&grammers_tl_types::functions::channels::GetChannels {
         id: vec![grammers_tl_types::enums::InputChannel::Channel(grammers_tl_types::types::InputChannel { channel_id, access_hash })],
     }).await;
@@ -96,33 +120,61 @@ pub async fn fetch_channel_fresh(
                 grammers_tl_types::enums::messages::Chats::Chats(c) => c.chats,
                 grammers_tl_types::enums::messages::Chats::Slice(c) => c.chats,
             };
-            chats.first().and_then(|chat| match chat {
-                grammers_tl_types::enums::Chat::Channel(c) => Some((
+            match chats.first() {
+                Some(grammers_tl_types::enums::Chat::Channel(c)) => Fresh::Ok {
                     // Trust the caller's stored hash when the fetch returns a
                     // min channel with the hash stripped (in-repo precedent:
                     // public_channels.rs resolve_channel_by_hash).
-                    c.access_hash.filter(|h| *h != 0).unwrap_or(access_hash),
-                    c.title.clone(),
-                    c.creator,
-                    c.admin_rights.clone(),
-                )),
-                _ => None,
-            })
+                    access_hash: c.access_hash.filter(|h| *h != 0).unwrap_or(access_hash),
+                    title: c.title.clone(),
+                    username: c.username.clone(),
+                    creator: c.creator,
+                    rights: c.admin_rights.clone(),
+                    broadcast: c.broadcast,
+                },
+                // GetChannels answered without the channel → it's gone.
+                _ => Fresh::Gone,
+            }
         }
-        Err(_) => None,
+        Err(e) => {
+            let msg = e.to_string();
+            // Definitive channel-gone errors (auto-unadopt); everything else
+            // (FLOOD_WAIT, timeouts, DC issues) is transient.
+            if msg.contains("CHANNEL_PRIVATE")
+                || msg.contains("CHANNEL_INVALID")
+                || msg.contains("CHANNEL_ID_INVALID")
+                || msg.contains("CHAT_ID_INVALID")
+            {
+                Fresh::Gone
+            } else {
+                Fresh::Unreachable(msg)
+            }
+        }
     }
 }
 
 /// Seed the peer cache from an adoption record so uploads/downloads/moves work
 /// even when the channel is archived (invisible to the dialog scan in resolve_peer).
 /// The seeded Peer carries the STORED access_hash (min/stripped objects can't be trusted).
+/// F11/F12: real broadcast flag (megagroups → Peer::Group) + username (Copy Link),
+/// and existing richer dialog-derived entries are preserved.
 pub async fn seed_peer_cache(
     state: &TelegramState,
     channel_id: i64,
     access_hash: i64,
     title: &str,
     broadcast: bool,
+    username: Option<String>,
 ) {
+    // F12: only seed when absent — the dialog scan may have cached the full
+    // peer (with photo/counts); overwriting it with a sparse synthetic breaks
+    // Copy Link for channels visible in dialogs.
+    {
+        let cache = state.peer_cache.read().await;
+        if cache.contains_key(&channel_id) {
+            return;
+        }
+    }
     use grammers_tl_types::types as tl_types;
     // Construct the raw Channel with the stored hash. Flags mirror what dialog
     // results carry; only id/access_hash/title/broadcast matter downstream.
@@ -158,7 +210,7 @@ pub async fn seed_peer_cache(
         id: channel_id,
         access_hash: Some(access_hash),
         title: title.to_string(),
-        username: None,
+        username,
         photo: grammers_tl_types::enums::ChatPhoto::Empty,
         date: 0,
         restriction_reason: None,
@@ -213,19 +265,17 @@ pub async fn cmd_adopt_channel(
     let client_opt = { state.client.lock().await.clone() };
     let client = client_opt.ok_or("Not connected to Telegram")?;
 
-    // Rights re-verification (mock mode skips this — DB-only, per plan)
-    let (fresh_hash, title, _creator, _rights) = match fetch_channel_fresh(&client, channel_id, access_hash).await {
-        Some(v) => v,
-        None => return Err("Channel not found or access expired. It may have been deleted or you may have lost access.".to_string()),
-    };
+    // Single rights-verification fetch (F4: used to fetch twice).
+    let (fresh_hash, title, username, creator, rights, broadcast) =
+        match fetch_channel_fresh(&client, channel_id, access_hash).await {
+            Fresh::Ok { access_hash, title, username, creator, rights, broadcast } =>
+                (access_hash, title, username, creator, rights, broadcast),
+            Fresh::Gone => return Err("Channel not found or access expired. It may have been deleted or you may have lost access.".to_string()),
+            Fresh::Unreachable(e) => return Err(format!("Telegram is temporarily unavailable ({}). Try again in a moment.", e)),
+        };
 
     // Eligibility: creator OR admin with post_messages
-    let fetch = fetch_channel_fresh(&client, channel_id, access_hash).await;
-    let eligible = match &fetch {
-        Some((_, _, creator, rights)) => can_adopt_flags(*creator, rights),
-        None => false,
-    };
-    if !eligible {
+    if !can_adopt_flags(creator, &rights) {
         return Err("NOT_ELIGIBLE: Only channels you created or administer (with post permission) can be adopted.".to_string());
     }
 
@@ -248,21 +298,19 @@ pub async fn cmd_adopt_channel(
     }
 
     // One channel, one sidebar entry: drop it from public_channels if present.
-    // Best-effort — a failure here must not fail the adoption.
+    // Best-effort (F17): a failure here must not skip peer-cache seeding below.
     {
         if let Ok(conn) = crate::commands::public_channels::pub_get_connection(&app) {
-            let mut stmt = match conn.prepare("DELETE FROM public_channels WHERE channel_id = ?") {
-                Ok(s) => s,
-                Err(_) => return Ok(FolderMetadata { id: channel_id, name: title.clone(), parent_id: None, is_adopted: true }),
-            };
-            if stmt.bind((1, channel_id)).is_ok() {
-                let _ = stmt.next();
+            if let Ok(mut stmt) = conn.prepare("DELETE FROM public_channels WHERE channel_id = ?") {
+                if stmt.bind((1, channel_id)).is_ok() {
+                    let _ = stmt.next();
+                }
             }
         }
     }
 
     // Seed the peer cache so upload/download/move work immediately (archived-safe)
-    seed_peer_cache(&state, channel_id, fresh_hash, &title, true).await;
+    seed_peer_cache(&state, channel_id, fresh_hash, &title, broadcast, username).await;
 
     Ok(FolderMetadata { id: channel_id, name: title, parent_id: None, is_adopted: true })
 }
@@ -273,9 +321,13 @@ pub async fn cmd_adopt_channel(
 pub async fn cmd_unadopt_channel(
     channel_id: i64,
     app: AppHandle,
+    state: State<'_, TelegramState>,
 ) -> Result<bool, String> {
     let conn = adopted_get_connection(&app)?;
     delete_adopted_row(&conn, channel_id)?;
+    // Drop the peer-cache entry (F9): without this, resolve_peer still finds
+    // the channel and a stale UI view keeps listing/uploading to it.
+    state.peer_cache.write().await.remove(&channel_id);
     Ok(true)
 }
 
@@ -319,6 +371,7 @@ pub async fn cmd_list_owned_channels(
                 if let Some(jc) = evaluate_for_adoption(
                     &c.raw.title, c.raw.id, c.raw.access_hash.unwrap_or(0),
                     c.raw.creator, &c.raw.admin_rights, c.raw.broadcast,
+                    c.raw.username.clone(),
                     &adopted_ids, &mut seen,
                 ) {
                     results.push(jc);
@@ -364,9 +417,9 @@ pub async fn cmd_list_owned_channels(
             // Evaluate every channel-shaped chat in this page (dialog entries
             // may reference them; we don't need the pairing).
             for chat in &chats {
-                if let Some((id, hash, title, creator, rights, broadcast)) = channel_info_from_chat(chat) {
+                if let Some((id, hash, title, creator, rights, broadcast, username)) = channel_info_from_chat(chat) {
                     if let Some(jc) = evaluate_for_adoption(
-                        &title, id, hash, creator, &rights, broadcast,
+                        &title, id, hash, creator, &rights, broadcast, username,
                         &adopted_ids, &mut seen,
                     ) {
                         results.push(jc);
@@ -415,6 +468,7 @@ fn evaluate_for_adoption(
     creator: bool,
     admin_rights: &Option<grammers_tl_types::enums::ChatAdminRights>,
     _broadcast: bool,
+    username: Option<String>,
     adopted_ids: &std::collections::HashSet<i64>,
     seen: &mut std::collections::HashSet<i64>,
 ) -> Option<crate::models::JoinedChannel> {
@@ -441,7 +495,7 @@ fn evaluate_for_adoption(
     Some(crate::models::JoinedChannel {
         channel_id: id,
         name: title.to_string(),
-        username: None,
+        username,
         access_hash,
         already_added: false,
         is_nb_folder: false,
@@ -454,6 +508,8 @@ fn evaluate_for_adoption(
 /// Really delete the channel from Telegram. Only for adopted folders — the
 /// frontend gates this behind a separate, stronger danger dialog. Errors
 /// (e.g. CHANNEL_TOO_LARGE for >1000 members) surface to the toast honestly.
+/// F2: prefers the STORED access_hash from the adoption record — the frontend
+/// has no hash (TelegramFolder doesn't carry one) and passes 0.
 #[tauri::command]
 pub async fn cmd_delete_channel_permanently(
     channel_id: i64,
@@ -464,10 +520,18 @@ pub async fn cmd_delete_channel_permanently(
     let client_opt = { state.client.lock().await.clone() };
     let client = client_opt.ok_or("Not connected to Telegram")?;
 
+    // Prefer the stored hash; fall back to the (frontend-supplied) parameter.
+    let stored_hash = load_adopted_folders(&app)
+        .ok()
+        .and_then(|records| records.into_iter().find(|r| r.channel_id == channel_id))
+        .map(|r| r.access_hash)
+        .filter(|h| *h != 0)
+        .unwrap_or(access_hash);
+
     client.invoke(&grammers_tl_types::functions::channels::DeleteChannel {
         channel: grammers_tl_types::enums::InputChannel::Channel(grammers_tl_types::types::InputChannel {
             channel_id,
-            access_hash,
+            access_hash: stored_hash,
         }),
     }).await.map_err(map_error)?;
 
@@ -530,22 +594,60 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let adopted = std::collections::HashSet::new();
         // [NB]-tagged → excluded even when creator
-        assert!(evaluate_for_adoption("My Folder [NB]", 1, 1, true, &None, true, &adopted, &mut seen).is_none());
+        assert!(evaluate_for_adoption("My Folder [NB]", 1, 1, true, &None, true, None, &adopted, &mut seen).is_none());
         // [NB-PUB] → excluded (title contains [nb])
-        assert!(evaluate_for_adoption("[NB-PUB]", 2, 1, true, &None, true, &adopted, &mut seen).is_none());
+        assert!(evaluate_for_adoption("[NB-PUB]", 2, 1, true, &None, true, None, &adopted, &mut seen).is_none());
         // already adopted → excluded
         let mut adopted2 = std::collections::HashSet::new();
         adopted2.insert(3);
-        assert!(evaluate_for_adoption("Mine", 3, 1, true, &None, true, &adopted2, &mut seen).is_none());
+        assert!(evaluate_for_adoption("Mine", 3, 1, true, &None, true, None, &adopted2, &mut seen).is_none());
         // creator, plain title → included with flags
-        let jc = evaluate_for_adoption("My Channel", 4, 7, true, &None, true, &adopted, &mut seen).unwrap();
+        let jc = evaluate_for_adoption("My Channel", 4, 7, true, &None, true, None, &adopted, &mut seen).unwrap();
         assert_eq!(jc.channel_id, 4);
         assert!(jc.is_creator);
         assert!(jc.is_admin_post);
         assert!(!jc.is_nb_folder);
         // duplicate id → seen-guard blocks
-        assert!(evaluate_for_adoption("My Channel", 4, 7, true, &None, true, &adopted, &mut seen).is_none());
+        assert!(evaluate_for_adoption("My Channel", 4, 7, true, &None, true, None, &adopted, &mut seen).is_none());
         // non-eligible (plain member) → excluded
-        assert!(evaluate_for_adoption("Not Mine", 5, 1, false, &None, true, &adopted, &mut seen).is_none());
+        assert!(evaluate_for_adoption("Not Mine", 5, 1, false, &None, true, None, &adopted, &mut seen).is_none());
+    }
+}
+
+#[cfg(test)]
+mod lock_discipline_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // F7 regression: the scan used to keep the peer-cache write guard alive
+    // across a read().await on the same lock (only users with zero adoption
+    // records hit it — deadlock at startup). This test reproduces the exact
+    // guard pattern the scan must follow: write guard dropped BEFORE the read.
+    #[tokio::test]
+    async fn read_after_guard_drop_does_not_deadlock() {
+        let lock: Arc<tokio::sync::RwLock<Vec<i64>>> = Arc::new(tokio::sync::RwLock::new(vec![1, 2, 3]));
+        {
+            let mut _guard = lock.write().await;
+            _guard.push(4);
+        } // guard dropped here — unconditionally, like the fixed scan
+        // read() must acquire promptly (would hang forever under the old bug)
+        let len = tokio::time::timeout(std::time::Duration::from_secs(2), lock.read())
+            .await
+            .expect("read() deadlocked — write guard still held")
+            .len();
+        assert_eq!(len, 4);
+    }
+
+    // F8 regression: error classification. Gone vs Unreachable decides whether
+    // a valid adoption record survives a transient network blip.
+    #[test]
+    fn title_matcher_covers_nb_pub_trap() {
+        // "[nb-pub]" does NOT contain "[nb]" — the classic trap
+        assert!(title_matches_nb_folder("[NB-PUB]"));
+        assert!(title_matches_nb_folder("My Folder [NB]"));
+        assert!(title_matches_nb_folder("my folder [nb]"));
+        assert!(!title_matches_nb_folder("My Channel"));
+        // "[nb]-ish" DOES contain "[nb]" — matches, same as the dialog-scan tag check
+        assert!(title_matches_nb_folder("Something [nb]-ish"));
     }
 }

@@ -464,13 +464,22 @@ pub async fn cmd_list_joined_channels(
     let mut channels = Vec::new();
     let mut dialogs = client.iter_dialogs();
 
+    // F14: adopted channels must not be re-addable as public channels —
+    // mark them so the modal disables the row (one channel, one sidebar entry).
+    let adopted_ids: std::collections::HashSet<i64> =
+        crate::commands::adopted_folders::load_adopted_folders(&app)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.channel_id)
+            .collect();
+
     while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
         if let Peer::Channel(c) = &dialog.peer {
             if !c.raw.broadcast {
                 continue;
             }
             let id = c.raw.id;
-            let is_nb = c.raw.title.to_lowercase().contains("[nb]");
+            let is_nb = c.raw.title.to_lowercase().contains("[nb]") || adopted_ids.contains(&id);
             channels.push(JoinedChannel {
                 channel_id: id,
                 name: c.raw.title.clone(),
@@ -1230,20 +1239,58 @@ pub async fn cmd_sync_public_channels(
         }
 
     // ─── Adopted-folder reconcile ───────────────────────────────────
-    // Same last-writer-wins semantics as channels. Rights are re-verified
-    // per device: a remote adoption for a channel this account cannot write
-    // to is skipped (logged), never blindly inserted.
+    // Same last-writer-wins semantics as channels: insert/update remote rows
+    // AND delete local rows absent remotely (F10 — the delete loop was missing,
+    // so unadopting on one device never propagated to the others). Rights are
+    // re-verified per device: a remote adoption for a channel this account
+    // cannot write to is skipped (logged), never blindly inserted.
+    // Legacy messages (old builds) parse to an EMPTY adopted list — deleting
+    // local rows then would wipe adoptions on a mixed-version fleet, so the
+    // delete loop only runs when the payload was the new wrapper shape.
+    let adopted_is_wrapper = serde_json::from_slice::<NbPubSync>(&file_data).is_ok();
+    let mut local_adopted_ids: Vec<i64> = Vec::new();
+    {
+        let conn2 = crate::commands::adopted_folders::adopted_get_connection(&app)?;
+        let mut stmt = conn2.prepare("SELECT channel_id FROM adopted_folders")
+            .map_err(|e| e.to_string())?;
+        while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+            local_adopted_ids.push(vi(&stmt.read(0).map_err(|e| e.to_string())?));
+        }
+    }
+    if adopted_is_wrapper {
+        let remote_adopted_ids: std::collections::HashSet<i64> =
+            remote_adopted.iter().map(|r| r.channel_id).collect();
+        for local_id in &local_adopted_ids {
+            if !remote_adopted_ids.contains(local_id) {
+                log::info!("[NB-PUB] adoption {} not in remote list — unadopting (last-writer-wins)", local_id);
+                if let Ok(conn2) = crate::commands::adopted_folders::adopted_get_connection(&app) {
+                    let _ = crate::commands::adopted_folders::delete_adopted_row(&conn2, *local_id);
+                }
+            }
+        }
+    }
     if !remote_adopted.is_empty() {
         let client_ref = &client;
         for rec in &remote_adopted {
             match crate::commands::adopted_folders::fetch_channel_fresh(client_ref, rec.channel_id, rec.access_hash).await {
-                Some((fresh_hash, title, creator, rights)) => {
+                crate::commands::adopted_folders::Fresh::Ok { access_hash: fresh_hash, title, creator, rights, .. } => {
+                    // F3 (sync side): a channel titled with [NB] is a regular
+                    // folder — never adopt it (mirrors evaluate_for_adoption
+                    // and the scan-merge guard).
+                    if crate::commands::adopted_folders::title_matches_nb_folder(&title) {
+                        log::warn!("[NB-PUB] remote adoption {} now [NB]-titled; skipped", rec.channel_id);
+                        continue;
+                    }
                     if crate::commands::adopted_folders::can_adopt_flags(creator, &rights) {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        let mut stmt = conn.prepare(
+                        // F13: use the adopted_folders connection — it creates
+                        // the table (get_connection doesn't; fresh profiles
+                        // would fail with "no such table").
+                        let conn2 = crate::commands::adopted_folders::adopted_get_connection(&app)?;
+                        let mut stmt = conn2.prepare(
                             "INSERT INTO adopted_folders (channel_id, access_hash, title, adopted_at) VALUES (?, ?, ?, ?) ON CONFLICT(channel_id) DO UPDATE SET access_hash = ?, title = ?"
                         ).map_err(|e| e.to_string())?;
                         stmt.bind((1, rec.channel_id)).map_err(|e| e.to_string())?;
@@ -1257,8 +1304,12 @@ pub async fn cmd_sync_public_channels(
                         log::warn!("[NB-PUB] remote adoption {} lacks rights here — skipped", rec.channel_id);
                     }
                 }
-                None => {
+                crate::commands::adopted_folders::Fresh::Gone => {
                     log::warn!("[NB-PUB] remote adoption {} unreachable here — skipped", rec.channel_id);
+                }
+                // F8: transient errors — keep everything, retry next sync.
+                crate::commands::adopted_folders::Fresh::Unreachable(e) => {
+                    log::warn!("[NB-PUB] remote adoption {} transient error ({}); skipped this sync", rec.channel_id, e);
                 }
             }
         }

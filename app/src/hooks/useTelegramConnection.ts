@@ -18,6 +18,9 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const [isSyncing, setIsSyncing] = useState(false);
     const [isConnected, setIsConnected] = useState(true);
     const autoSyncDone = useRef(false);
+    // F19: post-first-scan folder list — the startup rescan must diff against
+    // THIS, not the stale `folders` closure (which still holds the pre-scan list).
+    const rescanBaseline = useRef<TelegramFolder[]>([]);
 
     const networkIsOnline = useNetworkStatus();
 
@@ -57,6 +60,8 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             try {
                 const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
                 applySyncResult(result);
+                // F19: record the post-first-scan baseline for the rescan below.
+                rescanBaseline.current = result.current ?? [];
                 // Vault prune (spec §4.4): drop dead folder ids from vault.json.
                 // Works while locked; intersection-only on the backend.
                 if (result.removed.length > 0) {
@@ -69,6 +74,13 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 // Sync public channels from [NB-PUB]
                 try {
                     const prevPublicIds = (await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id);
+                    // F15: capture the adopted set BEFORE sync — the (expensive)
+                    // rescan below only runs when sync actually landed NEW
+                    // adoptions, instead of on every launch.
+                    const prevAdoptedIds = new Set(
+                        (await invoke<any[]>('cmd_get_adopted_folders').catch(() => [] as any[]))
+                            .map((r: any) => r.channel_id)
+                    );
                     await invoke('cmd_sync_public_channels');
                     // The sync command rewrote SQLite behind React Query's back;
                     // invalidate so the sidebar reflects the reconciled list NOW
@@ -88,16 +100,29 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                     }
                     // NB-PUB sync may have landed NEW adoption records in SQLite
                     // AFTER the folder scan above already ran (startup ordering:
-                    // scan → public-channel sync). Re-scan so adopted folders
-                    // appear on FIRST launch, not the second (plan QA 8b).
-                    try {
-                        const rescan = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
-                        applySyncResult(rescan);
-                        if (rescan.added.length > 0 || rescan.updated.length > 0 || rescan.removed.length > 0) {
-                            showSyncSummary(rescan);
+                    // scan → public-channel sync). Re-scan ONLY when the adopted
+                    // set grew (plan QA 8b) — a full dialog walk on every launch
+                    // doubles the FLOOD_WAIT surface for nothing.
+                    const nextAdopted = await invoke<any[]>('cmd_get_adopted_folders').catch(() => [] as any[]);
+                    const grew = nextAdopted.some((r: any) => !prevAdoptedIds.has(r.channel_id));
+                    if (grew) {
+                        try {
+                            // F19: diff against the FIRST scan's result.current —
+                            // `folders` in this closure is the pre-sync list, so
+                            // the rescan would re-report the first scan's changes.
+                            const rescan = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: rescanBaseline.current });
+                            applySyncResult(rescan);
+                            if (rescan.added.length > 0 || rescan.updated.length > 0) {
+                                showSyncSummary(rescan);
+                            }
+                            if (rescan.removed.length > 0) {
+                                try {
+                                    await invoke('cmd_vault_prune', { kind: 'folder', ids: rescan.removed });
+                                } catch { /* non-fatal */ }
+                            }
+                        } catch {
+                            // Non-fatal: adopted folders surface on the next manual sync.
                         }
-                    } catch {
-                        // Non-fatal: adopted folders surface on the next manual sync.
                     }
                 } catch (e) {
                     console.warn('[Public Channels] Sync failed:', e);

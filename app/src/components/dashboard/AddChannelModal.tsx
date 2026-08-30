@@ -25,6 +25,7 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
     const [browseFetched, setBrowseFetched] = useState(false);
     const [ownedChannels, setOwnedChannels] = useState<JoinedChannel[]>([]);
     const [ownedLoading, setOwnedLoading] = useState(false);
+    const [ownedScanFailed, setOwnedScanFailed] = useState(false);
     const [adoptingId, setAdoptingId] = useState<number | null>(null);
 
     // Push the local channel list to the [NB-PUB] sync channel after any add.
@@ -120,8 +121,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
         try {
             const channels = await invoke<JoinedChannel[]>('cmd_list_owned_channels');
             setOwnedChannels(channels);
+            setOwnedScanFailed(false);
         } catch (e: any) {
+            // F20: a silent catch made the whole section vanish — surface it.
             console.warn('[Adopt] owned-channel scan failed:', e);
+            setOwnedScanFailed(true);
         } finally {
             setOwnedLoading(false);
         }
@@ -349,7 +353,7 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
                             )}
 
                             {/* ─── Your channels (adopt as folders) ─────────── */}
-                            {onAdoptChannel && (ownedLoading || ownedChannels.length > 0) && (
+                            {onAdoptChannel && (ownedLoading || ownedChannels.length > 0 || ownedScanFailed) && (
                                 <div className="pt-3">
                                     <div className="flex items-center gap-1.5 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider pb-2">
                                         <Crown className="w-3.5 h-3.5" />
@@ -359,6 +363,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
                                         <div className="flex items-center justify-center py-6 gap-2">
                                             <Loader2 className="w-5 h-5 animate-spin text-nobuf-primary" />
                                             <span className="text-sm text-nobuf-subtext">Scanning your channels…</span>
+                                        </div>
+                                    )}
+                                    {ownedScanFailed && !ownedLoading && (
+                                        <div className="px-3 py-2 text-xs text-nobuf-subtext italic">
+                                            Couldn't scan your channels. Try reopening this dialog.
                                         </div>
                                     )}
                                     {!ownedLoading && ownedChannels.length > 0 && (
@@ -385,6 +394,7 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
                                                                     ? <><Crown className="w-3 h-3 text-amber-400" /> Owner</>
                                                                     : <><Shield className="w-3 h-3 text-blue-400" /> Admin</>
                                                                 }
+                                                                {channel.username && <span className="ml-1">@{channel.username}</span>}
                                                             </span>
                                                         </div>
                                                         {/* Action */}
