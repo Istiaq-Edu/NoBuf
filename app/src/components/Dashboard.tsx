@@ -1079,9 +1079,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 {showMoveModal && (
                     <MoveToFolderModal
                         folders={visibleFolders}
+                        chats={visibleChats}
                         onClose={() => setShowMoveModal(false)}
                         onSelect={handleBulkMove}
                         activeFolderId={activeFolderId}
+                        activeChatId={activeView.type === 'chat' ? activeView.chatId : null}
                         key="move-modal"
                     />
                 )}
@@ -1465,11 +1467,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             <ForwardToFolderModal
                 open={showForwardModal}
                 onClose={() => setShowForwardModal(false)}
-                sourceChannelId={activeView.type === 'public' ? activeView.channelId : 0}
+                sourceChannelId={activeView.type === 'public' ? activeView.channelId
+                    : activeView.type === 'chat' ? activeView.chatId : 0}
                 selectedFileIds={selectedIds}
                 folders={visibleFolders}
+                chats={visibleChats}
                 onForwarded={() => {
                     queryClient.invalidateQueries({ queryKey: ['files'] });
+                    queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
                 }}
             />
 

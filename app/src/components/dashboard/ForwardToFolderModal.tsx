@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { TelegramFolder, ForwardResult } from '../../types';
+import { TelegramFolder, ChatInfo, ForwardResult } from '../../types';
 
 interface Props {
     open: boolean;
@@ -9,18 +9,24 @@ interface Props {
     sourceChannelId: number;
     selectedFileIds: number[];
     folders: TelegramFolder[];
+    /** Chat targets (D17): targetFolderId = chatId through the mirrored-id seam. */
+    chats: ChatInfo[];
     onForwarded: () => void;
 }
 
-export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedFileIds, folders, onForwarded }: Props) {
-    const [selectedFolder, setSelectedFolder] = useState<TelegramFolder | null>(null);
+/** Target shape: a folder OR a chat (both dispatch through
+ *  cmd_forward_to_folder — targetFolderId carries the chat id). */
+type Target = { id: number; name: string; isChat: boolean };
+
+export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedFileIds, folders, chats, onForwarded }: Props) {
+    const [selectedTarget, setSelectedTarget] = useState<Target | null>(null);
     const [forwarding, setForwarding] = useState(false);
     const [progress, setProgress] = useState(0);
 
     if (!open) return null;
 
     const handleForward = async () => {
-        if (!selectedFolder) return;
+        if (!selectedTarget) return;
         setForwarding(true);
         setProgress(10);
         try {
@@ -30,12 +36,12 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
             const result = await invoke<ForwardResult>('cmd_forward_to_folder', {
                 sourceChannelId,
                 messageIds,
-                targetFolderId: selectedFolder.id,
+                targetFolderId: selectedTarget.id,
             });
             
             setProgress(100);
             if (result.success) {
-                toast.success(`Forwarded ${result.forwarded_count} file(s) to ${selectedFolder.name}.`);
+                toast.success(`Forwarded ${result.forwarded_count} file(s) to ${selectedTarget.name}.`);
             } else {
                 toast.warning(`Forwarded ${result.forwarded_count} file(s) with ${result.errors.length} error(s).`);
                 result.errors.forEach(e => toast.error(e));
@@ -51,7 +57,7 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
     };
 
     const handleClose = () => {
-        setSelectedFolder(null);
+        setSelectedTarget(null);
         setProgress(0);
         onClose();
     };
@@ -73,17 +79,17 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
                 </div>
 
                 <div className="p-4 space-y-2 max-h-80 overflow-y-auto sidebar-scroll">
-                    {folders.length === 0 && (
+                    {folders.length === 0 && chats.length === 0 && (
                         <div className="text-center py-6 text-sm text-nobuf-subtext">
-                            No NoBuf folders available. Create a folder first.
+                            No destinations available.
                         </div>
                     )}
                     {folders.map(folder => (
                         <div
-                            key={folder.id}
-                            onClick={() => setSelectedFolder(folder)}
+                            key={`f-${folder.id}`}
+                            onClick={() => setSelectedTarget({ id: folder.id, name: folder.name, isChat: false })}
                             className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
-                                selectedFolder?.id === folder.id
+                                selectedTarget?.id === folder.id && !selectedTarget.isChat
                                     ? 'border-nobuf-primary bg-nobuf-primary/10'
                                     : 'border-nobuf-border hover:bg-nobuf-hover'
                             }`}
@@ -92,7 +98,29 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
                                 <span className="text-nobuf-primary text-xs font-bold">📁</span>
                             </div>
                             <span className="text-sm font-medium text-nobuf-text truncate">{folder.name}</span>
-                            {selectedFolder?.id === folder.id && (
+                            {selectedTarget?.id === folder.id && !selectedTarget.isChat && (
+                                <span className="ml-auto text-nobuf-primary text-sm">✓</span>
+                            )}
+                        </div>
+                    ))}
+                    {chats.map(chat => (
+                        <div
+                            key={`c-${chat.chat_id}`}
+                            onClick={() => setSelectedTarget({ id: chat.chat_id, name: chat.title, isChat: true })}
+                            className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
+                                selectedTarget?.id === chat.chat_id && selectedTarget.isChat
+                                    ? 'border-nobuf-primary bg-nobuf-primary/10'
+                                    : 'border-nobuf-border hover:bg-nobuf-hover'
+                            }`}
+                        >
+                            <div className="w-8 h-8 rounded-lg bg-blue-500/15 flex items-center justify-center shrink-0">
+                                <span className="text-blue-400 text-xs font-bold">{chat.title.charAt(0).toUpperCase()}</span>
+                            </div>
+                            <div className="min-w-0">
+                                <div className="text-sm font-medium text-nobuf-text truncate">{chat.title}</div>
+                                <div className="text-[10px] text-nobuf-subtext">Chat</div>
+                            </div>
+                            {selectedTarget?.id === chat.chat_id && selectedTarget.isChat && (
                                 <span className="ml-auto text-nobuf-primary text-sm">✓</span>
                             )}
                         </div>
@@ -120,7 +148,7 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
                     </button>
                     <button
                         onClick={handleForward}
-                        disabled={!selectedFolder || forwarding}
+                        disabled={!selectedTarget || forwarding}
                         className="flex-1 py-2.5 rounded-lg bg-nobuf-primary text-white text-sm font-medium hover:bg-nobuf-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                         {forwarding ? 'Forwarding...' : `Forward ${selectedFileIds.length} file(s)`}
