@@ -1,5 +1,7 @@
 # Fresh-Eyes Review Findings — feat/adopt-owned-channels (29b2c64, 250852e, 2add3f3)
 
+> **FIXED in 531cdef** — all P0/P1/P2/P3 actionable findings fixed; F6 risk-accepted, F21/F22 latent. Gates: cargo 445/445 (2 new tests), tsc clean, vitest 1191/1191.
+
 All findings PARENT-VERIFIED from source unless noted. Sources: my fresh-eyes pass (F1-F6),
 3 parallel subagent reviewers (Rust, Frontend, Telegram-API), cross-validated.
 
