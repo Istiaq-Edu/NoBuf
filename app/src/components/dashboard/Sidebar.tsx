@@ -508,7 +508,7 @@ export function Sidebar({
                 onClose={() => setShowAddChannelModal(false)}
                 onAdded={onPublicChannelsChanged}
                 onAdoptChannel={onAdoptChannel}
-                initialTab="browse"
+                mode="private"
             />
 
         </aside>

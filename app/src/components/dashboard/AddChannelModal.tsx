@@ -11,12 +11,18 @@ interface Props {
     onAdded: () => void;
     /** Adopt an owned/administered channel as a full folder (not read-only). */
     onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
-    /** Tab to land on when the modal opens (default: link). */
-    initialTab?: 'link' | 'browse';
+    /**
+     * What the modal is for — set by the entry point:
+     * - 'private'  (Private Channels '+'): ONLY owned/administered channels
+     *   adoptable as folders. No public-channel flows shown.
+     * - 'public'   (Public Channels '+'): ONLY public-channel flows —
+     *   paste link + joined-channels list. No adoption section.
+     */
+    mode?: 'private' | 'public';
 }
 
-export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initialTab = 'link' }: Props) {
-    const [tab, setTab] = useState<'link' | 'browse'>(initialTab);
+export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, mode = 'public' }: Props) {
+    const [tab, setTab] = useState<'link' | 'browse'>('link');
     const [linkInput, setLinkInput] = useState('');
     const [preview, setPreview] = useState<ChannelPreview | null>(null);
     const [resolving, setResolving] = useState(false);
@@ -30,10 +36,13 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
     const [ownedScanFailed, setOwnedScanFailed] = useState(false);
     const [adoptingId, setAdoptingId] = useState<number | null>(null);
 
+    // Private mode has no tabs — it's a single owned-channels list.
+    const effectiveTab = mode === 'private' ? 'browse' : tab;
+
     // Reopen always lands on the intended tab (state persists while mounted).
     useEffect(() => {
-        if (open) setTab(initialTab);
-    }, [open, initialTab]);
+        if (open && mode === 'public') setTab('link');
+    }, [open, mode]);
 
     // Push the local channel list to the [NB-PUB] sync channel after any add.
     // Fire-and-forget: the local SQLite row is already committed, so a failed
@@ -45,11 +54,17 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
         });
     };
 
-    // Fetch joined channels once when modal opens (not on every tab switch)
+    // Fetch channels once when modal opens (not on every tab switch).
+    // Mode-scoped: private mode only scans owned channels; public mode only
+    // lists joined channels — no cross-fetching either way.
     useEffect(() => {
         if (!open || browseFetched) return;
-        loadJoinedChannels();
-        loadOwnedChannels();
+        if (mode === 'private') {
+            loadOwnedChannels();
+            setBrowseFetched(true);
+        } else {
+            loadJoinedChannels();
+        }
     }, [open]);
 
     if (!open) return null;
@@ -197,13 +212,16 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
             >
                 {/* Header */}
                 <div className="flex items-center justify-between p-4 border-b border-nobuf-border shrink-0">
-                    <h3 className="font-semibold text-nobuf-text">Add Channel</h3>
+                    <h3 className="font-semibold text-nobuf-text">
+                        {mode === 'private' ? 'Add Private Channel' : 'Add Public Channel'}
+                    </h3>
                     <button onClick={handleClose} className="text-nobuf-subtext hover:text-nobuf-text transition-colors p-1 rounded hover:bg-nobuf-hover">
                         <X className="w-4 h-4" />
                     </button>
                 </div>
 
-                {/* Segmented tab control */}
+                {/* Segmented tab control — public mode only */}
+                {mode === 'public' && (
                 <div className="flex gap-1 p-3 border-b border-nobuf-border shrink-0">
                     <button
                         onClick={() => setTab('link')}
@@ -228,10 +246,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                         Browse Joined
                     </button>
                 </div>
+                )}
 
                 {/* Content */}
                 <div className="flex-1 overflow-y-auto p-4 sidebar-scroll">
-                    {tab === 'link' && (
+                    {mode === 'public' && tab === 'link' && (
                         <div className="space-y-4">
                             <div>
                                 <label className="text-xs text-nobuf-subtext mb-1.5 block">Telegram channel link or @username</label>
@@ -273,7 +292,7 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                         </div>
                     )}
 
-                    {tab === 'browse' && (
+                    {effectiveTab === 'browse' && (
                         <div className="space-y-3">
                             {/* Search input with icon */}
                             <div className="relative">
@@ -281,22 +300,22 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                                 <input
                                     type="text"
                                     className="w-full bg-nobuf-hover rounded-lg pl-9 pr-3 py-2.5 text-sm text-nobuf-text placeholder:text-nobuf-subtext focus:outline-none focus:ring-2 focus:ring-nobuf-primary/40 border border-nobuf-border"
-                                    placeholder="Search joined channels..."
+                                    placeholder={mode === 'private' ? 'Search your channels...' : 'Search joined channels...'}
                                     value={browseSearch}
                                     onChange={e => setBrowseSearch(e.target.value)}
                                 />
                             </div>
 
-                            {/* Loading state */}
-                            {browseLoading && (
+                            {/* Loading state — joined list (public mode only) */}
+                            {mode === 'public' && browseLoading && (
                                 <div className="flex flex-col items-center justify-center py-12 gap-2">
                                     <Loader2 className="w-6 h-6 animate-spin text-nobuf-primary" />
                                     <span className="text-sm text-nobuf-subtext">Loading channels...</span>
                                 </div>
                             )}
 
-                            {/* Empty states */}
-                            {!browseLoading && filteredJoined.length === 0 && (
+                            {/* Empty states — joined list (public mode only) */}
+                            {mode === 'public' && !browseLoading && filteredJoined.length === 0 && (
                                 <div className="flex flex-col items-center justify-center py-12 gap-2">
                                     <Compass className="w-8 h-8 text-nobuf-subtext/40" />
                                     <span className="text-sm text-nobuf-subtext">
@@ -305,8 +324,8 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                                 </div>
                             )}
 
-                            {/* Channel list */}
-                            {!browseLoading && filteredJoined.length > 0 && (
+                            {/* Channel list — joined channels (public mode only) */}
+                            {mode === 'public' && !browseLoading && filteredJoined.length > 0 && (
                                 <div className="space-y-1">
                                     {filteredJoined.map(channel => {
                                         const disabled = channel.already_added || channel.is_nb_folder;
@@ -360,11 +379,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                             )}
 
                             {/* ─── Your channels (adopt as folders) ─────────── */}
-                            {onAdoptChannel && (ownedLoading || ownedChannels.length > 0 || ownedScanFailed) && (
+                            {onAdoptChannel && (mode === 'private' || effectiveTab === 'browse') && (ownedLoading || ownedChannels.length > 0 || ownedScanFailed) && (
                                 <div className="pt-3">
                                     <div className="flex items-center gap-1.5 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider pb-2">
                                         <Crown className="w-3.5 h-3.5" />
-                                        Your Channels — add as folders
+                                        {mode === 'private' ? 'Your Channels — tap to add as a folder' : 'Your Channels — add as folders'}
                                     </div>
                                     {ownedLoading && (
                                         <div className="flex items-center justify-center py-6 gap-2">
@@ -414,6 +433,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initia
                                                         )}
                                                     </div>
                                                 ))}
+                                        </div>
+                                    )}
+                                    {mode === 'private' && !ownedLoading && !ownedScanFailed && ownedChannels.length === 0 && (
+                                        <div className="px-3 py-6 text-center text-sm text-nobuf-subtext">
+                                            No channels you own or administer (with post permission) were found.
                                         </div>
                                     )}
                                     <p className="text-[11px] text-nobuf-subtext/70 px-1 pt-2">

@@ -96,7 +96,7 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                 onClose={() => setShowAddModal(false)}
                 onAdded={onRemoved}
                 onAdoptChannel={onAdoptChannel}
-                initialTab="browse"
+                mode="public"
             />
         </>
     );
