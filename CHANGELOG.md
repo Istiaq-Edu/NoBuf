@@ -2,11 +2,12 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.4.7] - 2026-08-29
+## [1.5.0] - 2026-08-30
 
 ### Documentation
 
 - Update CHANGELOG.md for v1.4.6
+- Update CHANGELOG.md for v1.4.7
 
 ## [1.4.5] - 2026-08-28
 
