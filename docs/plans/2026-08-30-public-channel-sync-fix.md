@@ -137,6 +137,18 @@ Files: `AddChannelModal.tsx`, `Dashboard.tsx`, `usePublicChannels.ts`
    - d. Search inside a channel returns results (fs.rs fix proven).
 3. Report results as do-this/expect-that table.
 
+## 4b. Live QA results (2026-08-30, real account, dev build)
+
+| Step | Evidence | Verdict |
+|---|---|---|
+| Startup download-reconcile | 3 channels added on another device (IBOX TV, Movie Video Series, DramaBay) appeared in local SQLite + sidebar on first startup after fix. `nb_pub_message_id` 7→9 read. | ✅ VERIFIED |
+| Local-only row wipe (edge 14) | Old `Pr00n` channel (added June 28, never uploaded due to Bug A) was removed from DB by first reconcile. Channel remains joined on Telegram; recoverable via Browse. As designed + documented. | ✅ VERIFIED (expected) |
+| Add → upload | "Latest Movies 🎬" added via UI at 02:58:09 local → row in SQLite + `nb_pub_message_id` 9→10 (fresh JSON uploaded). | ✅ VERIFIED |
+| New bug found live: stale UI | Sidebar showed pre-sync list while DB held reconciled list — startup sync rewrote SQLite without invalidating React Query. Fixed in 8162504, verified live via HMR reload (sidebar updated to synced list without restart). | ✅ FIXED |
+| Wipe → restart → restore | NOT executed: wiping local rows risks user data; download path already proven by startup-reconcile above. | ⛔ Skipped (info gained = 0) |
+| Remove → upload | Delegated to user (requires removing a real channel). | ⏸ User tests |
+| Cross-device round-trip | Delegated to user (needs the other device). | ⏸ User tests |
+
 ## 5. Edge cases inventory
 
 | # | Edge | Handling |
