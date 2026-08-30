@@ -26,6 +26,10 @@ pub fn get_connection(app: &AppHandle) -> Result<Connection, String> {
         added_at    INTEGER NOT NULL,
         group_id    INTEGER
     )").map_err(|e| e.to_string())?;
+    // cmd_get_enriched_chats LEFT JOINs `groups` (owned by folder_groups.rs).
+    // Create it here too so the JOIN can't fail on a profile that never ran
+    // a groups command (review: cross-module table dependency).
+    conn.execute("CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, color_hex TEXT DEFAULT '#22c55e', display_order INTEGER NOT NULL DEFAULT 0)").map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -123,13 +127,20 @@ pub fn classify_dialog_peer(
                     added_ids.contains(&c.id),
                 ))
             }
-            // Basic group with real data.
-            Chat::Chat(c) => Some((
-                "basic_group".to_string(),
-                None, // basic chats have no access_hash in TL
-                c.title.clone(),
-                added_ids.contains(&c.id),
-            )),
+            // Basic group with real data. [NB]-titled basic groups stay out
+            // (plan §1.1 #2 covers 'Group chats' broadly; cosmetic-only since
+            // scan_folders never matches Peer::Group as folders).
+            Chat::Chat(c) => {
+                if crate::commands::adopted_folders::title_matches_nb_folder(&c.title) {
+                    return None;
+                }
+                Some((
+                    "basic_group".to_string(),
+                    None, // basic chats have no access_hash in TL
+                    c.title.clone(),
+                    added_ids.contains(&c.id),
+                ))
+            }
             // Dead/stub dialogs: chats you left or were kicked from, or
             // placeholder objects. Instant-CHAT_GONE rows — never offer them.
             Chat::Forbidden(_) | Chat::Empty(_) => None,
@@ -248,6 +259,12 @@ pub async fn cmd_add_chat(
     if peer_kind != "basic_group" && access_hash.is_none() {
         return Err(format!("access_hash required for peer_kind {}", peer_kind));
     }
+    // Range guard: PeerId::user/chat/channel PANIC on out-of-range ids
+    // (grammers-session peer.rs:160-176). Real Telegram ids are always in
+    // range; reject fabricated ones before they poison the peer cache.
+    if chat_id <= 0 || chat_id > (1 << 55) {
+        return Err(format!("chat_id out of valid range: {}", chat_id));
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -282,7 +299,8 @@ pub async fn cmd_add_chat(
 }
 
 /// Unlist a chat from the Chats section. No Telegram-side action (D11) —
-/// the chat and its history stay fully intact.
+/// the chat and its history stay fully intact. Prunes any vault entry so
+/// the id can't linger hidden forever (review M5).
 #[tauri::command]
 pub async fn cmd_remove_chat(
     chat_id: i64,
@@ -297,6 +315,16 @@ pub async fn cmd_remove_chat(
         stmt.next().map_err(|e| e.to_string())?;
     }
     state.peer_cache.write().await.remove(&chat_id);
+    // Best-effort vault prune (same discipline as the frontend's
+    // public-channel diff pruning): a hidden-then-removed chat must not
+    // leave an invisible, un-unhideable vault id behind.
+    {
+        let mut store = crate::commands::vault::load_store(&app);
+        if store.vaulted_chat_ids.contains(&chat_id) {
+            store = crate::commands::vault::prune_chat_ids(store, &[chat_id]);
+            let _ = crate::commands::vault::save_store(&app, &mut store);
+        }
+    }
     Ok(true)
 }
 
@@ -324,6 +352,11 @@ fn is_stale_hash_error(err: &str) -> bool {
 /// Build a kind-checked InputPeer from a stored chat row.
 /// 'user' → InputPeerUser (hash required); 'basic_group' → InputPeerChat
 /// (hash-free); 'group' (supergroup) → InputPeerChannel (hash required).
+/// Also used by cmd_forward_to_folder's chat-source fallback.
+pub fn resolve_chat_peer_pub(chat: &ChatInfo) -> Result<grammers_tl_types::enums::InputPeer, String> {
+    resolve_chat_peer(chat)
+}
+
 fn resolve_chat_peer(chat: &ChatInfo) -> Result<grammers_tl_types::enums::InputPeer, String> {
     use grammers_tl_types::enums::InputPeer;
     use grammers_tl_types::types;
@@ -389,7 +422,16 @@ async fn refresh_chat_peer(
     // pattern). Best-effort: only used when the main scan missed.
     if fresh.is_none() {
         if let Some(f) = scan_archive_for_chat(client, chat.chat_id).await {
-            fresh = Some(f);
+            // Preserve added_at/group_id — the archive row only carries
+            // identity (kind/hash/title), not local metadata.
+            fresh = Some(ChatInfo {
+                chat_id: f.chat_id,
+                peer_kind: f.peer_kind,
+                access_hash: f.access_hash,
+                title: f.title,
+                added_at: chat.added_at,
+                group_id: chat.group_id,
+            });
         }
     }
     let f = fresh.ok_or_else(|| "CHAT_GONE: Chat not found in dialogs".to_string())?;
@@ -415,6 +457,10 @@ async fn refresh_chat_peer(
 }
 
 /// Archive-folder scan via raw GetDialogs{folder_id: Some(1)} pagination.
+/// Scans BOTH `chats` (groups/megagroups) and `users` (DMs) — archived DMs
+/// never appear in `chats`. Pagination follows the adopted_folders.rs:436-448
+/// pattern: offset_id = last dialog's top_message, offset_date = 0,
+/// offset_peer advanced to the last dialog's peer.
 async fn scan_archive_for_chat(
     client: &grammers_client::Client,
     chat_id: i64,
@@ -422,7 +468,7 @@ async fn scan_archive_for_chat(
     use grammers_tl_types::enums;
     let mut offset_date: i32 = 0;
     let mut offset_id: i32 = 0;
-    let offset_peer = enums::InputPeer::Empty;
+    let mut offset_peer = enums::InputPeer::Empty;
     loop {
         let resp = client
             .invoke(&grammers_tl_types::functions::messages::GetDialogs {
@@ -435,9 +481,9 @@ async fn scan_archive_for_chat(
                 hash: 0,
             })
             .await;
-        let (dialogs, chats) = match resp {
-            Ok(enums::messages::Dialogs::Dialogs(d)) => (d.dialogs, d.chats),
-            Ok(enums::messages::Dialogs::Slice(d)) => (d.dialogs, d.chats),
+        let (dialogs, chats, users) = match resp {
+            Ok(enums::messages::Dialogs::Dialogs(d)) => (d.dialogs, d.chats, d.users),
+            Ok(enums::messages::Dialogs::Slice(d)) => (d.dialogs, d.chats, d.users),
             Ok(_) => break,
             Err(e) => {
                 // Best-effort: archive scan failures degrade to "not found".
@@ -445,6 +491,25 @@ async fn scan_archive_for_chat(
                 break;
             }
         };
+        // Archived DMs live in `users`.
+        for u in &users {
+            let peer = Peer::User(grammers_client::types::User { raw: u.clone() });
+            if dialog_id(&peer) == chat_id {
+                if let Some((peer_kind, access_hash, title, _)) =
+                    classify_dialog_peer(&peer, i64::MAX, &Default::default(), &Default::default())
+                {
+                    return Some(ChatInfo {
+                        chat_id,
+                        peer_kind,
+                        access_hash,
+                        title,
+                        added_at: 0,
+                        group_id: None,
+                    });
+                }
+            }
+        }
+        // Groups and megagroups live in `chats`.
         for c in &chats {
             let peer = match c {
                 enums::Chat::Channel(_) | enums::Chat::Chat(_) | enums::Chat::Forbidden(_) | enums::Chat::Empty(_) => {
@@ -471,18 +536,38 @@ async fn scan_archive_for_chat(
         if count < 100 {
             break;
         }
-        // Advance pagination using the last dialog (adopted_folders.rs:383-425
-        // uses message-date paging; simplest correct advance here: the last
-        // dialog's top_message date via the enum accessor).
-        if let Some(last) = dialogs.last() {
-            use grammers_tl_types::enums::Dialog;
-            let (d_date, d_id) = match last {
-                Dialog::Dialog(d) => (d.top_message, d.top_message),
-                Dialog::Folder(f) => (f.top_message, f.top_message),
-            };
-            offset_date = d_date;
-            offset_id = d_id;
-        } else {
+        // Advance pagination per adopted_folders.rs:436-448: offset_id anchors
+        // to the last dialog's top_message; offset_date stays 0; offset_peer
+        // moves to the last dialog's peer.
+        let mut advanced = false;
+        for d in dialogs.iter().rev() {
+            if let enums::Dialog::Dialog(dd) = d {
+                offset_id = dd.top_message;
+                offset_date = 0;
+                offset_peer = match &dd.peer {
+                    enums::Peer::Channel(pc) => enums::InputPeer::Channel(
+                        grammers_tl_types::types::InputPeerChannel {
+                            channel_id: pc.channel_id,
+                            access_hash: 0,
+                        },
+                    ),
+                    enums::Peer::User(pu) => enums::InputPeer::User(
+                        grammers_tl_types::types::InputPeerUser {
+                            user_id: pu.user_id,
+                            access_hash: 0,
+                        },
+                    ),
+                    enums::Peer::Chat(pc) => enums::InputPeer::Chat(
+                        grammers_tl_types::types::InputPeerChat {
+                            chat_id: pc.chat_id,
+                        },
+                    ),
+                };
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
             break;
         }
     }
@@ -586,7 +671,10 @@ pub async fn cmd_get_chat_files(
                             let e = std::path::Path::new(&n)
                                 .extension()
                                 .map(|os| os.to_str().unwrap_or("").to_string());
-                            (n, s, Some(mi), e, None)
+                            let dur = crate::commands::public_channels::extract_duration_from_doc(
+                                &grammers_tl_types::enums::Document::Document(doc.clone()),
+                            );
+                            (n, s, Some(mi), e, dur)
                         } else {
                             continue;
                         }
@@ -1179,6 +1267,22 @@ mod tests {
     }
 
     #[test]
+    fn nb_titled_basic_group_is_excluded() {
+        let (adopted, added) = empty_sets();
+        let peer = Peer::Group(grammers_client::types::Group { raw: basic_chat(8, "Stuff [NB]") });
+        assert!(classify_dialog_peer(&peer, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
+    fn user_empty_stub_is_excluded() {
+        let (adopted, added) = empty_sets();
+        let peer = Peer::User(grammers_client::types::User {
+            raw: grammers_tl_types::enums::User::Empty(grammers_tl_types::types::UserEmpty { id: 77 }),
+        });
+        assert!(classify_dialog_peer(&peer, 1, &adopted, &added).is_none());
+    }
+
+    #[test]
     fn stale_hash_error_mapping() {
         assert!(is_stale_hash_error("PEER_ID_INVALID"));
         assert!(is_stale_hash_error("USER_ID_INVALID"));
@@ -1186,5 +1290,27 @@ mod tests {
         assert!(is_stale_hash_error("CHANNEL_ID_INVALID"));
         assert!(!is_stale_hash_error("FLOOD_WAIT_30"));
         assert!(!is_stale_hash_error("USER_IS_BLOCKED"));
+    }
+
+    // ── Review fixes: source-scan guards (house pattern) ────────
+
+    #[test]
+    fn archive_scan_advances_offset_peer_between_pages() {
+        // Regression guard for the fixed pagination bug (review MAJOR, three
+        // reviewers converged): scan_archive_for_chat must advance offset_peer
+        // from the last dialog's peer and keep offset_date = 0 — the old code
+        // wrote top_message (a MESSAGE ID) into offset_date and never moved
+        // offset_peer, truncating the archive to page 1.
+        let src = include_str!("normal_chats.rs");
+        let start = src.find("async fn scan_archive_for_chat").expect("fn exists");
+        let end = src[start..].find("/// List a chat's media history").map(|i| start + i).expect("next fn");
+        let body = &src[start..end];
+        // offset_date is reset to 0 (never assigned top_message)...
+        assert!(body.contains("offset_date = 0;"), "must reset offset_date per adopted pattern");
+        assert!(!body.contains("offset_date = d_date"), "offset_date must not receive top_message");
+        // ...offset_peer is reassigned (not a frozen Empty)...
+        assert!(body.contains("offset_peer = match &dd.peer"), "must advance offset_peer from last dialog");
+        // ...and the users array is scanned (archived DMs live there).
+        assert!(body.contains("for u in &users"), "must scan users for archived DMs");
     }
 }

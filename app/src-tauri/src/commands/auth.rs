@@ -259,6 +259,13 @@ pub async fn cmd_logout(
     let _ = std::fs::remove_file(app_data_dir.join("telegram.session-wal"));
     let _ = std::fs::remove_file(app_data_dir.join("telegram.session-shm"));
 
+    // 5. Per-account data: the normal_chats list carries DM titles/hashes
+    // (contact PII) — clear it on logout so the next account starts clean
+    // (QA row 21). Same DB the vault wipe already operates on; best-effort.
+    if let Ok(conn) = sqlite::Connection::open(app_data_dir.join("nobuf_groups.db")) {
+        let _ = conn.execute("DELETE FROM normal_chats");
+    }
+
     log::info!("Logout complete. Runner count: {}", state.runner_count.load(Ordering::SeqCst));
     Ok(true)
 }
