@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { HardDrive, Folder, Plus, PanelLeftClose, PanelLeftOpen, Check, ChevronDown, ChevronRight, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { SidebarItem } from './SidebarItem';
+import { AddChannelModal } from './AddChannelModal';
 import { BandwidthWidget } from './BandwidthWidget';
 import { FolderGroupTabs } from './FolderGroupTabs';
 import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel } from '../../types';
@@ -74,6 +75,10 @@ export function Sidebar({
     const [showNewGroupInput, setShowNewGroupInput] = useState(false);
         const [newGroupName, setNewGroupName] = useState('');
         const [newGroupColor, setNewGroupColor] = useState('#22c55e');
+
+    // Add Channel modal (adoption of owned/administered channels as folders
+    // + adding public channels by link — one entry point)
+    const [showAddChannelModal, setShowAddChannelModal] = useState(false);
 
         // Per-section collapse state (independent of sidebar-wide collapse)
         const [foldersExpanded, setFoldersExpanded] = useState(true);
@@ -461,6 +466,14 @@ export function Sidebar({
                                 {!collapsed && <span>Folder</span>}
                             </button>
                             <button
+                                onClick={() => { if (collapsed) onToggleCollapse(); setShowAddChannelModal(true); }}
+                                className={`flex items-center justify-center rounded-lg text-xs font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-all border border-dashed border-nobuf-border hover:border-nobuf-primary/40 active:scale-95 gap-1.5 ${collapsed ? 'w-8 h-8' : 'flex-1 px-3 py-2'}`}
+                                title="Add your channel as a folder (or a public channel by link)"
+                            >
+                                <Plus className="w-3.5 h-3.5 shrink-0" />
+                                {!collapsed && <span>Channel</span>}
+                            </button>
+                            <button
                                 onClick={() => { if (collapsed) onToggleCollapse(); setShowNewGroupInput(true); }}
                                 className={`flex items-center justify-center rounded-lg text-xs font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-all border border-dashed border-nobuf-border hover:border-nobuf-primary/40 active:scale-95 gap-1.5 ${collapsed ? 'w-8 h-8' : 'flex-1 px-3 py-2'}`}
                                 title="New Group"
@@ -487,6 +500,15 @@ export function Sidebar({
                     {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
                 </div>
             </div>
+
+            {/* Add Channel modal — owned channels as folders + public by link */}
+            <AddChannelModal
+                open={showAddChannelModal}
+                onClose={() => setShowAddChannelModal(false)}
+                onAdded={onPublicChannelsChanged}
+                onAdoptChannel={onAdoptChannel}
+                initialTab="browse"
+            />
 
         </aside>
     )

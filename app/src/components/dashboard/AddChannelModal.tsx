@@ -11,10 +11,12 @@ interface Props {
     onAdded: () => void;
     /** Adopt an owned/administered channel as a full folder (not read-only). */
     onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
+    /** Tab to land on when the modal opens (default: link). */
+    initialTab?: 'link' | 'browse';
 }
 
-export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Props) {
-    const [tab, setTab] = useState<'link' | 'browse'>('link');
+export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel, initialTab = 'link' }: Props) {
+    const [tab, setTab] = useState<'link' | 'browse'>(initialTab);
     const [linkInput, setLinkInput] = useState('');
     const [preview, setPreview] = useState<ChannelPreview | null>(null);
     const [resolving, setResolving] = useState(false);
@@ -27,6 +29,11 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
     const [ownedLoading, setOwnedLoading] = useState(false);
     const [ownedScanFailed, setOwnedScanFailed] = useState(false);
     const [adoptingId, setAdoptingId] = useState<number | null>(null);
+
+    // Reopen always lands on the intended tab (state persists while mounted).
+    useEffect(() => {
+        if (open) setTab(initialTab);
+    }, [open, initialTab]);
 
     // Push the local channel list to the [NB-PUB] sync channel after any add.
     // Fire-and-forget: the local SQLite row is already committed, so a failed
@@ -190,7 +197,7 @@ export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Prop
             >
                 {/* Header */}
                 <div className="flex items-center justify-between p-4 border-b border-nobuf-border shrink-0">
-                    <h3 className="font-semibold text-nobuf-text">Add Public Channel</h3>
+                    <h3 className="font-semibold text-nobuf-text">Add Channel</h3>
                     <button onClick={handleClose} className="text-nobuf-subtext hover:text-nobuf-text transition-colors p-1 rounded hover:bg-nobuf-hover">
                         <X className="w-4 h-4" />
                     </button>
