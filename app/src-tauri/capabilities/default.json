@@ -104,6 +104,7 @@
     "allow-cmd-pick-chats",
     "allow-cmd-add-chat",
     "allow-cmd-remove-chat",
+    "allow-cmd-get-chat-files",
     "allow-cmd-forward-to-folder",
     "allow-cmd-update-nb-pub-sync",
     "allow-cmd-sync-public-channels",

@@ -38,7 +38,23 @@ pub async fn resolve_peer(
             let peer_id = match &dialog.peer {
                 Peer::Channel(c) => Some(c.raw.id),
                 Peer::User(u) => Some(u.raw.id()),
-                _ => None,
+                // Basic groups AND megagroups arrive as Peer::Group. Key by the
+                // RAW chat/channel id from the inner Chat enum — NOT
+                // Group::id(), which returns a packed PeerId (group.rs:61-71).
+                // Normal-chats feature: needed so chat peers resolve through
+                // this shared seam (upload/download/stream/move all use it).
+                // Last-wins on cross-namespace numeric collisions (pre-existing
+                // policy; kind-qualified keys are a deliberate non-goal).
+                Peer::Group(g) => match &g.raw {
+                    tl::enums::Chat::Channel(c) => Some(c.id),
+                    tl::enums::Chat::Chat(c) => Some(c.id),
+                    tl::enums::Chat::Forbidden(c) => Some(c.id),
+                    tl::enums::Chat::Empty(c) => Some(c.id),
+                    // ChannelForbidden (a dead megagroup) carries an id too;
+                    // cache it so a stale resolution errors cleanly instead of
+                    // "not found".
+                    tl::enums::Chat::ChannelForbidden(c) => Some(c.id),
+                },
             };
             if let Some(id) = peer_id {
                 cache.insert(id, dialog.peer.clone());

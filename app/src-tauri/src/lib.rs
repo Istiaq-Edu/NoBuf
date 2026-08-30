@@ -582,6 +582,7 @@ pub fn run() {
             commands::cmd_pick_chats,
             commands::cmd_add_chat,
             commands::cmd_remove_chat,
+            commands::cmd_get_chat_files,
             commands::cmd_forward_to_folder,
             commands::cmd_update_nb_pub_sync,
             commands::cmd_sync_public_channels,

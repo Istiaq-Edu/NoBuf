@@ -300,8 +300,333 @@ pub async fn cmd_remove_chat(
     Ok(true)
 }
 
-// ─── Peer cache seeding (R2 will call this at startup too) ───────
+// ─── Resolution + file listing (R2) ──────────────────────────────
 
+/// Errors that mean "this chat is gone for good" (dead-chat path D13).
+pub fn is_chat_gone_error(err: &str) -> bool {
+    err.contains("CHAT_GONE")
+        || err.contains("USER_IS_BLOCKED")
+        || err.contains("USER_ID_INVALID")
+        || err.contains("PEER_ID_INVALID")
+        || err.contains("USER_NOT_PARTICIPANT")
+        || err.contains("CHAT_ID_INVALID")
+        || err.contains("CHANNEL_PRIVATE")
+}
+
+/// Errors that mean the stored access_hash is stale (retry after refresh).
+fn is_stale_hash_error(err: &str) -> bool {
+    err.contains("PEER_ID_INVALID")
+        || err.contains("USER_ID_INVALID")
+        || err.contains("CHANNEL_INVALID")
+        || err.contains("CHANNEL_ID_INVALID")
+}
+
+/// Build a kind-checked InputPeer from a stored chat row.
+/// 'user' → InputPeerUser (hash required); 'basic_group' → InputPeerChat
+/// (hash-free); 'group' (supergroup) → InputPeerChannel (hash required).
+fn resolve_chat_peer(chat: &ChatInfo) -> Result<grammers_tl_types::enums::InputPeer, String> {
+    use grammers_tl_types::enums::InputPeer;
+    use grammers_tl_types::types;
+    match chat.peer_kind.as_str() {
+        "user" => Ok(InputPeer::User(types::InputPeerUser {
+            user_id: chat.chat_id,
+            access_hash: chat
+                .access_hash
+                .ok_or_else(|| "Missing access_hash for user chat".to_string())?,
+        })),
+        "basic_group" => Ok(InputPeer::Chat(types::InputPeerChat {
+            chat_id: chat.chat_id,
+        })),
+        "group" => Ok(InputPeer::Channel(types::InputPeerChannel {
+            channel_id: chat.chat_id,
+            access_hash: chat
+                .access_hash
+                .ok_or_else(|| "Missing access_hash for supergroup".to_string())?,
+        })),
+        other => Err(format!("Unknown peer_kind: {}", other)),
+    }
+}
+
+/// Load a stored chat row or fail with CHAT_GONE (removed while in use).
+fn load_chat_row(app: &AppHandle, chat_id: i64) -> Result<ChatInfo, String> {
+    load_normal_chats(app)?
+        .into_iter()
+        .find(|c| c.chat_id == chat_id)
+        .ok_or_else(|| "CHAT_GONE: Chat is no longer in NoBuf".to_string())
+}
+
+/// Stale-hash recovery (scoped to cmd_get_chat_files — plan §1.1): re-scan
+/// dialogs (+ archive), update the stored hash + cache, retry once.
+async fn refresh_chat_peer(
+    client: &grammers_client::Client,
+    app: &AppHandle,
+    state: &TelegramState,
+    chat: &mut ChatInfo,
+) -> Result<(), String> {
+    // Main dialog list scan: collect a fresh (kind, hash) for this chat id.
+    let mut fresh: Option<ChatInfo> = None;
+    {
+        let mut dialogs = client.iter_dialogs();
+        while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
+            if dialog_id(&dialog.peer) == chat.chat_id {
+                if let Some((peer_kind, access_hash, title, _)) =
+                    classify_dialog_peer(&dialog.peer, i64::MAX, &Default::default(), &Default::default())
+                {
+                    fresh = Some(ChatInfo {
+                        chat_id: chat.chat_id,
+                        peer_kind,
+                        access_hash,
+                        title,
+                        added_at: chat.added_at,
+                        group_id: chat.group_id,
+                    });
+                }
+                break;
+            }
+        }
+    }
+    // Archive scan (folder_id=1, raw pagination — adopted_folders.rs:383-425
+    // pattern). Best-effort: only used when the main scan missed.
+    if fresh.is_none() {
+        if let Some(f) = scan_archive_for_chat(client, chat.chat_id).await {
+            fresh = Some(f);
+        }
+    }
+    let f = fresh.ok_or_else(|| "CHAT_GONE: Chat not found in dialogs".to_string())?;
+    // Persist the refreshed hash + title.
+    {
+        let conn = get_connection(app)?;
+        let mut stmt = conn.prepare(
+            "UPDATE normal_chats SET access_hash = ?, title = ?, peer_kind = ? WHERE chat_id = ?",
+        ).map_err(|e| e.to_string())?;
+        match f.access_hash {
+            Some(h) => stmt.bind((1, h)).map_err(|e| e.to_string())?,
+            None => stmt.bind((1, Value::Null)).map_err(|e| e.to_string())?,
+        }
+        stmt.bind((2, f.title.as_str())).map_err(|e| e.to_string())?;
+        stmt.bind((3, f.peer_kind.as_str())).map_err(|e| e.to_string())?;
+        stmt.bind((4, chat.chat_id)).map_err(|e| e.to_string())?;
+        stmt.next().map_err(|e| e.to_string())?;
+    }
+    // Re-seed the cache with the fresh peer.
+    seed_chat_cache_entry(state, f.chat_id, &f.peer_kind, f.access_hash, &f.title).await;
+    *chat = f;
+    Ok(())
+}
+
+/// Archive-folder scan via raw GetDialogs{folder_id: Some(1)} pagination.
+async fn scan_archive_for_chat(
+    client: &grammers_client::Client,
+    chat_id: i64,
+) -> Option<ChatInfo> {
+    use grammers_tl_types::enums;
+    let mut offset_date: i32 = 0;
+    let mut offset_id: i32 = 0;
+    let offset_peer = enums::InputPeer::Empty;
+    loop {
+        let resp = client
+            .invoke(&grammers_tl_types::functions::messages::GetDialogs {
+                exclude_pinned: true,
+                folder_id: Some(1),
+                offset_date,
+                offset_id,
+                offset_peer: offset_peer.clone(),
+                limit: 100,
+                hash: 0,
+            })
+            .await;
+        let (dialogs, chats) = match resp {
+            Ok(enums::messages::Dialogs::Dialogs(d)) => (d.dialogs, d.chats),
+            Ok(enums::messages::Dialogs::Slice(d)) => (d.dialogs, d.chats),
+            Ok(_) => break,
+            Err(e) => {
+                // Best-effort: archive scan failures degrade to "not found".
+                log::warn!("[CHATS] archive scan failed: {}", e);
+                break;
+            }
+        };
+        for c in &chats {
+            let peer = match c {
+                enums::Chat::Channel(_) | enums::Chat::Chat(_) | enums::Chat::Forbidden(_) | enums::Chat::Empty(_) => {
+                    Peer::Group(grammers_client::types::Group { raw: c.clone() })
+                }
+                _ => continue,
+            };
+            if dialog_id(&peer) == chat_id {
+                if let Some((peer_kind, access_hash, title, _)) =
+                    classify_dialog_peer(&peer, i64::MAX, &Default::default(), &Default::default())
+                {
+                    return Some(ChatInfo {
+                        chat_id,
+                        peer_kind,
+                        access_hash,
+                        title,
+                        added_at: 0,
+                        group_id: None,
+                    });
+                }
+            }
+        }
+        let count = dialogs.len();
+        if count < 100 {
+            break;
+        }
+        // Advance pagination using the last dialog (adopted_folders.rs:383-425
+        // uses message-date paging; simplest correct advance here: the last
+        // dialog's top_message date via the enum accessor).
+        if let Some(last) = dialogs.last() {
+            use grammers_tl_types::enums::Dialog;
+            let (d_date, d_id) = match last {
+                Dialog::Dialog(d) => (d.top_message, d.top_message),
+                Dialog::Folder(f) => (f.top_message, f.top_message),
+            };
+            offset_date = d_date;
+            offset_id = d_id;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// List a chat's media history with offset pagination — mirrors
+/// cmd_get_public_channel_files (public_channels.rs:642-746): GetHistory
+/// limit 100, client-side filter to documents/photos, 50-file cap,
+/// has_more = fetched >= 100. CHAT_GONE mapping for dead chats (D13).
+#[tauri::command]
+pub async fn cmd_get_chat_files(
+    chat_id: i64,
+    offset_id: Option<i32>,
+    app: AppHandle,
+    state: State<'_, TelegramState>,
+) -> Result<(Vec<crate::models::FileMetadata>, bool), String> {
+    let client_opt = { state.client.lock().await.clone() };
+    let client = client_opt.ok_or("Not connected to Telegram")?;
+
+    let mut chat = load_chat_row(&app, chat_id)?;
+
+    let fetch = |input_peer: grammers_tl_types::enums::InputPeer| {
+        let client = client.clone();
+        async move {
+            client
+                .invoke(&grammers_tl_types::functions::messages::GetHistory {
+                    peer: input_peer,
+                    offset_id: offset_id.unwrap_or(0),
+                    offset_date: 0,
+                    add_offset: 0,
+                    limit: 100,
+                    max_id: 0,
+                    min_id: 0,
+                    hash: 0,
+                })
+                .await
+        }
+    };
+
+    let mut input_peer = resolve_chat_peer(&chat)?;
+    let result = fetch(input_peer.clone()).await;
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let err = e.to_string();
+            if is_stale_hash_error(&err) {
+                // Refresh (dialog + archive re-scan → update stored hash) and
+                // retry once. Failure to refresh maps to CHAT_GONE below.
+                refresh_chat_peer(&client, &app, &state, &mut chat).await?;
+                input_peer = resolve_chat_peer(&chat)?;
+                fetch(input_peer).await.map_err(|e2| {
+                    let msg = e2.to_string();
+                    if is_chat_gone_error(&msg) {
+                        format!("CHAT_GONE: {}", msg)
+                    } else {
+                        map_error(e2)
+                    }
+                })?
+            } else if is_chat_gone_error(&err) {
+                return Err(format!("CHAT_GONE: {}", err));
+            } else {
+                return Err(map_error(e));
+            }
+        }
+    };
+
+    let messages = crate::commands::utils::messages_from_history(&result);
+    log::info!(
+        "[Chats] GetHistory returned {} messages for chat {}",
+        messages.len(),
+        chat_id
+    );
+
+    let mut files = Vec::new();
+    let limit = 50;
+    let mut count = 0;
+    let has_more = messages.len() >= 100;
+
+    for msg in messages {
+        if count >= limit {
+            break;
+        }
+        if let grammers_tl_types::enums::Message::Message(m) = msg {
+            if let Some(media) = &m.media {
+                let (name, size, mime, ext, duration) = match media {
+                    grammers_tl_types::enums::MessageMedia::Document(d) => {
+                        if let Some(grammers_tl_types::enums::Document::Document(doc)) = &d.document {
+                            let n = doc
+                                .attributes
+                                .iter()
+                                .find_map(|a| match a {
+                                    grammers_tl_types::enums::DocumentAttribute::Filename(f) => {
+                                        Some(f.file_name.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let s = doc.size as u64;
+                            let mi = doc.mime_type.clone();
+                            let e = std::path::Path::new(&n)
+                                .extension()
+                                .map(|os| os.to_str().unwrap_or("").to_string());
+                            (n, s, Some(mi), e, None)
+                        } else {
+                            continue;
+                        }
+                    }
+                    grammers_tl_types::enums::MessageMedia::Photo(_) => (
+                        "Photo.jpg".to_string(),
+                        0,
+                        Some("image/jpeg".to_string()),
+                        Some("jpg".to_string()),
+                        None,
+                    ),
+                    _ => continue,
+                };
+                files.push(crate::models::FileMetadata {
+                    id: m.id as i64,
+                    folder_id: Some(chat_id),
+                    name,
+                    size,
+                    mime_type: mime,
+                    file_ext: ext,
+                    created_at: m.date.to_string(),
+                    icon_type: "file".to_string(),
+                    duration,
+                });
+                count += 1;
+            }
+        }
+    }
+
+    log::info!(
+        "[Chats] Extracted {} files (has_more={}) for chat {}",
+        files.len(),
+        has_more,
+        chat_id
+    );
+
+    Ok((files, has_more))
+}
+
+// ─── Peer cache seeding (R2 will call this at startup too) ───────
 /// Insert a synthetic peer for a stored chat row so seam ops (upload/
 /// download/stream via resolve_peer) work even when the dialog is archived
 /// or the scan hasn't run yet.
@@ -735,5 +1060,88 @@ mod tests {
 
         let u = user(99, "Z", false);
         assert_eq!(dialog_id(&u), 99);
+    }
+
+    // ── R2: resolve_chat_peer construction ──────────────────────
+
+    fn chat_row(kind: &str, id: i64, hash: Option<i64>) -> ChatInfo {
+        ChatInfo {
+            chat_id: id,
+            peer_kind: kind.to_string(),
+            access_hash: hash,
+            title: "T".into(),
+            added_at: 0,
+            group_id: None,
+        }
+    }
+
+    #[test]
+    fn resolve_chat_peer_user_builds_input_peer_user_with_hash() {
+        let p = resolve_chat_peer(&chat_row("user", 42, Some(777))).unwrap();
+        match p {
+            grammers_tl_types::enums::InputPeer::User(u) => {
+                assert_eq!(u.user_id, 42);
+                assert_eq!(u.access_hash, 777);
+            }
+            other => panic!("expected InputPeerUser, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_chat_peer_basic_group_builds_input_peer_chat_hashless() {
+        let p = resolve_chat_peer(&chat_row("basic_group", 7, None)).unwrap();
+        match p {
+            grammers_tl_types::enums::InputPeer::Chat(c) => assert_eq!(c.chat_id, 7),
+            other => panic!("expected InputPeerChat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_chat_peer_supergroup_builds_input_peer_channel_with_hash() {
+        let p = resolve_chat_peer(&chat_row("group", 900, Some(123))).unwrap();
+        match p {
+            grammers_tl_types::enums::InputPeer::Channel(c) => {
+                assert_eq!(c.channel_id, 900);
+                assert_eq!(c.access_hash, 123);
+            }
+            other => panic!("expected InputPeerChannel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_chat_peer_missing_hash_errors_for_user_and_supergroup() {
+        assert!(resolve_chat_peer(&chat_row("user", 1, None)).is_err());
+        assert!(resolve_chat_peer(&chat_row("group", 2, None)).is_err());
+        // basic_group legitimately has no hash
+        assert!(resolve_chat_peer(&chat_row("basic_group", 3, None)).is_ok());
+        // unknown kind rejected
+        assert!(resolve_chat_peer(&chat_row("channel", 4, Some(5))).is_err());
+    }
+
+    // ── R2: CHAT_GONE error mapping ──────────────────────────────
+
+    #[test]
+    fn chat_gone_error_mapping() {
+        assert!(is_chat_gone_error("CHAT_GONE: x"));
+        assert!(is_chat_gone_error("USER_IS_BLOCKED"));
+        assert!(is_chat_gone_error("USER_ID_INVALID"));
+        assert!(is_chat_gone_error("PEER_ID_INVALID"));
+        assert!(is_chat_gone_error("USER_NOT_PARTICIPANT"));
+        assert!(is_chat_gone_error("CHAT_ID_INVALID"));
+        assert!(is_chat_gone_error("CHANNEL_PRIVATE"));
+        // Transient errors must NOT map to CHAT_GONE (D13 false-positive guard)
+        assert!(!is_chat_gone_error("FLOOD_WAIT_30"));
+        assert!(!is_chat_gone_error("timeout"));
+        assert!(!is_chat_gone_error("network error"));
+    }
+
+    #[test]
+    fn stale_hash_error_mapping() {
+        assert!(is_stale_hash_error("PEER_ID_INVALID"));
+        assert!(is_stale_hash_error("USER_ID_INVALID"));
+        assert!(is_stale_hash_error("CHANNEL_INVALID"));
+        assert!(is_stale_hash_error("CHANNEL_ID_INVALID"));
+        assert!(!is_stale_hash_error("FLOOD_WAIT_30"));
+        assert!(!is_stale_hash_error("USER_IS_BLOCKED"));
     }
 }

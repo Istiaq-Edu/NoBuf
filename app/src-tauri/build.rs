@@ -85,6 +85,7 @@ fn main() {
                                 "cmd_pick_chats",
                                 "cmd_add_chat",
                                 "cmd_remove_chat",
+                                "cmd_get_chat_files",
                                 "cmd_forward_to_folder",
                                 "cmd_update_nb_pub_sync",
                                 "cmd_sync_public_channels",

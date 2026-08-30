@@ -2109,6 +2109,13 @@ pub async fn cmd_scan_folders(
         }
     }
 
+    // Normal chats: seed the peer cache from the stored rows (archived chats
+    // are invisible to the dialog scan above). Unconditional overwrite — the
+    // stored row is the authority for that dialog id (plan §1.1, V2-16).
+    // Runs AFTER adopted seeding so a chat id that also exists as an adopted
+    // channel id resolves to the chat row.
+    crate::commands::normal_chats::seed_chat_peer_cache(&state, &app).await;
+
     log::info!("Scan found {} NoBuf folders. Peer cache size: {}.", found_folders.len(), state.peer_cache.read().await.len());
 
     // Build lookup: found folder ID -> FolderMetadata
