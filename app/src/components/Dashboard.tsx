@@ -54,10 +54,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const {
         store, folders, activeFolderId, setActiveFolderId, isConnected,
-        handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
+        handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder,
+        handleAdoptChannel, handleUnadoptChannel, handleDeleteChannelPermanently
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
+
+    // F9: unadopt/delete-permanently wrappers — when the ACTIVE folder is
+    // removed, activeView must leave 'folder' too, or Dashboard's sync effect
+    // snaps activeFolderId back to the removed id (functional ghost view:
+    // listing + uploads keep working against a "removed" channel).
+    const handleUnadopt = useCallback((folderId: number, folderName: string) => {
+        setActiveView(prev => (prev.type === 'folder' && prev.folderId === folderId)
+            ? { type: 'saved' }
+            : prev);
+        handleUnadoptChannel(folderId, folderName);
+    }, [handleUnadoptChannel, setActiveView]);
+    const handleDeleteChannelPerm = useCallback((folderId: number, accessHash: number, folderName: string) => {
+        setActiveView(prev => (prev.type === 'folder' && prev.folderId === folderId)
+            ? { type: 'saved' }
+            : prev);
+        handleDeleteChannelPermanently(folderId, accessHash, folderName);
+    }, [handleDeleteChannelPermanently, setActiveView]);
 
         // ---- View history (Back button) ------------------------------------
         // Every navigation through navigateTo pushes onto the stack; goBack
@@ -1063,6 +1081,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onRename={handleFolderRename}
                 onReorder={handleFolderReorder}
                 onCreate={handleCreateFolder}
+                onUnadopt={handleUnadopt}
+                onDeleteChannelPermanently={handleDeleteChannelPerm}
+                onAdoptChannel={handleAdoptChannel}
                 isConnected={isConnected}
                 bandwidth={bandwidth || null}
                 collapsed={sidebarCollapsed}

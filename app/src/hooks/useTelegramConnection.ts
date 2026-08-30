@@ -18,6 +18,9 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const [isSyncing, setIsSyncing] = useState(false);
     const [isConnected, setIsConnected] = useState(true);
     const autoSyncDone = useRef(false);
+    // F19: post-first-scan folder list — the startup rescan must diff against
+    // THIS, not the stale `folders` closure (which still holds the pre-scan list).
+    const rescanBaseline = useRef<TelegramFolder[]>([]);
 
     const networkIsOnline = useNetworkStatus();
 
@@ -57,6 +60,8 @@ export function useTelegramConnection(onLogoutParent: () => void) {
             try {
                 const result = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: folders });
                 applySyncResult(result);
+                // F19: record the post-first-scan baseline for the rescan below.
+                rescanBaseline.current = result.current ?? [];
                 // Vault prune (spec §4.4): drop dead folder ids from vault.json.
                 // Works while locked; intersection-only on the backend.
                 if (result.removed.length > 0) {
@@ -69,6 +74,13 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 // Sync public channels from [NB-PUB]
                 try {
                     const prevPublicIds = (await invoke<any[]>('cmd_get_public_channels')).map((c: any) => c.channel_id);
+                    // F15: capture the adopted set BEFORE sync — the (expensive)
+                    // rescan below only runs when sync actually landed NEW
+                    // adoptions, instead of on every launch.
+                    const prevAdoptedIds = new Set(
+                        (await invoke<any[]>('cmd_get_adopted_folders').catch(() => [] as any[]))
+                            .map((r: any) => r.channel_id)
+                    );
                     await invoke('cmd_sync_public_channels');
                     // The sync command rewrote SQLite behind React Query's back;
                     // invalidate so the sidebar reflects the reconciled list NOW
@@ -84,6 +96,32 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                             await invoke('cmd_vault_prune', { kind: 'public_channel', ids: gone });
                         } catch {
                             // Non-fatal: stale id survives until next sync.
+                        }
+                    }
+                    // NB-PUB sync may have landed NEW adoption records in SQLite
+                    // AFTER the folder scan above already ran (startup ordering:
+                    // scan → public-channel sync). Re-scan ONLY when the adopted
+                    // set grew (plan QA 8b) — a full dialog walk on every launch
+                    // doubles the FLOOD_WAIT surface for nothing.
+                    const nextAdopted = await invoke<any[]>('cmd_get_adopted_folders').catch(() => [] as any[]);
+                    const grew = nextAdopted.some((r: any) => !prevAdoptedIds.has(r.channel_id));
+                    if (grew) {
+                        try {
+                            // F19: diff against the FIRST scan's result.current —
+                            // `folders` in this closure is the pre-sync list, so
+                            // the rescan would re-report the first scan's changes.
+                            const rescan = await invoke<ScanResult>('cmd_start_auto_sync', { localFolders: rescanBaseline.current });
+                            applySyncResult(rescan);
+                            if (rescan.added.length > 0 || rescan.updated.length > 0) {
+                                showSyncSummary(rescan);
+                            }
+                            if (rescan.removed.length > 0) {
+                                try {
+                                    await invoke('cmd_vault_prune', { kind: 'folder', ids: rescan.removed });
+                                } catch { /* non-fatal */ }
+                            }
+                        } catch {
+                            // Non-fatal: adopted folders surface on the next manual sync.
                         }
                     }
                 } catch (e) {
@@ -326,6 +364,96 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     }, [store]);
 
+    // Adopt an owned/administered channel as a full folder. The backend returns
+    // the FolderMetadata; we push it into folders state DIRECTLY (the
+    // handleCreateFolder pattern) so the folder appears immediately — the
+    // AddChannelModal's onAdded only invalidates ['publicChannels'].
+    const handleAdoptChannel = useCallback(async (channelId: number, accessHash: number): Promise<TelegramFolder | null> => {
+        if (!store) return null;
+        try {
+            const folder = await invoke<TelegramFolder>('cmd_adopt_channel', { channelId, accessHash });
+            setFolders(prev => {
+                const updated = prev.some(f => f.id === folder.id)
+                    ? prev.map(f => f.id === folder.id ? folder : f)
+                    : [...prev, folder];
+                store.set('folders', updated).then(() => store.save());
+                return updated;
+            });
+            toast.success(`"${folder.name}" added as a NoBuf folder.`);
+            return folder;
+        } catch (e) {
+            const err = String(e);
+            if (err.startsWith('ALREADY_ADOPTED')) {
+                toast.info('This channel is already a NoBuf folder.');
+            } else if (err.startsWith('NOT_ELIGIBLE')) {
+                toast.error('Only channels you created or administer (with post permission) can be added as folders.');
+            } else {
+                toast.error('Failed to add channel: ' + e);
+            }
+            return null;
+        }
+    }, [store]);
+
+    // Unadopt: remove the adoption record; the Telegram channel and its
+    // subscribers are untouched. Also pushes the updated adoption list to
+    // [NB-PUB] (fire-and-forget, same pattern as public-channel mutations).
+    const handleUnadoptChannel = useCallback(async (folderId: number, folderName: string) => {
+        if (!await confirm({
+            title: "Remove from NoBuf",
+            message: `Remove "${folderName}" from NoBuf?\nThe channel stays on Telegram with all its subscribers — only the folder disappears here.`,
+            confirmText: "Remove",
+            variant: 'info'
+        })) return;
+        if (!store) return;
+        try {
+            await invoke('cmd_unadopt_channel', { channelId: folderId });
+            invoke('cmd_update_nb_pub_sync').catch(() => { /* local-only until next upload */ });
+            const updated = folders.filter(f => f.id !== folderId);
+            setFolders(updated);
+            await store.set('folders', updated);
+            await store.save();
+            if (activeFolderId === folderId) {
+                setActiveFolderId(null);
+                await store.set('activeFolderId', null);
+                await store.save();
+            }
+            toast.success(`"${folderName}" removed from NoBuf. The channel stays on Telegram.`);
+        } catch (e) {
+            toast.error('Failed to remove folder: ' + e);
+        }
+    }, [store, folders, activeFolderId, confirm]);
+
+    // Permanently delete the underlying Telegram channel (adopted folders only,
+    // gated behind a stronger danger dialog in the UI).
+    const handleDeleteChannelPermanently = useCallback(async (folderId: number, accessHash: number, folderName: string) => {
+        if (!await confirm({
+            title: "Delete Channel Permanently",
+            message: `This will PERMANENTLY DELETE "${folderName}" from Telegram — the channel, its subscribers, and every file in it.\n\nThis cannot be undone. To only remove it from NoBuf, use "Remove from NoBuf" instead.`,
+            confirmText: "Delete Channel Forever",
+            variant: 'danger'
+        })) return;
+        try {
+            await invoke('cmd_delete_channel_permanently', { channelId: folderId, accessHash });
+            invoke('cmd_update_nb_pub_sync').catch(() => { });
+            const updated = folders.filter(f => f.id !== folderId);
+            setFolders(updated);
+            if (store) {
+                await store.set('folders', updated);
+                await store.save();
+            }
+            if (activeFolderId === folderId) {
+                setActiveFolderId(null);
+                if (store) {
+                    await store.set('activeFolderId', null);
+                    await store.save();
+                }
+            }
+            toast.success(`"${folderName}" and its channel were permanently deleted.`);
+        } catch (e) {
+            toast.error('Failed to delete channel: ' + e);
+        }
+    }, [store, folders, activeFolderId, confirm]);
+
     const handleSetActiveFolderId = async (id: number | null) => {
         setActiveFolderId(id);
         if (store) {
@@ -347,6 +475,9 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         handleFolderRename,
         handleFolderDelete,
         handleFolderReorder,
+        handleAdoptChannel,
+        handleUnadoptChannel,
+        handleDeleteChannelPermanently,
         isNetworkError,
         forceLogout
     };

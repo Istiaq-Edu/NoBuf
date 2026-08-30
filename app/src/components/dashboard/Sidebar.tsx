@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { HardDrive, Folder, Plus, PanelLeftClose, PanelLeftOpen, Check, ChevronDown, ChevronRight, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { SidebarItem } from './SidebarItem';
+import { AddChannelModal } from './AddChannelModal';
 import { BandwidthWidget } from './BandwidthWidget';
 import { FolderGroupTabs } from './FolderGroupTabs';
 import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel } from '../../types';
@@ -16,6 +17,12 @@ interface SidebarProps {
     onRename: (id: number, newName: string) => void;
     onReorder: (reordered: TelegramFolder[]) => void;
     onCreate: (name: string) => Promise<void>;
+    /** Unadopt an adopted folder (channel stays on Telegram). */
+    onUnadopt?: (id: number, name: string) => void;
+    /** Permanently delete the underlying channel of an adopted folder. */
+    onDeleteChannelPermanently?: (id: number, accessHash: number, name: string) => void;
+    /** Adopt an owned/administered channel as a folder (from AddChannelModal). */
+    onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
     isConnected: boolean;
     bandwidth: BandwidthStats | null;
     collapsed: boolean;
@@ -49,6 +56,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
+    onUnadopt, onDeleteChannelPermanently, onAdoptChannel,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
     activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel,
@@ -67,6 +75,10 @@ export function Sidebar({
     const [showNewGroupInput, setShowNewGroupInput] = useState(false);
         const [newGroupName, setNewGroupName] = useState('');
         const [newGroupColor, setNewGroupColor] = useState('#22c55e');
+
+    // Add Channel modal (adoption of owned/administered channels as folders
+    // + adding public channels by link — one entry point)
+    const [showAddChannelModal, setShowAddChannelModal] = useState(false);
 
         // Per-section collapse state (independent of sidebar-wide collapse)
         const [foldersExpanded, setFoldersExpanded] = useState(true);
@@ -275,21 +287,30 @@ export function Sidebar({
 
                             {/* Private Channels section header — collapsible */}
                             {!collapsed && (
-                                <button
-                                    onClick={() => setFoldersExpanded(e => !e)}
-                                    className="flex items-center gap-1.5 px-1 pt-3 pb-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors w-full text-left group"
-                                >
-                                    {foldersExpanded
-                                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0 transition-transform" />
-                                        : <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform" />
-                                    }
-                                    <span className="flex-1">Private Channels</span>
-                                    {filteredFolders.length > 0 && (
-                                        <span className="text-[10px] font-normal text-nobuf-subtext/60 bg-nobuf-hover px-1.5 py-0.5 rounded-full">
-                                            {filteredFolders.length}
-                                        </span>
-                                    )}
-                                </button>
+                                <div className="flex items-center gap-1 pt-3 pb-1 shrink-0">
+                                    <button
+                                        onClick={() => setFoldersExpanded(e => !e)}
+                                        className="flex items-center gap-1.5 px-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors flex-1 min-w-0 text-left"
+                                    >
+                                        {foldersExpanded
+                                            ? <ChevronDown className="w-3.5 h-3.5 shrink-0 transition-transform" />
+                                            : <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform" />
+                                        }
+                                        <span className="flex-1 truncate">Private Channels</span>
+                                        {filteredFolders.length > 0 && (
+                                            <span className="text-[10px] font-normal text-nobuf-subtext/60 bg-nobuf-hover px-1.5 py-0.5 rounded-full">
+                                                {filteredFolders.length}
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={() => setShowAddChannelModal(true)}
+                                        className="text-nobuf-subtext hover:text-nobuf-primary transition-colors shrink-0 ml-1"
+                                        title="Add your channel as a folder (or a public channel by link)"
+                                    >
+                                        <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
                             )}
 
                             {/* Folder list — conditional render (no max-h clipping) */}
@@ -310,7 +331,15 @@ export function Sidebar({
                                                                             }
                                                                             onDrop(e, folder.id);
                                                                         }}
-                                                                        onDelete={() => onDelete(folder.id, folder.name)}
+                                                                        onDelete={() => {
+                                                                            // Adopted folders: hover-X routes to UNADOPT, never
+                                                                            // the channel-deleting cmd_delete_folder.
+                                                                            if (folder.is_adopted && onUnadopt) {
+                                                                                onUnadopt(folder.id, folder.name);
+                                                                            } else {
+                                                                                onDelete(folder.id, folder.name);
+                                                                            }
+                                                                        }}
                                                                         onRename={(newName: string) => onRename(folder.id, newName)}
                                                                         onHideInVault={() => onHideInVault('folder', folder.id)}
                                                                         onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
@@ -326,6 +355,9 @@ export function Sidebar({
                                                                         isLast={index === filteredFolders.length - 1}
                                                                         folderId={folder.id}
                                                                         collapsed={collapsed}
+                                                                        isAdopted={!!folder.is_adopted}
+                                                                        onUnadopt={onUnadopt ? () => onUnadopt(folder.id, folder.name) : undefined}
+                                                                        onDeleteChannelPermanently={onDeleteChannelPermanently ? () => onDeleteChannelPermanently(folder.id, 0, folder.name) : undefined}
                                                                     />
                                                                 ))}
                                                             </>
@@ -343,6 +375,7 @@ export function Sidebar({
                                 onRemoved={onPublicChannelsChanged}
                                 onRemove={onRemovePublicChannel}
                                 onHideInVault={(cid) => onHideInVault('public_channel', cid)}
+                                onAdoptChannel={onAdoptChannel}
                                 expanded={pubExpanded}
                                 onToggleExpand={() => setPubExpanded(e => !e)}
                             />
@@ -468,6 +501,15 @@ export function Sidebar({
                     {bandwidth && <BandwidthWidget bandwidth={bandwidth} />}
                 </div>
             </div>
+
+            {/* Add Channel modal — owned channels as folders + public by link */}
+            <AddChannelModal
+                open={showAddChannelModal}
+                onClose={() => setShowAddChannelModal(false)}
+                onAdded={onPublicChannelsChanged}
+                onAdoptChannel={onAdoptChannel}
+                mode="private"
+            />
 
         </aside>
     )
