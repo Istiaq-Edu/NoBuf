@@ -4,7 +4,7 @@ import { Store } from '@tauri-apps/plugin-store';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useConfirm } from '../context/ConfirmContext';
-import { TelegramFolder, ScanResult } from '../types';
+import { TelegramFolder, ScanResult, ChatInfo } from '../types';
 import { diffRemovedPublicIds } from '../context/VaultContext';
 import { useNetworkStatus } from './useNetworkStatus';
 
@@ -13,6 +13,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     const { confirm } = useConfirm();
 
     const [folders, setFolders] = useState<TelegramFolder[]>([]);
+    const [chats, setChats] = useState<ChatInfo[]>([]);
     const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
     const [store, setStore] = useState<Store | null>(null);
     const [isSyncing, setIsSyncing] = useState(false);
@@ -37,6 +38,16 @@ export function useTelegramConnection(onLogoutParent: () => void) {
 
                 const savedFolders = await _store.get<TelegramFolder[]>('folders');
                 if (savedFolders) setFolders(savedFolders);
+
+                // Chats: DB (cmd_list_chats) owns membership; the store array
+                // owns ORDER (D12/F25 order-merge rule — the folders pattern).
+                const storedChats = await _store.get<ChatInfo[]>('chats');
+                try {
+                    const dbChats = await invoke<ChatInfo[]>('cmd_list_chats');
+                    setChats(mergeChatOrder(dbChats, storedChats || []));
+                } catch {
+                    setChats(storedChats || []);
+                }
 
                 const savedActiveFolderId = await _store.get<number | null>('activeFolderId');
                 if (savedActiveFolderId !== undefined) setActiveFolderId(savedActiveFolderId);
@@ -224,6 +235,12 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 await store.delete('api_id');
                 await store.delete('api_hash');
                 await store.delete('folders');
+                // V2-06 logout hygiene: revived uploadQueue rows could deliver
+                // the previous account's chat uploads; the chats list and the
+                // persisted active view belong to the old account too.
+                await store.delete('uploadQueue');
+                await store.delete('chats');
+                await store.delete('activeFolderId');
                 await store.save();
             }
         } catch {
@@ -243,6 +260,12 @@ export function useTelegramConnection(onLogoutParent: () => void) {
                 await store.delete('api_id');
                 await store.delete('api_hash');
                 await store.delete('folders');
+                // V2-06 logout hygiene: revived uploadQueue rows could deliver
+                // the previous account's chat uploads; the chats list and the
+                // persisted active view belong to the old account too.
+                await store.delete('uploadQueue');
+                await store.delete('chats');
+                await store.delete('activeFolderId');
                 await store.save();
             }
             onLogoutParent();
@@ -364,6 +387,59 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     }, [store]);
 
+    // ─── Chats (normal_chats feature, plan F1) ─────────────────────
+
+    const persistChats = useCallback(async (next: ChatInfo[]) => {
+        setChats(next);
+        if (store) {
+            await store.set('chats', next);
+            await store.save();
+        }
+    }, [store]);
+
+    const handleAddChat = useCallback(async (chat: { chat_id: number; peer_kind: string; access_hash: number | null; title: string }): Promise<ChatInfo | null> => {
+        try {
+            const added = await invoke<ChatInfo>('cmd_add_chat', {
+                chatId: chat.chat_id,
+                peerKind: chat.peer_kind,
+                accessHash: chat.access_hash,
+                title: chat.title,
+            });
+            await persistChats(chats.some(c => c.chat_id === added.chat_id) ? chats : [...chats, added]);
+            toast.success(`"${added.title}" added to Chats.`);
+            return added;
+        } catch (e) {
+            toast.error(`Failed to add chat: ${e}`);
+            return null;
+        }
+    }, [chats, persistChats]);
+
+    const handleRemoveChat = useCallback(async (chatId: number, title: string) => {
+        try {
+            await invoke('cmd_remove_chat', { chatId });
+            await persistChats(chats.filter(c => c.chat_id !== chatId));
+            toast.success(`"${title}" removed from NoBuf.`);
+            return true;
+        } catch (e) {
+            toast.error(`Failed to remove chat: ${e}`);
+            return false;
+        }
+    }, [chats, persistChats]);
+
+    const handleChatReorder = useCallback(async (reordered: ChatInfo[]) => {
+        await persistChats(reordered);
+    }, [persistChats]);
+
+    // Dead-chat auto-remove (D13): the useChatFiles chatGone flag routes here
+    // via a Dashboard effect — the hook itself can't navigate.
+    const handleChatGone = useCallback(async (chatId: number, title: string) => {
+        try {
+            await invoke('cmd_remove_chat', { chatId });
+        } catch { /* row may already be gone */ }
+        await persistChats(chats.filter(c => c.chat_id !== chatId));
+        toast.info(`"${title || 'Chat'}" is no longer available and was removed.`);
+    }, [chats, persistChats]);
+
     // Adopt an owned/administered channel as a full folder. The backend returns
     // the FolderMetadata; we push it into folders state DIRECTLY (the
     // handleCreateFolder pattern) so the folder appears immediately — the
@@ -465,6 +541,7 @@ export function useTelegramConnection(onLogoutParent: () => void) {
     return {
         store,
         folders,
+        chats,
         activeFolderId,
         setActiveFolderId: handleSetActiveFolderId,
         isSyncing,
@@ -475,10 +552,39 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         handleFolderRename,
         handleFolderDelete,
         handleFolderReorder,
+        handleAddChat,
+        handleRemoveChat,
+        handleChatReorder,
+        handleChatGone,
         handleAdoptChannel,
         handleUnadoptChannel,
         handleDeleteChannelPermanently,
         isNetworkError,
         forceLogout
     };
+}
+
+/**
+ * D12/F25 order-merge rule: the store array owns ORDER, the DB owns
+ * MEMBERSHIP. Stored entries that still exist in the DB keep their position
+ * (with refreshed DB data); new DB rows append; DB-missing rows are pruned.
+ * Pure function — unit-testable.
+ */
+export function mergeChatOrder(dbChats: ChatInfo[], storedOrder: ChatInfo[]): ChatInfo[] {
+    const dbIds = new Set(dbChats.map(c => c.chat_id));
+    const ordered: ChatInfo[] = [];
+    const seen = new Set<number>();
+    for (const s of storedOrder) {
+        if (dbIds.has(s.chat_id) && !seen.has(s.chat_id)) {
+            const fresh = dbChats.find(c => c.chat_id === s.chat_id)!;
+            ordered.push(fresh);
+            seen.add(s.chat_id);
+        }
+    }
+    for (const c of dbChats) {
+        if (!seen.has(c.chat_id)) {
+            ordered.push(c);
+        }
+    }
+    return ordered;
 }
