@@ -287,21 +287,30 @@ export function Sidebar({
 
                             {/* Private Channels section header — collapsible */}
                             {!collapsed && (
-                                <button
-                                    onClick={() => setFoldersExpanded(e => !e)}
-                                    className="flex items-center gap-1.5 px-1 pt-3 pb-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors w-full text-left group"
-                                >
-                                    {foldersExpanded
-                                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0 transition-transform" />
-                                        : <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform" />
-                                    }
-                                    <span className="flex-1">Private Channels</span>
-                                    {filteredFolders.length > 0 && (
-                                        <span className="text-[10px] font-normal text-nobuf-subtext/60 bg-nobuf-hover px-1.5 py-0.5 rounded-full">
-                                            {filteredFolders.length}
-                                        </span>
-                                    )}
-                                </button>
+                                <div className="flex items-center gap-1 pt-3 pb-1 shrink-0">
+                                    <button
+                                        onClick={() => setFoldersExpanded(e => !e)}
+                                        className="flex items-center gap-1.5 px-1 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider hover:text-nobuf-text transition-colors flex-1 min-w-0 text-left"
+                                    >
+                                        {foldersExpanded
+                                            ? <ChevronDown className="w-3.5 h-3.5 shrink-0 transition-transform" />
+                                            : <ChevronRight className="w-3.5 h-3.5 shrink-0 transition-transform" />
+                                        }
+                                        <span className="flex-1 truncate">Private Channels</span>
+                                        {filteredFolders.length > 0 && (
+                                            <span className="text-[10px] font-normal text-nobuf-subtext/60 bg-nobuf-hover px-1.5 py-0.5 rounded-full">
+                                                {filteredFolders.length}
+                                            </span>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={() => setShowAddChannelModal(true)}
+                                        className="text-nobuf-subtext hover:text-nobuf-primary transition-colors shrink-0 ml-1"
+                                        title="Add your channel as a folder (or a public channel by link)"
+                                    >
+                                        <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
                             )}
 
                             {/* Folder list — conditional render (no max-h clipping) */}
@@ -464,14 +473,6 @@ export function Sidebar({
                             >
                                 <Plus className="w-3.5 h-3.5 shrink-0" />
                                 {!collapsed && <span>Folder</span>}
-                            </button>
-                            <button
-                                onClick={() => { if (collapsed) onToggleCollapse(); setShowAddChannelModal(true); }}
-                                className={`flex items-center justify-center rounded-lg text-xs font-medium text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text transition-all border border-dashed border-nobuf-border hover:border-nobuf-primary/40 active:scale-95 gap-1.5 ${collapsed ? 'w-8 h-8' : 'flex-1 px-3 py-2'}`}
-                                title="Add your channel as a folder (or a public channel by link)"
-                            >
-                                <Plus className="w-3.5 h-3.5 shrink-0" />
-                                {!collapsed && <span>Channel</span>}
                             </button>
                             <button
                                 onClick={() => { if (collapsed) onToggleCollapse(); setShowNewGroupInput(true); }}
