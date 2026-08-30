@@ -16,6 +16,12 @@ interface SidebarProps {
     onRename: (id: number, newName: string) => void;
     onReorder: (reordered: TelegramFolder[]) => void;
     onCreate: (name: string) => Promise<void>;
+    /** Unadopt an adopted folder (channel stays on Telegram). */
+    onUnadopt?: (id: number, name: string) => void;
+    /** Permanently delete the underlying channel of an adopted folder. */
+    onDeleteChannelPermanently?: (id: number, accessHash: number, name: string) => void;
+    /** Adopt an owned/administered channel as a folder (from AddChannelModal). */
+    onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
     isConnected: boolean;
     bandwidth: BandwidthStats | null;
     collapsed: boolean;
@@ -49,6 +55,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
+    onUnadopt, onDeleteChannelPermanently, onAdoptChannel,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
     activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel,
@@ -310,7 +317,15 @@ export function Sidebar({
                                                                             }
                                                                             onDrop(e, folder.id);
                                                                         }}
-                                                                        onDelete={() => onDelete(folder.id, folder.name)}
+                                                                        onDelete={() => {
+                                                                            // Adopted folders: hover-X routes to UNADOPT, never
+                                                                            // the channel-deleting cmd_delete_folder.
+                                                                            if (folder.is_adopted && onUnadopt) {
+                                                                                onUnadopt(folder.id, folder.name);
+                                                                            } else {
+                                                                                onDelete(folder.id, folder.name);
+                                                                            }
+                                                                        }}
                                                                         onRename={(newName: string) => onRename(folder.id, newName)}
                                                                         onHideInVault={() => onHideInVault('folder', folder.id)}
                                                                         onAssignGroup={(groupId) => handleAssignGroup(folder.id, groupId)}
@@ -326,6 +341,9 @@ export function Sidebar({
                                                                         isLast={index === filteredFolders.length - 1}
                                                                         folderId={folder.id}
                                                                         collapsed={collapsed}
+                                                                        isAdopted={!!folder.is_adopted}
+                                                                        onUnadopt={onUnadopt ? () => onUnadopt(folder.id, folder.name) : undefined}
+                                                                        onDeleteChannelPermanently={onDeleteChannelPermanently ? () => onDeleteChannelPermanently(folder.id, 0, folder.name) : undefined}
                                                                     />
                                                                 ))}
                                                             </>
@@ -343,6 +361,7 @@ export function Sidebar({
                                 onRemoved={onPublicChannelsChanged}
                                 onRemove={onRemovePublicChannel}
                                 onHideInVault={(cid) => onHideInVault('public_channel', cid)}
+                                onAdoptChannel={onAdoptChannel}
                                 expanded={pubExpanded}
                                 onToggleExpand={() => setPubExpanded(e => !e)}
                             />

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Plus, ChevronDown, ChevronRight } from 'lucide-react';
-import { PublicChannel, ActiveView } from '../../types';
+import { PublicChannel, ActiveView, TelegramFolder } from '../../types';
 import { PublicChannelItem } from './PublicChannelItem';
 import { AddChannelModal } from './AddChannelModal';
 
@@ -12,11 +12,13 @@ interface Props {
     onRemoved: () => void;
     onRemove?: (channelId: number) => void;
     onHideInVault?: (channelId: number) => void;
+    /** Adopt an owned/administered channel as a folder (pushes into folders state directly). */
+    onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
     expanded?: boolean;
     onToggleExpand?: () => void;
 }
 
-export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, onHideInVault, expanded = true, onToggleExpand }: Props) {
+export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, onHideInVault, onAdoptChannel, expanded = true, onToggleExpand }: Props) {
     const [showAddModal, setShowAddModal] = useState(false);
     const activeChannelId = activeView.type === 'public' ? activeView.channelId : null;
 
@@ -93,6 +95,7 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                 open={showAddModal}
                 onClose={() => setShowAddModal(false)}
                 onAdded={onRemoved}
+                onAdoptChannel={onAdoptChannel}
             />
         </>
     );

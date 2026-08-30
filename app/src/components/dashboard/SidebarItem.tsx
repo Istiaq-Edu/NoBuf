@@ -36,6 +36,12 @@ interface SidebarItemProps {
     collapsed?: boolean;
     /** Vault (D9/D10): show "Hide in Vault" in the context menu. */
     onHideInVault?: () => void;
+    /** Adopted-folder marker: gates Unadopt vs Delete menu items. */
+    isAdopted?: boolean;
+    /** Unadopt (remove from NoBuf; channel stays on Telegram). Adopted folders only. */
+    onUnadopt?: () => void;
+    /** Really delete the Telegram channel. Adopted folders only; UI gates behind a stronger danger dialog. */
+    onDeleteChannelPermanently?: () => void;
     /** Vault drop target: a folder-reorder drag dropped here HIDES that folder (D9/D10). */
     onVaultDropFolder?: (folderId: number) => void;
     /** Vault drop target: a public-channel drag dropped here HIDES that channel (D9/D10). */
@@ -49,7 +55,8 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function SidebarItem({
     icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename, onAssignGroup, currentGroupId, groupColor,
     onFolderDragStart, onFolderDragOver, onFolderDragLeave, onFolderDrop, onFolderDragEnd,
-    reorderIndicator, isFirst, isLast, folderId, collapsed, onHideInVault, onVaultDropFolder, onVaultDropPublicChannel, badgeCount
+    reorderIndicator, isFirst, isLast, folderId, collapsed, onHideInVault, onVaultDropFolder, onVaultDropPublicChannel, badgeCount,
+    isAdopted, onUnadopt, onDeleteChannelPermanently
 }: SidebarItemProps) {
     const [isOver, setIsOver] = useState(false);
     const [isRenaming, setIsRenaming] = useState(false);
@@ -380,7 +387,22 @@ export function SidebarItem({
                             <div className="h-px bg-nobuf-border mx-2 my-1" />
                         </>
                     )}
-                    {onDelete && (
+                    {onUnadopt && isAdopted && (
+                        <>
+                            <button
+                                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-nobuf-subtext hover:bg-nobuf-hover hover:text-nobuf-text rounded-lg mx-1 transition-all duration-150"
+                                onClick={() => { setShowContextMenu(false); onUnadopt(); }}
+                            >
+                                <X className="w-4 h-4" />
+                                Remove from NoBuf
+                            </button>
+                            <div className="h-px bg-nobuf-border mx-2 my-1" />
+                            <div className="px-3 py-1 text-[10px] text-nobuf-subtext/70">
+                                The channel and its subscribers stay on Telegram.
+                            </div>
+                        </>
+                    )}
+                    {onDelete && !isAdopted && (
                         <>
                             <div className="h-px bg-nobuf-border mx-2 my-1" />
                             <button
@@ -389,6 +411,18 @@ export function SidebarItem({
                             >
                                 <Trash2 className="w-4 h-4" />
                                 Delete
+                            </button>
+                        </>
+                    )}
+                    {onDeleteChannelPermanently && isAdopted && (
+                        <>
+                            <div className="h-px bg-nobuf-border mx-2 my-1" />
+                            <button
+                                className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-red-400/80 hover:bg-red-500/10 hover:text-red-400 rounded-lg mx-1 transition-all duration-150"
+                                onClick={() => { setShowContextMenu(false); onDeleteChannelPermanently(); }}
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                Delete channel permanently…
                             </button>
                         </>
                     )}

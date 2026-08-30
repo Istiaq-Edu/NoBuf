@@ -1,17 +1,19 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { Link as LinkIcon, Compass, Loader2, Search, X, Check, Radio } from 'lucide-react';
-import { ChannelPreview, JoinedChannel, PublicChannel } from '../../types';
+import { Link as LinkIcon, Compass, Loader2, Search, X, Check, Radio, Crown, Shield } from 'lucide-react';
+import { ChannelPreview, JoinedChannel, PublicChannel, TelegramFolder } from '../../types';
 import { ChannelPreviewCard } from './ChannelPreviewCard';
 
 interface Props {
     open: boolean;
     onClose: () => void;
     onAdded: () => void;
+    /** Adopt an owned/administered channel as a full folder (not read-only). */
+    onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
 }
 
-export function AddChannelModal({ open, onClose, onAdded }: Props) {
+export function AddChannelModal({ open, onClose, onAdded, onAdoptChannel }: Props) {
     const [tab, setTab] = useState<'link' | 'browse'>('link');
     const [linkInput, setLinkInput] = useState('');
     const [preview, setPreview] = useState<ChannelPreview | null>(null);
@@ -21,6 +23,9 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
     const [browseSearch, setBrowseSearch] = useState('');
     const [browseLoading, setBrowseLoading] = useState(false);
     const [browseFetched, setBrowseFetched] = useState(false);
+    const [ownedChannels, setOwnedChannels] = useState<JoinedChannel[]>([]);
+    const [ownedLoading, setOwnedLoading] = useState(false);
+    const [adoptingId, setAdoptingId] = useState<number | null>(null);
 
     // Push the local channel list to the [NB-PUB] sync channel after any add.
     // Fire-and-forget: the local SQLite row is already committed, so a failed
@@ -36,6 +41,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
     useEffect(() => {
         if (!open || browseFetched) return;
         loadJoinedChannels();
+        loadOwnedChannels();
     }, [open]);
 
     if (!open) return null;
@@ -109,6 +115,36 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         }
     };
 
+    const loadOwnedChannels = async () => {
+        setOwnedLoading(true);
+        try {
+            const channels = await invoke<JoinedChannel[]>('cmd_list_owned_channels');
+            setOwnedChannels(channels);
+        } catch (e: any) {
+            console.warn('[Adopt] owned-channel scan failed:', e);
+        } finally {
+            setOwnedLoading(false);
+        }
+    };
+
+    // Adopt: channel becomes a full read-write folder (original title kept,
+    // no [NB] tag). The handler in useTelegramConnection pushes the returned
+    // folder into folders state directly, so it appears immediately.
+    const handleAdopt = async (channel: JoinedChannel) => {
+        if (!onAdoptChannel) return;
+        setAdoptingId(channel.channel_id);
+        try {
+            const folder = await onAdoptChannel(channel.channel_id, channel.access_hash);
+            if (folder) {
+                uploadSync();
+                onAdded();
+                setOwnedChannels(prev => prev.filter(c => c.channel_id !== channel.channel_id));
+            }
+        } finally {
+            setAdoptingId(null);
+        }
+    };
+
     const handleAddFromBrowse = async (channel: JoinedChannel) => {
         try {
             await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: channel.channel_id, accessHash: channel.access_hash });
@@ -132,6 +168,9 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         setLinkInput('');
         setPreview(null);
         setBrowseSearch('');
+        // Reset the fetch latch so eligibility/already-added state is fresh on
+        // the next open (pre-existing staleness: the latch never cleared).
+        setBrowseFetched(false);
         onClose();
     };
 
@@ -306,6 +345,63 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
                                             </div>
                                         );
                                     })}
+                                </div>
+                            )}
+
+                            {/* ─── Your channels (adopt as folders) ─────────── */}
+                            {onAdoptChannel && (ownedLoading || ownedChannels.length > 0) && (
+                                <div className="pt-3">
+                                    <div className="flex items-center gap-1.5 text-xs font-semibold text-nobuf-subtext uppercase tracking-wider pb-2">
+                                        <Crown className="w-3.5 h-3.5" />
+                                        Your Channels — add as folders
+                                    </div>
+                                    {ownedLoading && (
+                                        <div className="flex items-center justify-center py-6 gap-2">
+                                            <Loader2 className="w-5 h-5 animate-spin text-nobuf-primary" />
+                                            <span className="text-sm text-nobuf-subtext">Scanning your channels…</span>
+                                        </div>
+                                    )}
+                                    {!ownedLoading && ownedChannels.length > 0 && (
+                                        <div className="space-y-1">
+                                            {ownedChannels
+                                                .filter(c => !browseSearch || c.name.toLowerCase().includes(browseSearch.toLowerCase()))
+                                                .map(channel => (
+                                                    <div
+                                                        key={channel.channel_id}
+                                                        className="flex items-center gap-3 p-2.5 rounded-lg border border-nobuf-border hover:bg-nobuf-hover hover:border-nobuf-primary/30 cursor-pointer transition-all"
+                                                        onClick={() => { if (adoptingId === null) handleAdopt(channel); }}
+                                                    >
+                                                        {/* Avatar */}
+                                                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-amber-500 to-orange-500 flex items-center justify-center shrink-0">
+                                                            <span className="text-white font-bold text-xs">
+                                                                {channel.name.charAt(0).toUpperCase()}
+                                                            </span>
+                                                        </div>
+                                                        {/* Name + ownership badge */}
+                                                        <div className="flex-1 min-w-0">
+                                                            <span className="text-sm font-medium text-nobuf-text block truncate">{channel.name}</span>
+                                                            <span className="flex items-center gap-1 text-xs text-nobuf-subtext">
+                                                                {channel.is_creator
+                                                                    ? <><Crown className="w-3 h-3 text-amber-400" /> Owner</>
+                                                                    : <><Shield className="w-3 h-3 text-blue-400" /> Admin</>
+                                                                }
+                                                            </span>
+                                                        </div>
+                                                        {/* Action */}
+                                                        {adoptingId === channel.channel_id ? (
+                                                            <Loader2 className="w-4 h-4 animate-spin text-nobuf-primary shrink-0" />
+                                                        ) : (
+                                                            <span className="text-xs text-amber-400 font-medium px-2 py-1 rounded bg-amber-400/10 shrink-0">
+                                                                + Folder
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                        </div>
+                                    )}
+                                    <p className="text-[11px] text-nobuf-subtext/70 px-1 pt-2">
+                                        Channels you own or administer become full NoBuf folders — upload, download, move — keeping their original name (no [NB] tag).
+                                    </p>
                                 </div>
                             )}
                         </div>

@@ -54,7 +54,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
     const {
         store, folders, activeFolderId, setActiveFolderId, isConnected,
-        handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder
+        handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder,
+        handleAdoptChannel, handleUnadoptChannel, handleDeleteChannelPermanently
     } = useTelegramConnection(onLogout);
 
     const [activeView, setActiveView] = useState<ActiveView>({ type: 'saved' });
@@ -1063,6 +1064,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onRename={handleFolderRename}
                 onReorder={handleFolderReorder}
                 onCreate={handleCreateFolder}
+                onUnadopt={handleUnadoptChannel}
+                onDeleteChannelPermanently={handleDeleteChannelPermanently}
+                onAdoptChannel={handleAdoptChannel}
                 isConnected={isConnected}
                 bandwidth={bandwidth || null}
                 collapsed={sidebarCollapsed}

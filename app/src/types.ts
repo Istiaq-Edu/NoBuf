@@ -12,6 +12,8 @@ export interface TelegramFolder {
     id: number;
     name: string;
     parent_id?: number;
+    /** True when this folder is an adopted owned/administered channel (not a [NB]-tagged channel). Drives sidebar menu gating (Unadopt vs Delete). */
+    is_adopted?: boolean;
 }
 
 export interface ScanResult {
@@ -86,6 +88,15 @@ export interface JoinedChannel {
     access_hash: number;
     already_added: boolean;
     is_nb_folder: boolean;
+    is_creator?: boolean;
+    is_admin_post?: boolean;
+}
+
+export interface AdoptedFolder {
+    channel_id: number;
+    access_hash: number;
+    title: string;
+    adopted_at: number;
 }
 
 export interface ForwardResult {
