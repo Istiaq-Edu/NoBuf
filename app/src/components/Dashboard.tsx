@@ -112,7 +112,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 const concealed =
                     (candidate.type === 'folder' && vaultRef.current.hiddenFolderIds.has(candidate.folderId)) ||
                     (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId)) ||
-                    (candidate.type === 'chat' && (vaultRef.current as any).hiddenChatIds?.has(candidate.chatId));
+                    (candidate.type === 'chat' && vaultRef.current.hiddenChatIds.has(candidate.chatId));
                 past = past.slice(0, -1);
                 if (!concealed) {
                     pastViewsRef.current = past;
@@ -149,7 +149,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             ? filterHidden(publicChannels, c => c.channel_id, vault.hiddenPublicIds)
             : publicChannels;
         const visibleChats = vault.ready
-            ? filterHidden(chats, c => c.chat_id, (vault as any).hiddenChatIds ?? new Set<number>())
+            ? filterHidden(chats, c => c.chat_id, vault.hiddenChatIds)
             : chats;
 
         // Hide helper for Phase 3 entry points (context menu / drop).
@@ -238,7 +238,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             const restored = restoredIdRef.current;
             restoredIdRef.current = null;
             if (restored === null) return;
-            if (vault.hiddenFolderIds.has(restored) || vault.hiddenPublicIds.has(restored) || (vault as any).hiddenChatIds?.has(restored)) {
+            if (vault.hiddenFolderIds.has(restored) || vault.hiddenPublicIds.has(restored) || vault.hiddenChatIds.has(restored)) {
                 setActiveView({ type: 'saved' });
                 store?.delete('activeFolderId').then(() => store?.save()).catch(() => {});
             }
@@ -1244,8 +1244,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <VaultView
                         onOpenFolder={(id) => navigateTo({ type: 'folder', folderId: id })}
                         onOpenPublicChannel={(id) => navigateTo({ type: 'public', channelId: id })}
+                        onOpenChat={(id) => navigateTo({ type: 'chat', chatId: id })}
                         getFolderName={(id) => folders.find(f => f.id === id)?.name || `Unknown folder (${id})`}
                         getChannelName={(id) => publicChannels.find(c => c.channel_id === id)?.name || `Unknown channel (${id})`}
+                        getChatName={(id) => chats.find(c => c.chat_id === id)?.title || `Unknown chat (${id})`}
                     />
                 ) : (
                 <FileExplorer

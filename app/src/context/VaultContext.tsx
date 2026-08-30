@@ -2,15 +2,18 @@ import { createContext, useContext, useState, useEffect, useCallback, useMemo, R
 import { invoke } from '@tauri-apps/api/core';
 import { useQueryClient } from '@tanstack/react-query';
 
-/** Shape returned by cmd_vault_get_state. IDs present ONLY when unlocked. */
+/** Shape returned by cmd_vault_get_state. IDs are ALWAYS included (the
+ *  backend's concealment gate lives in the search filter, not the response). */
 export interface VaultState {
     has_passcode: boolean;
     is_unlocked: boolean;
     entry_visible: boolean;
     folder_count: number;
     public_count: number;
+    chat_count: number;
     folder_ids: number[] | null;
     public_ids: number[] | null;
+    chat_ids: number[] | null;
 }
 
 export type VaultKind = 'folder' | 'public_channel' | 'chat';
@@ -23,10 +26,12 @@ interface VaultContextValue {
     entryVisible: boolean;
     folderCount: number;
     publicCount: number;
+    chatCount: number;
     totalCount: number;
     /** Hidden IDs — empty while locked (backend withholds them). */
     hiddenFolderIds: Set<number>;
     hiddenPublicIds: Set<number>;
+    hiddenChatIds: Set<number>;
     refresh: () => Promise<VaultState>;
     hide: (kind: VaultKind, id: number) => Promise<void>;
     unhide: (kind: VaultKind, id: number) => Promise<void>;
@@ -86,6 +91,7 @@ function applyState(
     if (!state.is_unlocked) {
         queryClient.removeQueries({ queryKey: ['files'] });
         queryClient.removeQueries({ queryKey: ['publicChannelFiles'] });
+        queryClient.removeQueries({ queryKey: ['chatFiles'] });
     }
 }
 
@@ -143,6 +149,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         // Fresh data on next visit; nothing sensitive remains cached anyway.
         if (kind === 'folder') {
             queryClient.removeQueries({ queryKey: ['files', id] });
+        } else if (kind === 'chat') {
+            queryClient.removeQueries({ queryKey: ['chatFiles', id] });
         } else {
             queryClient.removeQueries({ queryKey: ['publicChannelFiles', id] });
         }
@@ -207,6 +215,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     // underlying state actually changes.
     const hiddenFolderIds = useMemo(() => new Set(state?.folder_ids ?? []), [state?.folder_ids]);
     const hiddenPublicIds = useMemo(() => new Set(state?.public_ids ?? []), [state?.public_ids]);
+    const hiddenChatIds = useMemo(() => new Set(state?.chat_ids ?? []), [state?.chat_ids]);
 
     const value: VaultContextValue = useMemo(() => ({
         ready: ready && state !== null,
@@ -215,9 +224,11 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         entryVisible: state?.entry_visible ?? true,
         folderCount: state?.folder_count ?? 0,
         publicCount: state?.public_count ?? 0,
-        totalCount: (state?.folder_count ?? 0) + (state?.public_count ?? 0),
+        chatCount: state?.chat_count ?? 0,
+        totalCount: (state?.folder_count ?? 0) + (state?.public_count ?? 0) + (state?.chat_count ?? 0),
         hiddenFolderIds,
         hiddenPublicIds,
+        hiddenChatIds,
         refresh,
         hide,
         unhide,
@@ -227,7 +238,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         lock,
         reset,
         setEntryVisible,
-    }), [ready, state, hiddenFolderIds, hiddenPublicIds, refresh, hide, unhide, verify, setPasscode, changePasscode, lock, reset, setEntryVisible]);
+    }), [ready, state, hiddenFolderIds, hiddenPublicIds, hiddenChatIds, refresh, hide, unhide, verify, setPasscode, changePasscode, lock, reset, setEntryVisible]);
 
     return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
 }

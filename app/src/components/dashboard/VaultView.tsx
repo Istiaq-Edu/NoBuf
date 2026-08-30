@@ -1,16 +1,18 @@
 import { useState } from 'react';
-import { Lock, Unlock, Folder, Radio, RotateCcw, KeyRound, LogOut, ChevronRight } from 'lucide-react';
+import { Lock, Unlock, Folder, Radio, RotateCcw, KeyRound, LogOut, ChevronRight, MessageCircle } from 'lucide-react';
 import { useVault, type VaultKind } from '../../context/VaultContext';
 import { useConfirm } from '../../context/ConfirmContext';
 
 interface VaultViewProps {
-    /** Navigate into a hidden folder/channel (only offered when unlocked). */
+    /** Navigate into a hidden folder/channel/chat (only offered when unlocked). */
     onOpenFolder: (id: number) => void;
     onOpenPublicChannel: (id: number) => void;
+    onOpenChat: (id: number) => void;
     /** Resolve display names from the RAW (unfiltered) lists — hidden items
      *  never appear in visibleFolders/visiblePublicChannels. */
     getFolderName: (id: number) => string;
     getChannelName: (id: number) => string;
+    getChatName: (id: number) => string;
 }
 
 /**
@@ -18,7 +20,7 @@ interface VaultViewProps {
  * link with confirm, D8). Unlocked → list of hidden items with unhide /
  * open actions, change-passcode, Lock-now (D12).
  */
-export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, getChannelName }: VaultViewProps) {
+export function VaultView({ onOpenFolder, onOpenPublicChannel, onOpenChat, getFolderName, getChannelName, getChatName }: VaultViewProps) {
     const vault = useVault();
     const { confirm } = useConfirm();
     const [passcode, setPasscode] = useState('');
@@ -102,6 +104,7 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, ge
     // ---- Unlocked: hidden items + actions (D12) -------------------------
     const folderItems: number[] = Array.from(vault.hiddenFolderIds);
     const publicItems: number[] = Array.from(vault.hiddenPublicIds);
+    const chatItems: number[] = Array.from(vault.hiddenChatIds);
     const empty = vault.totalCount === 0;
 
     return (
@@ -160,6 +163,24 @@ export function VaultView({ onOpenFolder, onOpenPublicChannel, getFolderName, ge
                                 kindLabel="public channel"
                                 onOpen={() => onOpenPublicChannel(id)}
                                 onUnhide={() => vault.unhide('public_channel' as VaultKind, id)}
+                            />
+                        ))}
+                    </div>
+                </section>
+            )}
+
+            {chatItems.length > 0 && (
+                <section>
+                    <h3 className="text-xs font-semibold text-nobuf-subtext uppercase tracking-wider px-1 pb-2">Chats</h3>
+                    <div className="space-y-1">
+                        {chatItems.map(id => (
+                            <HiddenRow
+                                key={`c-${id}`}
+                                icon={MessageCircle}
+                                label={getChatName(id)}
+                                kindLabel="chat"
+                                onOpen={() => onOpenChat(id)}
+                                onUnhide={() => vault.unhide('chat' as VaultKind, id)}
                             />
                         ))}
                     </div>
