@@ -37,6 +37,8 @@ pub struct VaultStore {
     pub vaulted_folder_ids: Vec<i64>,
     #[serde(default)]
     pub vaulted_public_channel_ids: Vec<i64>,
+    #[serde(default)]
+    pub vaulted_chat_ids: Vec<i64>,
     #[serde(default = "default_true")]
     pub entry_visible: bool,
     /// Saved Messages message id carrying the sync blob (edit-in-place).
@@ -58,6 +60,7 @@ impl Default for VaultStore {
             iterations: PBKDF2_ITERATIONS,
             vaulted_folder_ids: Vec::new(),
             vaulted_public_channel_ids: Vec::new(),
+            vaulted_chat_ids: Vec::new(),
             entry_visible: true,
             sync_message_id: None,
             rev: 0,
@@ -74,10 +77,13 @@ pub struct VaultStateResponse {
     pub entry_visible: bool,
     pub folder_count: usize,
     pub public_count: usize,
+    pub chat_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_ids: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_ids: Option<Vec<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_ids: Option<Vec<i64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,11 +214,17 @@ pub fn prune_public_ids(mut store: VaultStore, ids: &[i64]) -> VaultStore {
     store
 }
 
+/// Remove every occurrence of `ids` from the chat list. Idempotent.
+pub fn prune_chat_ids(mut store: VaultStore, ids: &[i64]) -> VaultStore {
+    store.vaulted_chat_ids.retain(|id| !ids.contains(id));
+    store
+}
+
 /// Hidden-ID sets when the vault is locked, None when unlocked. Used by
 /// cmd_search_global (fs.rs): global Telegram search results carry their source
-/// peer id, which would otherwise leak vaulted folders'/channels' filenames past
-/// the lock. Load once per search call, not per result.
-pub fn hidden_ids_if_locked(app: &AppHandle, unlocked: bool) -> Option<(Vec<i64>, Vec<i64>)> {
+/// peer id, which would otherwise leak vaulted folders'/channels'/chats'
+/// filenames past the lock. Load once per search call, not per result.
+pub fn hidden_ids_if_locked(app: &AppHandle, unlocked: bool) -> Option<(Vec<i64>, Vec<i64>, Vec<i64>)> {
     if unlocked {
         return None;
     }
@@ -220,20 +232,21 @@ pub fn hidden_ids_if_locked(app: &AppHandle, unlocked: bool) -> Option<(Vec<i64>
     Some((
         store.vaulted_folder_ids.clone(),
         store.vaulted_public_channel_ids.clone(),
+        store.vaulted_chat_ids.clone(),
     ))
 }
 
 /// Pure predicate for the search filter: keep a result unless its source peer
-/// id is hidden in EITHER scope while locked. Headless-testable.
+/// id is hidden in ANY scope while locked. Headless-testable.
 pub fn search_result_keeps(
-    hidden: &Option<(Vec<i64>, Vec<i64>)>,
+    hidden: &Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     folder_id: Option<i64>,
 ) -> bool {
-    let Some((folders, publics)) = hidden else {
+    let Some((folders, publics, chats)) = hidden else {
         return true;
     };
     match folder_id {
-        Some(id) => !folders.contains(&id) && !publics.contains(&id),
+        Some(id) => !folders.contains(&id) && !publics.contains(&id) && !chats.contains(&id),
         // Results with no resolvable peer (shouldn't happen for channel docs)
         // cannot point into a vaulted scope — keep them.
         None => true,
@@ -244,13 +257,15 @@ pub fn search_result_keeps(
 pub enum VaultKind {
     Folder,
     PublicChannel,
+    Chat,
 }
 
 pub fn parse_kind(kind: &str) -> Result<VaultKind, String> {
     match kind {
         "folder" => Ok(VaultKind::Folder),
         "public_channel" => Ok(VaultKind::PublicChannel),
-        _ => Err("kind must be 'folder' or 'public_channel'".to_string()),
+        "chat" => Ok(VaultKind::Chat),
+        _ => Err("kind must be 'folder', 'public_channel' or 'chat'".to_string()),
     }
 }
 
@@ -275,8 +290,10 @@ fn state_response(store: &VaultStore, unlocked: bool) -> VaultStateResponse {
         entry_visible: store.entry_visible,
         folder_count: store.vaulted_folder_ids.len(),
         public_count: store.vaulted_public_channel_ids.len(),
+        chat_count: store.vaulted_chat_ids.len(),
         folder_ids: Some(store.vaulted_folder_ids.clone()),
         public_ids: Some(store.vaulted_public_channel_ids.clone()),
+        chat_ids: Some(store.vaulted_chat_ids.clone()),
     }
 }
 
@@ -354,6 +371,12 @@ pub async fn cmd_vault_hide(
                 save_store(&app, &mut store)?;
             }
         }
+        VaultKind::Chat => {
+            if !store.vaulted_chat_ids.contains(&id) {
+                store.vaulted_chat_ids.push(id);
+                save_store(&app, &mut store)?;
+            }
+        }
     }
     Ok(state_response(&store, is_unlocked(&app)))
 }
@@ -371,6 +394,7 @@ pub async fn cmd_vault_unhide(
     let mut store = match parsed_kind {
         VaultKind::Folder => prune_folder_ids(load_store(&app), &[id]),
         VaultKind::PublicChannel => prune_public_ids(load_store(&app), &[id]),
+        VaultKind::Chat => prune_chat_ids(load_store(&app), &[id]),
     };
     save_store(&app, &mut store)?;
     Ok(state_response(&store, true))
@@ -444,6 +468,7 @@ pub async fn cmd_vault_reset(app: AppHandle) -> Result<VaultStateResponse, Strin
     store.iterations = PBKDF2_ITERATIONS;
     store.vaulted_folder_ids.clear();
     store.vaulted_public_channel_ids.clear();
+    store.vaulted_chat_ids.clear();
     save_store(&app, &mut store)?;
     set_unlocked(&app, false);
     Ok(state_response(&store, false))
@@ -461,6 +486,7 @@ pub async fn cmd_vault_wipe_ids(app: AppHandle) -> Result<VaultStateResponse, St
     let mut store = load_store(&app);
     store.vaulted_folder_ids.clear();
     store.vaulted_public_channel_ids.clear();
+    store.vaulted_chat_ids.clear();
     save_store(&app, &mut store)?;
     set_unlocked(&app, false);
     Ok(state_response(&store, false))
@@ -478,6 +504,7 @@ pub async fn cmd_vault_prune(
     let mut store = match parsed_kind {
         VaultKind::Folder => prune_folder_ids(load_store(&app), &ids),
         VaultKind::PublicChannel => prune_public_ids(load_store(&app), &ids),
+        VaultKind::Chat => prune_chat_ids(load_store(&app), &ids),
     };
     save_store(&app, &mut store)?;
     Ok(state_response(&store, is_unlocked(&app)))
@@ -503,6 +530,7 @@ pub async fn cmd_vault_set_entry_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::vault_sync::VaultSyncBlob;
 
     const TEST_PASSCODE: &str = "4321";
 
@@ -645,19 +673,80 @@ mod tests {
 
     #[test]
     fn search_filter_drops_vaulted_peers_only_while_locked() {
-        let hidden_locked = Some((vec![100], vec![200]));
-        let unlocked: Option<(Vec<i64>, Vec<i64>)> = None;
+        let hidden_locked = Some((vec![100], vec![200], vec![400]));
+        let unlocked: Option<(Vec<i64>, Vec<i64>, Vec<i64>)> = None;
 
-        // Locked: vaulted folder peer and vaulted public peer are dropped.
+        // Locked: vaulted folder peer, public peer, and chat peer are dropped.
         assert!(!search_result_keeps(&hidden_locked, Some(100)));
         assert!(!search_result_keeps(&hidden_locked, Some(200)));
+        assert!(!search_result_keeps(&hidden_locked, Some(400)));
         // Locked: non-vaulted peers survive.
         assert!(search_result_keeps(&hidden_locked, Some(300)));
         assert!(search_result_keeps(&hidden_locked, None));
         // Unlocked (None): everything flows, including formerly hidden ids.
         assert!(search_result_keeps(&unlocked, Some(100)));
         assert!(search_result_keeps(&unlocked, Some(200)));
+        assert!(search_result_keeps(&unlocked, Some(400)));
         assert!(search_result_keeps(&unlocked, None));
+    }
+
+    #[test]
+    fn chat_kind_end_to_end() {
+        // parse_kind accepts 'chat'; hide/unhide via prune_chat_ids isolates
+        // the chat list from folder/public lists.
+        assert!(parse_kind("chat").is_ok());
+        let mut store = with_passcode();
+        store.vaulted_folder_ids.push(1);
+        store.vaulted_public_channel_ids.push(2);
+        store.vaulted_chat_ids.push(3);
+        let store = prune_chat_ids(store, &[3, 99]);
+        assert_eq!(store.vaulted_folder_ids, vec![1]);
+        assert_eq!(store.vaulted_public_channel_ids, vec![2]);
+        assert!(store.vaulted_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn chat_ids_sync_blob_roundtrip_old_and_new() {
+        // New blob carries chat_ids; an old-build blob (no chat_ids field)
+        // parses to empty — mixed-fleet compatibility.
+        let new_blob = serde_json::json!({
+            "v": 1, "owner_id": 7, "rev": 2,
+            "folder_ids": [1], "public_ids": [2], "chat_ids": [3],
+            "salt_hex": "", "hash_hex": "", "iterations": 600000, "entry_visible": true
+        });
+        let parsed: VaultSyncBlob = serde_json::from_value(new_blob).unwrap();
+        assert_eq!(parsed.chat_ids, vec![3]);
+        // F19: old-build blob without the field
+        let old_blob = serde_json::json!({
+            "v": 1, "owner_id": 7, "rev": 1,
+            "folder_ids": [1], "public_ids": [2],
+            "salt_hex": "", "hash_hex": "", "iterations": 600000, "entry_visible": true
+        });
+        let parsed_old: VaultSyncBlob = serde_json::from_value(old_blob).unwrap();
+        assert!(parsed_old.chat_ids.is_empty());
+        // And the merge arm unions chat ids into the local list
+        let mut local_folder_ids = vec![1i64];
+        let mut local_public_ids = vec![2i64];
+        let mut local_chat_ids = vec![9i64];
+        let mut salt = String::new();
+        let mut hash = String::new();
+        let mut iterations = 600_000u32;
+        let mut entry_visible = true;
+        crate::commands::vault_sync::merge_remote_into_local(
+            crate::commands::vault_sync::LocalVaultFields {
+                folder_ids: &mut local_folder_ids,
+                public_ids: &mut local_public_ids,
+                chat_ids: &mut local_chat_ids,
+                salt_hex: &mut salt,
+                hash_hex: &mut hash,
+                iterations: &mut iterations,
+                entry_visible: &mut entry_visible,
+            },
+            &parsed,
+            false,
+        );
+        assert!(local_chat_ids.contains(&9)); // pre-existing
+        assert!(local_chat_ids.contains(&3)); // merged from remote
     }
 
     #[test]

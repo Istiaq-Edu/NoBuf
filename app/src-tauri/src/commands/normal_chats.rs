@@ -3,7 +3,7 @@ use tauri::{State, AppHandle, Manager};
 use sqlite::{Connection, Value};
 use crate::commands::TelegramState;
 use crate::commands::utils::map_error;
-use crate::models::{ChatInfo, PickableChat};
+use crate::models::{ChatInfo, PickableChat, EnrichedChat};
 
 // ─── SQLite helpers ──────────────────────────────────────────────
 // Same DB file as groups/public_channels/adopted (house pattern: one
@@ -624,6 +624,49 @@ pub async fn cmd_get_chat_files(
     );
 
     Ok((files, has_more))
+}
+
+// ─── Chat group assignment (D9) ──────────────────────────────────
+
+/// Assign a chat to a colored group (null = unassign). Mirrors
+/// cmd_assign_folder_to_group (folder_groups.rs) against the
+/// normal_chats.group_id column.
+#[tauri::command]
+pub fn cmd_assign_chat_to_group(
+    chat_id: i64,
+    group_id: Option<i64>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    let conn = get_connection(&app)?;
+    let mut stmt = conn.prepare("UPDATE normal_chats SET group_id = ? WHERE chat_id = ?")
+        .map_err(|e| e.to_string())?;
+    match group_id {
+        Some(g) => stmt.bind((1, g)).map_err(|e| e.to_string())?,
+        None => stmt.bind((1, Value::Null)).map_err(|e| e.to_string())?,
+    }
+    stmt.bind((2, chat_id)).map_err(|e| e.to_string())?;
+    stmt.next().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Chat id → group (id, color) map for the sidebar's group-chip filtering.
+/// Mirrors cmd_get_enriched_folders (folder_groups.rs:141-154 pattern).
+#[tauri::command]
+pub fn cmd_get_enriched_chats(app: AppHandle) -> Result<Vec<EnrichedChat>, String> {
+    let conn = get_connection(&app)?;
+    let mut stmt = conn.prepare(
+        "SELECT n.chat_id, n.group_id, g.color_hex FROM normal_chats n LEFT JOIN groups g ON n.group_id = g.id",
+    ).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let row: Vec<Value> = (0..3).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        out.push(EnrichedChat {
+            chat_id: vi(&row[0]),
+            group_id: voi(&row[1]),
+            group_color: match &row[2] { Value::String(s) => Some(s.clone()), _ => None },
+        });
+    }
+    Ok(out)
 }
 
 // ─── Peer cache seeding (R2 will call this at startup too) ───────

@@ -130,6 +130,14 @@ pub struct ChatInfo {
     pub group_id: Option<i64>,
 }
 
+/// Chat id → group assignment (sidebar group-chip filtering).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EnrichedChat {
+    pub chat_id: i64,
+    pub group_id: Option<i64>,
+    pub group_color: Option<String>,
+}
+
 /// A dialog eligible for the chat picker (already-added rows included,
 /// flagged, so the modal can render them disabled).
 #[derive(Debug, Serialize, Deserialize, Clone)]
