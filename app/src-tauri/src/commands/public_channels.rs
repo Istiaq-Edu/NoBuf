@@ -881,6 +881,13 @@ async fn find_or_create_nb_pub_channel(
         grammers_tl_types::enums::Updates::Updates(u) => {
             let chat = u.chats.first().ok_or("No chat in CreateChannel response")?;
             if let grammers_tl_types::enums::Chat::Channel(c) = chat {
+                // Persist the fresh hash at creation so later lookups skip the
+                // dialog scan (which cannot see archived channels).
+                if let Some(ah) = c.access_hash {
+                    if ah != 0 {
+                        set_setting(app, "nb_pub_access_hash", &ah.to_string());
+                    }
+                }
                 c.id
             } else {
                 return Err("Created chat is not a channel".to_string());
@@ -896,20 +903,40 @@ async fn find_or_create_nb_pub_channel(
 async fn get_nb_pub_access_hash(
     client: &Client,
     channel_id: i64,
+    app: &AppHandle,
     state: &TelegramState,
 ) -> Result<i64, String> {
+    // 1. Peer cache (in-memory, fastest)
     {
         let cache = state.peer_cache.read().await;
         if let Some(Peer::Channel(c)) = cache.get(&channel_id) {
-            return Ok(c.raw.access_hash.unwrap_or(0));
+            let ah = c.raw.access_hash.unwrap_or(0);
+            if ah != 0 {
+                set_setting(app, "nb_pub_access_hash", &ah.to_string());
+                return Ok(ah);
+            }
         }
     }
 
+    // 2. Persisted settings — survives restarts AND manual archiving (the
+    //    dialog scan only walks the main list, folder_id: None).
+    if let Some(ah_str) = get_setting(app, "nb_pub_access_hash") {
+        if let Ok(ah) = ah_str.parse::<i64>() {
+            if ah != 0 {
+                return Ok(ah);
+            }
+        }
+    }
+
+    // 3. Dialog scan (only path that verifies the hash is still current)
     let mut dialogs = client.iter_dialogs();
     while let Some(dialog) = dialogs.next().await.map_err(map_error)? {
         if let Peer::Channel(c) = &dialog.peer {
             if c.raw.id == channel_id {
                 let ah = c.raw.access_hash.unwrap_or(0);
+                if ah != 0 {
+                    set_setting(app, "nb_pub_access_hash", &ah.to_string());
+                }
                 state.peer_cache.write().await.insert(channel_id, dialog.peer.clone());
                 return Ok(ah);
             }
@@ -946,21 +973,17 @@ pub async fn cmd_update_nb_pub_sync(
     let json_bytes = json_data.as_bytes().to_vec();
 
     let nb_pub_id = find_or_create_nb_pub_channel(&client, &app, &state).await?;
-    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &state).await?;
+    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &app, &state).await?;
 
-    // Delete old sync message if exists
-    if let Some(old_msg_id_str) = get_setting(&app, "nb_pub_message_id") {
-        if let Ok(old_id) = old_msg_id_str.parse::<i32>() {
-            if old_id > 0 {
-                let _ = client.invoke(&grammers_tl_types::functions::channels::DeleteMessages {
-                    channel: build_input_channel(nb_pub_id, ah),
-                    id: vec![old_id],
-                }).await;
-            }
-        }
-    }
+    // Capture the old message id BEFORE the new upload overwrites the setting.
+    let old_msg_id: Option<i32> = get_setting(&app, "nb_pub_message_id")
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|id| *id > 0);
 
-    // Upload new JSON file
+    // Upload new JSON file FIRST, then delete the old message. If we crash
+    // between the two, the failure mode is a leftover duplicate (self-healing:
+    // sync reads the newest message, limit=1) instead of losing the only copy
+    // of the sync data remotely.
     let temp_path = std::env::temp_dir().join("nb_pub_sync.json");
     std::fs::write(&temp_path, &json_bytes).map_err(|e| e.to_string())?;
 
@@ -969,9 +992,30 @@ pub async fn cmd_update_nb_pub_sync(
     use grammers_client::InputMessage;
     let input_peer = build_input_peer(nb_pub_id, ah);
     let message = InputMessage::new().text("").document(uploaded);
-    let sent = client.send_message(&input_peer, message).await.map_err(map_error)?;
+    let sent = client.send_message(&input_peer, message).await.map_err(|e| {
+        // Stale [NB-PUB] (deleted/recreated elsewhere): clear the settings so the
+        // next upload recreates the channel instead of failing forever.
+        let msg = e.to_string();
+        if msg.contains("CHANNEL_PRIVATE") || msg.contains("CHANNEL_INVALID") {
+            set_setting(&app, "nb_pub_channel_id", "");
+            set_setting(&app, "nb_pub_message_id", "");
+            set_setting(&app, "nb_pub_access_hash", "");
+            log::warn!("[NB-PUB] upload failed with stale channel ({}); cleared settings", msg);
+        }
+        map_error(e)
+    })?;
 
     set_setting(&app, "nb_pub_message_id", &sent.id().to_string());
+
+    // Delete old sync message only after the new one is up.
+    if let Some(old_id) = old_msg_id {
+        if let Err(e) = client.invoke(&grammers_tl_types::functions::channels::DeleteMessages {
+            channel: build_input_channel(nb_pub_id, ah),
+            id: vec![old_id],
+        }).await {
+            log::warn!("[NB-PUB] deleting old sync message {} failed: {}", old_id, e);
+        }
+    }
 
     Ok(true)
 }
@@ -1020,7 +1064,7 @@ pub async fn cmd_sync_public_channels(
         }
     };
 
-    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &state).await?;
+    let ah = get_nb_pub_access_hash(&client, nb_pub_id, &app, &state).await?;
     let input_peer = build_input_peer(nb_pub_id, ah);
 
     let result = client.invoke(&grammers_tl_types::functions::messages::GetHistory {
@@ -1032,13 +1076,21 @@ pub async fn cmd_sync_public_channels(
         max_id: 0,
         min_id: 0,
         hash: 0,
-    }).await.map_err(map_error)?;
+    }).await.map_err(|e| {
+        // The stored [NB-PUB] id/hash went stale (channel deleted and recreated,
+        // or the account left it). Clear the settings so the next upload lazily
+        // recreates the channel instead of failing forever.
+        let msg = e.to_string();
+        if msg.contains("CHANNEL_PRIVATE") || msg.contains("CHANNEL_INVALID") {
+            set_setting(&app, "nb_pub_channel_id", "");
+            set_setting(&app, "nb_pub_message_id", "");
+            set_setting(&app, "nb_pub_access_hash", "");
+            log::warn!("[NB-PUB] channel gone ({}); cleared settings, will recreate on next upload", msg);
+        }
+        map_error(e)
+    })?;
 
-    let messages = match result {
-        grammers_tl_types::enums::messages::Messages::Messages(m) => m.messages,
-        grammers_tl_types::enums::messages::Messages::Slice(m) => m.messages,
-        _ => Vec::new(),
-    };
+    let messages = crate::commands::utils::messages_from_history(&result);
 
     if messages.is_empty() {
         return cmd_get_public_channels(app);
@@ -1100,8 +1152,15 @@ pub async fn cmd_sync_public_channels(
             tokio::time::sleep(delay).await;
         }
 
-    let remote_channels: Vec<PublicChannel> = serde_json::from_slice(&file_data)
-        .map_err(|e| format!("Failed to parse sync JSON: {}", e))?;
+    let remote_channels: Vec<PublicChannel> = match serde_json::from_slice(&file_data) {
+        Ok(ch) => ch,
+        Err(e) => {
+            // Corrupt/foreign JSON in [NB-PUB] must not brick the sidebar:
+            // log and keep the local list, exactly like the other fallbacks.
+            log::warn!("[NB-PUB] sync JSON parse failed ({}); keeping local list", e);
+            return cmd_get_public_channels(app);
+        }
+    };
 
     // Reconcile with local DB
     let conn = get_connection(&app)?;
@@ -1359,5 +1418,109 @@ mod tests {
         });
         let (cid, _ah, _t) = found.expect("broadcast channel must be found");
         assert_eq!(cid, 4);
+    }
+
+    // ─── messages_from_history (sync download + search fix) ─────────
+
+    fn test_message(id: i32) -> grammers_tl_types::enums::Message {
+        grammers_tl_types::enums::Message::Message(grammers_tl_types::types::Message {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            post: false,
+            from_scheduled: false,
+            legacy: false,
+            edit_hide: false,
+            pinned: false,
+            noforwards: false,
+            invert_media: false,
+            offline: false,
+            video_processing_pending: false,
+            paid_suggested_post_stars: false,
+            paid_suggested_post_ton: false,
+            id,
+            from_id: None,
+            from_boosts_applied: None,
+            peer_id: grammers_tl_types::enums::Peer::Channel(
+                grammers_tl_types::types::PeerChannel { channel_id: 1 },
+            ),
+            saved_peer_id: None,
+            fwd_from: None,
+            via_bot_id: None,
+            via_business_bot_id: None,
+            reply_to: None,
+            date: 0,
+            message: String::new(),
+            media: None,
+            reply_markup: None,
+            entities: None,
+            views: None,
+            forwards: None,
+            replies: None,
+            edit_date: None,
+            post_author: None,
+            grouped_id: None,
+            reactions: None,
+            restriction_reason: None,
+            ttl_period: None,
+            quick_reply_shortcut_id: None,
+            effect: None,
+            factcheck: None,
+            report_delivery_until_date: None,
+            paid_message_stars: None,
+            suggested_post: None,
+            schedule_repeat_period: None,
+        })
+    }
+
+    #[test]
+    fn messages_from_history_handles_channel_messages_variant() {
+        // The sync-download bug: GetHistory against a channel answers
+        // ChannelMessages; a 2-arm match silently dropped it.
+        let msgs = vec![test_message(7), test_message(8)];
+        let result = grammers_tl_types::enums::messages::Messages::ChannelMessages(
+            grammers_tl_types::types::messages::ChannelMessages {
+                inexact: false,
+                pts: 0,
+                count: 2,
+                offset_id_offset: None,
+                messages: msgs.clone(),
+                topics: vec![],
+                chats: vec![],
+                users: vec![],
+            },
+        );
+        let extracted = crate::commands::utils::messages_from_history(&result);
+        assert_eq!(extracted.len(), 2, "ChannelMessages variant must not be dropped");
+    }
+
+    #[test]
+    fn messages_from_history_handles_messages_and_slice_variants() {
+        let msgs = vec![test_message(1)];
+        let plain = grammers_tl_types::enums::messages::Messages::Messages(
+            grammers_tl_types::types::messages::Messages {
+                messages: msgs.clone(),
+                topics: vec![],
+                chats: vec![],
+                users: vec![],
+            },
+        );
+        assert_eq!(crate::commands::utils::messages_from_history(&plain).len(), 1);
+
+        let slice = grammers_tl_types::enums::messages::Messages::Slice(
+            grammers_tl_types::types::messages::MessagesSlice {
+                inexact: false,
+                count: 1,
+                next_rate: None,
+                offset_id_offset: None,
+                search_flood: None,
+                messages: msgs,
+                topics: vec![],
+                chats: vec![],
+                users: vec![],
+            },
+        );
+        assert_eq!(crate::commands::utils::messages_from_history(&slice).len(), 1);
     }
 }

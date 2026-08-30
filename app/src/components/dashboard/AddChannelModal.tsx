@@ -22,6 +22,16 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
     const [browseLoading, setBrowseLoading] = useState(false);
     const [browseFetched, setBrowseFetched] = useState(false);
 
+    // Push the local channel list to the [NB-PUB] sync channel after any add.
+    // Fire-and-forget: the local SQLite row is already committed, so a failed
+    // upload only means the change stays local until the next successful one.
+    const uploadSync = () => {
+        invoke('cmd_update_nb_pub_sync').catch((e: any) => {
+            console.warn('[Public Channels] Sync update failed:', e);
+            toast.error('Sync update failed — changes are local only.');
+        });
+    };
+
     // Fetch joined channels once when modal opens (not on every tab switch)
     useEffect(() => {
         if (!open || browseFetched) return;
@@ -50,6 +60,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         try {
             await invoke<PublicChannel>('cmd_join_channel_by_link', { link: linkInput });
             toast.success('Channel added to NoBuf.');
+            uploadSync();
             onAdded();
             handleClose();
         } catch (e: any) {
@@ -70,6 +81,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         try {
             await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: preview.channel_id, accessHash: preview.access_hash });
             toast.success('Channel added to NoBuf.');
+            uploadSync();
             onAdded();
             handleClose();
         } catch (e: any) {
@@ -101,6 +113,7 @@ export function AddChannelModal({ open, onClose, onAdded }: Props) {
         try {
             await invoke<PublicChannel>('cmd_add_joined_channel', { channelId: channel.channel_id, accessHash: channel.access_hash });
             toast.success(`${channel.name} added to NoBuf.`);
+            uploadSync();
             onAdded();
             setJoinedChannels(prev => prev.map(c =>
                 c.channel_id === channel.channel_id ? { ...c, already_added: true } : c

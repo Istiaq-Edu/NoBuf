@@ -63,6 +63,22 @@ pub async fn clear_peer_cache(peer_cache: &Arc<RwLock<HashMap<i64, Peer>>>) {
     peer_cache.write().await.clear();
 }
 
+/// Extract the message list from a `messages.getHistory` / `messages.search`
+/// response. Channels answer with the `ChannelMessages` variant — a match that
+/// omits that arm silently yields an empty list (the class of bug that broke
+/// public-channel sync download and in-channel search).
+pub fn messages_from_history(
+    result: &tl::enums::messages::Messages,
+) -> Vec<tl::enums::Message> {
+    use tl::enums::messages::Messages;
+    match result {
+        Messages::Messages(m) => m.messages.clone(),
+        Messages::Slice(m) => m.messages.clone(),
+        Messages::ChannelMessages(m) => m.messages.clone(),
+        _ => Vec::new(),
+    }
+}
+
 // --- Upload size limit (Premium-aware) ---
 // grammers exposes no premium() accessor; read the raw TL flag.
 // VERIFIED: `pub premium: bool` at generated_types.rs:57654 (grammers rev d07f96f);
