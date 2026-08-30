@@ -26,6 +26,7 @@ import { ForwardToFolderModal } from './dashboard/ForwardToFolderModal';
 import { VaultPasscodeModal } from './dashboard/VaultPasscodeModal';
 import { VaultView } from './dashboard/VaultView';
 import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
+import { useChatFiles } from '../hooks/useChats';
 import { ActiveView } from '../types';
 import { useConfirm } from '../context/ConfirmContext';
 
@@ -53,8 +54,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
 
     const {
-        store, folders, activeFolderId, setActiveFolderId, isConnected,
+        store, folders, chats, activeFolderId, setActiveFolderId, isConnected,
         handleLogout, handleCreateFolder, handleFolderRename, handleFolderDelete, handleFolderReorder,
+        handleAddChat, handleRemoveChat, handleChatReorder, handleChatGone,
         handleAdoptChannel, handleUnadoptChannel, handleDeleteChannelPermanently
     } = useTelegramConnection(onLogout);
 
@@ -92,7 +94,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             const prev = activeViewRef.current;
             const changed = prev.type !== next.type
                 || (next.type === 'folder' && prev.type === 'folder' && prev.folderId !== next.folderId)
-                || (next.type === 'public' && prev.type === 'public' && prev.channelId !== next.channelId);
+                || (next.type === 'public' && prev.type === 'public' && prev.channelId !== next.channelId)
+                || (next.type === 'chat' && prev.type === 'chat' && prev.chatId !== next.chatId);
             if (changed) {
                 pastViewsRef.current = [...pastViewsRef.current, prev].slice(-50);
                 setCanGoBack(true);
@@ -108,12 +111,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 const candidate = past[past.length - 1];
                 const concealed =
                     (candidate.type === 'folder' && vaultRef.current.hiddenFolderIds.has(candidate.folderId)) ||
-                    (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId));
+                    (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId)) ||
+                    (candidate.type === 'chat' && (vaultRef.current as any).hiddenChatIds?.has(candidate.chatId));
                 past = past.slice(0, -1);
                 if (!concealed) {
                     pastViewsRef.current = past;
                     setCanGoBack(past.length > 0);
                     if (candidate.type === 'folder') setActiveFolderId(candidate.folderId);
+                    else if (candidate.type === 'chat') setActiveFolderId(candidate.chatId);
                     else if (candidate.type !== 'public') setActiveFolderId(null);
                     setActiveView(candidate);
                     return;
@@ -143,6 +148,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const visiblePublicChannels = vault.ready
             ? filterHidden(publicChannels, c => c.channel_id, vault.hiddenPublicIds)
             : publicChannels;
+        const visibleChats = vault.ready
+            ? filterHidden(chats, c => c.chat_id, (vault as any).hiddenChatIds ?? new Set<number>())
+            : chats;
 
         // Hide helper for Phase 3 entry points (context menu / drop).
         // D14: hiding the currently-viewing channel jumps to Saved Messages,
@@ -150,7 +158,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const handleHideInVault = useCallback(async (kind: VaultKind, id: number) => {
             const viewingIt =
                 (activeView.type === 'folder' && kind === 'folder' && activeView.folderId === id) ||
-                (activeView.type === 'public' && kind === 'public_channel' && activeView.channelId === id);
+                (activeView.type === 'public' && kind === 'public_channel' && activeView.channelId === id) ||
+                (activeView.type === 'chat' && kind === 'chat' && activeView.chatId === id);
             try {
                 await vault.hide(kind, id);
                 toast.success('Hidden in Vault');
@@ -169,7 +178,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 setActiveView({ type: 'saved' });
                 setSelectedIds([]);
                 setPreviewFile(null);
-                toast.message('Moved to Saved Messages — channel is now in the Vault');
+                toast.message(kind === 'chat'
+                    ? 'Moved to Saved Messages — chat is now in the Vault'
+                    : 'Moved to Saved Messages — channel is now in the Vault');
             }
         }, [activeView, vault]);
 
@@ -227,11 +238,32 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             const restored = restoredIdRef.current;
             restoredIdRef.current = null;
             if (restored === null) return;
-            if (vault.hiddenFolderIds.has(restored) || vault.hiddenPublicIds.has(restored)) {
+            if (vault.hiddenFolderIds.has(restored) || vault.hiddenPublicIds.has(restored) || (vault as any).hiddenChatIds?.has(restored)) {
                 setActiveView({ type: 'saved' });
                 store?.delete('activeFolderId').then(() => store?.save()).catch(() => {});
             }
         }, [vault.ready, vault.hiddenFolderIds, vault.hiddenPublicIds, activeFolderId, store]);
+
+        // V2-02 boot-restore guard: activeView starts 'saved' while a persisted
+        // activeFolderId (= chatId under mirroring) restores from the store and
+        // the sync effect never re-runs — without this, a restart-in-chat lands
+        // in a ghost 'Folder'-titled view with an unpaginated listing. Once the
+        // chats list loads: restore the chat view properly, or null an unknown id.
+        const bootRestoredRef = useRef(false);
+        useEffect(() => {
+            if (bootRestoredRef.current || !store || !isConnected) return;
+            if (activeView.type !== 'saved' || activeFolderId === null) return;
+            // Only act when the persisted id matches NO folder (i.e. it might
+            // be a chat id) — folder ids restore through their own path.
+            if (folders.some(f => f.id === activeFolderId)) return;
+            if (publicChannels.some(c => c.channel_id === activeFolderId)) return;
+            if (chats.some(c => c.chat_id === activeFolderId)) {
+                bootRestoredRef.current = true;
+                navigateTo({ type: 'chat', chatId: activeFolderId });
+            }
+            // A chat id that matches nothing gets nulled on vault-ready by the
+            // restore gate below; do nothing here (chats may still be loading).
+        }, [store, isConnected, activeView, activeFolderId, folders, publicChannels, chats, navigateTo]);
 
         // Ctrl+Shift+V — open Vault (D11). preventDefault: WebView2 reserves
         // this combo for paste-plain-text. Bound outside the input-guard path
@@ -279,6 +311,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 setActiveFolderId(activeView.folderId);
             } else if (activeView.type === 'public') {
                 setActiveFolderId(activeView.channelId);
+            } else if (activeView.type === 'chat') {
+                // THE core change (plan §2.1): mirror chatId into the
+                // activeFolderId seam so streaming/preview/downloads/deletes/
+                // moves/drop-uploads all work through existing code.
+                setActiveFolderId(activeView.chatId);
             }
         }, [activeView, setActiveFolderId]);
 
@@ -329,10 +366,27 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [previewContextIndex, setPreviewContextIndex] = useState(-1);
 
     const isPublicView = activeView.type === 'public';
-    const isReadOnly = isPublicView;
+    const isChatView = activeView.type === 'chat';
+    const isReadOnly = isPublicView; // chat views are full-drive (D1) — NOT read-only
     const { files: pubChannelFiles, isLoading: pubFilesLoading, hasMore: pubHasMore, lastOffsetId: pubLastOffsetId, notAMember: pubNotAMember, loadMore } = usePublicChannelFiles(
         isPublicView ? activeView.channelId : null
     );
+    const { files: chatFiles, isLoading: chatFilesLoading, hasMore: chatHasMore, lastOffsetId: chatLastOffsetId, chatGone, loadMore: loadMoreChat } = useChatFiles(
+        isChatView ? activeView.chatId : null
+    );
+        // D13: dead-chat auto-remove. useChatFiles exposes the chatGone flag;
+        // hooks can't navigate — this effect performs remove + toast + jump.
+        const chatGoneHandledRef = useRef<number | null>(null);
+        useEffect(() => {
+            if (!chatGone || activeView.type !== 'chat') return;
+            const deadId = activeView.chatId;
+            if (chatGoneHandledRef.current === deadId) return;
+            chatGoneHandledRef.current = deadId;
+            const title = chats.find(c => c.chat_id === deadId)?.title || '';
+            void handleChatGone(deadId, title);
+            navigateTo({ type: 'saved' });
+        }, [chatGone, activeView, chats, handleChatGone, navigateTo]);
+
 
     // --- External file drag-drop (upload) ---
     // WebView2 routes native OS file drops through the DOCUMENT (capture phase), not
@@ -384,7 +438,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             sizeStr: formatBytes(f.size),
             type: f.icon_type || (f.name.endsWith('/') ? 'folder' : 'file')
         }))),
-        enabled: !!store && !isPublicView && vault.ready,
+        enabled: !!store && !isPublicView && !isChatView && vault.ready,
     });
 
     // documents-changed (parts-first plan §A): the backend emits this after
@@ -394,16 +448,27 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     useEffect(() => {
         let disposed = false;
         let timer: number | undefined;
+        const unlistenFns: Array<() => void> = [];
         (async () => {
             try {
                 const { listen } = await import('@tauri-apps/api/event');
-                await listen<{ folder_id?: number | null }>('documents-changed', () => {
+                const unlisten = await listen<{ folder_id?: number | null }>('documents-changed', (evt) => {
                     if (disposed) return;
                     window.clearTimeout(timer);
                     timer = window.setTimeout(() => {
-                        if (!disposed) queryClient.invalidateQueries({ queryKey: ['files'] });
+                        if (disposed) return;
+                        queryClient.invalidateQueries({ queryKey: ['files'] });
+                        // Chat uploads carry folder_id = chat id (mirrored-id
+                        // design): invalidate the chat listing too. The whole
+                        // ['chats'] list is in memory — a payload id that
+                        // matches a known chat refreshes its files.
+                        const payloadId = evt.payload?.folder_id;
+                        if (payloadId !== null && payloadId !== undefined && chats.some(c => c.chat_id === payloadId)) {
+                            queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
+                        }
                     }, 300);
                 });
+                unlistenFns.push(unlisten);
             } catch (e) {
                 console.warn('[documents-changed] listener attach failed', e);
             }
@@ -411,11 +476,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         return () => {
             disposed = true;
             window.clearTimeout(timer);
+            for (const fn of unlistenFns) { try { fn(); } catch { /* already gone */ } }
         };
-    }, [queryClient]);
+    }, [queryClient, chats]);
 
-    const allFiles = isPublicView ? pubChannelFiles : nbFiles;
-    const isLoading = isPublicView ? pubFilesLoading : nbFilesLoading;
+    const allFiles = isPublicView ? pubChannelFiles : isChatView ? chatFiles : nbFiles;
+    const isLoading = isPublicView ? pubFilesLoading : isChatView ? chatFilesLoading : nbFilesLoading;
 
     const displayedFiles = (() => {
         // 1. Apply search filter
@@ -802,6 +868,31 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         }
     }
 
+    // Internal file drag dropped on a ChatItem → move into that chat (D17).
+    // cmd_move_files is kind-agnostic; targetFolderId = chatId (mirrored ids).
+    const handleFileDropOnChat = async (chatId: number, e: React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const dataTransferFileId = e.dataTransfer.getData("application/x-telegram-file-id");
+        const fileId = internalDragRef.current || (dataTransferFileId ? parseInt(dataTransferFileId) : null);
+        if (!fileId || activeFolderId === chatId) return;
+        try {
+            const idsToMove = selectedIds.includes(fileId) ? selectedIds : [fileId];
+            await invoke('cmd_move_files', {
+                messageIds: idsToMove,
+                sourceFolderId: activeFolderId,
+                targetFolderId: chatId,
+            });
+            queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+            queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
+            if (selectedIds.includes(fileId)) setSelectedIds([]);
+            toast.success(`Moved ${idsToMove.length} file(s).`);
+            setInternalDragFileId(null);
+        } catch {
+            toast.error('Failed to move file(s).');
+        }
+    };
+
     const handleLoadMore = useCallback(() => {
             if (!loadMore.isPending && pubLastOffsetId) {
                 loadMore.mutate(pubLastOffsetId);
@@ -840,6 +931,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         ? "Vault"
         : activeView.type === 'public'
         ? (publicChannels.find(c => c.channel_id === activeView.channelId)?.name || "Public Channel")
+        : activeView.type === 'chat'
+        ? (chats.find(c => c.chat_id === activeView.chatId)?.title || "Chat")
         : activeFolderId === null
             ? "Saved Messages"
             : folders.find(f => f.id === activeFolderId)?.name || "Folder";
@@ -1084,6 +1177,16 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onUnadopt={handleUnadopt}
                 onDeleteChannelPermanently={handleDeleteChannelPerm}
                 onAdoptChannel={handleAdoptChannel}
+                chats={visibleChats}
+                onSelectChat={(chatId) => navigateTo({ type: 'chat', chatId })}
+                onChatAdded={(added) => {
+                    // Idempotent re-add through the single writer — pushes into
+                    // chats state + store (INSERT OR IGNORE on the backend).
+                    void handleAddChat(added);
+                }}
+                onRemoveChat={(chatId, title) => void handleRemoveChat(chatId, title)}
+                onChatReorder={handleChatReorder}
+                onFileDropOnChat={handleFileDropOnChat}
                 isConnected={isConnected}
                 bandwidth={bandwidth || null}
                 collapsed={sidebarCollapsed}
@@ -1164,8 +1267,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDragStart={(fileId) => setInternalDragFileId(fileId)}
                     onDragEnd={() => setTimeout(() => setInternalDragFileId(null), 50)}
                     readOnly={isReadOnly}
-                    hasMore={isPublicView ? pubHasMore : false}
-                                        onLoadMore={isPublicView ? handleLoadMore : undefined}
+                    hasMore={isPublicView ? pubHasMore : isChatView ? chatHasMore : false}
+                                        onLoadMore={isPublicView ? handleLoadMore : isChatView ? () => { if (chatLastOffsetId) loadMoreChat.mutate(chatLastOffsetId); } : undefined}
                     notAMember={isPublicView ? pubNotAMember : false}
                     onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
                     showForwardOption={isReadOnly}

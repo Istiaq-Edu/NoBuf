@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Plus, Pencil, Trash2, Check, X, FolderInput, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { PUBLIC_CHANNEL_DRAG_MIME } from '../../types';
+import { PUBLIC_CHANNEL_DRAG_MIME, CHAT_DRAG_MIME } from '../../types';
 
 interface FolderGroup {
     id: number;
@@ -46,6 +46,8 @@ interface SidebarItemProps {
     onVaultDropFolder?: (folderId: number) => void;
     /** Vault drop target: a public-channel drag dropped here HIDES that channel (D9/D10). */
     onVaultDropPublicChannel?: (channelId: number) => void;
+    /** Vault drop target: a chat drag dropped here HIDES that chat (D8, review2 V2-01). */
+    onVaultDropChat?: (chatId: number) => void;
     /** Count pill (D15). Rendered only when > 0; positioned per collapsed state. */
     badgeCount?: number;
 }
@@ -55,7 +57,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function SidebarItem({
     icon: Icon, label, active = false, onClick, onDrop, onDelete, onRename, onAssignGroup, currentGroupId, groupColor,
     onFolderDragStart, onFolderDragOver, onFolderDragLeave, onFolderDrop, onFolderDragEnd,
-    reorderIndicator, isFirst, isLast, folderId, collapsed, onHideInVault, onVaultDropFolder, onVaultDropPublicChannel, badgeCount,
+    reorderIndicator, isFirst, isLast, folderId, collapsed, onHideInVault, onVaultDropFolder, onVaultDropPublicChannel, onVaultDropChat, badgeCount,
     isAdopted, onUnadopt, onDeleteChannelPermanently
 }: SidebarItemProps) {
     const [isOver, setIsOver] = useState(false);
@@ -226,6 +228,16 @@ export function SidebarItem({
                         const raw = e.dataTransfer.getData(PUBLIC_CHANNEL_DRAG_MIME);
                         if (raw) {
                             onVaultDropPublicChannel(Number(raw));
+                            return;
+                        }
+                    }
+                    // Priority 0 (chat vault drop, V2-01): a CHAT_DRAG_MIME drag
+                    // dropped on the vault item HIDES that chat. Without this
+                    // arm the drag silently does nothing (D8 + QA row 10).
+                    if (onVaultDropChat && e.dataTransfer.types.includes(CHAT_DRAG_MIME)) {
+                        const raw = e.dataTransfer.getData(CHAT_DRAG_MIME);
+                        if (raw) {
+                            onVaultDropChat(Number(raw));
                             return;
                         }
                     }

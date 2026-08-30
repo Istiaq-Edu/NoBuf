@@ -13,7 +13,7 @@ export interface VaultState {
     public_ids: number[] | null;
 }
 
-export type VaultKind = 'folder' | 'public_channel';
+export type VaultKind = 'folder' | 'public_channel' | 'chat';
 
 interface VaultContextValue {
     /** True once the first get_state resolves — gates restore logic (§4.3). */
