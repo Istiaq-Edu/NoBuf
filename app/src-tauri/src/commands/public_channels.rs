@@ -34,6 +34,12 @@ fn get_connection(app: &AppHandle) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Cross-module accessor: adopted_folders.rs drops adopted channels from
+/// public_channels (one channel, one sidebar entry).
+pub fn pub_get_connection(app: &AppHandle) -> Result<Connection, String> {
+    get_connection(app)
+}
+
 fn vi(v: &Value) -> i64 {
     match v { Value::Integer(i) => *i, _ => 0 }
 }
@@ -463,6 +469,10 @@ pub async fn cmd_list_joined_channels(
                 access_hash: c.raw.access_hash.unwrap_or(0),
                 already_added: added_ids.contains(&id),
                 is_nb_folder: is_nb,
+                is_creator: c.raw.creator,
+                is_admin_post: c.raw.admin_rights.as_ref()
+                    .map(|r| matches!(r, grammers_tl_types::enums::ChatAdminRights::Rights(rights) if rights.post_messages))
+                    .unwrap_or(false) || c.raw.creator,
             });
         }
     }

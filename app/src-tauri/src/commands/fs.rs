@@ -1,4 +1,4 @@
-﻿use tauri::{State, Emitter};
+﻿use tauri::{State, Emitter, AppHandle};
 use grammers_client::types::{Media, Peer};
 use grammers_client::InputMessage;
 use grammers_tl_types as tl;
@@ -55,24 +55,44 @@ pub async fn cmd_rename_folder(
     let client_opt = { state.client.lock().await.clone() };
     if client_opt.is_none() {
         log::info!("[MOCK] Renamed folder {} to '{}'", folder_id, new_name);
-        return Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None });
+        return Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None, is_adopted: false });
     }
     let client = client_opt.unwrap();
 
     let peer = resolve_peer(&client, Some(folder_id), &state.peer_cache).await?;
 
-    let input_channel = match peer {
+    // Adopted folders: real rename WITHOUT re-appending [NB], and megagroups
+    // (Peer::Group) must pass too — grammers routes non-broadcast channels there.
+    let (input_channel, is_adopted) = match &peer {
         Peer::Channel(c) => {
-            tl::enums::InputChannel::Channel(tl::types::InputChannel {
+            let ic = tl::enums::InputChannel::Channel(tl::types::InputChannel {
                 channel_id: c.raw.id,
                 access_hash: c.raw.access_hash.ok_or("No access hash for channel")?,
-            })
+            });
+            (ic, false)
+        },
+        Peer::Group(g) => {
+            // Megagroups adopted as folders: the raw Chat is still Chat::Channel
+            // with an access_hash — build the InputChannel from it.
+            match &g.raw {
+                tl::enums::Chat::Channel(c) => {
+                    let ic = tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                        channel_id: c.id,
+                        access_hash: c.access_hash.ok_or("No access hash for channel")?,
+                    });
+                    (ic, false)
+                },
+                _ => return Err("Only channels (folders) can be renamed.".to_string()),
+            }
         },
         _ => return Err("Only channels (folders) can be renamed.".to_string()),
     };
 
-    // Ensure [NB] tag is present in the new title
-    let tagged_name = if new_name.to_lowercase().contains("[nb]") {
+    // Adopted folders rename the real title as-is (no [NB] append — single truth).
+    // Regular [NB] folders keep the tag enforced.
+    let tagged_name = if is_adopted {
+        new_name.clone()
+    } else if new_name.to_lowercase().contains("[nb]") {
         new_name.clone()
     } else {
         format!("{} [NB]", new_name)
@@ -94,7 +114,7 @@ pub async fn cmd_rename_folder(
         }
     }
 
-    Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None })
+    Ok(FolderMetadata { id: folder_id, name: new_name, parent_id: None, is_adopted })
 }
 
 /// Trigger an automatic sync on startup. This runs the same reconciliation
@@ -102,9 +122,10 @@ pub async fn cmd_rename_folder(
 #[tauri::command]
 pub async fn cmd_start_auto_sync(
     local_folders: Vec<FolderMetadata>,
+    app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<ScanResult, String> {
-    cmd_scan_folders(local_folders, state).await
+    cmd_scan_folders(local_folders, app, state).await
 }
 
 #[tauri::command]
@@ -124,6 +145,7 @@ pub async fn cmd_create_folder(
             id: mock_id,
             name,
             parent_id: None,
+            is_adopted: false,
         });
     }
     // -----------
@@ -168,15 +190,29 @@ pub async fn cmd_create_folder(
         id: chat_id,
         name,
         parent_id: None,
+        is_adopted: false,
     })
 }
 
 /// Delete a NoBuf folder (channel) from Telegram. Also cleans peer cache.
+/// ADOPTED folders are refused here — their channel + subscribers survive;
+/// unadopt (cmd_unadopt_channel) removes them from NoBuf, and
+/// cmd_delete_channel_permanently handles real deletion behind its own dialog.
 #[tauri::command]
 pub async fn cmd_delete_folder(
     folder_id: i64,
+    app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<bool, String> {
+    // Adopted-folder guard
+    {
+        if let Ok(records) = crate::commands::adopted_folders::load_adopted_folders(&app) {
+            if records.iter().any(|r| r.channel_id == folder_id) {
+                return Err("ADOPTED_FOLDER: Use 'Remove from NoBuf' instead — this channel stays on Telegram.".to_string());
+            }
+        }
+    }
+
     let client_opt = {
         state.client.lock().await.clone()
     };
@@ -1952,9 +1988,14 @@ pub async fn cmd_get_channel_username(
 ///
 /// Matching strategy: [NB] in channel title only. No about/description check.
 /// Display name strips the [NB] tag for clean UI.
+/// ADOPTED channels (owned/administered, adopted via cmd_adopt_channel) merge in
+/// as folders regardless of the [NB] tag — merged into found_folders BEFORE the
+/// diff so they never land in both `added` and `removed` (applySyncResult's
+/// remove-filter runs after add and would drop them otherwise).
 #[tauri::command]
 pub async fn cmd_scan_folders(
     local_folders: Vec<FolderMetadata>,
+    app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<ScanResult, String> {
     let client_opt = { state.client.lock().await.clone() };
@@ -1986,7 +2027,7 @@ pub async fn cmd_scan_folders(
                         .trim()
                         .to_string();
                     log::info!(" -> MATCH: '{}' (ID: {})", display_name, id);
-                    found_folders.push(FolderMetadata { id, name: display_name, parent_id: None });
+                    found_folders.push(FolderMetadata { id, name: display_name, parent_id: None, is_adopted: false });
                 }
             },
             Peer::User(u) => {
@@ -1996,7 +2037,43 @@ pub async fn cmd_scan_folders(
         }
     }
 
-    log::info!("Scan found {} NoBuf folders. Peer cache size: {}.", found_folders.len(), peer_cache.len());
+    // ─── Adopted-folder merge (pre-diff, critical ordering) ────────
+    // Adoption records are folders regardless of the [NB] tag. Rights are
+    // re-verified per record: lost rights or a dead channel (CHANNEL_PRIVATE)
+    // auto-unadopts and reports the id in `removed` so the frontend drops it.
+    let adopted_records = crate::commands::adopted_folders::load_adopted_folders(&app)
+        .unwrap_or_default();
+    if !adopted_records.is_empty() {
+        // Release the peer-cache lock before the await points below (adopted
+        // helpers take their own lock).
+        drop(peer_cache);
+        for rec in &adopted_records {
+            match crate::commands::adopted_folders::fetch_channel_fresh(&client, rec.channel_id, rec.access_hash).await {
+                Some((fresh_hash, title, creator, rights)) => {
+                    if crate::commands::adopted_folders::can_adopt_flags(creator, &rights) {
+                        log::info!(" -> ADOPTED: '{}' (ID: {})", title, rec.channel_id);
+                        found_folders.push(FolderMetadata { id: rec.channel_id, name: title.clone(), parent_id: None, is_adopted: true });
+                        // Keep the stored hash current + peer cache seeded
+                        // (archived adopted channels never appear in dialogs).
+                        crate::commands::adopted_folders::seed_peer_cache(&state, rec.channel_id, fresh_hash, &title, true).await;
+                    } else {
+                        log::warn!("[ADOPTED] {} lost rights — auto-unadopt", rec.channel_id);
+                        if let Ok(conn) = crate::commands::adopted_folders::adopted_get_connection(&app) {
+                            let _ = crate::commands::adopted_folders::delete_adopted_row(&conn, rec.channel_id);
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("[ADOPTED] {} unreachable (deleted or stale hash) — auto-unadopt", rec.channel_id);
+                    if let Ok(conn) = crate::commands::adopted_folders::adopted_get_connection(&app) {
+                        let _ = crate::commands::adopted_folders::delete_adopted_row(&conn, rec.channel_id);
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!("Scan found {} NoBuf folders. Peer cache size: {}.", found_folders.len(), state.peer_cache.read().await.len());
 
     // Build lookup: found folder ID -> FolderMetadata
     let found_map: HashMap<i64, &FolderMetadata> = found_folders.iter().map(|f| (f.id, f)).collect();

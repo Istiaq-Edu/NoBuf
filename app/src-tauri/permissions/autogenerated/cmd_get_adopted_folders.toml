@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-get-adopted-folders"
+description = "Enables the cmd_get_adopted_folders command without any pre-configured scope."
+commands.allow = ["cmd_get_adopted_folders"]
+
+[[permission]]
+identifier = "deny-cmd-get-adopted-folders"
+description = "Denies the cmd_get_adopted_folders command without any pre-configured scope."
+commands.deny = ["cmd_get_adopted_folders"]

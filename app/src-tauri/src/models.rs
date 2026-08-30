@@ -34,6 +34,12 @@ pub struct FolderMetadata {
     pub id: i64,
     pub parent_id: Option<i64>,
     pub name: String,
+    /// True when this folder is an adopted owned/administered channel (not a
+    /// [NB]-tagged channel). Rides through ScanResult so the frontend can gate
+    /// menu actions (unadopt vs delete). serde default keeps old persisted
+    /// folder lists (frontend store) and legacy NB-PUB payloads parsing.
+    #[serde(default)]
+    pub is_adopted: bool,
 }
 
 /// Result of a full reconciliation sync between local state and Telegram.
@@ -94,6 +100,22 @@ pub struct JoinedChannel {
     pub access_hash: i64,
     pub already_added: bool,
     pub is_nb_folder: bool,
+    /// True when the logged-in account created this channel.
+    #[serde(default)]
+    pub is_creator: bool,
+    /// True when the logged-in account administers this channel with
+    /// post_messages rights (creators get this too, via synthetic rights).
+    #[serde(default)]
+    pub is_admin_post: bool,
+}
+
+/// An owned/administered channel adopted as a full NoBuf folder (no [NB] tag).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AdoptedFolder {
+    pub channel_id: i64,
+    pub access_hash: i64,
+    pub title: String,
+    pub adopted_at: i64,
 }
 
 /// Result of forwarding files to a [NB] folder.
