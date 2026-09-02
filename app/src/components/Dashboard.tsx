@@ -900,8 +900,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 toast.success(`Moved ${idsToMove.length} file(s).`);
 
                 setInternalDragFileId(null);
-            } catch {
-                toast.error(`Failed to move file(s).`);
+            } catch (e) {
+                toast.error(`Failed to move file(s): ${e}`);
             }
         }
     }

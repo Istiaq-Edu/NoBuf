@@ -58,13 +58,15 @@ export function filterHidden<T>(items: T[], getId: (item: T) => number, hidden: 
 }
 
 /** Startup restore gate (spec §4.3): true when the persisted selection
- *  references a vaulted item in either scope. */
+ *  references a vaulted item in any scope (m13: chats included — a stale
+ *  pre-chat signature would silently miss vaulted chats if ever wired). */
 export function isVaultedSelection(
     id: number,
     hiddenFolderIds: ReadonlySet<number>,
-    hiddenPublicIds: ReadonlySet<number>
+    hiddenPublicIds: ReadonlySet<number>,
+    hiddenChatIds: ReadonlySet<number> = new Set()
 ): boolean {
-    return hiddenFolderIds.has(id) || hiddenPublicIds.has(id);
+    return hiddenFolderIds.has(id) || hiddenPublicIds.has(id) || hiddenChatIds.has(id);
 }
 
 /**
