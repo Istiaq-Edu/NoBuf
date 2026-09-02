@@ -1327,9 +1327,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     notAMember={isPublicView ? pubNotAMember : false}
                     onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
                     showForwardOption={isReadOnly}
-                    canForward={isChatView}
-                    canDelete={isChatView}
-                    canRename={false}
+                    canForward={isChatView || undefined}
+                    canDelete={isChatView || undefined}
+                    canRename={isChatView ? false : undefined}
                     emptyTitle={isChatView ? 'No files in this chat yet' : undefined}
                     emptySubtitle={isChatView ? 'Files sent or received in this chat appear here. Drag and drop here to send to the chat.' : undefined}
                     onForwardToFolder={() => setShowForwardModal(true)}

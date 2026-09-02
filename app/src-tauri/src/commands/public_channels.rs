@@ -707,10 +707,11 @@ pub async fn cmd_get_public_channel_files(
                 let (name, size, mime, ext, duration) = match media {
                     grammers_tl_types::enums::MessageMedia::Document(d) => {
                         if let Some(grammers_tl_types::enums::Document::Document(doc)) = &d.document {
-                            let n = doc.attributes.iter().find_map(|a| match a {
-                                grammers_tl_types::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
-                                _ => None,
-                            }).unwrap_or_else(|| "Unknown".to_string());
+                            let n = crate::commands::utils::document_display_name(
+                                &doc.attributes,
+                                doc.mime_type.as_str(),
+                                m.id,
+                            );
                             let s = doc.size as u64;
                             let mi = doc.mime_type.clone();
                             let e = std::path::Path::new(&n).extension().map(|os| os.to_str().unwrap_or("").to_string());

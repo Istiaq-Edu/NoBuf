@@ -202,6 +202,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn document_display_name_prefers_filename_attribute() {
+        let attrs = vec![tl::enums::DocumentAttribute::Filename(tl::types::DocumentAttributeFilename {
+            file_name: "movie.mp4".to_string(),
+        })];
+        assert_eq!(document_display_name(&attrs, "video/mp4", 42), "movie.mp4");
+    }
+
+    #[test]
+    fn document_display_name_synthesizes_for_filenameless_video() {
+        // Mobile-shot video: Video attribute + mime, NO Filename (the live
+        // "Unknown" bug — 164 MB video in a DM rendered unclassified).
+        let video = tl::types::DocumentAttributeVideo {
+            round_message: false,
+            nosound: false,
+            supports_streaming: true,
+            duration: 91.0,
+            w: 1920,
+            h: 1080,
+            preload_prefix_size: None,
+            video_codec: None,
+            video_start_ts: None,
+        };
+        let attrs = vec![tl::enums::DocumentAttribute::Video(video)];
+        let name = document_display_name(&attrs, "video/mp4", 77);
+        assert_eq!(name, "video_77.mp4");
+    }
+
+    #[test]
+    fn document_display_name_synthesizes_voice_and_photo() {
+        let voice = tl::types::DocumentAttributeAudio {
+            duration: 12,
+            voice: true,
+            title: None,
+            performer: None,
+            waveform: None,
+        };
+        assert_eq!(
+            document_display_name(&[tl::enums::DocumentAttribute::Audio(voice)], "audio/ogg", 5),
+            "voice_5.ogg"
+        );
+        assert_eq!(document_display_name(&[], "image/jpeg", 6), "photo_6.jpg");
+    }
+
+    #[test]
+    fn document_display_name_falls_back_to_file() {
+        assert_eq!(document_display_name(&[], "application/octet-stream", 9), "file_9.bin");
+    }
+
+    #[test]
     fn test_backoff_grows_exponentially() {
         let b1 = backoff_with_jitter(1, 5000, 60_000);
         let b2 = backoff_with_jitter(2, 5000, 60_000);
@@ -298,6 +347,65 @@ impl Default for NetworkSettings {
             download_speed_limit_kb: 0,
         }
     }
+}
+
+/// Extension for a mime type (common Telegram media types).
+pub fn mime_ext(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/x-matroska" => "mkv",
+        "video/x-msvideo" => "avi",
+        "video/mpeg" => "mpeg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "audio/x-wav" | "audio/wav" => "wav",
+        "audio/mp4" => "m4a",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "text/plain" => "txt",
+        _ => return None,
+    })
+}
+
+/// Display name for a Telegram document. Mobile-captured media often has NO
+/// DocumentAttribute::Filename — just Video/Audio attributes + a mime type.
+/// All three file listings (folders fs.rs, public_channels.rs, normal_chats.rs)
+/// fell back to "Unknown"/"" for those, breaking frontend classification
+/// (isVideoFile('Unknown') = false → generic icon, no Play). Synthesize a
+/// name from the media attributes/mime instead.
+pub fn document_display_name(attributes: &[tl::enums::DocumentAttribute], mime: &str, message_id: i32) -> String {
+    if let Some(name) = attributes.iter().find_map(|a| match a {
+        tl::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
+        _ => None,
+    }) {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    let kind = if attributes.iter().any(|a| matches!(a, tl::enums::DocumentAttribute::Video(_))) {
+        "video"
+    } else if attributes.iter().any(|a| matches!(a, tl::enums::DocumentAttribute::Audio(a) if a.voice)) {
+        "voice"
+    } else if attributes.iter().any(|a| matches!(a, tl::enums::DocumentAttribute::Audio(_))) {
+        "audio"
+    } else if attributes.iter().any(|a| matches!(a, tl::enums::DocumentAttribute::Sticker(_))) {
+        "sticker"
+    } else if mime.starts_with("image/") {
+        "photo"
+    } else {
+        "file"
+    };
+    let ext = mime_ext(mime).unwrap_or("bin");
+    format!("{}_{}.{}", kind, message_id, ext)
 }
 
 fn network_settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {

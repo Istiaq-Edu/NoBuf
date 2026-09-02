@@ -1887,7 +1887,20 @@ pub async fn cmd_get_files(
     if let Some(doc) = msg.media() {
             let (name, size, mime, ext, duration) = match &doc {
                 Media::Document(d) => {
-                    let n = d.name().to_string();
+                    // Filename-less media (mobile captures): synthesize a name
+                    // — "" broke frontend classification (shared helper).
+                    // d (grammers Media::Document) exposes name() but not its raw
+                    // attributes; reconstruct: name() empty → synthesize from the
+                    // file_ext/mime we already have.
+                    let n = {
+                        let raw_name = d.name().to_string();
+                        if raw_name.is_empty() {
+                            let mime = d.mime_type().unwrap_or("");
+                            format!("{}_{}.{}", if mime.starts_with("video/") { "video" } else if mime.starts_with("audio/") { "audio" } else if mime.starts_with("image/") { "photo" } else { "file" }, msg.id(), crate::commands::utils::mime_ext(mime).unwrap_or("bin"))
+                        } else {
+                            raw_name
+                        }
+                    };
                     let s = d.size();
                     let m = d.mime_type().map(|s| s.to_string());
                     let e = std::path::Path::new(&n).extension().map(|os| os.to_str().unwrap_or("").to_string());
