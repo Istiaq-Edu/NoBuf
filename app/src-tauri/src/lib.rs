@@ -483,6 +483,13 @@ pub fn run() {
                 .title(format!("NoBuf v{}", env!("CARGO_PKG_VERSION")))
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(360.0, 500.0)
+                // WebView2 ships with compositor smooth wheel scrolling DISABLED:
+                // every wheel notch teleports instantly instead of gliding, which
+                // reads as laggy/chunky scrolling (reproduced on every PC, incl.
+                // built exes). --enable-smooth-scrolling restores the glide.
+                // additional_browser_args REPLACES wry's defaults, so re-disable
+                // the OOUI/SmartScreen features wry passes by default.
+                .additional_browser_args("--enable-smooth-scrolling --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection")
                 .disable_drag_drop_handler()
                 .build()?;
 
