@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Trash2, Lock, User, Bot, Users, ChevronRight } from 'lucide-react';
 import { ChatInfo, CHAT_DRAG_MIME, CHAT_REORDER_MIME } from '../../types';
@@ -52,7 +52,6 @@ export function ChatItem({
     const [showMenu, setShowMenu] = useState(false);
     const [showGroupSubmenu, setShowGroupSubmenu] = useState(false);
     const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
-    const [menuRef, setMenuRef] = useState<HTMLDivElement | null>(null);
     const [availableGroups, setAvailableGroups] = useState<FolderGroup[]>([]);
 
     useEffect(() => {
@@ -61,9 +60,21 @@ export function ChatItem({
         }
     }, [showGroupSubmenu, onAssignGroup]);
 
-    const closeOnOutside = (e: React.MouseEvent) => {
-        if (menuRef && !menuRef.contains(e.target as Node)) setShowMenu(false);
-    };
+    // Close on ANY outside mousedown (SidebarItem.tsx:111-120 pattern). A row-local
+    // onMouseDown only closes the menu when the next click lands back on THIS row —
+    // right-clicking another row left the old menu mounted (stacked menus bug).
+    const menuDivRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        if (!showMenu) return;
+        const handler = (e: MouseEvent) => {
+            if (menuDivRef.current && !menuDivRef.current.contains(e.target as Node)) {
+                setShowMenu(false);
+                setShowGroupSubmenu(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [showMenu]);
 
     return (
         <div
@@ -115,7 +126,6 @@ export function ChatItem({
                 setShowMenu(true);
                 setShowGroupSubmenu(false);
             }}
-            onMouseDown={showMenu ? closeOnOutside : undefined}
         >
             {/* Avatar circle with first letter + group-color ring (V2-09b) */}
             <div className="relative shrink-0">
@@ -170,7 +180,7 @@ export function ChatItem({
 
             {showMenu && (
                 <div
-                    ref={setMenuRef}
+                    ref={(node) => { menuDivRef.current = node; }}
                     className="fixed z-50 bg-nobuf-surface/95 backdrop-blur-md border border-nobuf-border rounded-xl shadow-2xl py-1.5 min-w-[180px] animate-in fade-in zoom-in-95 duration-150"
                     style={{
                         left: Math.min(menuPos.x, window.innerWidth - 200),

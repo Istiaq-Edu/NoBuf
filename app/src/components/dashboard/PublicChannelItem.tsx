@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { AlertCircle, Trash2, Lock } from 'lucide-react';
 import { PublicChannel, PUBLIC_CHANNEL_DRAG_MIME } from '../../types';
 
@@ -21,12 +21,21 @@ interface Props {
 export function PublicChannelItem({ channel, active, collapsed, onClick, onRemove, onHideInVault }: Props) {
     const [showMenu, setShowMenu] = useState(false);
     const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
-    const [menuRef, setMenuRef] = useState<HTMLDivElement | null>(null);
+    const menuRef = useRef<HTMLDivElement | null>(null);
 
-    // Close on outside click (same pattern as SidebarItem's context menu).
-    const closeOnOutside = (e: React.MouseEvent) => {
-        if (menuRef && !menuRef.contains(e.target as Node)) setShowMenu(false);
-    };
+    // Close on ANY outside mousedown (SidebarItem.tsx:111-120 pattern). A row-local
+    // onMouseDown only closes the menu when the next click lands back on THIS row —
+    // right-clicking another row left the old menu mounted (stacked menus bug).
+    useEffect(() => {
+        if (!showMenu) return;
+        const handler = (e: MouseEvent) => {
+            if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+                setShowMenu(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [showMenu]);
 
     return (
         <div
@@ -52,7 +61,6 @@ export function PublicChannelItem({ channel, active, collapsed, onClick, onRemov
                 setMenuPos({ x: e.clientX, y: e.clientY });
                 setShowMenu(true);
             }}
-            onMouseDown={showMenu ? closeOnOutside : undefined}
         >
             {/* Avatar circle with first letter */}
             <div className="relative shrink-0">
@@ -99,7 +107,7 @@ export function PublicChannelItem({ channel, active, collapsed, onClick, onRemov
 
             {showMenu && (
                 <div
-                    ref={setMenuRef}
+                    ref={(node) => { menuRef.current = node; }}
                     className="fixed z-50 bg-nobuf-surface/95 backdrop-blur-md border border-nobuf-border rounded-xl shadow-2xl py-1.5 min-w-[180px] animate-in fade-in zoom-in-95 duration-150"
                     style={{
                         left: Math.min(menuPos.x, window.innerWidth - 200),
