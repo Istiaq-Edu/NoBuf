@@ -28,7 +28,8 @@ interface VaultContextValue {
     publicCount: number;
     chatCount: number;
     totalCount: number;
-    /** Hidden IDs — empty while locked (backend withholds them). */
+    /** Hidden IDs — ALWAYS present (the backend includes them while locked
+     *  so the UI can conceal; see vault.rs state_response). */
     hiddenFolderIds: Set<number>;
     hiddenPublicIds: Set<number>;
     hiddenChatIds: Set<number>;

@@ -397,13 +397,14 @@ export function useTelegramConnection(onLogoutParent: () => void) {
         }
     }, [store]);
 
-    const handleAddChat = useCallback(async (chat: { chat_id: number; peer_kind: string; access_hash: number | null; title: string }): Promise<ChatInfo | null> => {
+    const handleAddChat = useCallback(async (chat: { chat_id: number; peer_kind: string; access_hash: number | null; title: string; is_bot?: boolean }): Promise<ChatInfo | null> => {
         try {
             const added = await invoke<ChatInfo>('cmd_add_chat', {
                 chatId: chat.chat_id,
                 peerKind: chat.peer_kind,
                 accessHash: chat.access_hash,
                 title: chat.title,
+                isBot: chat.is_bot ?? false,
             });
             await persistChats(chats.some(c => c.chat_id === added.chat_id) ? chats : [...chats, added]);
             toast.success(`"${added.title}" added to Chats.`);

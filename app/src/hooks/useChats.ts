@@ -1,28 +1,19 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
-import { ChatInfo } from '../types';
 
 /**
  * Chats-section hooks (normal_chats backend, plan F1).
  *
- * useChats — the sidebar list (['chats'] query → cmd_list_chats).
  * useChatFiles — a chat's media grid with offset pagination, cloned from
  *   usePublicChannelFiles. CHAT_GONE errors surface as a `chatGone` flag —
  *   hooks can't navigate (no router; activeView is Dashboard-local state),
  *   so the Dashboard's effect performs the auto-remove + toast + navigate
  *   (plan §2.2, review2 V2-19 — the notAMember pattern).
+ *
+ * The sidebar's chats LIST lives in useTelegramConnection state (store+DB
+ * merge via mergeChatOrder) — not react-query (F-A11: the unused ['chats']
+ * query hook was dead code and was removed).
  */
-
-export function useChats() {
-    const { data: chats = [], isLoading } = useQuery<ChatInfo[]>({
-        queryKey: ['chats'],
-        queryFn: () => invoke<ChatInfo[]>('cmd_list_chats'),
-        staleTime: 30_000,
-        refetchOnWindowFocus: false,
-    });
-
-    return { chats, isLoading };
-}
 
 export function useChatFiles(chatId: number | null) {
     const queryClient = useQueryClient();

@@ -24,8 +24,11 @@ pub fn get_connection(app: &AppHandle) -> Result<Connection, String> {
         access_hash INTEGER,
         title       TEXT NOT NULL,
         added_at    INTEGER NOT NULL,
-        group_id    INTEGER
+        group_id    INTEGER,
+        is_bot      INTEGER NOT NULL DEFAULT 0
     )").map_err(|e| e.to_string())?;
+    // m6 (F-C8): dev DBs created before is_bot — best-effort backfill.
+    let _ = conn.execute("ALTER TABLE normal_chats ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0");
     // cmd_get_enriched_chats LEFT JOINs `groups` (owned by folder_groups.rs).
     // Create it here too so the JOIN can't fail on a profile that never ran
     // a groups command (review: cross-module table dependency).
@@ -53,6 +56,8 @@ fn row_to_chat_info(row: &[Value]) -> ChatInfo {
         title: vs(&row[3]),
         added_at: vi(&row[4]),
         group_id: voi(&row[5]),
+        // is_bot (m6): absent in pre-migration dev rows → default false.
+        is_bot: !row.is_empty() && row.len() > 6 && matches!(row[6], Value::Integer(1)),
     }
 }
 
@@ -60,11 +65,11 @@ fn row_to_chat_info(row: &[Value]) -> ChatInfo {
 pub fn load_normal_chats(app: &AppHandle) -> Result<Vec<ChatInfo>, String> {
     let conn = get_connection(app)?;
     let mut stmt = conn.prepare(
-        "SELECT chat_id, peer_kind, access_hash, title, added_at, group_id FROM normal_chats ORDER BY rowid"
+        "SELECT chat_id, peer_kind, access_hash, title, added_at, group_id, is_bot FROM normal_chats ORDER BY rowid"
     ).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
-        let row: Vec<Value> = (0..6).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        let row: Vec<Value> = (0..7).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
         out.push(row_to_chat_info(&row));
     }
     Ok(out)
@@ -194,6 +199,7 @@ pub async fn cmd_pick_chats(
         {
             let id = dialog_id(&dialog.peer);
             let kind_label = pickable_kind_label(&dialog.peer);
+            let is_bot = matches!(&dialog.peer, Peer::User(u) if matches!(&u.raw, grammers_tl_types::enums::User::User(raw) if raw.bot));
             out.push(PickableChat {
                 chat_id: id,
                 peer_kind,
@@ -201,6 +207,7 @@ pub async fn cmd_pick_chats(
                 title,
                 already_added,
                 kind_label,
+                is_bot,
             });
         }
     }
@@ -250,6 +257,7 @@ pub async fn cmd_add_chat(
     peer_kind: String,
     access_hash: Option<i64>,
     title: String,
+    is_bot: Option<bool>,
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<ChatInfo, String> {
@@ -274,7 +282,7 @@ pub async fn cmd_add_chat(
     {
         let conn = get_connection(&app)?;
         let mut stmt = conn.prepare(
-            "INSERT OR IGNORE INTO normal_chats (chat_id, peer_kind, access_hash, title, added_at, group_id) VALUES (?, ?, ?, ?, ?, NULL)"
+            "INSERT OR IGNORE INTO normal_chats (chat_id, peer_kind, access_hash, title, added_at, group_id, is_bot) VALUES (?, ?, ?, ?, ?, NULL, ?)"
         ).map_err(|e| e.to_string())?;
         stmt.bind((1, chat_id)).map_err(|e| e.to_string())?;
         stmt.bind((2, peer_kind.as_str())).map_err(|e| e.to_string())?;
@@ -284,6 +292,7 @@ pub async fn cmd_add_chat(
         }
         stmt.bind((4, title.as_str())).map_err(|e| e.to_string())?;
         stmt.bind((5, now)).map_err(|e| e.to_string())?;
+        stmt.bind((6, if is_bot.unwrap_or(false) { 1 } else { 0 })).map_err(|e| e.to_string())?;
         stmt.next().map_err(|e| e.to_string())?;
     }
 
@@ -412,6 +421,8 @@ async fn refresh_chat_peer(
                         title,
                         added_at: chat.added_at,
                         group_id: chat.group_id,
+                        // Identity refresh: preserve stored botness.
+                        is_bot: chat.is_bot,
                     });
                 }
                 break;
@@ -431,6 +442,7 @@ async fn refresh_chat_peer(
                 title: f.title,
                 added_at: chat.added_at,
                 group_id: chat.group_id,
+                is_bot: f.is_bot,
             });
         }
     }
@@ -495,6 +507,7 @@ async fn scan_archive_for_chat(
         for u in &users {
             let peer = Peer::User(grammers_client::types::User { raw: u.clone() });
             if dialog_id(&peer) == chat_id {
+                let is_bot = matches!(u, grammers_tl_types::enums::User::User(raw) if raw.bot);
                 if let Some((peer_kind, access_hash, title, _)) =
                     classify_dialog_peer(&peer, i64::MAX, &Default::default(), &Default::default())
                 {
@@ -505,6 +518,7 @@ async fn scan_archive_for_chat(
                         title,
                         added_at: 0,
                         group_id: None,
+                        is_bot,
                     });
                 }
             }
@@ -526,6 +540,7 @@ async fn scan_archive_for_chat(
                         peer_kind,
                         access_hash,
                         title,
+                        is_bot: false,
                         added_at: 0,
                         group_id: None,
                     });
@@ -1203,6 +1218,7 @@ mod tests {
             title: "T".into(),
             added_at: 0,
             group_id: None,
+            is_bot: false,
         }
     }
 

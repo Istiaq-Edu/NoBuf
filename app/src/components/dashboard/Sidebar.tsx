@@ -5,7 +5,7 @@ import { SidebarItem } from './SidebarItem';
 import { AddChannelModal } from './AddChannelModal';
 import { BandwidthWidget } from './BandwidthWidget';
 import { FolderGroupTabs } from './FolderGroupTabs';
-import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel, ChatInfo } from '../../types';
+import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel, ChatInfo, PickableChat } from '../../types';
 import { PublicChannelSidebarSection } from './PublicChannelSidebarSection';
 import { ChatSidebarSection } from './ChatSidebarSection';
 
@@ -25,9 +25,12 @@ interface SidebarProps {
     /** Adopt an owned/administered channel as a folder (from AddChannelModal). */
     onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
     // ---- Chats (normal_chats feature, plan F2) ----
+    /** RENDER list (vault-filtered). */
     chats: ChatInfo[];
+    /** RAW list — reorder math (F-A01). */
+    allChats: ChatInfo[];
     onSelectChat: (chatId: number) => void;
-    onChatAdded: (chat: ChatInfo) => void;
+    onChatAdded: (chat: PickableChat) => Promise<ChatInfo | null>;
     onRemoveChat: (chatId: number, title: string) => void;
     onChatReorder: (reordered: ChatInfo[]) => void;
     /** Internal file drag → move into chat (D17 drag gesture). */
@@ -66,7 +69,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     onUnadopt, onDeleteChannelPermanently, onAdoptChannel,
-    chats, onSelectChat, onChatAdded, onRemoveChat, onChatReorder, onFileDropOnChat,
+    chats, allChats, onSelectChat, onChatAdded, onRemoveChat, onChatReorder, onFileDropOnChat,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
     activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel,
@@ -411,6 +414,7 @@ export function Sidebar({
                                                                                         {/* Chats section — between Private and Public (D4) */}
                                                                                         <ChatSidebarSection
                                                                                                 chats={filteredChats}
+                                                                                                allChats={allChats}
                                                                                                 activeView={activeView}
                                                                                                 collapsed={collapsed}
                                                                                                 onSelect={onSelectChat}

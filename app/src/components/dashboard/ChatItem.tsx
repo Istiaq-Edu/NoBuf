@@ -22,7 +22,6 @@ interface Props {
     currentGroupId?: number | null;
     groupColor?: string | null;
     /** Drag-reorder within the Chats section (D12). */
-    onChatDragStart?: (e: React.DragEvent) => void;
     onChatDragOver?: (e: React.DragEvent) => void;
     onChatDragLeave?: (e: React.DragEvent) => void;
     onChatDrop?: (e: React.DragEvent) => void;
@@ -30,13 +29,12 @@ interface Props {
     reorderIndicator?: 'above' | 'below' | null;
     /** Internal file-drop → move into this chat (D17 drag gesture). */
     onFileDrop?: (e: React.DragEvent) => void;
-    onFileDragOver?: (e: React.DragEvent) => void;
 }
 
-function KindIcon({ peerKind, className }: { peerKind: string; className?: string }) {
-    if (peerKind === 'user') return <User className={className} />;
-    if (peerKind === 'basic_group' || peerKind === 'group') return <Users className={className} />;
-    return <Bot className={className} />;
+// m6 (F-C8): bots are peer_kind 'user' + is_bot — the old Bot arm was dead code.
+function KindIcon({ peerKind, isBot, className }: { peerKind: string; isBot?: boolean; className?: string }) {
+    if (peerKind === 'user') return isBot ? <Bot className={className} /> : <User className={className} />;
+    return <Users className={className} />;
 }
 
 /**
@@ -48,8 +46,8 @@ function KindIcon({ peerKind, className }: { peerKind: string; className?: strin
 export function ChatItem({
     chat, active, collapsed, onClick, onRemove, onHideInVault,
     onAssignGroup, currentGroupId, groupColor,
-    onChatDragStart, onChatDragOver, onChatDragLeave, onChatDrop: onChatDropHandler, onChatDragEnd,
-    reorderIndicator, onFileDrop, onFileDragOver,
+    onChatDragOver, onChatDragLeave, onChatDrop: onChatDropHandler, onChatDragEnd,
+    reorderIndicator, onFileDrop,
 }: Props) {
     const [showMenu, setShowMenu] = useState(false);
     const [showGroupSubmenu, setShowGroupSubmenu] = useState(false);
@@ -84,7 +82,6 @@ export function ChatItem({
             onDragStart={(e) => {
                 if (collapsed) { e.preventDefault(); return; }
                 // Reorder drag (same gesture as folders — SidebarItem pattern).
-                onChatDragStart?.(e);
                 e.dataTransfer.setData(CHAT_REORDER_MIME, String(chat.chat_id));
                 // Vault-hide drag (PublicChannelItem pattern).
                 e.dataTransfer.setData(CHAT_DRAG_MIME, String(chat.chat_id));
@@ -98,7 +95,6 @@ export function ChatItem({
                     e.preventDefault();
                     e.stopPropagation();
                     e.dataTransfer.dropEffect = 'move';
-                    onFileDragOver?.(e);
                 }
             }}
             onDragLeave={onChatDragLeave}
@@ -138,6 +134,7 @@ export function ChatItem({
                 {/* Kind icon (V2-09d) — user/bot/group at the avatar's corner */}
                 <KindIcon
                     peerKind={chat.peer_kind}
+                    isBot={chat.is_bot}
                     className={`absolute ${collapsed ? '-top-1 -right-1 w-2 h-2' : '-top-1 -right-1 w-2.5 h-2.5'} text-nobuf-subtext bg-nobuf-surface rounded-full p-0.5`}
                 />
             </div>
@@ -147,7 +144,7 @@ export function ChatItem({
                     <div className="flex-1 min-w-0">
                         <span className="text-sm truncate block">{chat.title}</span>
                         <span className="text-[10px] text-nobuf-subtext truncate block">
-                            {chat.peer_kind === 'user' ? 'Direct message'
+                            {chat.peer_kind === 'user' ? (chat.is_bot ? 'Bot' : 'Direct message')
                                 : chat.peer_kind === 'basic_group' ? 'Group'
                                 : 'Supergroup'}
                         </span>

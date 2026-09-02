@@ -807,6 +807,14 @@ pub async fn cmd_forward_to_folder(
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<ForwardResult, String> {
+    // F-B3: source==target would forward every message onto itself (duplicate
+    // the chat's history) and toast a lying success. Mirror cmd_move_files'
+    // early-return guard (fs.rs) — the frontend also filters the source from
+    // the target list, this is the backend half of the same hardening.
+    if source_channel_id == target_folder_id {
+        return Err("Source and target are the same chat".to_string());
+    }
+
     let client_opt = { state.client.lock().await.clone() };
     let client = client_opt.ok_or("Not connected to Telegram")?;
 

@@ -7,13 +7,14 @@ import { PickableChat, ChatInfo } from '../../types';
 interface Props {
     open: boolean;
     onClose: () => void;
-    onAdded: (chat: ChatInfo) => void;
+    /** Single-writer add — performs the invoke; returns the added chat or null. */
+    onAdded: (chat: PickableChat) => Promise<ChatInfo | null>;
 }
 
 /**
  * Chat picker modal (plan F2, D3): single view — search + eligible dialog
  * list. Already-added chats render disabled with a green check. Adding calls
- * cmd_add_chat directly (no parent handler hop — the caller supplies onAdded
+ * cmd_add_chat — the caller's onAdded (single writer)
  * for state push, the AddChannelModal-adopt pattern).
  */
 export function AddChatModal({ open, onClose, onAdded }: Props) {
@@ -44,15 +45,12 @@ export function AddChatModal({ open, onClose, onAdded }: Props) {
         if (chat.already_added || addingId !== null) return;
         setAddingId(chat.chat_id);
         try {
-            const added = await invoke<ChatInfo>('cmd_add_chat', {
-                chatId: chat.chat_id,
-                peerKind: chat.peer_kind,
-                accessHash: chat.access_hash,
-                title: chat.title,
-            });
-            setPickable(prev => prev.map(p => p.chat_id === chat.chat_id ? { ...p, already_added: true } : p));
-            onAdded(added);
-            toast.success(`"${added.title}" added to Chats.`);
+            // m2 (F-A07/F-C5): single writer — the parent (handleAddChat) owns
+            // the cmd_add_chat invoke + state + store. The modal only reports.
+            const added = await onAdded(chat);
+            if (added) {
+                setPickable(prev => prev.map(p => p.chat_id === chat.chat_id ? { ...p, already_added: true } : p));
+            }
         } catch (e) {
             toast.error(`Failed to add chat: ${e}`);
         } finally {

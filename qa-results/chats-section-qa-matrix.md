@@ -9,19 +9,19 @@ Branch: `feat/normal-chats-section` (base dbafe50). Builds: cargo check 0/0, car
 | 1 | Open '+' in Chats header | Picker lists eligible dialogs only (no channels/self/[NB]/adopted/forbidden; already-added disabled) | ☐ |
 | 2 | Search picker | Live filter | ☐ |
 | 3 | Add a DM | Row appears; toast; picker row disabled on reopen | ☐ |
-| 4 | Open a chat | FileExplorer grid from history; pagination; empty chat → empty state | ☐ |
+| 4 | Open a chat | FileExplorer grid from history; pagination; empty chat → "No files in this chat yet" | ☐ |
 | 5 | Upload button in chat view | Uploads to chat (message lands in the Telegram chat; transfer row shows filename) | ☐ |
 | 6 | Drag an OS file into the app while in a chat view | Streams direct to the chat (NOT Saved Messages) | ☐ |
-| 7 | Delete a file in chat view | Telegram-native: own message deletes; others' where allowed; refusal = error toast | ☐ |
+| 7 | Delete a file in chat view | Telegram-native delete; grid refreshes immediately (chatFiles invalidated); refusal = error toast | ☐ |
 | 8 | Stream a video from a chat | Player works (folderId seam mirrors chat id) | ☐ |
-| 9 | Remove chat (hover-X) | Unlist only; Telegram chat untouched | ☐ |
+| 9 | Remove chat (hover-X) | Unlist only; if it was the open chat, view jumps to Saved Messages | ☐ |
 | 10 | Drag chat to Vault | Hidden; VaultView lists it; unhide restores; locked global search conceals its files | ☐ |
 | 11 | Assign chat to colored group (ChatItem context menu) | Group dot ring; chip filter shows it under that group; deleting the group clears the assignment | ☐ |
 | 12 | Drag-reorder chats | Order persists across restart | ☐ |
 | 13 | Open dead chat (deleted account / left group) | Auto-remove + toast; navigate home | ☐ |
-| 14 | Move file chat→folder | Forward+delete; file appears in folder; on delete-refusal file remains in source with "Delete original failed" toast | ☐ |
+| 14 | Move file chat→folder | Forward+delete; file disappears from the chat grid; on delete-refusal the toast carries the backend "Delete original failed" text (partial success disclosed) | ☐ |
 | 15 | Move file folder→chat and chat→chat (drag onto ChatItem) | File lands in target | ☐ |
-| 16 | Forward from public channel to chat / from chat to chat (Forward modal) | File lands in target | ☐ |
+| 16 | Forward from public channel to chat / from chat to chat (file context menu → Forward) | File lands in target; source chat never offered as target | ☐ |
 | 17 | Drop oversize video in chat view | Split flow works (folder_id = chatId end-to-end); discard-job delete-parts works | ☐ |
 | 18 | Collapse sidebar (rail) | Chats '+' renders centered; items render as letter avatars | ☐ |
 | 19 | Restart app | Chats, order, group assignments, vault state persist; archived chat still opens; app open in a chat view restores THAT view (not a ghost "Folder" view) | ☐ |

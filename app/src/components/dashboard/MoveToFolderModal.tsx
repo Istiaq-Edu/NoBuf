@@ -23,7 +23,7 @@ export function MoveToFolderModal({ folders, chats, onClose, onSelect, activeFol
                     <button onClick={onClose} className="text-nobuf-subtext hover:text-nobuf-text"><Plus className="w-5 h-5 rotate-45" /></button>
                 </div>
                 <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                    {(activeFolderId !== null || activeChatId != null) && (
+                    {(activeFolderId !== null || activeChatId !== null) && (
                         <button
                             onClick={() => onSelect(null)}
                             className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm text-left text-nobuf-text hover:bg-nobuf-hover transition-colors"
@@ -53,7 +53,7 @@ export function MoveToFolderModal({ folders, chats, onClose, onSelect, activeFol
 
                     {chats.filter(c => c.chat_id !== activeChatId).map(c => (
                         <button
-                            key={c.chat_id}
+                            key={`c-${c.chat_id}`}
                             onClick={() => onSelect(c.chat_id)}
                             className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-sm text-left text-nobuf-text hover:bg-nobuf-hover transition-colors"
                         >
@@ -67,7 +67,7 @@ export function MoveToFolderModal({ folders, chats, onClose, onSelect, activeFol
                         </button>
                     ))}
 
-                    {folders.length === 0 && chats.length === 0 && activeFolderId === null && activeChatId == null && (
+                    {folders.length === 0 && chats.length === 0 && activeFolderId === null && activeChatId === null && (
                         <div className="p-4 text-center text-xs text-nobuf-subtext">No other destinations available.</div>
                     )}
                 </div>

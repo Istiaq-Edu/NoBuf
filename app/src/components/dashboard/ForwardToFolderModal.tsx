@@ -11,6 +11,8 @@ interface Props {
     folders: TelegramFolder[];
     /** Chat targets (D17): targetFolderId = chatId through the mirrored-id seam. */
     chats: ChatInfo[];
+    /** Current chat view id (source exclusion — F-B3/V2-08 parity). */
+    sourceChatId?: number | null;
     onForwarded: () => void;
 }
 
@@ -18,7 +20,7 @@ interface Props {
  *  cmd_forward_to_folder — targetFolderId carries the chat id). */
 type Target = { id: number; name: string; isChat: boolean };
 
-export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedFileIds, folders, chats, onForwarded }: Props) {
+export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedFileIds, folders, chats, sourceChatId, onForwarded }: Props) {
     const [selectedTarget, setSelectedTarget] = useState<Target | null>(null);
     const [forwarding, setForwarding] = useState(false);
     const [progress, setProgress] = useState(0);
@@ -103,7 +105,7 @@ export function ForwardToFolderModal({ open, onClose, sourceChannelId, selectedF
                             )}
                         </div>
                     ))}
-                    {chats.map(chat => (
+                    {chats.filter(chat => chat.chat_id !== sourceChatId).map(chat => (
                         <div
                             key={`c-${chat.chat_id}`}
                             onClick={() => setSelectedTarget({ id: chat.chat_id, name: chat.title, isChat: true })}

@@ -1,15 +1,19 @@
 import { useState, useCallback } from 'react';
 import { Plus, ChevronDown, ChevronRight } from 'lucide-react';
-import { ChatInfo, ActiveView, CHAT_REORDER_MIME } from '../../types';
+import { ChatInfo, PickableChat, ActiveView, CHAT_REORDER_MIME } from '../../types';
 import { ChatItem } from './ChatItem';
 import { AddChatModal } from './AddChatModal';
 
 interface Props {
+    /** RENDER list (vault + group filtered). */
     chats: ChatInfo[];
+    /** RAW chat list — reorder math must run here (F-A01: persisting the
+     *  filtered subset silently deleted non-matching chats; order destroyed). */
+    allChats: ChatInfo[];
     activeView: ActiveView;
     collapsed: boolean;
     onSelect: (chatId: number) => void;
-    onAdded: (chat: ChatInfo) => void;
+    onAdded: (chat: PickableChat) => Promise<ChatInfo | null>;
     onRemove: (chatId: number, title: string) => void;
     onReorder: (reordered: ChatInfo[]) => void;
     onHideInVault?: (chatId: number) => void;
@@ -23,13 +27,35 @@ interface Props {
 }
 
 /**
+ * Pure reorder math (folder pattern: Sidebar.tsx:184-210) — runs on the
+ * FULL list so filtered-out chats keep their positions (F-A01 test-pinned).
+ */
+export function reorderChatList(
+    list: ChatInfo[],
+    draggedId: number,
+    targetId: number,
+    position: 'above' | 'below'
+): ChatInfo[] | null {
+    if (draggedId === targetId) return null;
+    const draggedIndex = list.findIndex(c => c.chat_id === draggedId);
+    if (draggedIndex === -1) return null;
+    const targetIndex = list.findIndex(c => c.chat_id === targetId);
+    if (targetIndex === -1) return null;
+    const reordered = [...list];
+    const [draggedItem] = reordered.splice(draggedIndex, 1);
+    const newTargetIndex = reordered.findIndex(c => c.chat_id === targetId);
+    reordered.splice(position === 'above' ? newTargetIndex : newTargetIndex + 1, 0, draggedItem);
+    return reordered;
+}
+
+/**
  * Chats sidebar section (plan F2, D4/D10): always visible with header +
  * '+' between Private Channels and Public Channels. PublicChannelSidebarSection
  * clone with the folder-style reorder machinery (Sidebar.tsx:143-219 pattern,
  * scoped within this section).
  */
 export function ChatSidebarSection({
-    chats, activeView, collapsed, onSelect, onAdded, onRemove, onReorder,
+    chats, allChats, activeView, collapsed, onSelect, onAdded, onRemove, onReorder,
     onHideInVault, onAssignGroup, chatGroupMap, onFileDropOnChat,
     expanded = true, onToggleExpand,
 }: Props) {
@@ -52,27 +78,15 @@ export function ChatSidebarSection({
     }, []);
 
     const handleChatDrop = useCallback((e: React.DragEvent) => {
+        e.preventDefault();
         const reorderData = e.dataTransfer.getData(CHAT_REORDER_MIME);
         if (!reorderData || dragOverChatId === null || dragOverPosition === null) return;
         const draggedId = Number(reorderData);
-        if (draggedId === dragOverChatId) {
-            setDragOverChatId(null);
-            setDragOverPosition(null);
-            return;
-        }
-        const draggedIndex = chats.findIndex(c => c.chat_id === draggedId);
-        if (draggedIndex === -1) return;
-        const targetIndex = chats.findIndex(c => c.chat_id === dragOverChatId);
-        if (targetIndex === -1) return;
-
-        const reordered = [...chats];
-        const [draggedItem] = reordered.splice(draggedIndex, 1);
-        const newTargetIndex = reordered.findIndex(c => c.chat_id === dragOverChatId);
-        reordered.splice(dragOverPosition === 'above' ? newTargetIndex : newTargetIndex + 1, 0, draggedItem);
-        onReorder(reordered);
+        const reordered = reorderChatList(allChats, draggedId, dragOverChatId, dragOverPosition);
+        if (reordered) onReorder(reordered);
         setDragOverChatId(null);
         setDragOverPosition(null);
-    }, [chats, dragOverChatId, dragOverPosition, onReorder]);
+    }, [allChats, dragOverChatId, dragOverPosition, onReorder]);
 
     const handleDragEnd = useCallback(() => {
         setDragOverChatId(null);
@@ -137,7 +151,16 @@ export function ChatSidebarSection({
                             currentGroupId={chatGroupMap[chat.chat_id]?.id ?? null}
                             groupColor={chatGroupMap[chat.chat_id]?.color ?? null}
                             onChatDragOver={(e) => handleChatDragOver(e, chat.chat_id)}
-                            onChatDragLeave={() => { setDragOverChatId(null); setDragOverPosition(null); }}
+                            onChatDragLeave={(e) => {
+                                // Folder-pattern rect guard (SidebarItem.tsx:201-210):
+                                // dragleave fires on child crossings — only clear when
+                                // the pointer actually left the item (else flicker).
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
+                                    setDragOverChatId(null);
+                                    setDragOverPosition(null);
+                                }
+                            }}
                             onChatDrop={handleChatDrop}
                             onChatDragEnd={handleDragEnd}
                             reorderIndicator={dragOverChatId === chat.chat_id ? dragOverPosition : null}

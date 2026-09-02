@@ -80,6 +80,8 @@ export interface ChatInfo {
     title: string;
     added_at: number;
     group_id: number | null;
+    /** Bot DM (peer_kind 'user' + bot) — icon/subtitle (m6). */
+    is_bot?: boolean;
 }
 
 /** A dialog eligible for the chat picker (already-added rows included,
@@ -91,6 +93,8 @@ export interface PickableChat {
     title: string;
     already_added: boolean;
     kind_label: string; // 'Direct message' | 'Bot' | 'Group' | 'Supergroup'
+    /** Bot DM (m6) — carried to cmd_add_chat. */
+    is_bot: boolean;
 }
 
 /** Chat id → group assignment (sidebar group-chip filtering). */

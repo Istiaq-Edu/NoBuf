@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-pick-chats"
+description = "Enables the cmd_pick_chats command without any pre-configured scope."
+commands.allow = ["cmd_pick_chats"]
+
+[[permission]]
+identifier = "deny-cmd-pick-chats"
+description = "Denies the cmd_pick_chats command without any pre-configured scope."
+commands.deny = ["cmd_pick_chats"]

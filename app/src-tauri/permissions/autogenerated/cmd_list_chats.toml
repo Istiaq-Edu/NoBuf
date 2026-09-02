@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-list-chats"
+description = "Enables the cmd_list_chats command without any pre-configured scope."
+commands.allow = ["cmd_list_chats"]
+
+[[permission]]
+identifier = "deny-cmd-list-chats"
+description = "Denies the cmd_list_chats command without any pre-configured scope."
+commands.deny = ["cmd_list_chats"]

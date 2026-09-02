@@ -128,6 +128,8 @@ pub struct ChatInfo {
     pub title: String,
     pub added_at: i64,
     pub group_id: Option<i64>,
+    /// Bot DMs are peer_kind='user' + bot flag (m6/F-C8) — sidebar icon/subtitle.
+    pub is_bot: bool,
 }
 
 /// Chat id → group assignment (sidebar group-chip filtering).
@@ -149,6 +151,8 @@ pub struct PickableChat {
     pub already_added: bool,
     /// 'Direct message' | 'Bot' | 'Group' | 'Supergroup'
     pub kind_label: String,
+    /// Bot DM (m6) — carried to cmd_add_chat for persistence.
+    pub is_bot: bool,
 }
 
 /// Result of forwarding files to a [NB] folder.

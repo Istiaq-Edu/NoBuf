@@ -27,7 +27,7 @@ import { VaultPasscodeModal } from './dashboard/VaultPasscodeModal';
 import { VaultView } from './dashboard/VaultView';
 import { usePublicChannels, usePublicChannelFiles } from '../hooks/usePublicChannels';
 import { useChatFiles } from '../hooks/useChats';
-import { ActiveView } from '../types';
+import { ActiveView, CHAT_REORDER_MIME, CHAT_DRAG_MIME, PUBLIC_CHANNEL_DRAG_MIME } from '../types';
 import { useConfirm } from '../context/ConfirmContext';
 
 // Hooks
@@ -87,6 +87,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const activeViewRef = useRef<ActiveView>(activeView);
         useEffect(() => { activeViewRef.current = activeView; }, [activeView]);
         const vaultRef = useRef(vault);
+
         useEffect(() => { vaultRef.current = vault; }, [vault]);
         const [canGoBack, setCanGoBack] = useState(false);
         const navigateToRef = useRef<(v: ActiveView) => void>(() => {});
@@ -102,7 +103,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             }
             setActiveView(next);
         }, []);
-        const goBack = useCallback(() => {
+    const goBack = useCallback(() => {
             // Pop until we find a target that is still allowed. Vault-hidden
             // items are skipped (Finding D): Back must never land on a view
             // the rest of the feature works to conceal.
@@ -113,8 +114,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     (candidate.type === 'folder' && vaultRef.current.hiddenFolderIds.has(candidate.folderId)) ||
                     (candidate.type === 'public' && vaultRef.current.hiddenPublicIds.has(candidate.channelId)) ||
                     (candidate.type === 'chat' && vaultRef.current.hiddenChatIds.has(candidate.chatId));
+                // F-A06: also skip dead entities — Back must not re-enter a
+                // removed chat (the chatGone dedup ref would block recovery).
+                const dead =
+                    (candidate.type === 'folder' && !foldersRef.current.some(f => f.id === candidate.folderId)) ||
+                    (candidate.type === 'public' && !publicChannelsRef.current.some(c => c.channel_id === candidate.channelId)) ||
+                    (candidate.type === 'chat' && !chatsRef.current.some(c => c.chat_id === candidate.chatId));
                 past = past.slice(0, -1);
-                if (!concealed) {
+                if (!concealed && !dead) {
                     pastViewsRef.current = past;
                     setCanGoBack(past.length > 0);
                     if (candidate.type === 'folder') setActiveFolderId(candidate.folderId);
@@ -134,6 +141,15 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // re-binding the window listener on every render.
         useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
         const { publicChannels, removeChannel } = usePublicChannels();
+
+        // F-A06: live entity lists for goBack's dead-view skip (declared after
+        // all three lists exist — folders/chats come from props/context above).
+        const foldersRef = useRef(folders);
+        const publicChannelsRef = useRef(publicChannels);
+        const chatsRef = useRef(chats);
+        useEffect(() => { foldersRef.current = folders; }, [folders]);
+        useEffect(() => { publicChannelsRef.current = publicChannels; }, [publicChannels]);
+        useEffect(() => { chatsRef.current = chats; }, [chats]);
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
 
@@ -251,19 +267,32 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         // chats list loads: restore the chat view properly, or null an unknown id.
         const bootRestoredRef = useRef(false);
         useEffect(() => {
+            // F-A02: wait for vault state — the restore gate's !vault.ready
+            // capture window usually loses the mount race (vault is one invoke;
+            // initStore restores the id after Store.load + several gets), so
+            // THIS guard is the last line of defense. Never restore into a
+            // hidden chat; never decide before vault state exists.
             if (bootRestoredRef.current || !store || !isConnected) return;
+            if (!vault.ready) return;
             if (activeView.type !== 'saved' || activeFolderId === null) return;
             // Only act when the persisted id matches NO folder (i.e. it might
             // be a chat id) — folder ids restore through their own path.
             if (folders.some(f => f.id === activeFolderId)) return;
             if (publicChannels.some(c => c.channel_id === activeFolderId)) return;
+            if (vault.hiddenFolderIds.has(activeFolderId) || vault.hiddenChatIds.has(activeFolderId)) {
+                bootRestoredRef.current = true;
+                setActiveView({ type: 'saved' });
+                store.delete('activeFolderId').then(() => store.save()).catch(() => {});
+                return;
+            }
             if (chats.some(c => c.chat_id === activeFolderId)) {
                 bootRestoredRef.current = true;
                 navigateTo({ type: 'chat', chatId: activeFolderId });
             }
-            // A chat id that matches nothing gets nulled on vault-ready by the
-            // restore gate below; do nothing here (chats may still be loading).
-        }, [store, isConnected, activeView, activeFolderId, folders, publicChannels, chats, navigateTo]);
+            // Unknown ids (dead chat, hand-edited store): the sync effect's
+            // 'saved' arm nulls them on first pass (handleSetActiveFolderId is
+            // unmemoized → the effect re-runs every render).
+        }, [store, isConnected, vault.ready, vault.hiddenFolderIds, vault.hiddenChatIds, activeView, activeFolderId, folders, publicChannels, chats, navigateTo, setActiveView]);
 
         // Ctrl+Shift+V — open Vault (D11). preventDefault: WebView2 reserves
         // this combo for paste-plain-text. Bound outside the input-guard path
@@ -380,6 +409,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         useEffect(() => {
             if (!chatGone || activeView.type !== 'chat') return;
             const deadId = activeView.chatId;
+            // F-A06/MINOR-5: a re-added chat dying again must re-fire — reset
+            // the dedup ref when the chat is no longer in the list (removed).
+            if (chatGoneHandledRef.current === deadId && !chats.some(c => c.chat_id === deadId)) {
+                chatGoneHandledRef.current = null;
+            }
             if (chatGoneHandledRef.current === deadId) return;
             chatGoneHandledRef.current = deadId;
             const title = chats.find(c => c.chat_id === deadId)?.title || '';
@@ -416,7 +450,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         return () => { cancelled = true; };
     }, [isConnected]);
     // Public channels are read-only; only saved/folder views accept uploads.
-    const canUploadHere = !isReadOnly;
+    const canUploadHere = !isReadOnly && activeView.type !== 'vault'; // m3: vault view must not stage to the mirrored chat/folder id
     // Staging-in-progress rows (dropped files being copied to %TEMP% before they
     // enter the upload queue). Keyed by name; cleared when its batch finishes.
     const [stagingItems, setStagingItems] = useState<{ name: string; pct: number }[]>([]);
@@ -888,8 +922,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             if (selectedIds.includes(fileId)) setSelectedIds([]);
             toast.success(`Moved ${idsToMove.length} file(s).`);
             setInternalDragFileId(null);
-        } catch {
-            toast.error('Failed to move file(s).');
+        } catch (e) {
+            toast.error(`Failed to move file(s): ${e}`);
         }
     };
 
@@ -898,6 +932,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 loadMore.mutate(pubLastOffsetId);
             }
         }, [loadMore, pubLastOffsetId]);
+
+        const handleLoadMoreChat = useCallback(() => {
+            // F-A05: same guard as the public arm — without it the observer's
+            // immediate re-fire on every re-render appends duplicate pages.
+            if (!loadMoreChat.isPending && chatLastOffsetId) {
+                loadMoreChat.mutate(chatLastOffsetId);
+            }
+        }, [loadMoreChat, chatLastOffsetId]);
 
         const handleRemovePublicChannel = async (channelId: number) => {
             const channel = publicChannels.find(c => c.channel_id === channelId);
@@ -987,7 +1029,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 // browser) would navigate the whole webview on drop. Block that —
                 // unless the target is an editable field, where text drops are legit.
                 const t = e.dataTransfer ? Array.from(e.dataTransfer.types) : [];
-                const isInternal = t.includes(FILE_ID_MIME) || t.includes(FOLDER_REORDER_MIME);
+                const isInternal = t.includes(FILE_ID_MIME) || t.includes(FOLDER_REORDER_MIME) || t.includes(CHAT_REORDER_MIME) || t.includes(CHAT_DRAG_MIME) || t.includes(PUBLIC_CHANNEL_DRAG_MIME);
                 if (!isInternal) {
                     const el = e.target as HTMLElement | null;
                     if (!el?.closest?.('input, textarea, [contenteditable="true"]')) e.preventDefault();
@@ -1180,13 +1222,22 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onDeleteChannelPermanently={handleDeleteChannelPerm}
                 onAdoptChannel={handleAdoptChannel}
                 chats={visibleChats}
+                allChats={chats}
                 onSelectChat={(chatId) => navigateTo({ type: 'chat', chatId })}
                 onChatAdded={(added) => {
-                    // Idempotent re-add through the single writer — pushes into
-                    // chats state + store (INSERT OR IGNORE on the backend).
-                    void handleAddChat(added);
+                    // m2: single writer — this is the ONLY cmd_add_chat invoke
+                    // and the ONLY success toast. Returns ChatInfo | null.
+                    return handleAddChat(added);
                 }}
-                onRemoveChat={(chatId, title) => void handleRemoveChat(chatId, title)}
+                onRemoveChat={(chatId, title) => {
+                    // F-A04: if this chat is open, leave the view — otherwise a
+                    // zombie grid stays on a cache-evicted chat and the persisted
+                    // activeFolderId stays poisoned until the next navigation.
+                    if (activeView.type === 'chat' && activeView.chatId === chatId) {
+                        navigateTo({ type: 'saved' });
+                    }
+                    void handleRemoveChat(chatId, title);
+                }}
                 onChatReorder={handleChatReorder}
                 onFileDropOnChat={handleFileDropOnChat}
                 isConnected={isConnected}
@@ -1272,10 +1323,15 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     onDragEnd={() => setTimeout(() => setInternalDragFileId(null), 50)}
                     readOnly={isReadOnly}
                     hasMore={isPublicView ? pubHasMore : isChatView ? chatHasMore : false}
-                                        onLoadMore={isPublicView ? handleLoadMore : isChatView ? () => { if (chatLastOffsetId) loadMoreChat.mutate(chatLastOffsetId); } : undefined}
+                                        onLoadMore={isPublicView ? handleLoadMore : isChatView ? handleLoadMoreChat : undefined}
                     notAMember={isPublicView ? pubNotAMember : false}
                     onRemoveChannel={isPublicView && activeView.type === 'public' ? () => handleRemovePublicChannel(activeView.channelId) : undefined}
                     showForwardOption={isReadOnly}
+                    canForward={isChatView}
+                    canDelete={isChatView}
+                    canRename={false}
+                    emptyTitle={isChatView ? 'No files in this chat yet' : undefined}
+                    emptySubtitle={isChatView ? 'Files sent or received in this chat appear here. Drag and drop here to send to the chat.' : undefined}
                     onForwardToFolder={() => setShowForwardModal(true)}
                 />
                 )}
@@ -1471,6 +1527,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 onClose={() => setShowForwardModal(false)}
                 sourceChannelId={activeView.type === 'public' ? activeView.channelId
                     : activeView.type === 'chat' ? activeView.chatId : 0}
+                sourceChatId={activeView.type === 'chat' ? activeView.chatId : null}
                 selectedFileIds={selectedIds}
                 folders={visibleFolders}
                 chats={visibleChats}

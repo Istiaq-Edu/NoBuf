@@ -15,11 +15,23 @@ interface ContextMenuProps {
     channelIsPublic?: boolean;
     onForwardToFolder?: () => void;
     showForwardOption?: boolean;
+    /** Granular flags (plan §2.1 — chat views: forward+delete, no rename).
+     *  Fall back to showForwardOption-derived defaults when absent. */
+    canForward?: boolean;
+    canDelete?: boolean;
+    canRename?: boolean;
 }
 
-export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onCopyLink, channelIsPublic, onForwardToFolder, showForwardOption }: ContextMenuProps) {
+export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPreview, onCopyLink, channelIsPublic, onForwardToFolder, showForwardOption, canForward, canDelete, canRename }: ContextMenuProps) {
     const [adjustedPos, setAdjustedPos] = useState({ x, y });
     const menuRef = useRef<HTMLDivElement>(null);
+
+    // Granular flags resolve: explicit prop > showForwardOption default.
+    // Public views (showForwardOption=true): forward, no delete, no rename.
+    // Chat views (plan §2.1): forward + delete, no rename.
+    const forwardOn = canForward ?? !!showForwardOption;
+    const deleteOn = canDelete ?? !showForwardOption;
+    const renameOn = canRename ?? !showForwardOption;
 
     // Adjust position to stay in bounds
     useEffect(() => {
@@ -99,7 +111,7 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 </button>
             )}
 
-            {showForwardOption && onForwardToFolder && (
+            {forwardOn && onForwardToFolder && (
                 <button
                     onClick={onForwardToFolder}
                     className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-text hover:bg-nobuf-hover rounded transition-colors text-left w-full"
@@ -126,14 +138,14 @@ export function ContextMenu({ x, y, file, onClose, onDownload, onDelete, onPrevi
                 </button>
             )}
 
-            {!showForwardOption && (
+            {renameOn && (
                             <button disabled className="flex items-center gap-2 px-2 py-1.5 text-sm text-nobuf-subtext hover:bg-nobuf-hover rounded transition-colors text-left w-full cursor-not-allowed opacity-50">
                                 <Pencil className="w-4 h-4" />
                                 Rename
                             </button>
                         )}
 
-            {(!showForwardOption) && (
+            {deleteOn && (
                 <>
                     <div className="h-px bg-nobuf-border my-1" />
 

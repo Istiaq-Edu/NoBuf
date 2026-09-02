@@ -18,6 +18,7 @@ export function useFileOperations(
         try {
             await invoke('cmd_delete_file', { messageId: id, folderId: activeFolderId });
             queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+            queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
             toast.success("File deleted");
         } catch (e) {
             toast.error(`Delete failed: ${e}`);
@@ -40,6 +41,7 @@ export function useFileOperations(
         }
         setSelectedIds([]);
         queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+        queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
         if (success > 0) toast.success(`Deleted ${success} files.`);
         if (fail > 0) toast.error(`Failed to delete ${fail} files.`);
     }
@@ -91,12 +93,13 @@ export function useFileOperations(
                 sourceFolderId: activeFolderId,
                 targetFolderId: targetFolderId
             });
-            toast.success(`Moved ${selectedIds.length} files.`);
             queryClient.invalidateQueries({ queryKey: ['files', activeFolderId] });
+            queryClient.invalidateQueries({ queryKey: ['chatFiles'] });
             setSelectedIds([]);
+            toast.success(`Moved ${selectedIds.length} files.`);
             if (onSuccess) onSuccess();
-        } catch {
-            toast.error('Failed to move files');
+        } catch (e) {
+            toast.error(`Failed to move files: ${e}`);
         }
     };
 
