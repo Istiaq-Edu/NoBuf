@@ -116,10 +116,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                     (candidate.type === 'chat' && vaultRef.current.hiddenChatIds.has(candidate.chatId));
                 // F-A06: also skip dead entities — Back must not re-enter a
                 // removed chat (the chatGone dedup ref would block recovery).
+                const l = listsLoadedRef.current;
                 const dead =
-                    (candidate.type === 'folder' && !foldersRef.current.some(f => f.id === candidate.folderId)) ||
-                    (candidate.type === 'public' && !publicChannelsRef.current.some(c => c.channel_id === candidate.channelId)) ||
-                    (candidate.type === 'chat' && !chatsRef.current.some(c => c.chat_id === candidate.chatId));
+                    (candidate.type === 'folder' && l.folders && !foldersRef.current.some(f => f.id === candidate.folderId)) ||
+                    (candidate.type === 'public' && l.publicChannels && !publicChannelsRef.current.some(c => c.channel_id === candidate.channelId)) ||
+                    (candidate.type === 'chat' && l.chats && !chatsRef.current.some(c => c.chat_id === candidate.chatId));
                 past = past.slice(0, -1);
                 if (!concealed && !dead) {
                     pastViewsRef.current = past;
@@ -147,9 +148,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         const foldersRef = useRef(folders);
         const publicChannelsRef = useRef(publicChannels);
         const chatsRef = useRef(chats);
-        useEffect(() => { foldersRef.current = folders; }, [folders]);
-        useEffect(() => { publicChannelsRef.current = publicChannels; }, [publicChannels]);
-        useEffect(() => { chatsRef.current = chats; }, [chats]);
+        // B4: track load-completion separately — an empty array mid-hydration
+        // must not read as "entity is dead" in goBack's skip logic.
+        const listsLoadedRef = useRef({ folders: false, publicChannels: false, chats: false });
+        useEffect(() => { foldersRef.current = folders; listsLoadedRef.current.folders = true; }, [folders]);
+        useEffect(() => { publicChannelsRef.current = publicChannels; listsLoadedRef.current.publicChannels = true; }, [publicChannels]);
+        useEffect(() => { chatsRef.current = chats; listsLoadedRef.current.chats = true; }, [chats]);
         const [showForwardModal, setShowForwardModal] = useState(false);
         const { confirm } = useConfirm();
 
