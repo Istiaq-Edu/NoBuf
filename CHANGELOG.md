@@ -2,12 +2,24 @@
 
 All notable changes to NoBuf will be documented in this file.
 
-## [1.5.0] - 2026-08-30
+## [1.6.0] - 2026-08-30
 
 ### Documentation
 
+- Update CHANGELOG.md for v1.0.0
+- Update CHANGELOG.md for v1.0.0
+- Update CHANGELOG.md for v1.0.0
+- Update CHANGELOG.md for v1.1.0
+- Update CHANGELOG.md for v1.1.0
+- Update CHANGELOG.md for v1.1.0
+- Update CHANGELOG.md for v1.3.0
+- Update CHANGELOG.md for v1.3.1
+- Update CHANGELOG.md for v1.3.1
+- Update CHANGELOG.md for v1.4.0
+- Update CHANGELOG.md for v1.4.5
 - Update CHANGELOG.md for v1.4.6
 - Update CHANGELOG.md for v1.4.7
+- Update CHANGELOG.md for v1.5.0
 
 ## [1.4.5] - 2026-08-28
 
@@ -175,15 +187,6 @@ All notable changes to NoBuf will be documented in this file.
 - Add design spec + implementation plan for public channel browsing
 - Verification, validation & optimization plan for public channel feature
 - Update CHANGELOG.md for v0.9.0
-- Update CHANGELOG.md for v1.0.0
-- Update CHANGELOG.md for v1.0.0
-- Update CHANGELOG.md for v1.0.0
-- Update CHANGELOG.md for v1.1.0
-- Update CHANGELOG.md for v1.1.0
-- Update CHANGELOG.md for v1.1.0
-- Update CHANGELOG.md for v1.3.0
-- Update CHANGELOG.md for v1.3.1
-- Update CHANGELOG.md for v1.3.1
 - Vault feature design spec (hide channels/folders behind passcode)
 - Vault spec rev 2 after adversarial design review (16 findings triaged, 7 Required fixed)
 - Fold late frontend-reviewer observation into consolidated report (R17 FYI)
@@ -195,8 +198,6 @@ All notable changes to NoBuf will be documented in this file.
 - Record F3 (first-hide race) in consolidated report
 - Record F4 (stale unlock across account switch) in consolidated report
 - Spec rev 6 — locked get_state ID-withholding was a design error, corrected
-- Update CHANGELOG.md for v1.4.0
-- Update CHANGELOG.md for v1.4.5
 - **split-upload:** Validated plan for >2GB lossless split-and-upload
 - **plan:** Record Phase D D0 spike decision (Strategy 1 — fresh MediaSource per part)
 
