@@ -585,6 +585,8 @@ pub fn run() {
             commands::cmd_get_chat_files,
             commands::cmd_assign_chat_to_group,
             commands::cmd_get_enriched_chats,
+            commands::cmd_assign_public_channel_to_group,
+            commands::cmd_get_enriched_public_channels,
             commands::cmd_forward_to_folder,
             commands::cmd_update_nb_pub_sync,
             commands::cmd_sync_public_channels,

@@ -14,11 +14,15 @@ interface Props {
     onHideInVault?: (channelId: number) => void;
     /** Adopt an owned/administered channel as a folder (pushes into folders state directly). */
     onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
+    /** Colored-group assignment (D9 parity) — same entry point as folders/chats. */
+    onAssignGroup?: (channelId: number, groupId: number | null) => void;
+    /** channelId → { id, color } from cmd_get_enriched_public_channels (chip filter). */
+    channelGroupMap: Record<number, { id: number | null; color: string | null }>;
     expanded?: boolean;
     onToggleExpand?: () => void;
 }
 
-export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, onHideInVault, onAdoptChannel, expanded = true, onToggleExpand }: Props) {
+export function PublicChannelSidebarSection({ channels, activeView, collapsed, onSelect, onRemoved, onRemove, onHideInVault, onAdoptChannel, onAssignGroup, channelGroupMap, expanded = true, onToggleExpand }: Props) {
     const [showAddModal, setShowAddModal] = useState(false);
     const activeChannelId = activeView.type === 'public' ? activeView.channelId : null;
 
@@ -81,6 +85,9 @@ export function PublicChannelSidebarSection({ channels, activeView, collapsed, o
                                             }
                                         }}
                                         onHideInVault={onHideInVault ? () => onHideInVault(channel.channel_id) : undefined}
+                                        onAssignGroup={onAssignGroup ? (groupId) => onAssignGroup(channel.channel_id, groupId) : undefined}
+                                        currentGroupId={channelGroupMap[channel.channel_id]?.id ?? null}
+                                        groupColor={channelGroupMap[channel.channel_id]?.color ?? null}
                                     />
                                 ))}
                                 {!collapsed && channels.length === 0 && (

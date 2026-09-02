@@ -5,7 +5,7 @@ use sqlite::{Connection, Value};
 use std::path::PathBuf;
 use crate::commands::TelegramState;
 use crate::commands::utils::map_error;
-use crate::models::{PublicChannel, ChannelPreview, JoinedChannel, ForwardResult, FileMetadata, AdoptedFolder};
+use crate::models::{PublicChannel, ChannelPreview, JoinedChannel, ForwardResult, FileMetadata, AdoptedFolder, EnrichedChannel};
 
 /// [NB-PUB] sync payload. New builds write {channels, adopted}; the reader
 /// falls back to a plain Vec<PublicChannel> for messages written by old builds.
@@ -36,6 +36,9 @@ fn get_connection(app: &AppHandle) -> Result<Connection, String> {
         added_at     INTEGER NOT NULL,
         is_member    INTEGER NOT NULL DEFAULT 1
     )").map_err(|e| e.to_string())?;
+    // Group assignment (D9 parity with folders/chats): dev DBs created before
+    // the column — best-effort backfill (normal_chats.rs is_bot pattern).
+    let _ = conn.execute("ALTER TABLE public_channels ADD COLUMN group_id INTEGER");
     conn.execute("CREATE TABLE IF NOT EXISTS nb_pub_settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -59,6 +62,10 @@ fn vs(v: &Value) -> String {
 
 fn vb(v: &Value) -> bool {
     match v { Value::Integer(i) => *i != 0, _ => false }
+}
+
+fn voi(v: &Value) -> Option<i64> {
+    match v { Value::Integer(i) => Some(*i), _ => None }
 }
 
 fn row_to_public_channel(row: &[Value]) -> PublicChannel {
@@ -634,6 +641,50 @@ pub fn cmd_get_public_channels(
         channels.push(row_to_public_channel(&row));
     }
     Ok(channels)
+}
+
+// ─── Group assignment (D9 parity with folders/chats) ─────────────
+
+/// Assign a public channel to a colored group (null = unassign).
+/// Group data is DEVICE-LOCAL: the [NB-PUB] sync payload/reconcile never
+/// touch group_id, matching folder/chat assignment semantics.
+#[tauri::command]
+pub fn cmd_assign_public_channel_to_group(
+    channel_id: i64,
+    group_id: Option<i64>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    let conn = get_connection(&app)?;
+    let mut stmt = conn.prepare("UPDATE public_channels SET group_id = ? WHERE channel_id = ?")
+        .map_err(|e| e.to_string())?;
+    match group_id {
+        Some(g) => stmt.bind((1, g)).map_err(|e| e.to_string())?,
+        None => stmt.bind((1, Value::Null)).map_err(|e| e.to_string())?,
+    }
+    stmt.bind((2, channel_id)).map_err(|e| e.to_string())?;
+    stmt.next().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Public channel id → group (id, color) map for the sidebar's chip filtering.
+/// Mirrors cmd_get_enriched_chats (normal_chats.rs) — channels absent from
+/// the map render unassigned; the LEFT JOIN keeps rows with NULL group_id.
+#[tauri::command]
+pub fn cmd_get_enriched_public_channels(app: AppHandle) -> Result<Vec<EnrichedChannel>, String> {
+    let conn = get_connection(&app)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.channel_id, p.group_id, g.color_hex FROM public_channels p LEFT JOIN groups g ON p.group_id = g.id",
+    ).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+        let row: Vec<Value> = (0..3).map(|i| stmt.read(i).unwrap_or(Value::Null)).collect();
+        out.push(EnrichedChannel {
+            channel_id: vi(&row[0]),
+            group_id: voi(&row[1]),
+            group_color: match &row[2] { Value::String(s) => Some(s.clone()), _ => None },
+        });
+    }
+    Ok(out)
 }
 
 // ─── Get files from a public channel (paginated, 50 per page) ───

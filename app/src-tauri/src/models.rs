@@ -140,6 +140,15 @@ pub struct EnrichedChat {
     pub group_color: Option<String>,
 }
 
+/// Public channel id → group assignment (sidebar group-chip filtering) —
+/// the EnrichedChat shape, keyed by channel id (D9 parity).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EnrichedChannel {
+    pub channel_id: i64,
+    pub group_id: Option<i64>,
+    pub group_color: Option<String>,
+}
+
 /// A dialog eligible for the chat picker (already-added rows included,
 /// flagged, so the modal can render them disabled).
 #[derive(Debug, Serialize, Deserialize, Clone)]

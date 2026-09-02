@@ -111,6 +111,12 @@ pub fn cmd_delete_group(id: i64, app: AppHandle) -> Result<bool, String> {
     };
     stmt.bind((1, id)).map_err(|e| e.to_string())?;
     stmt.iter().next();
+    // Public channels: same dangling-assignment cleanup (D9 parity).
+    // Best-effort for the same fresh-install reason.
+    if let Ok(mut stmt) = conn.prepare("UPDATE public_channels SET group_id = NULL WHERE group_id = ?") {
+        let _ = stmt.bind((1, id));
+        stmt.iter().next();
+    }
     Ok(true)
 }
 

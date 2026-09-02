@@ -88,6 +88,8 @@ fn main() {
                                 "cmd_get_chat_files",
                                 "cmd_assign_chat_to_group",
                                 "cmd_get_enriched_chats",
+                                "cmd_assign_public_channel_to_group",
+                                "cmd_get_enriched_public_channels",
                                 "cmd_forward_to_folder",
                                 "cmd_update_nb_pub_sync",
                                 "cmd_sync_public_channels",

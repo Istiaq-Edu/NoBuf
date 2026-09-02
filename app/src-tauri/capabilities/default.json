@@ -107,6 +107,8 @@
     "allow-cmd-get-chat-files",
     "allow-cmd-assign-chat-to-group",
     "allow-cmd-get-enriched-chats",
+    "allow-cmd-assign-public-channel-to-group",
+    "allow-cmd-get-enriched-public-channels",
     "allow-cmd-forward-to-folder",
     "allow-cmd-update-nb-pub-sync",
     "allow-cmd-sync-public-channels",

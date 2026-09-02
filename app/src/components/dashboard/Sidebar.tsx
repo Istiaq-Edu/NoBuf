@@ -87,6 +87,9 @@ export function Sidebar({
     // Chats: enriched group data (D9 chip filtering) — parallel to folders.
     const [chatGroupMap, setChatGroupMap] = useState<Record<number, { id: number | null; color: string | null }>>({});
 
+    // Public channels: enriched group data (D9 parity) — parallel to chats.
+    const [channelGroupMap, setChannelGroupMap] = useState<Record<number, { id: number | null; color: string | null }>>({});
+
     // New Group inline input
     const [showNewGroupInput, setShowNewGroupInput] = useState(false);
         const [newGroupName, setNewGroupName] = useState('');
@@ -139,6 +142,19 @@ export function Sidebar({
             .catch(() => {});
     }, [groupAssignVersion, chats.length]);
 
+    // Fetch enriched public channels (D9 parity — parallel to chats).
+    useEffect(() => {
+        invoke<Array<{ channel_id: number; group_id: number | null; group_color: string | null }>>('cmd_get_enriched_public_channels')
+            .then(enriched => {
+                const map: Record<number, { id: number | null; color: string | null }> = {};
+                for (const c of enriched) {
+                    map[c.channel_id] = { id: c.group_id, color: c.group_color };
+                }
+                setChannelGroupMap(map);
+            })
+            .catch(() => {});
+    }, [groupAssignVersion, publicChannels.length]);
+
     // Filter folders by active group
     const filteredFolders = activeGroupId === null
         ? folders
@@ -148,6 +164,11 @@ export function Sidebar({
     const filteredChats = activeGroupId === null
         ? chats
         : chats.filter(c => (chatGroupMap[c.chat_id]?.id ?? null) === activeGroupId);
+
+    // Filter public channels by active group (same chip governs all sections).
+    const filteredChannels = activeGroupId === null
+        ? publicChannels
+        : publicChannels.filter(c => (channelGroupMap[c.channel_id]?.id ?? null) === activeGroupId);
 
     const handleAssignGroup = useCallback(async (folderId: number, groupId: number | null) => {
         try {
@@ -164,6 +185,15 @@ export function Sidebar({
             setGroupAssignVersion(v => v + 1);
         } catch (e) {
             console.error('Failed to assign chat group:', e);
+        }
+    }, []);
+
+    const handleAssignChannelGroup = useCallback(async (channelId: number, groupId: number | null) => {
+        try {
+            await invoke('cmd_assign_public_channel_to_group', { channelId, groupId });
+            setGroupAssignVersion(v => v + 1);
+        } catch (e) {
+            console.error('Failed to assign channel group:', e);
         }
     }, []);
 
@@ -434,7 +464,7 @@ export function Sidebar({
 
                                                                                         {/* Public Channels section — inside nav so it shares scroll space */}
                             <PublicChannelSidebarSection
-                                channels={publicChannels}
+                                channels={filteredChannels}
                                 activeView={activeView}
                                 collapsed={collapsed}
                                 onSelect={onSelectPublicChannel}
@@ -442,6 +472,8 @@ export function Sidebar({
                                 onRemove={onRemovePublicChannel}
                                 onHideInVault={(cid) => onHideInVault('public_channel', cid)}
                                 onAdoptChannel={onAdoptChannel}
+                                onAssignGroup={handleAssignChannelGroup}
+                                channelGroupMap={channelGroupMap}
                                 expanded={pubExpanded}
                                 onToggleExpand={() => setPubExpanded(e => !e)}
                             />
