@@ -35,6 +35,13 @@ interface FileExplorerProps {
     onLoadMore?: () => void;
     onForwardToFolder?: () => void;
     showForwardOption?: boolean;
+    /** Empty-state copy overrides (F29: chat views). */
+    emptyTitle?: string;
+    emptySubtitle?: string;
+    /** Granular menu flags (chat views: forward+delete, no rename). */
+    canForward?: boolean;
+    canDelete?: boolean;
+    canRename?: boolean;
     notAMember?: boolean;
     onRemoveChannel?: () => void;
 }
@@ -126,9 +133,11 @@ export function FileExplorer({
     files, loading, error, viewMode, selectedIds, activeFolderId,
     onFileClick, onDelete, onDownload, onPreview, onManualUpload, onFolderUpload, onSelectionClear, onToggleSelection, onDrop, onDragStart, onDragEnd, uploadHighlight,
     readOnly, hasMore, onLoadMore,
-    onForwardToFolder, showForwardOption,
+    onForwardToFolder, showForwardOption, canForward, canDelete, canRename, emptyTitle, emptySubtitle,
     notAMember, onRemoveChannel
 }: FileExplorerProps) {
+    const emptyTitleFinal = emptyTitle ?? 'This folder is empty';
+    const emptySubtitleFinal = emptySubtitle ?? 'Drag and drop files here, or click the button below to upload from your computer.';
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: TelegramFile } | null>(null);
     const [channelUsername, setChannelUsername] = useState<string | null>(null);
 
@@ -304,7 +313,11 @@ export function FileExplorer({
     if (files.length === 0) {
         return (
             <div className="flex-1 p-6 overflow-auto">
-                <EmptyState onUpload={onManualUpload} />
+                <EmptyState
+                    onUpload={onManualUpload}
+                    title={emptyTitleFinal}
+                    subtitle={emptySubtitleFinal}
+                />
             </div>
         );
     }
@@ -528,6 +541,9 @@ export function FileExplorer({
                     onCopyLink={handleCopyLink}
                     channelIsPublic={!!channelUsername}
                     showForwardOption={showForwardOption}
+                    canForward={canForward}
+                    canDelete={canDelete}
+                    canRename={canRename}
                     onForwardToFolder={onForwardToFolder}
                 />
             )}

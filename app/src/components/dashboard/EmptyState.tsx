@@ -2,9 +2,12 @@
 
 interface EmptyStateProps {
     onUpload: () => void;
+    /** Optional copy overrides (F29 — chat views say "chat", not "folder"). */
+    title?: string;
+    subtitle?: string;
 }
 
-export function EmptyState({ onUpload }: EmptyStateProps) {
+export function EmptyState({ onUpload, title, subtitle }: EmptyStateProps) {
     return (
         <div className="flex flex-col items-center justify-center py-20 px-8 text-center">
             {/* Custom SVG Illustration */}
@@ -49,10 +52,10 @@ export function EmptyState({ onUpload }: EmptyStateProps) {
             </svg>
 
             <h3 className="text-xl font-semibold text-nobuf-text mb-2">
-                This folder is empty
+                {title ?? 'This folder is empty'}
             </h3>
             <p className="text-nobuf-subtext text-sm mb-6 max-w-xs">
-                Drag and drop files here, or click the button below to upload from your computer.
+                {subtitle ?? 'Drag and drop files here, or click the button below to upload from your computer.'}
             </p>
 
             <button

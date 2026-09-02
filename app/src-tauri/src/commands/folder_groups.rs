@@ -102,6 +102,15 @@ pub fn cmd_delete_group(id: i64, app: AppHandle) -> Result<bool, String> {
     let mut stmt = conn.prepare("UPDATE folder_metadata SET group_id = NULL WHERE group_id = ?").map_err(|e| e.to_string())?;
     stmt.bind((1, id)).map_err(|e| e.to_string())?;
     stmt.iter().next();
+    // Normal chats: clear dangling group assignments too (review2 V2-21 —
+    // else chats with the deleted group id vanish from chip-filtered views).
+    // Best-effort: the table may not exist yet on a fresh install.
+    let mut stmt = match conn.prepare("UPDATE normal_chats SET group_id = NULL WHERE group_id = ?") {
+        Ok(s) => s,
+        Err(_) => return Ok(true), // table not created yet — nothing to clear
+    };
+    stmt.bind((1, id)).map_err(|e| e.to_string())?;
+    stmt.iter().next();
     Ok(true)
 }
 

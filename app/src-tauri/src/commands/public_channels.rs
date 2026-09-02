@@ -159,7 +159,7 @@ fn build_input_channel(channel_id: i64, access_hash: i64) -> grammers_tl_types::
 
 // ─── Duration extraction ─────────────────────────────────────────
 
-fn extract_duration_from_doc(doc: &grammers_tl_types::enums::Document) -> Option<f64> {
+pub fn extract_duration_from_doc(doc: &grammers_tl_types::enums::Document) -> Option<f64> {
     if let grammers_tl_types::enums::Document::Document(d) = doc {
         for attr in &d.attributes {
             match attr {
@@ -707,10 +707,11 @@ pub async fn cmd_get_public_channel_files(
                 let (name, size, mime, ext, duration) = match media {
                     grammers_tl_types::enums::MessageMedia::Document(d) => {
                         if let Some(grammers_tl_types::enums::Document::Document(doc)) = &d.document {
-                            let n = doc.attributes.iter().find_map(|a| match a {
-                                grammers_tl_types::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
-                                _ => None,
-                            }).unwrap_or_else(|| "Unknown".to_string());
+                            let n = crate::commands::utils::document_display_name(
+                                &doc.attributes,
+                                doc.mime_type.as_str(),
+                                m.id,
+                            );
                             let s = doc.size as u64;
                             let mi = doc.mime_type.clone();
                             let e = std::path::Path::new(&n).extension().map(|os| os.to_str().unwrap_or("").to_string());
@@ -807,22 +808,49 @@ pub async fn cmd_forward_to_folder(
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<ForwardResult, String> {
+    // F-B3: source==target would forward every message onto itself (duplicate
+    // the chat's history) and toast a lying success. Mirror cmd_move_files'
+    // early-return guard (fs.rs) — the frontend also filters the source from
+    // the target list, this is the backend half of the same hardening.
+    if source_channel_id == target_folder_id {
+        return Err("Source and target are the same chat".to_string());
+    }
+
     let client_opt = { state.client.lock().await.clone() };
     let client = client_opt.ok_or("Not connected to Telegram")?;
 
-    let source_access_hash = {
-        let conn = get_connection(&app)?;
-        let mut stmt = conn.prepare("SELECT access_hash FROM public_channels WHERE channel_id = ?")
-            .map_err(|e| e.to_string())?;
-        stmt.bind((1, source_channel_id)).map_err(|e| e.to_string())?;
-        if stmt.next().map_err(|e| e.to_string())? != sqlite::State::Row {
-            return Err("Source channel not found".to_string());
+    // Source resolution: public_channels table first, then normal_chats
+    // (chat sources — D17). Folders/Saved need neither (resolve_peer).
+    let source_input_peer: grammers_tl_types::enums::InputPeer = {
+        let source_access_hash = {
+            let conn = get_connection(&app)?;
+            let mut stmt = conn.prepare("SELECT access_hash FROM public_channels WHERE channel_id = ?")
+                .map_err(|e| e.to_string())?;
+            stmt.bind((1, source_channel_id)).map_err(|e| e.to_string())?;
+            if stmt.next().map_err(|e| e.to_string())? == sqlite::State::Row {
+                Some(vi(&stmt.read(0).map_err(|e| e.to_string())?))
+            } else {
+                None
+            }
+        };
+        match source_access_hash {
+            Some(hash) => build_input_peer(source_channel_id, hash),
+            None => {
+                // Not a public channel — try the chats table (kind-checked).
+                let chat = crate::commands::normal_chats::load_normal_chats(&app)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|c| c.chat_id == source_channel_id);
+                match chat {
+                    Some(c) => crate::commands::normal_chats::resolve_chat_peer_pub(&c)?,
+                    None => return Err("Source channel not found".to_string()),
+                }
+            }
         }
-        vi(&stmt.read(0).map_err(|e| e.to_string())?)
     };
 
     let target_peer = crate::commands::utils::resolve_peer(&client, Some(target_folder_id), &state.peer_cache).await?;
-    let source_input_peer = build_input_peer(source_channel_id, source_access_hash);
+    let source_input_peer = source_input_peer;
 
     let mut errors = Vec::new();
     let mut forwarded = 0;

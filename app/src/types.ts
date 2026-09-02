@@ -71,6 +71,39 @@ export interface PublicChannel {
     is_member: boolean;
 }
 
+/** A normal chat (DM / basic group / supergroup) added to the Chats section.
+ *  Field names mirror the Rust ChatInfo verbatim (snake_case). */
+export interface ChatInfo {
+    chat_id: number;
+    peer_kind: 'user' | 'basic_group' | 'group';
+    access_hash: number | null; // null for basic groups
+    title: string;
+    added_at: number;
+    group_id: number | null;
+    /** Bot DM (peer_kind 'user' + bot) — icon/subtitle (m6). */
+    is_bot?: boolean;
+}
+
+/** A dialog eligible for the chat picker (already-added rows included,
+ *  flagged, so the modal can render them disabled). */
+export interface PickableChat {
+    chat_id: number;
+    peer_kind: 'user' | 'basic_group' | 'group';
+    access_hash: number | null;
+    title: string;
+    already_added: boolean;
+    kind_label: string; // 'Direct message' | 'Bot' | 'Group' | 'Supergroup'
+    /** Bot DM (m6) — carried to cmd_add_chat. */
+    is_bot: boolean;
+}
+
+/** Chat id → group assignment (sidebar group-chip filtering). */
+export interface EnrichedChat {
+    chat_id: number;
+    group_id: number | null;
+    group_color: string | null;
+}
+
 export interface ChannelPreview {
     title: string;
     about: string | null;
@@ -111,7 +144,12 @@ export type ActiveView =
     | { type: 'saved' }
     | { type: 'folder'; folderId: number }
     | { type: 'public'; channelId: number }
+    | { type: 'chat'; chatId: number }
     | { type: 'vault' };
 
 /** Drag MIME marking a dragged public channel (vault-hide source). */
 export const PUBLIC_CHANNEL_DRAG_MIME = 'application/x-nobuf-public-channel';
+/** Drag MIME marking a dragged chat (vault-hide source). */
+export const CHAT_DRAG_MIME = 'application/x-nobuf-chat';
+/** Drag MIME for chat reorder within the Chats section. */
+export const CHAT_REORDER_MIME = 'application/x-nobuf-chat-reorder';

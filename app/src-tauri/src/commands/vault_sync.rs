@@ -32,6 +32,10 @@ pub struct VaultSyncBlob {
     pub folder_ids: Vec<i64>,
     #[serde(default)]
     pub public_ids: Vec<i64>,
+    /// Normal-chats feature: hidden chat ids. Old blobs (no field) parse to
+    /// empty; old builds drop the field (serde default both ways).
+    #[serde(default)]
+    pub chat_ids: Vec<i64>,
     /// Hex-encoded PBKDF2 salt (empty = no passcode).
     #[serde(default)]
     pub salt_hex: String,
@@ -73,6 +77,7 @@ pub fn encode_sync_message(blob: &VaultSyncBlob) -> Result<String, String> {
 pub struct LocalVaultFields<'a> {
     pub folder_ids: &'a mut Vec<i64>,
     pub public_ids: &'a mut Vec<i64>,
+    pub chat_ids: &'a mut Vec<i64>,
     pub salt_hex: &'a mut String,
     pub hash_hex: &'a mut String,
     pub iterations: &'a mut u32,
@@ -92,6 +97,11 @@ pub fn merge_remote_into_local(
     for id in &remote.public_ids {
         if !local.public_ids.contains(id) {
             local.public_ids.push(*id);
+        }
+    }
+    for id in &remote.chat_ids {
+        if !local.chat_ids.contains(id) {
+            local.chat_ids.push(*id);
         }
     }
 
@@ -121,6 +131,7 @@ pub fn blob_from_store(store: &vault::VaultStore, owner_id: i64) -> VaultSyncBlo
         rev: store.rev,
         folder_ids: store.vaulted_folder_ids.clone(),
         public_ids: store.vaulted_public_channel_ids.clone(),
+        chat_ids: store.vaulted_chat_ids.clone(),
         salt_hex: hex_of(store.salt.as_ref()),
         hash_hex: hex_of(store.passcode_hash.as_ref()),
         iterations: store.iterations,
@@ -137,7 +148,7 @@ pub fn apply_remote_blob(
     remote_newer: bool,
 ) -> Result<bool, String> {
     let mut store = vault::load_store(app);
-    let before_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone());
+    let before_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone(), store.vaulted_chat_ids.clone());
     let before = (
         store.salt.clone(),
         store.passcode_hash.clone(),
@@ -151,6 +162,7 @@ pub fn apply_remote_blob(
             crate::commands::vault_sync::LocalVaultFields {
                 folder_ids: &mut store.vaulted_folder_ids,
                 public_ids: &mut store.vaulted_public_channel_ids,
+                chat_ids: &mut store.vaulted_chat_ids,
                 salt_hex: &mut salt_hex,
                 hash_hex: &mut hash_hex,
                 iterations: &mut store.iterations,
@@ -176,7 +188,7 @@ pub fn apply_remote_blob(
     if remote.rev > store.rev {
         store.rev = remote.rev;
     }
-    let after_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone());
+    let after_ids = (store.vaulted_folder_ids.clone(), store.vaulted_public_channel_ids.clone(), store.vaulted_chat_ids.clone());
     let changed = after_ids != before_ids
         || (store.salt.clone(), store.passcode_hash.clone(), store.iterations, store.entry_visible) != before;
     vault::save_store(app, &mut store)?;
@@ -404,6 +416,7 @@ mod tests {
             rev: 0,
             folder_ids: folder_ids.to_vec(),
             public_ids: public_ids.to_vec(),
+            chat_ids: Vec::new(),
             salt_hex: if hash_hex.is_empty() { String::new() } else { "aabb".into() },
             hash_hex: hash_hex.into(),
             iterations: 600_000,
@@ -437,6 +450,7 @@ mod tests {
     fn merge_unions_id_lists_order_stable() {
         let mut f = vec![10, 20];
         let mut p = vec![30];
+        let mut c = Vec::new();
         let mut salt = String::new();
         let mut hash = String::new();
         let mut iters = 600_000;
@@ -444,6 +458,7 @@ mod tests {
         merge_remote_into_local(
             LocalVaultFields {
                 folder_ids: &mut f, public_ids: &mut p,
+                chat_ids: &mut c,
                 salt_hex: &mut salt, hash_hex: &mut hash,
                 iterations: &mut iters, entry_visible: &mut vis,
             },
@@ -456,7 +471,7 @@ mod tests {
 
     #[test]
     fn creds_adopted_only_when_local_empty_or_remote_newer() {
-        let mut f = vec![]; let mut p = vec![];
+        let mut f = vec![]; let mut p = vec![]; let mut c = vec![];
         let mut salt = "local_salt".into();
         let mut hash = "local_hash".into();
         let mut iters = 600_000u32;
@@ -466,6 +481,7 @@ mod tests {
         merge_remote_into_local(
             LocalVaultFields {
                 folder_ids: &mut f, public_ids: &mut p,
+                chat_ids: &mut c,
                 salt_hex: &mut salt, hash_hex: &mut hash,
                 iterations: &mut iters, entry_visible: &mut vis,
             },
@@ -478,6 +494,7 @@ mod tests {
         merge_remote_into_local(
             LocalVaultFields {
                 folder_ids: &mut f, public_ids: &mut p,
+                chat_ids: &mut c,
                 salt_hex: &mut salt, hash_hex: &mut hash,
                 iterations: &mut iters, entry_visible: &mut vis,
             },
@@ -490,7 +507,7 @@ mod tests {
 
     #[test]
     fn empty_local_adopts_remote_creds_even_if_not_newer() {
-        let mut f = vec![]; let mut p = vec![];
+        let mut f = vec![]; let mut p = vec![]; let mut c = vec![];
         let mut salt = String::new();
         let mut hash = String::new();
         let mut iters = 600_000u32;
@@ -498,6 +515,7 @@ mod tests {
         merge_remote_into_local(
             LocalVaultFields {
                 folder_ids: &mut f, public_ids: &mut p,
+                chat_ids: &mut c,
                 salt_hex: &mut salt, hash_hex: &mut hash,
                 iterations: &mut iters, entry_visible: &mut vis,
             },
@@ -512,6 +530,7 @@ mod tests {
     fn merge_is_idempotent() {
         let mut f = vec![1];
         let mut p = vec![];
+        let mut c = vec![];
         let mut salt = String::new();
         let mut hash = String::new();
         let mut iters = 600_000u32;
@@ -522,6 +541,7 @@ mod tests {
                 LocalVaultFields {
                     folder_ids: &mut f,
                     public_ids: &mut p,
+                    chat_ids: &mut c,
                     salt_hex: &mut salt,
                     hash_hex: &mut hash,
                     iterations: &mut iters,
@@ -536,6 +556,7 @@ mod tests {
                 LocalVaultFields {
                     folder_ids: &mut f,
                     public_ids: &mut p,
+                    chat_ids: &mut c,
                     salt_hex: &mut salt,
                     hash_hex: &mut hash,
                     iterations: &mut iters,

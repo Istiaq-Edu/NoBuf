@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cmd-add-chat"
+description = "Enables the cmd_add_chat command without any pre-configured scope."
+commands.allow = ["cmd_add_chat"]
+
+[[permission]]
+identifier = "deny-cmd-add-chat"
+description = "Denies the cmd_add_chat command without any pre-configured scope."
+commands.deny = ["cmd_add_chat"]

@@ -5,8 +5,9 @@ import { SidebarItem } from './SidebarItem';
 import { AddChannelModal } from './AddChannelModal';
 import { BandwidthWidget } from './BandwidthWidget';
 import { FolderGroupTabs } from './FolderGroupTabs';
-import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel } from '../../types';
+import { TelegramFolder, BandwidthStats, ActiveView, PublicChannel, ChatInfo, PickableChat } from '../../types';
 import { PublicChannelSidebarSection } from './PublicChannelSidebarSection';
+import { ChatSidebarSection } from './ChatSidebarSection';
 
 interface SidebarProps {
     folders: TelegramFolder[];
@@ -23,6 +24,17 @@ interface SidebarProps {
     onDeleteChannelPermanently?: (id: number, accessHash: number, name: string) => void;
     /** Adopt an owned/administered channel as a folder (from AddChannelModal). */
     onAdoptChannel?: (channelId: number, accessHash: number) => Promise<TelegramFolder | null>;
+    // ---- Chats (normal_chats feature, plan F2) ----
+    /** RENDER list (vault-filtered). */
+    chats: ChatInfo[];
+    /** RAW list — reorder math (F-A01). */
+    allChats: ChatInfo[];
+    onSelectChat: (chatId: number) => void;
+    onChatAdded: (chat: PickableChat) => Promise<ChatInfo | null>;
+    onRemoveChat: (chatId: number, title: string) => void;
+    onChatReorder: (reordered: ChatInfo[]) => void;
+    /** Internal file drag → move into chat (D17 drag gesture). */
+    onFileDropOnChat?: (chatId: number, e: React.DragEvent) => void;
     isConnected: boolean;
     bandwidth: BandwidthStats | null;
     collapsed: boolean;
@@ -37,8 +49,8 @@ interface SidebarProps {
     // ---- Vault (spec §4.2) ----
     /** Navigate to the vault view (lock screen shows if locked). */
     onOpenVault: () => void;
-    /** Hide a folder/public channel (D16 gating handled upstream). */
-    onHideInVault: (kind: 'folder' | 'public_channel', id: number) => void;
+    /** Hide a folder/public channel/chat (D16 gating handled upstream). */
+    onHideInVault: (kind: 'folder' | 'public_channel' | 'chat', id: number) => void;
     /** Reject an external file drop that landed on the vault item. */
     onVaultRejectFileDrop: () => void;
     /** Pinned vault entry visibility (D3 settings toggle). */
@@ -57,6 +69,7 @@ const FOLDER_REORDER_MIME = 'application/x-nobuf-folder-reorder';
 export function Sidebar({
     folders, activeFolderId, setActiveFolderId, onDrop, onDelete, onRename, onReorder, onCreate,
     onUnadopt, onDeleteChannelPermanently, onAdoptChannel,
+    chats, allChats, onSelectChat, onChatAdded, onRemoveChat, onChatReorder, onFileDropOnChat,
     isConnected, bandwidth, collapsed, onToggleCollapse,
     mobileOpen, onMobileClose: _onMobileClose,
     activeView, publicChannels, onSelectPublicChannel, onPublicChannelsChanged, onRemovePublicChannel,
@@ -71,6 +84,9 @@ export function Sidebar({
     const [groupAssignVersion, setGroupAssignVersion] = useState(0);
     const [groupRefreshKey, setGroupRefreshKey] = useState(0);
 
+    // Chats: enriched group data (D9 chip filtering) — parallel to folders.
+    const [chatGroupMap, setChatGroupMap] = useState<Record<number, { id: number | null; color: string | null }>>({});
+
     // New Group inline input
     const [showNewGroupInput, setShowNewGroupInput] = useState(false);
         const [newGroupName, setNewGroupName] = useState('');
@@ -83,6 +99,7 @@ export function Sidebar({
         // Per-section collapse state (independent of sidebar-wide collapse)
         const [foldersExpanded, setFoldersExpanded] = useState(true);
         const [pubExpanded, setPubExpanded] = useState(true);
+        const [chatsExpanded, setChatsExpanded] = useState(true);
 
     const handleCreateGroup = async () => {
         if (!newGroupName.trim()) return;
@@ -109,10 +126,28 @@ export function Sidebar({
             .catch(() => {});
     }, [groupAssignVersion]);
 
+    // Fetch enriched chats (D9 chip filtering) — parallel to folders.
+    useEffect(() => {
+        invoke<Array<{ chat_id: number; group_id: number | null; group_color: string | null }>>('cmd_get_enriched_chats')
+            .then(enriched => {
+                const map: Record<number, { id: number | null; color: string | null }> = {};
+                for (const c of enriched) {
+                    map[c.chat_id] = { id: c.group_id, color: c.group_color };
+                }
+                setChatGroupMap(map);
+            })
+            .catch(() => {});
+    }, [groupAssignVersion, chats.length]);
+
     // Filter folders by active group
     const filteredFolders = activeGroupId === null
         ? folders
         : folders.filter(f => (folderGroupMap[f.id]?.id ?? null) === activeGroupId);
+
+    // Filter chats by active group (same chip governs both sections).
+    const filteredChats = activeGroupId === null
+        ? chats
+        : chats.filter(c => (chatGroupMap[c.chat_id]?.id ?? null) === activeGroupId);
 
     const handleAssignGroup = useCallback(async (folderId: number, groupId: number | null) => {
         try {
@@ -120,6 +155,15 @@ export function Sidebar({
             setGroupAssignVersion(v => v + 1);
         } catch (e) {
             console.error('Failed to assign group:', e);
+        }
+    }, []);
+
+    const handleAssignChatGroup = useCallback(async (chatId: number, groupId: number | null) => {
+        try {
+            await invoke('cmd_assign_chat_to_group', { chatId, groupId });
+            setGroupAssignVersion(v => v + 1);
+        } catch (e) {
+            console.error('Failed to assign chat group:', e);
         }
     }, []);
 
@@ -279,6 +323,7 @@ export function Sidebar({
                                     }}
                                     onVaultDropFolder={(fid) => onHideInVault('folder', fid)}
                                     onVaultDropPublicChannel={(cid) => onHideInVault('public_channel', cid)}
+                                    onVaultDropChat={(cid) => onHideInVault('chat', cid)}
                                     badgeCount={vaultCount}
                                     folderId={null}
                                     collapsed={collapsed}
@@ -363,7 +408,28 @@ export function Sidebar({
                                                             </>
                                                                                         )}
 
-                                                                                        {/* Divider between Private and Public sections */}
+                                                                                        {/* Divider between Private and Chats sections */}
+                                                                                        <div className="h-px bg-nobuf-border mx-2 my-2 shrink-0" />
+
+                                                                                        {/* Chats section — between Private and Public (D4) */}
+                                                                                        <ChatSidebarSection
+                                                                                                chats={filteredChats}
+                                                                                                allChats={allChats}
+                                                                                                activeView={activeView}
+                                                                                                collapsed={collapsed}
+                                                                                                onSelect={onSelectChat}
+                                                                                                onAdded={onChatAdded}
+                                                                                                onRemove={onRemoveChat}
+                                                                                                onReorder={onChatReorder}
+                                                                                                onHideInVault={(cid) => onHideInVault('chat', cid)}
+                                                                                                onAssignGroup={handleAssignChatGroup}
+                                                                                                chatGroupMap={chatGroupMap}
+                                                                                                onFileDropOnChat={onFileDropOnChat}
+                                                                                                expanded={chatsExpanded}
+                                                                                                onToggleExpand={() => setChatsExpanded(e => !e)}
+                                                                                        />
+
+                                                                                        {/* Divider between Chats and Public sections */}
                                                                                         <div className="h-px bg-nobuf-border mx-2 my-2 shrink-0" />
 
                                                                                         {/* Public Channels section — inside nav so it shares scroll space */}
