@@ -156,6 +156,16 @@ export function normalizeSplitUploadProgress(payload: SplitUploadProgressPayload
 /** Module-level store so multiple hook instances share one source of truth. */
 const splitRows = new Map<string, SplitJobRow>();
 const splitRowListeners = new Set<() => void>();
+/**
+ * Job ids discarded in this webview session. The dying worker's late
+ * `split-progress` events (emitted before it notices the row is gone — the
+ * only resurrection path; `upload-progress` events already no-op on missing
+ * rows) must not resurrect a discarded job's UI row — without this set those
+ * events re-insert a ghost row whose every action 404s ("Job not found").
+ * Never cleared: the DB row is deleted too, so hydration can't feed these
+ * ids, and a fresh confirm derives a brand-new job id.
+ */
+const discardedJobIds = new Set<string>();
 let progressListenerAttached = false;
 let uploadProgressListenerAttached = false;
 /** Startup resume notice fires ONCE per webview lifetime, not per remount
@@ -166,13 +176,25 @@ function notifySplitRows() {
     splitRowListeners.forEach(l => l());
 }
 
+/** Test-only: wipe the module store + tombstones so tests can't bleed state. */
+export function __resetSplitRowsForTests() {
+    splitRows.clear();
+    discardedJobIds.clear();
+    notifySplitRows();
+}
+
 /** Remove a job's row entirely (Discard/Delete) so it leaves the panel at once. */
 export function removeSplitRow(jobId: string) {
+    discardedJobIds.add(jobId);
     splitRows.delete(jobId);
     notifySplitRows();
 }
 
 function upsertSplitRow(row: Partial<SplitJobRow> & { jobId: string }) {
+    // A discarded job's dying worker still emits progress events before it
+    // notices the row is gone. Re-inserting here would resurrect a ghost row
+    // that no backend command can act on ("Job not found"). Drop instead.
+    if (discardedJobIds.has(row.jobId)) return;
     const prev = splitRows.get(row.jobId);
     splitRows.set(row.jobId, {
         jobId: row.jobId,

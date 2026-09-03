@@ -348,7 +348,19 @@ pub async fn cmd_cancel_transfer(
     if let Some(rest) = transfer_id.strip_prefix("split:") {
         if let Some((job_id, idx_str)) = rest.rsplit_once(':') {
             if let Ok(idx) = idx_str.parse::<u32>() {
-                crate::commands::split_upload::mark_part_cancelled(&app, job_id, idx)?;
+                // The tid insert above is the authoritative stop signal for
+                // any live worker; the persisted status flip is UI state.
+                // ONLY the row-gone case (job discarded) is expected and
+                // silently fine — the cancel already achieved its goal.
+                // Every other failure (DB locked, part index gone) is logged
+                // at warn level so a real persist failure stays visible.
+                if let Err(e) = crate::commands::split_upload::mark_part_cancelled(&app, job_id, idx) {
+                    if e == "Job not found" {
+                        log::info!("[SPLIT] part-cancel persist skipped (job row gone): {}", e);
+                    } else {
+                        log::warn!("[SPLIT] part-cancel persist failed: {}", e);
+                    }
+                }
             }
         }
     }

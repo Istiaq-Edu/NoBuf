@@ -212,6 +212,28 @@ fn job_is_resumable(status: &str) -> bool {
     matches!(status, "interrupted" | "failed" | "source_missing")
 }
 
+/// Error string returned when a job's row is gone from the DB (deleted by
+/// discard mid-run). Shared const so the producer (load_folder_id, the
+/// row-load in run_job_impl) and the consumer (the upload-site row-vanish
+/// match) cannot drift apart — a drifted literal would silently revert to
+/// leaking the just-split temp file (the bug that match exists to fix).
+const JOB_ROW_VANISHED: &str = "job row vanished";
+
+/// Discard-time stop-token decision (ghost-upload bug): a row in one of these
+/// statuses may still have a live or winding-down worker that must be
+/// signalled to stop before/after the row is deleted.
+/// - `running`: worker definitely live (or winding down after a cancel).
+/// - `queued`: promotion may have claimed it concurrently (claim race).
+/// - `interrupted`: mid-run cancel wrote the status but the worker can still
+///   be mid-part for up to a poll interval; ALSO covers crash-interrupted
+///   rows (no worker — the inserted tokens are then inert until restart).
+/// Terminal rows (done/failed/source_missing) have no worker.
+/// Fail-SAFE direction: an UNKNOWN status gets tokens (inert strings at
+/// worst) — the unsafe direction would skip signalling a live worker.
+pub fn discard_must_stop_worker(status: &str) -> bool {
+    !matches!(status, "done" | "failed" | "source_missing")
+}
+
 /// Ownership-boundary purge of every cancellation/retry token a job owns:
 /// `split-cancel:<id>`, all `split:<id>:*` part tids, all `split-retry:<id>:*`
 /// intent markers. Must run at EVERY point a fresh worker is about to observe
@@ -1401,10 +1423,10 @@ pub async fn cmd_discard_split_job(
     app: AppHandle,
     state: State<'_, TelegramState>,
 ) -> Result<(), String> {
-    let (temp_dir, folder_id, message_ids) = {
+    let (temp_dir, folder_id, message_ids, part_idxs, job_status) = {
         let conn = get_connection(&app)?;
         let mut stmt = conn
-            .prepare("SELECT temp_dir, folder_id, parts_json FROM split_upload_jobs WHERE id = ?")
+            .prepare("SELECT temp_dir, folder_id, parts_json, status FROM split_upload_jobs WHERE id = ?")
             .map_err(|e| e.to_string())?;
         stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
         let mut c = stmt.iter();
@@ -1414,17 +1436,63 @@ pub async fn cmd_discard_split_job(
                     sqlite::Value::Integer(value) => Some(*value),
                     _ => None,
                 };
-                let message_ids = parse_parts_json(&vs(&row[2]))
+                let parts = parse_parts_json(&vs(&row[2]));
+                let message_ids = parts
                     .iter()
                     .filter_map(|part| part.message_id)
                     .filter_map(|id| i32::try_from(id).ok())
                     .collect::<Vec<_>>();
-                (vs(&row[0]), folder_id, message_ids)
+                let part_idxs: Vec<u32> = parts.iter().map(|p| p.idx).collect();
+                (vs(&row[0]), folder_id, message_ids, part_idxs, vs(&row[3]))
             }
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
-            None => return Err("Job not found".to_string()),
+            None => {
+                // Row already gone (double discard / ghost row). With no parts
+                // to delete from Telegram the goal is already met — succeed so
+                // the UI just drops the row instead of toasting "Job not found".
+                if !delete_parts {
+                    return Ok(());
+                }
+                return Err("Job not found".to_string());
+            }
         }
     };
+    // Stop tokens FIRST (reviewer B-3): insert them BEFORE the Telegram
+    // delete RPC so an in-flight part aborts within ~100ms while the RPC
+    // runs — otherwise a part completing during the RPC uploads a message
+    // not covered by the message_ids snapshot (untracked orphan on
+    // Telegram under a deleted row). Tokens don't affect the RPC itself.
+    // This snapshot's message_ids stay the deletion set as before.
+    // S2(a): re-read the status HERE — the row can flip between the initial
+    // read above and this decision (user hits Resume/Retry on an
+    // interrupted/failed row while this discard runs; the fresh worker would
+    // upload under a row this command is about to delete). Deciding on the
+    // fresh value closes that race. Read failure or a row already deleted
+    // by a concurrent discard falls back to the stale value — the fail-safe
+    // predicate makes the worst case inert tokens, never a missed stop.
+    let job_status = {
+        let conn = get_connection(&app)?;
+        let mut stmt = conn
+            .prepare("SELECT status FROM split_upload_jobs WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
+        let mut c = stmt.iter();
+        match c.next() {
+            Some(Ok(row)) => vs(&row[0]),
+            _ => job_status,
+        }
+    };
+    if discard_must_stop_worker(&job_status) {
+        let tg = app.state::<TelegramState>();
+        let mut set = tg.cancelled_transfers.write().await;
+        set.insert(format!("split-cancel:{}", id));
+        for idx in &part_idxs {
+            set.insert(format!("split:{}:{}", id, idx));
+        }
+        log::info!("[SPLIT] discard {}: stop tokens inserted for possibly-live worker", id);
+    } else {
+        log::info!("[SPLIT] discard {}: row terminal; no stop tokens needed", id);
+    }
     if delete_parts && !message_ids.is_empty() {
         let client = state.client.lock().await.clone().ok_or("Not connected to Telegram")?;
         let peer = resolve_peer(&client, folder_id, &state.peer_cache).await?;
@@ -1466,11 +1534,8 @@ pub async fn cmd_discard_split_job(
         stmt.bind((1, id.as_str())).map_err(|e| e.to_string())?;
         stmt.iter().next();
     }
-    // The job row is gone — its cancellation/retry tokens are garbage. Purge
-    // them so the in-memory set can't grow without bound across a session of
-    // many discarded jobs (and no stale token can ever match a future
-    // re-derived job id).
-    purge_job_cancel_tokens(&app, &id).await;
+    // Stop tokens were already inserted BEFORE the Telegram RPC above; the
+    // supervisor purges them once the (possibly live) worker exits.
     Ok(())
 }
 
@@ -1509,7 +1574,7 @@ async fn run_job_supervised(app: AppHandle, job_id: String) -> Result<(), String
     let app2 = app.clone();
     let job_id2 = job_id.clone();
     let inner = std::panic::AssertUnwindSafe(run_job(app, job_id));
-    match futures::FutureExt::catch_unwind(inner).await {
+    let outcome = match futures::FutureExt::catch_unwind(inner).await {
         Ok(res) => {
             if res.is_err() {
                 // Row may be stranded in `running` by an unwritten terminal
@@ -1528,11 +1593,34 @@ async fn run_job_supervised(app: AppHandle, job_id: String) -> Result<(), String
             update_status_quiet(&app2, &job_id2, "interrupted", Some(format!("Worker crashed: {msg}")));
             Err(format!("worker panicked: {msg}"))
         }
+    };
+    // Row-gone cleanup (discard mid-run): with this worker finished and the
+    // DB row deleted, nothing can ever observe this job's cancel tokens —
+    // cmd_discard_split_job INSERTS them to stop the worker, and this is the
+    // point they become garbage. Purge so the set doesn't grow unboundedly
+    // across a session of discards. Row still present → leave tokens to the
+    // existing ownership boundaries (promotion/resume/retry).
+    if current_job_status(&app2, &job_id2).is_none() {
+        purge_job_cancel_tokens(&app2, &job_id2).await;
     }
+    // Pipeline release: this supervisor exit is the single ownership
+    // boundary every worker passes through, so release the slot HERE instead
+    // of relying on each in-loop exit path to remember the spawn (the
+    // between-parts cancel arm forgot it — a cancelled worker's queued
+    // successor stalled until an unrelated promotion trigger). Double-promote
+    // is safe: PIPELINE_CLAIM_SQL is atomic and the runner coalesces (250ms).
+    let a3 = app2.clone();
+    tokio::spawn(async move { promote_queued_jobs(a3).await });
+    outcome
 }
 
 /// Read a job row's current status — best-effort, empty string on failure
 /// (callers treat unknown like not-running for safety).
+/// NOTE: returns None BOTH for "row gone" AND for "DB unreadable" — callers
+/// using None to mean row-gone (the supervisor's discard-purge) must be
+/// safe against a transient read failure. That caller is: the worker has
+/// already exited, and every fresh-worker boundary (promotion/resume/retry)
+/// purges tokens itself, so an over-eager purge only errs toward "clean".
 fn current_job_status(app: &AppHandle, job_id: &str) -> Option<String> {
     let conn = get_connection(app).ok()?;
     let mut stmt = conn
@@ -1606,7 +1694,7 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                 parse_parts_json(&vs(&row[6])),
             ),
             Some(Err(e)) => return Err(format!("Job lookup failed: {}", e)),
-            None => return Err("job row vanished".to_string()),
+            None => return Err(JOB_ROW_VANISHED.to_string()),
         }
     };
 
@@ -1766,12 +1854,27 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
                     message_id: None,
                 },
             );
+            let folder_id = match load_folder_id(&app, &job_id) {
+                Ok(f) => f,
+                Err(e) if e == JOB_ROW_VANISHED => {
+                    // Discard deleted the row mid-run: this part's temp is
+                    // garbage. delete_temp_later normally runs after the
+                    // upload resolves — this early return used to skip it,
+                    // leaking the just-split .nobuf-tmp next to the source.
+                    log::info!("[SPLIT] job row vanished before uploading part {} — deleting temp and stopping", idx);
+                    delete_temp_later(temp_path.to_string_lossy().to_string());
+                    let a2 = app.clone();
+                    tokio::spawn(async move { promote_queued_jobs(a2).await });
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let res = upload_file_inner(
                 &app,
                 &tg,
                 &bw,
                 &temp_path.to_string_lossy(),
-                load_folder_id(&app, &job_id)?,
+                folder_id,
                 Some(tid.clone()),
                 Some(parts[k].name.clone()),
             )
@@ -1927,7 +2030,17 @@ async fn run_job_impl(app: AppHandle, job_id: String) -> Result<(), String> {
             let mut rows = stmt.iter();
             match rows.next() {
                 Some(Ok(row)) => parse_parts_json(&vs(&row[0])),
-                _ => return Err("job row vanished before retry".to_string()),
+                Some(Err(e)) => return Err(format!("job row read failed: {}", e)),
+                // Row deleted mid-run (discard): the retry intent is moot and
+                // persist_parts on a deleted row is a silent no-op UPDATE —
+                // exiting cleanly is the correct outcome. Temps for resolved
+                // parts were already scheduled for deletion in the loop.
+                None => {
+                    log::info!("[SPLIT] job {} row gone before retry reload — exiting", job_id);
+                    let a2 = app.clone();
+                    tokio::spawn(async move { promote_queued_jobs(a2).await });
+                    return Ok(());
+                }
             }
         };
         apply_retry_indices(&mut latest_parts, &retry_indices);
@@ -2153,14 +2266,21 @@ fn update_status(app: &AppHandle, job_id: &str, status: &str, error: Option<Stri
     }
     stmt.bind((3, epoch_secs())).map_err(|e| e.to_string())?;
     stmt.bind((4, job_id)).map_err(|e| e.to_string())?;
+    // Row-count gate (house total_change_count pattern, cf. PIPELINE_CLAIM):
+    // a no-op UPDATE means the row is GONE (discarded mid-run) — emitting a
+    // terminal split-progress event for it would resurrect a ghost UI row.
+    // The frontend tombstone drops it too; this gate makes the BACKEND stop
+    // emitting for deleted rows instead of relying on the frontend alone.
+    let before = conn.total_change_count();
     stmt.iter().next();
+    let row_existed = conn.total_change_count() > before;
     // Phase E fix: terminal transitions (interrupted/done/failed/cancelled)
     // previously persisted silently — the Transfers panel row stayed stuck at
     // the last progress phase ("uploading part k/N") until app restart, because
     // hydration reads cmd_list_split_jobs only once per webview and no
     // split-progress event was emitted on these paths. Emit here so the UI
     // flips to the interrupted row (Resume/Delete) immediately.
-    if matches!(status, "interrupted" | "done" | "failed" | "cancelled" | "source_missing") {
+    if row_existed && matches!(status, "interrupted" | "done" | "failed" | "cancelled" | "source_missing") {
         let mut total: u32 = 0;
         let mut done: u32 = 0;
         if let Ok(mut stmt2) = conn
@@ -2206,7 +2326,7 @@ fn load_folder_id(app: &AppHandle, job_id: &str) -> Result<Option<i64>, String> 
     match c.next() {
         Some(Ok(row)) => Ok(voi(&row[0])),
         Some(Err(e)) => Err(format!("Job lookup failed: {}", e)),
-        None => Err("job row vanished".to_string()),
+        None => Err(JOB_ROW_VANISHED.to_string()),
     }
 }
 
@@ -2668,6 +2788,28 @@ mod tests {
         )
         .unwrap();
         assert!(has_active_split_job(&conn));
+    }
+
+    // --------------------------------------------------------------------
+    // Discard-mid-run (ghost-upload bug): the discard command must INSERT
+    // stop tokens for any status that can still have a live worker, and
+    // must NEVER purge them (purging resurrected running uploads under a
+    // deleted row). Pinned against the shipped decision function.
+    // --------------------------------------------------------------------
+    #[test]
+    fn discard_stops_worker_for_every_non_terminal_status() {
+        // Live worker, mid-run cancel (worker winding down), claim race.
+        assert!(discard_must_stop_worker("running"), "running worker must be signalled");
+        assert!(discard_must_stop_worker("interrupted"), "interrupted-by-cancel worker can still be mid-part");
+        assert!(discard_must_stop_worker("queued"), "queued job may be claimed by promotion concurrently");
+        // Fail-SAFE: unknown/empty status gets tokens (inert at worst) — the
+        // unsafe direction would silently skip signalling a live worker.
+        assert!(discard_must_stop_worker(""), "unknown status must get tokens (fail-safe)");
+        assert!(discard_must_stop_worker("uploading"), "any non-terminal status must get tokens");
+        // Terminal rows have no worker to stop.
+        assert!(!discard_must_stop_worker("done"));
+        assert!(!discard_must_stop_worker("failed"));
+        assert!(!discard_must_stop_worker("source_missing"));
     }
 
     #[test]
